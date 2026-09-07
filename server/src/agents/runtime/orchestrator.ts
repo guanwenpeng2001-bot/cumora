@@ -379,6 +379,24 @@ ${indent(args.openaiKey)}
     - name: OPENAI_BASE_URL
       value: |-
 ${indent(args.openaiBaseUrl)}
+    - name: AGENT_RUNTIME_SECRET
+      value: |-
+${indent(env.AGENT_RUNTIME_SECRET)}
+    - name: REDIS_URL
+      value: |-
+${indent(env.REDIS_URL.replace('localhost', 'host.docker.internal').replace('127.0.0.1', 'host.docker.internal'))}
+    - name: NOVITA_API_KEY
+      value: |-
+${indent(env.NOVITA_API_KEY)}
+    - name: NOVITA_BASE_URL
+      value: |-
+${indent(env.NOVITA_BASE_URL)}
+    - name: DATABASE_URL
+      value: |-
+${indent(env.DATABASE_URL.replace('localhost', 'host.docker.internal').replace('127.0.0.1', 'host.docker.internal'))}
+    - name: OPENAI_MODEL
+      value: |-
+${indent(env.OPENAI_MODEL)}
   # Spot/Preemptible toleration: GKE Spot VM nodes are tainted
   # cloud.google.com/gke-spot=true:NoSchedule by default so cluster-
   # critical pods don't accidentally land on them. Agent pods are
@@ -892,7 +910,7 @@ async function ensurePodImpl(agentId: string): Promise<EnsurePodResult> {
   // we have to bake the resolved key into the manifest env at
   // pod-spawn time.
   let resolvedKey = env.OPENAI_API_KEY
-  let resolvedBaseUrl = '' // empty → OpenAI SDK uses its default (api.openai.com/v1)
+  let resolvedBaseUrl = process.env.OPENAI_BASE_URL ?? '' // empty → OpenAI SDK uses its default (api.openai.com/v1)
   if (sub2apiConfigured()) {
     try {
       const { rows } = await pool.query<{ sub2api_api_key: string | null }>(

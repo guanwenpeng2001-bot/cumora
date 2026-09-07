@@ -22,7 +22,7 @@ import { isImeComposing } from '@/lib/keyboard'
 import { MessageRow, TypingRow } from '@/components/Message'
 import { PollComposer } from '@/components/PollComposer'
 import { ScrollToLatestButton } from '@/components/ScrollToLatestButton'
-import { ISearch, IPin, IClip, IAt, ISmile, ISend, IConvene } from '@/components/icons'
+import { ISearch, IPin, IClip, IAt, ISmile, ISend, IConvene, IMic } from '@/components/icons'
 import type { Participant } from '@/types'
 import { useT } from '@/lib/i18n'
 
@@ -800,6 +800,116 @@ export function Composer({
     }
   }
 
+  // Voice input — MediaRecorder capture → base64 → server ASR → the text is
+  // inserted into the composer (never auto-sent, so the user can edit first).
+  const [voiceState, setVoiceState] = useState<'idle' | 'recording' | 'transcribing'>('idle')
+  const [voiceSeconds, setVoiceSeconds] = useState(0)
+  const [voiceError, setVoiceError] = useState<string | null>(null)
+  const recorderRef = useRef<MediaRecorder | null>(null)
+  const voiceStreamRef = useRef<MediaStream | null>(null)
+  const voiceTimerRef = useRef<number | null>(null)
+
+  const stopVoiceTimer = () => {
+    if (voiceTimerRef.current !== null) {
+      window.clearInterval(voiceTimerRef.current)
+      voiceTimerRef.current = null
+    }
+  }
+  const stopVoiceTracks = () => {
+    voiceStreamRef.current?.getTracks().forEach((track) => track.stop())
+    voiceStreamRef.current = null
+  }
+  const showVoiceError = (msg: string) => {
+    setVoiceError(msg)
+    // Auto-clear like the upload error pill.
+    window.setTimeout(() => setVoiceError(null), 4500)
+  }
+
+  const transcribeVoice = async (blob: Blob) => {
+    if (blob.size === 0) {
+      setVoiceState('idle')
+      showVoiceError(t('chat.voiceFailed'))
+      return
+    }
+    setVoiceState('transcribing')
+    try {
+      const bytes = new Uint8Array(await blob.arrayBuffer())
+      let binary = ''
+      const chunk = 0x8000
+      for (let i = 0; i < bytes.length; i += chunk) {
+        binary += String.fromCharCode(...bytes.subarray(i, i + chunk))
+      }
+      // 'audio/webm;codecs=opus' → 'webm'
+      const format = /audio\/(\w+)/.exec(blob.type)?.[1] ?? 'webm'
+      const { text } = await api.transcribeAudio(btoa(binary), format)
+      if (text.trim()) editorRef.current?.insertText(text.trim())
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      console.warn('[voice] transcription failed', msg)
+      showVoiceError(msg)
+    } finally {
+      setVoiceState('idle')
+      setVoiceSeconds(0)
+    }
+  }
+
+  const onVoiceClick = async () => {
+    if (voiceState === 'recording') {
+      // stop() fires onstop, which continues the upload flow.
+      recorderRef.current?.stop()
+      return
+    }
+    if (voiceState === 'transcribing') return
+    setVoiceError(null)
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
+      showVoiceError(t('chat.voiceNoSupport'))
+      return
+    }
+    let stream: MediaStream
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+    } catch {
+      showVoiceError(t('chat.voiceNoMic'))
+      return
+    }
+    let rec: MediaRecorder
+    try {
+      rec = MediaRecorder.isTypeSupported('audio/webm')
+        ? new MediaRecorder(stream, { mimeType: 'audio/webm' })
+        : new MediaRecorder(stream)
+    } catch {
+      stream.getTracks().forEach((track) => track.stop())
+      showVoiceError(t('chat.voiceNoSupport'))
+      return
+    }
+    const chunks: Blob[] = []
+    rec.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data) }
+    rec.onstop = () => {
+      stopVoiceTracks()
+      stopVoiceTimer()
+      void transcribeVoice(new Blob(chunks, { type: rec.mimeType || 'audio/webm' }))
+    }
+    recorderRef.current = rec
+    voiceStreamRef.current = stream
+    rec.start()
+    setVoiceSeconds(0)
+    voiceTimerRef.current = window.setInterval(() => setVoiceSeconds((s) => s + 1), 1000)
+    setVoiceState('recording')
+  }
+
+  // Unmounting mid-recording (switching rooms/views) discards the clip —
+  // detach handlers so onstop doesn't transcribe into an unmounted composer.
+  useEffect(() => () => {
+    stopVoiceTimer()
+    const rec = recorderRef.current
+    if (rec && rec.state !== 'inactive') {
+      rec.ondataavailable = null
+      rec.onstop = null
+      rec.stop()
+    }
+    stopVoiceTracks()
+  }, [])
+
   const onDrop = async (e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault()
     const f = e.dataTransfer.files?.[0]
@@ -1060,6 +1170,11 @@ export function Composer({
             {uploadError}
           </div>
         )}
+        {voiceError && (
+          <div className="mb-2 text-[11.5px] py-1 px-2 rounded-md text-coral-deep bg-coral-soft inline-block max-w-full truncate">
+            {voiceError}
+          </div>
+        )}
         {showReplyingPill && (
           <div className="mb-2 flex items-stretch gap-2 rounded-md bg-sky2-50 border border-sky2-100 pl-2 pr-1 py-1.5 min-w-0">
             <div className="w-[3px] rounded bg-skype shrink-0" />
@@ -1261,6 +1376,30 @@ export function Composer({
               />
             )}
           </div>
+          <button
+            type="button"
+            onClick={onVoiceClick}
+            disabled={voiceState === 'transcribing'}
+            className={cn(
+              'h-7 min-w-7 px-1.5 rounded-[7px] inline-flex items-center justify-center gap-1.5 transition',
+              voiceState === 'recording'
+                ? 'bg-coral-soft text-coral-deep animate-pulse'
+                : 'hover:bg-sky2-50 hover:text-skype-deep',
+              voiceState === 'transcribing' && 'opacity-60 cursor-wait',
+            )}
+            title={voiceState === 'recording' ? t('chat.voiceStop') : t('chat.voiceInput')}
+            aria-label={voiceState === 'recording' ? t('chat.voiceStop') : t('chat.voiceInput')}
+          >
+            <IMic className="w-[17px] h-[17px]" />
+            {voiceState === 'recording' && (
+              <span className="text-[11px] font-semibold tabular-nums">
+                {Math.floor(voiceSeconds / 60)}:{String(voiceSeconds % 60).padStart(2, '0')}
+              </span>
+            )}
+            {voiceState === 'transcribing' && (
+              <span className="text-[11px] italic">{t('chat.voiceTranscribing')}</span>
+            )}
+          </button>
           <button
             type="button"
             onClick={send}

@@ -69,7 +69,10 @@ export async function classifyInboxTriage(args: {
       instructions: req.instructions,
       input: req.input,
       text: { format: { type: 'json_object' } },
-      max_output_tokens: 500,
+      // Thinking models (e.g. deepseek vision-exp) spend part of this budget on
+      // reasoning_content before emitting the JSON — 500 starves them into an
+      // empty content. 2000 leaves room for brief reasoning + the verdict JSON.
+      max_output_tokens: 2000,
       reasoning: { effort: 'low' },
     }, {
       // Triage is a fast GATE. Do NOT retry — a rate-limited model retried (or

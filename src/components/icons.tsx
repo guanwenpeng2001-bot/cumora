@@ -101,3 +101,6 @@ export const IClock = (p: IconProps) => (
 export const IRepeat = (p: IconProps) => (
   <svg {...base} {...p}><path d="M17 1l4 4-4 4"/><path d="M3 11V9a4 4 0 014-4h14"/><path d="M7 23l-4-4 4-4"/><path d="M21 13v2a4 4 0 01-4 4H3"/></svg>
 )
+export const IMic = (p: IconProps) => (
+  <svg {...base} {...p}><path d="M12 2a3 3 0 00-3 3v6a3 3 0 006 0V5a3 3 0 00-3-3z"/><path d="M19 10v1a7 7 0 01-14 0v-1"/><path d="M12 18v4M8 22h8"/></svg>
+)

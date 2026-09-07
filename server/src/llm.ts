@@ -211,3 +211,180 @@ function legacyClient(): OpenAI {
   })
   return _legacy
 }
+
+/** Dedicated client for image generation (avatars, agent `cumora image`).
+ *  Text calls and image calls often need different providers (e.g. Kimi
+ *  for text, DashScope for images). When OPENAI_IMAGE_BASE_URL and
+ *  OPENAI_IMAGE_API_KEY are both set, images go there; otherwise fall
+ *  back to the shared legacy client (previous behavior). */
+/** DashScope (Alibaba Bailian) native text2image shim, shaped like OpenAI's
+ *  images.generate. DashScope's OpenAI-compatible mode does NOT expose
+ *  /images/generations — image models only exist on the native async task
+ *  API, so we create a task and poll it to completion here. */
+interface DashscopeTaskResponse {
+  output?: {
+    task_id?: string
+    task_status?: string
+    results?: { url?: string }[]
+    message?: string
+  }
+}
+
+function dashscopeImageClient(apiKey: string): OpenAI {
+  const base = 'https://dashscope.aliyuncs.com/api/v1'
+
+  async function downloadAsB64(url: string): Promise<{ b64_json: string }> {
+    // Download here and return b64_json instead of the URL: the caller's
+    // fetchImageBytes SSRF guard DNS-pins the host, which breaks on fake-ip
+    // VPN DNS (resolves to reserved ranges).
+    const img = await fetch(url, { signal: AbortSignal.timeout(30_000) })
+    if (!img.ok) throw new Error(`dashscope result download failed: ${img.status}`)
+    return { b64_json: Buffer.from(await img.arrayBuffer()).toString('base64') }
+  }
+
+  // qwen-image* models live on the synchronous multimodal-generation API;
+  // wan*/wanx* live on the async text2image task API.
+  async function generateSync(model: string, prompt: string, size?: string, n?: number) {
+    const resp = await fetch(`${base}/services/aigc/multimodal-generation/generation`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model,
+        input: { messages: [{ role: 'user', content: [{ text: prompt }] }] },
+        parameters: { size: (size ?? '1024x1024').replace('x', '*'), n: n ?? 1 },
+      }),
+      signal: AbortSignal.timeout(180_000),
+    })
+    if (!resp.ok) throw new Error(`dashscope multimodal-generation failed: ${resp.status} ${await resp.text()}`)
+    const body = (await resp.json()) as {
+      output?: { choices?: { message?: { content?: { image?: string }[] } }[] }
+    }
+    const url = body.output?.choices?.[0]?.message?.content?.find((c) => c.image)?.image
+    if (!url) throw new Error(`dashscope multimodal-generation returned no image: ${JSON.stringify(body).slice(0, 300)}`)
+    return { data: [await downloadAsB64(url)] }
+  }
+
+  async function generateAsync(model: string, prompt: string, size?: string, n?: number) {
+    const create = await fetch(`${base}/services/aigc/text2image/image-synthesis`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'X-DashScope-Async': 'enable',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model,
+        input: { prompt },
+        parameters: { size: (size ?? '1024x1024').replace('x', '*'), n: n ?? 1 },
+      }),
+    })
+    if (!create.ok) throw new Error(`dashscope task create failed: ${create.status} ${await create.text()}`)
+    const created = (await create.json()) as DashscopeTaskResponse
+    const taskId = created.output?.task_id
+    if (!taskId) throw new Error(`dashscope task create returned no task_id: ${JSON.stringify(created)}`)
+
+    const deadline = Date.now() + 180_000
+    for (;;) {
+      await new Promise((r) => setTimeout(r, 2000))
+      const poll = await fetch(`${base}/tasks/${taskId}`, { headers: { Authorization: `Bearer ${apiKey}` } })
+      if (!poll.ok) throw new Error(`dashscope task poll failed: ${poll.status}`)
+      const status = (await poll.json()) as DashscopeTaskResponse
+      const state = status.output?.task_status
+      if (state === 'SUCCEEDED') {
+        const url = status.output?.results?.[0]?.url
+        if (!url) throw new Error('dashscope task succeeded with no result url')
+        return { data: [await downloadAsB64(url)] }
+      }
+      if (state === 'FAILED' || state === 'CANCELED') {
+        throw new Error(`dashscope task ${state}: ${status.output?.message ?? 'no message'}`)
+      }
+      if (Date.now() > deadline) throw new Error('dashscope task timed out after 180s')
+    }
+  }
+
+  async function generate(args: { model: string; prompt: string; size?: string; n?: number }) {
+    // Fallback chain: primary model from the caller, then OPENAI_IMAGE_FALLBACK_MODELS
+    // in order. Quota exhaustion / unknown model / transient failure all advance
+    // the chain; the last error surfaces if every model fails.
+    const fallbacks = (process.env.OPENAI_IMAGE_FALLBACK_MODELS ?? '')
+      .split(',').map((s) => s.trim()).filter(Boolean)
+    const chain = [args.model, ...fallbacks.filter((m) => m !== args.model)]
+    let lastErr: unknown = null
+    for (const model of chain) {
+      try {
+        if (model.startsWith('qwen-image')) {
+          return await generateSync(model, args.prompt, args.size, args.n)
+        }
+        return await generateAsync(model, args.prompt, args.size, args.n)
+      } catch (e) {
+        lastErr = e
+        console.warn(`[image] ${model} failed, trying next:`, e instanceof Error ? e.message.slice(0, 200) : e)
+      }
+    }
+    throw lastErr instanceof Error ? lastErr : new Error(String(lastErr))
+  }
+
+  return { images: { generate } } as unknown as OpenAI
+}
+
+let _imageClient: OpenAI | null = null
+export function getImageClient(): OpenAI {
+  if (_imageClient) return _imageClient
+  const apiKey = process.env.OPENAI_IMAGE_API_KEY ?? ''
+  const provider = (process.env.OPENAI_IMAGE_PROVIDER ?? '').toLowerCase()
+  const baseURL = (process.env.OPENAI_IMAGE_BASE_URL ?? '').replace(/\/+$/, '')
+  if (provider === 'dashscope' && apiKey) {
+    _imageClient = dashscopeImageClient(apiKey)
+  } else if (baseURL && apiKey) {
+    _imageClient = new OpenAI({ apiKey, baseURL, maxRetries: SDK_MAX_RETRIES, timeout: SDK_TIMEOUT_MS })
+  } else {
+    _imageClient = legacyClient()
+  }
+  return _imageClient
+}
+
+/** Transcribe an audio clip via DashScope's OpenAI-compatible chat
+ *  endpoint — the qwen3-asr models accept an `input_audio` content part
+ *  carrying a base64 data URL.
+ *
+ *  Fallback chain mirrors dashscopeImageClient: primary model from
+ *  OPENAI_AUDIO_MODEL, then OPENAI_AUDIO_FALLBACK_MODELS (comma-separated)
+ *  in order; the last error surfaces if every model fails.
+ *  Key comes from OPENAI_AUDIO_API_KEY, falling back to
+ *  OPENAI_IMAGE_API_KEY (same Bailian key on this deployment). */
+export async function transcribeAudio(audioBase64: string, format: string): Promise<string> {
+  const apiKey = (process.env.OPENAI_AUDIO_API_KEY ?? '').trim() || (process.env.OPENAI_IMAGE_API_KEY ?? '').trim()
+  if (!apiKey) throw new Error('OPENAI_AUDIO_API_KEY is not set (and no OPENAI_IMAGE_API_KEY fallback)')
+  const primary = (process.env.OPENAI_AUDIO_MODEL ?? '').trim()
+  if (!primary) throw new Error('OPENAI_AUDIO_MODEL is not set')
+  const base = (process.env.OPENAI_AUDIO_BASE_URL || 'https://dashscope.aliyuncs.com/compatible-mode/v1').replace(/\/+$/, '')
+  const fallbacks = (process.env.OPENAI_AUDIO_FALLBACK_MODELS ?? '')
+    .split(',').map((s) => s.trim()).filter(Boolean)
+  const chain = [primary, ...fallbacks.filter((m) => m !== primary)]
+  let lastErr: unknown = null
+  for (const model of chain) {
+    try {
+      const resp = await fetch(`${base}/chat/completions`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model,
+          messages: [{
+            role: 'user',
+            content: [{ type: 'input_audio', input_audio: { data: `data:audio/${format};base64,${audioBase64}` } }],
+          }],
+        }),
+        signal: AbortSignal.timeout(120_000),
+      })
+      if (!resp.ok) throw new Error(`asr request failed: ${resp.status} ${(await resp.text()).slice(0, 300)}`)
+      const body = (await resp.json()) as { choices?: { message?: { content?: string } }[] }
+      const text = body.choices?.[0]?.message?.content?.trim()
+      if (!text) throw new Error(`asr returned no text: ${JSON.stringify(body).slice(0, 300)}`)
+      return text
+    } catch (e) {
+      lastErr = e
+      console.warn(`[asr] ${model} failed, trying next:`, e instanceof Error ? e.message.slice(0, 200) : e)
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr))
+}

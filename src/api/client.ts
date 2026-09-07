@@ -1286,6 +1286,12 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(typeof input === 'string' ? { url: input } : input),
     }),
+  /** Voice input: base64 audio clip → server-side ASR → plain text. */
+  transcribeAudio: (audio: string, format: string) =>
+    http<{ text: string }>('/audio/transcription', {
+      method: 'POST',
+      body: JSON.stringify({ audio, format }),
+    }),
   markRead: (conversationId: string) =>
     http<{ ok: boolean }>(`/conversations/${encodeURIComponent(conversationId)}/read`, {
       method: 'POST',

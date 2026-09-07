@@ -2466,12 +2466,8 @@ async function generateAndUploadImage(opts: {
   // get pooled with avatar regeneration. Both ultimately hit the same image
   // model but the spend driver is very different (per agent action vs per
   // agent creation), and the operator will want to slice them apart.
-  const { getTrackedLlmClient } = await import('./llm-ledger.js')
-  const client = await getTrackedLlmClient({
-    purpose: 'agent-image',
-    companyId: opts.tenant, agentId: opts.agentId,
-    extras: { size: opts.size, promptPreview: opts.prompt.slice(0, 120) },
-  })
+  const { getImageClient } = await import('../llm.js')
+  const client = getImageClient()
   const r = await client.images.generate({
     model: env.OPENAI_IMAGE_MODEL,
     prompt: opts.prompt,

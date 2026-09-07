@@ -15,6 +15,7 @@ import { publicBodyParserError } from '../body-parser-errors.js'
 import { startConvene } from '../agents/convene.js'
 import { ensureDirectConversation } from '../agents/private_chat.js'
 import { fetchImageBytes } from '../agents/image-fetcher.js'
+import { transcribeAudio } from '../llm.js'
 import { getTriageEconomics, getWakeEconomics } from '../agents/observability.js'
 import { resolveKanbanAssigneeChange, wakeKanbanAgents } from '../agents/kanban-wake.js'
 import { AgentCreationError, createAgentRecord } from '../agents/create.js'
@@ -128,8 +129,11 @@ api.use(authMiddleware as never)
 // its larger parser only after a valid user session has been established.
 const defaultJsonParser = json({ limit: '256kb' })
 const uploadJsonParser = json({ limit: '34mb' })
+// Voice-input clips are base64 JSON too — 10MB of audio inflates to ~13.4MB
+// on the wire, so this route needs its own parser past the default 256kb.
+const audioJsonParser = json({ limit: '16mb' })
 api.use((req, res, next) => {
-  if (req.method === 'POST' && /^\/uploads\/?$/.test(req.path)) {
+  if (req.method === 'POST' && (/^\/uploads\/?$/.test(req.path) || /^\/audio\/transcription\/?$/.test(req.path))) {
     next()
     return
   }
@@ -650,6 +654,27 @@ api.post('/uploads/refresh-url', safe(async (req, res) => {
   const key = normalizeStorageKey(requestedKey) ?? (url ? storageKeyFromPublicUrl(url) : null)
   if (!key) throw new HttpError(400, 'not a Cumora storage URL')
   res.json({ key, url: await storage.publicUrl(key) })
+}))
+
+const MAX_AUDIO_BYTES = 10 * 1024 * 1024  // 10 MB of decoded audio
+
+/** Voice-input transcription. The composer records a short MediaRecorder
+ *  clip and POSTs it as `{ audio: base64, format }`; we forward it to the
+ *  ASR model (see server/src/llm.ts transcribeAudio) and return the plain
+ *  text so the user can edit before sending. */
+api.post('/audio/transcription', requireAuthBeforeLargeBody, audioJsonParser, safe(async (req, res) => {
+  requireAuth(req)
+  const audio = String(req.body?.audio ?? '')
+  const format = String(req.body?.format ?? 'webm').trim().toLowerCase()
+  if (!audio) throw new HttpError(400, 'audio is required')
+  if (!/^[a-z0-9-]+$/.test(format)) throw new HttpError(400, 'invalid format')
+  // base64 carries 3 bytes per 4 chars — check the encoded length instead of
+  // decoding 13MB just to count it.
+  if (audio.length > Math.ceil(MAX_AUDIO_BYTES / 3) * 4) {
+    throw new HttpError(413, `audio too large (max ${MAX_AUDIO_BYTES} bytes decoded)`)
+  }
+  const text = await transcribeAudio(audio, format)
+  res.json({ text })
 }))
 
 // Liveness: "is this process alive?" — MUST NOT touch the DB. A slow or
@@ -3184,11 +3209,8 @@ export async function generateAndPersistAvatar(args: {
     '- The portrait should feel like it was drawn for a profile in a magazine that cares deeply about who this person is — Refinery29 / Vice / Kinfolk / Cereal magazine youth-feature energy.',
   ].filter(Boolean).join('\n')
 
-  const { getTrackedLlmClient } = await import('../agents/llm-ledger.js')
-  const client = await getTrackedLlmClient({
-    purpose: 'avatar-image', companyId: tenant, agentId: id,
-    extras: { gender, kind: a.kind },
-  })
+  const { getImageClient } = await import('../llm.js')
+  const client = getImageClient()
   const r = await client.images.generate({
     model: env.OPENAI_IMAGE_MODEL,
     prompt,
