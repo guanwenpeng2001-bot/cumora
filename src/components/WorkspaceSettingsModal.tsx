@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { type ApiWorkspaceMember, api, ws } from '@/api/client'
+import { type ApiWorkspaceMember, api, resolveAssetUrl, ws } from '@/api/client'
 import { useT } from '@/lib/i18n'
 import { type AuthCompany, useAuth } from '@/stores/auth'
 
@@ -145,7 +145,7 @@ export function WorkspaceSettingsModal({ company, companyCount, onInvite, onClos
                   <div key={member.id} className="flex items-center gap-3 px-3 py-2.5 bg-paper">
                     <div className="w-9 h-9 rounded-full grid place-items-center shrink-0 text-[13px] font-semibold text-white overflow-hidden bg-skype">
                       {member.avatarUrl
-                        ? <img src={member.avatarUrl} alt="" className="w-full h-full object-cover" />
+                        ? <img src={resolveAssetUrl(member.avatarUrl)} alt="" className="w-full h-full object-cover" />
                         : member.name.charAt(0).toUpperCase()}
                     </div>
                     <div className="min-w-0 flex-1">

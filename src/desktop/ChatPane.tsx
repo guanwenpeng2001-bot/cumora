@@ -7,7 +7,7 @@ import { isMuted, useConversations } from '@/stores/conversations'
 import { useParticipants } from '@/stores/participants'
 import { useMessages, sendUserMessage, messagesFor, VIRTUOSO_FIRST_INDEX_BASE } from '@/stores/messages'
 import type { MessagesState } from '@/stores/messages'
-import { api, type ApiAttachment } from '@/api/client'
+import { api, resolveAssetUrl, type ApiAttachment } from '@/api/client'
 import { Avatar, AvatarStack } from '@/components/Avatar'
 import { MembersPopover } from '@/components/MembersPopover'
 import { PreviewText } from '@/components/PreviewText'
@@ -1142,7 +1142,7 @@ export function Composer({
         {attachment && (
           <div className="mb-2 inline-flex items-center gap-2.5 py-1.5 px-2 bg-sky2-50 border border-sky2-100 rounded-lg max-w-full">
             {attachment.kind === 'img' ? (
-              <img src={attachment.url} alt={attachment.name}
+              <img src={resolveAssetUrl(attachment.url)} alt={attachment.name}
                 className="w-10 h-10 object-cover rounded-md" />
             ) : (
               <div className="w-10 h-10 rounded-md grid place-items-center shrink-0"

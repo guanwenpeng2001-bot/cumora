@@ -18,6 +18,7 @@
  * swap to the new objectUrl first.
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { resolveAssetUrl } from '@/api/client'
 import { isNativePlatform } from './native'
 
 interface Entry {
@@ -177,21 +178,26 @@ export function useCachedAvatarSrc(
   // changes and <img> reloads.
   const native = isNativePlatform()
 
+  // Server payloads are relative (`/uploads/...`) — resolve them against the
+  // API origin up front so the packaged app:// origin doesn't 404, and so
+  // `fetchedFrom` comparisons always see the resolved form.
+  const resolved = url ? resolveAssetUrl(url) : url
+
   const initial = (() => {
-    if (!url) return null
-    if (native) return url
+    if (!resolved) return null
+    if (native) return resolved
     const e = cache.get(participantId)
-    if (e && e.fetchedFrom === url) return e.objectUrl
-    return url
+    if (e && e.fetchedFrom === resolved) return e.objectUrl
+    return resolved
   })()
   const [src, setSrc] = useState<string | null>(initial)
 
   useEffect(() => {
-    if (!url) { setSrc(null); return }
-    if (native) { setSrc(url); return }
+    if (!resolved) { setSrc(null); return }
+    if (native) { setSrc(resolved); return }
     let cancelled = false
     const refresh = () => {
-      void fetchAndCache(participantId, url).then((s) => {
+      void fetchAndCache(participantId, resolved).then((s) => {
         if (!cancelled) setSrc(s)
       })
     }
@@ -204,7 +210,7 @@ export function useCachedAvatarSrc(
       cancelled = true
       listeners.delete(onChange)
     }
-  }, [participantId, url, native])
+  }, [participantId, resolved, native])
 
   return src
 }

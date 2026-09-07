@@ -5,6 +5,7 @@
  */
 import { useCallback, useEffect, useState } from 'react'
 import { adminApi, type AdminWaitlistEntry } from './api'
+import { resolveAssetUrl } from '@/api/client'
 import { Pager } from './Pager'
 import { useT } from '@/lib/i18n'
 
@@ -117,7 +118,7 @@ export function WaitlistPage({ onChanged }: { onChanged: () => void }) {
         {items.map((entry) => (
           <div key={entry.id} className="admin-row admin-row-waitlist">
             <div className="admin-cell-user">
-              <img className="admin-avatar" src={entry.avatarUrl} alt="" loading="lazy" />
+              <img className="admin-avatar" src={resolveAssetUrl(entry.avatarUrl)} alt="" loading="lazy" />
               <div className="admin-cell-user-text">
                 <div className="admin-cell-user-name">{entry.displayName}</div>
                 <div className="admin-cell-user-email">{entry.email}</div>

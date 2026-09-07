@@ -14,6 +14,7 @@
 
 ### Fixed
 
+- **打包桌面端(app:// 源)相对资源 URL 全部 404**:服务端返回的 `avatar_url` / 附件 `url` 是相对路径(`/uploads/...`),在 Electron 打包版里解析到 `app://cumora` 自身。新增 `resolveAssetUrl`(`src/api/client.ts`,以 `/` 开头时前缀 `getServerOrigin()`,浏览器同源部署返回 '' 时原样透传),接入所有消费者:`useCachedAvatarSrc`(头像统一入口,`fetchedFrom` 一律存解析后的绝对形式)、`AttachmentCard`(图片/下载/ImageViewer)、markdown 图片渲染器、邮件附件下载、AgentEditor 头像预览、WorkspaceSettingsModal 成员头像、admin UsersPage/WaitlistPage、桌面与移动 composer 附件预览
 - Docker 镜像内 shell 脚本 CRLF 行尾导致 `exec /usr/local/bin/agent-entrypoint failed`(`server/docker/*.sh` 转 LF;Windows clone 的已知坑)
 - inbox-triage `max_output_tokens` 500 → 2000:思维链模型(如 deepseek vision-exp)的 reasoning 会吃光 500 预算导致空 JSON、分拣失败
 

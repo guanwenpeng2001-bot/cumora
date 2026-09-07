@@ -17,7 +17,7 @@ import { useParticipants } from '@/stores/participants'
 import { useApp } from '@/stores/app'
 import { useMe } from '@/stores/auth'
 import { toggleReaction, retryFailedMessage, discardFailedMessage, useMessages } from '@/stores/messages'
-import { api } from '@/api/client'
+import { api, resolveAssetUrl } from '@/api/client'
 import { DocumentLink } from './DocumentLink'
 import { BoardLink } from './BoardLink'
 import { CardLink } from './CardLink'
@@ -444,7 +444,7 @@ const cumoraMarkdownComponents = {
         style={{ aspectRatio: '4 / 3', width: '100%', maxWidth: 420, maxHeight: 360 }}
       >
         <img
-          src={src}
+          src={resolveAssetUrl(src)}
           alt={alt ?? ''}
           className="w-full h-full object-contain"
           loading="lazy"
@@ -950,6 +950,9 @@ function AttachmentCard({ msg }: { msg: Message }) {
   const [viewerOpen, setViewerOpen] = useState(false)
   if (!msg.attachment) return null
   const a = msg.attachment
+  // Server payloads carry relative `/uploads/...` paths — resolve against
+  // the API origin so the packaged app:// page origin doesn't 404 them.
+  const assetUrl = a.url ? resolveAssetUrl(a.url) : a.url
 
   // Real image with a URL: render inline; clicking opens the lightbox.
   if (a.kind === 'img' && a.url) {
@@ -976,7 +979,7 @@ function AttachmentCard({ msg }: { msg: Message }) {
             style={{ aspectRatio: '4 / 3', width: '100%', maxHeight: 360 }}
           >
             <img
-              src={a.url}
+              src={assetUrl}
               alt={a.name}
               className="w-full h-full object-contain"
               loading="lazy"
@@ -987,7 +990,7 @@ function AttachmentCard({ msg }: { msg: Message }) {
           <div className="mt-1 text-[11px] text-ink-500 truncate">{a.name}{a.size ? ` · ${Math.round(a.size / 1024)}KB` : ''}</div>
         </button>
         {viewerOpen && (
-          <ImageViewer src={a.url} name={a.name} onClose={() => setViewerOpen(false)} />
+          <ImageViewer src={assetUrl ?? ''} name={a.name} onClose={() => setViewerOpen(false)} />
         )}
       </>
     )
@@ -1040,7 +1043,7 @@ function AttachmentCard({ msg }: { msg: Message }) {
 
   return (
     <a
-      href={a.url}
+      href={assetUrl}
       download={a.name}
       target="_blank"
       rel="noopener noreferrer"
@@ -1240,7 +1243,7 @@ function EmailAttachmentRow({ att }: { att: NonNullable<NonNullable<Message['ema
       </div>
       {att.url ? (
         <a
-          href={att.url}
+          href={resolveAssetUrl(att.url)}
           target="_blank"
           rel="noreferrer noopener"
           download={att.filename}

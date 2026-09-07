@@ -4,6 +4,7 @@
  */
 import { useCallback, useEffect, useState } from 'react'
 import { adminApi, type AdminUser, type AdminUserDetail, type AdminStats, type Tier } from './api'
+import { resolveAssetUrl } from '@/api/client'
 import { Pager } from './Pager'
 import { useAuth } from '@/stores/auth'
 import { useT } from '@/lib/i18n'
@@ -191,7 +192,7 @@ function UserRow({ u, expanded, onToggleExpand, onTierChange, onAdminToggle, onS
     <>
       <div className={`admin-row ${u.suspended ? 'admin-row-suspended' : ''}`} onClick={onToggleExpand} role="button">
         <div className="admin-cell-user">
-          <img className="admin-avatar" src={u.avatarUrl} alt="" loading="lazy" />
+          <img className="admin-avatar" src={resolveAssetUrl(u.avatarUrl)} alt="" loading="lazy" />
           <div className="admin-cell-user-text">
             <div className="admin-cell-user-name">
               {u.name}

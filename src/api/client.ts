@@ -49,6 +49,20 @@ export function getServerOrigin(): string {
   return SERVER_ORIGIN
 }
 
+/** Resolve a server-provided asset URL for the current runtime.
+ *  Server payloads (`avatar_url`, attachment `url`, …) are relative paths
+ *  like `/uploads/...`. In the browser they resolve against the page origin
+ *  and just work; in the packaged Electron app the page origin is
+ *  `app://cumora`, so relative paths 404 there — prefix the API origin
+ *  instead. When getServerOrigin() is '' (Vite dev / same-origin deploys)
+ *  the path is returned unchanged, preserving relative-URL behavior.
+ *  Absolute URLs (http:, data:, blob:) pass through untouched. */
+export function resolveAssetUrl(url: string | null | undefined): string {
+  if (!url) return ''
+  if (!url.startsWith('/')) return url
+  return `${SERVER_ORIGIN}${url}`
+}
+
 /** Origin to embed in a local computer pairing command.
  * In Vite dev the browser uses a relative proxy, so SERVER_ORIGIN is empty;
  * the daemon still needs the API target rather than the renderer origin. */

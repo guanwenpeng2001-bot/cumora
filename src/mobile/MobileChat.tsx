@@ -14,7 +14,7 @@ import { MessageRow, TypingRow } from '@/components/Message'
 import { RichInput, type RichInputHandle } from '@/components/RichInput'
 import { ScrollToLatestButton } from '@/components/ScrollToLatestButton'
 import { IBack, IConvene, IMore, IClip, IAt, ISmile, ISend, ISearch } from '@/components/icons'
-import { api, type ApiAttachment } from '@/api/client'
+import { api, resolveAssetUrl, type ApiAttachment } from '@/api/client'
 import type { Message, Participant } from '@/types'
 import { cn } from '@/lib/utils'
 import { isImeComposing } from '@/lib/keyboard'
@@ -657,7 +657,7 @@ export function MobileChat() {
         {attachment && (
           <div className="mb-2 inline-flex items-center gap-2.5 py-1.5 px-2 bg-sky2-50 border border-sky2-100 rounded-lg max-w-full">
             {attachment.kind === 'img' ? (
-              <img src={attachment.url} alt={attachment.name}
+              <img src={resolveAssetUrl(attachment.url)} alt={attachment.name}
                 className="w-10 h-10 object-cover rounded-md shrink-0" />
             ) : (
               <div className="w-10 h-10 rounded-md grid place-items-center shrink-0"

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { api, getPairingServerOrigin, type AgentInput } from '@/api/client'
+import { api, getPairingServerOrigin, resolveAssetUrl, type AgentInput } from '@/api/client'
 import { isNativePlatform } from '@/lib/native'
 import { useParticipants } from '@/stores/participants'
 import { useComputers } from '@/stores/computers'
@@ -299,7 +299,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
             style={{ background: avatarUrl ? 'transparent' : avatarBg }}
           >
             {avatarUrl
-              ? <img src={avatarUrl} alt={name || initial} className="absolute inset-0 w-full h-full object-cover" />
+              ? <img src={resolveAssetUrl(avatarUrl)} alt={name || initial} className="absolute inset-0 w-full h-full object-cover" />
               : initial}
           </div>
           <div className="flex-1">
@@ -533,7 +533,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
                   }}
                 >
                   {avatarUrl
-                    ? <img src={avatarUrl} alt={name || initial} className="absolute inset-0 w-full h-full object-cover rounded-full" />
+                    ? <img src={resolveAssetUrl(avatarUrl)} alt={name || initial} className="absolute inset-0 w-full h-full object-cover rounded-full" />
                     : initial}
                   {/* Diagonal shimmer sweep */}
                   {generatingAvatar && (
