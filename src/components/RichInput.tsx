@@ -22,6 +22,7 @@ import {
   type KeyboardEvent,
 } from 'react'
 import { findSkypeByKey, findSkypeByShortcode, SKYPE_SHORTCODE_RE, skypeEmojiUrl } from '@/lib/skypeEmojis'
+import { resolveAssetUrl } from '@/api/client'
 
 export interface MentionInfo {
   /** Display name shown after the `@` inside the chip. */
@@ -170,7 +171,9 @@ function makeMentionNode(id: string, info: MentionInfo): HTMLSpanElement {
     avatar.appendChild(img)
   } else if (info.avatarUrl) {
     const img = document.createElement('img')
-    img.src = info.avatarUrl
+    // Mention data carries the server's relative avatar path — resolve it so
+    // the packaged app:// origin doesn't 404 the chip image.
+    img.src = resolveAssetUrl(info.avatarUrl)
     img.alt = ''
     img.style.width = '100%'
     img.style.height = '100%'

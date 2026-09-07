@@ -18,6 +18,7 @@
  */
 import { useEffect, useRef, useState } from 'react'
 import { useT } from '@/lib/i18n'
+import { resolveAssetUrl } from '@/api/client'
 import { AnimatePresence, motion } from 'framer-motion'
 import type { NotificationPushPayload } from '@/lib/runtime'
 
@@ -248,7 +249,7 @@ function AuthorAvatar({ toast }: { toast: Toast }) {
     >
       {hasImg ? (
         <img
-          src={toast.authorAvatarUrl!}
+          src={resolveAssetUrl(toast.authorAvatarUrl)}
           alt={toast.authorName}
           className="absolute inset-0 w-full h-full object-cover"
           onError={() => setImgBroke(true)}

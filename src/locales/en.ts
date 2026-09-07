@@ -216,6 +216,7 @@ export const en = {
   'chat.voiceNoSupport': 'Audio recording is not supported in this browser',
   'chat.voiceNoMic': 'Microphone unavailable — check browser permissions',
   'chat.voiceFailed': 'Voice transcription failed',
+  'chat.voiceMaxDuration': 'Recording stopped automatically — 2 minute limit',
   'chat.gathering': 'Gathering messages…',
   'chat.loadFailed': "Couldn't load messages",
   'chat.retrying': 'Retrying…',

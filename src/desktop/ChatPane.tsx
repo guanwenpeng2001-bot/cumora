@@ -473,6 +473,10 @@ type ComposerDraftState = ComposerDraft
 
 const EMPTY_COMPOSER_DRAFT: ComposerDraftState = EMPTY_DRAFT
 
+/** Voice-input recordings are hard-capped — the ASR endpoint has a 10MB
+ *  body limit and nobody dictates for longer than this anyway. */
+const VOICE_MAX_SECONDS = 120
+
 function resolveDraftText(next: string | ((prev: string) => string), prev: string) {
   return typeof next === 'function' ? next(prev) : next
 }
@@ -808,11 +812,25 @@ export function Composer({
   const recorderRef = useRef<MediaRecorder | null>(null)
   const voiceStreamRef = useRef<MediaStream | null>(null)
   const voiceTimerRef = useRef<number | null>(null)
+  const voiceMaxTimerRef = useRef<number | null>(null)
+  const voiceErrorTimerRef = useRef<number | null>(null)
+  /** Set by the unmount cleanup — a pending getUserMedia permission prompt
+   *  can resolve AFTER the composer unmounted (room switch); without this
+   *  flag we'd start() a recorder nothing can stop (mic stays hot). */
+  const voiceUnmountedRef = useRef(false)
+  /** Synchronous latch against double-click: voiceState only flips to
+   *  'recording' after two awaits, so a fast second click would otherwise
+   *  start a competing recorder and leak the first stream. */
+  const startingRef = useRef(false)
 
-  const stopVoiceTimer = () => {
+  const stopVoiceTimers = () => {
     if (voiceTimerRef.current !== null) {
       window.clearInterval(voiceTimerRef.current)
       voiceTimerRef.current = null
+    }
+    if (voiceMaxTimerRef.current !== null) {
+      window.clearTimeout(voiceMaxTimerRef.current)
+      voiceMaxTimerRef.current = null
     }
   }
   const stopVoiceTracks = () => {
@@ -821,8 +839,13 @@ export function Composer({
   }
   const showVoiceError = (msg: string) => {
     setVoiceError(msg)
-    // Auto-clear like the upload error pill.
-    window.setTimeout(() => setVoiceError(null), 4500)
+    // Auto-clear like the upload error pill. Tracked so a fresh error
+    // resets the window instead of an older timer clearing it early.
+    if (voiceErrorTimerRef.current !== null) window.clearTimeout(voiceErrorTimerRef.current)
+    voiceErrorTimerRef.current = window.setTimeout(() => {
+      voiceErrorTimerRef.current = null
+      setVoiceError(null)
+    }, 4500)
   }
 
   const transcribeVoice = async (blob: Blob) => {
@@ -844,9 +867,10 @@ export function Composer({
       const { text } = await api.transcribeAudio(btoa(binary), format)
       if (text.trim()) editorRef.current?.insertText(text.trim())
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      console.warn('[voice] transcription failed', msg)
-      showVoiceError(msg)
+      // The pill stays a friendly localized string; the raw (often English)
+      // server/SDK error goes to the console only.
+      console.warn('[voice] transcription failed', err instanceof Error ? err.message : err)
+      showVoiceError(t('chat.voiceFailed'))
     } finally {
       setVoiceState('idle')
       setVoiceSeconds(0)
@@ -855,52 +879,76 @@ export function Composer({
 
   const onVoiceClick = async () => {
     if (voiceState === 'recording') {
-      // stop() fires onstop, which continues the upload flow.
-      recorderRef.current?.stop()
+      // stop() fires onstop, which continues the upload flow. Drop the ref
+      // and move to 'transcribing' immediately so a fast second click in the
+      // stop→onstop window can't call stop() again (InvalidStateError).
+      const rec = recorderRef.current
+      recorderRef.current = null
+      if (rec && rec.state !== 'inactive') rec.stop()
+      setVoiceState('transcribing')
       return
     }
-    if (voiceState === 'transcribing') return
+    if (voiceState === 'transcribing' || startingRef.current) return
+    startingRef.current = true
     setVoiceError(null)
-    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
-      showVoiceError(t('chat.voiceNoSupport'))
-      return
-    }
-    let stream: MediaStream
     try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-    } catch {
-      showVoiceError(t('chat.voiceNoMic'))
-      return
+      if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
+        showVoiceError(t('chat.voiceNoSupport'))
+        return
+      }
+      let stream: MediaStream
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      } catch {
+        showVoiceError(t('chat.voiceNoMic'))
+        return
+      }
+      if (voiceUnmountedRef.current) {
+        stream.getTracks().forEach((track) => track.stop())
+        return
+      }
+      let rec: MediaRecorder
+      try {
+        rec = MediaRecorder.isTypeSupported('audio/webm')
+          ? new MediaRecorder(stream, { mimeType: 'audio/webm' })
+          : new MediaRecorder(stream)
+      } catch {
+        stream.getTracks().forEach((track) => track.stop())
+        showVoiceError(t('chat.voiceNoSupport'))
+        return
+      }
+      const chunks: Blob[] = []
+      rec.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data) }
+      rec.onstop = () => {
+        stopVoiceTracks()
+        stopVoiceTimers()
+        void transcribeVoice(new Blob(chunks, { type: rec.mimeType || 'audio/webm' }))
+      }
+      recorderRef.current = rec
+      voiceStreamRef.current = stream
+      rec.start()
+      setVoiceSeconds(0)
+      voiceTimerRef.current = window.setInterval(() => setVoiceSeconds((s) => s + 1), 1000)
+      // Hard cap: stop at the limit and tell the user. The clip captured so
+      // far still goes through transcription via onstop.
+      voiceMaxTimerRef.current = window.setTimeout(() => {
+        const r = recorderRef.current
+        recorderRef.current = null
+        if (r && r.state !== 'inactive') r.stop()
+        showVoiceError(t('chat.voiceMaxDuration'))
+      }, VOICE_MAX_SECONDS * 1000)
+      setVoiceState('recording')
+    } finally {
+      startingRef.current = false
     }
-    let rec: MediaRecorder
-    try {
-      rec = MediaRecorder.isTypeSupported('audio/webm')
-        ? new MediaRecorder(stream, { mimeType: 'audio/webm' })
-        : new MediaRecorder(stream)
-    } catch {
-      stream.getTracks().forEach((track) => track.stop())
-      showVoiceError(t('chat.voiceNoSupport'))
-      return
-    }
-    const chunks: Blob[] = []
-    rec.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data) }
-    rec.onstop = () => {
-      stopVoiceTracks()
-      stopVoiceTimer()
-      void transcribeVoice(new Blob(chunks, { type: rec.mimeType || 'audio/webm' }))
-    }
-    recorderRef.current = rec
-    voiceStreamRef.current = stream
-    rec.start()
-    setVoiceSeconds(0)
-    voiceTimerRef.current = window.setInterval(() => setVoiceSeconds((s) => s + 1), 1000)
-    setVoiceState('recording')
   }
 
   // Unmounting mid-recording (switching rooms/views) discards the clip —
   // detach handlers so onstop doesn't transcribe into an unmounted composer.
   useEffect(() => () => {
-    stopVoiceTimer()
+    voiceUnmountedRef.current = true
+    stopVoiceTimers()
+    if (voiceErrorTimerRef.current !== null) window.clearTimeout(voiceErrorTimerRef.current)
     const rec = recorderRef.current
     if (rec && rec.state !== 'inactive') {
       rec.ondataavailable = null

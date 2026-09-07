@@ -220,6 +220,7 @@ export const zhCN: Partial<Record<keyof typeof en, string>> = {
   'chat.voiceNoSupport': '当前浏览器不支持录音',
   'chat.voiceNoMic': '无法访问麦克风，请检查浏览器权限',
   'chat.voiceFailed': '语音转写失败',
+  'chat.voiceMaxDuration': '已自动停止录音（最长 2 分钟）',
   'chat.gathering': '正在收取消息…',
   'chat.loadFailed': '消息加载失败',
   'chat.retrying': '重试中…',

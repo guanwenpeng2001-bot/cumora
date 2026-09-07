@@ -29,6 +29,7 @@
  * worth the complexity.
  */
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { resolveAssetUrl } from '@/api/client'
 import { Select } from '@/components/Select'
 import { Combobox } from '@/components/Combobox'
 import { useLocale, useT, tLabel, type MessageKey } from '@/lib/i18n'
@@ -1116,7 +1117,7 @@ function AgentAvatar({ url, initial, bg, size = 26 }: { url: string | null; init
   return (
     <span className="obs-agent-avatar" style={{ width: size, height: size, background: showImg ? 'transparent' : (bg ?? 'var(--ink-200)') }} aria-hidden>
       {showImg
-        ? <img src={url} alt="" width={size} height={size} onError={() => setBroke(true)} />
+        ? <img src={resolveAssetUrl(url)} alt="" width={size} height={size} onError={() => setBroke(true)} />
         : <span>{initial ?? '?'}</span>}
     </span>
   )

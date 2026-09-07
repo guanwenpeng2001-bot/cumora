@@ -14,6 +14,8 @@
 
 ### Fixed
 
+- **语音输入竞态与健壮性**(ChatPane.tsx):getUserMedia 权限弹窗挂起期间切换房间 → 已卸载组件上 `rec.start()`(麦克风常亮)——await 后检查 unmount 标志,已卸载则停轨返回;快速连点麦克风 → 两个 recorder、第一个流泄漏——加同步门闩 `startingRef`;stop→onstop 极短窗口内再点 → `InvalidStateError`——stop 分支立即置 transcribing 并清空 recorderRef;录音加 120s 硬上限(到点自动停止并提示,已录片段照常转写,新增双语 locale key `chat.voiceMaxDuration`);转写失败 pill 统一显示本地化 `chat.voiceFailed`,原始英文报错只进 console;错误 pill 的 4.5s 自动清除改为可追踪 timer(新错误先 clear 旧定时器)
+- **`resolveAssetUrl` 遗漏点补齐**(打包 Electron 下 404):NotificationWindow 通知头像、RichInput @提及 chip 头像、DocumentEditor 贴图(image 扩展 renderHTML 时解析,文档内容仍存相对路径,refresh-url 流程不受影响)、admin ObservabilityPage agent 头像;另修 `//cdn...` protocol-relative URL 被误判为相对路径的问题
 - **打包桌面端(app:// 源)相对资源 URL 全部 404**:服务端返回的 `avatar_url` / 附件 `url` 是相对路径(`/uploads/...`),在 Electron 打包版里解析到 `app://cumora` 自身。新增 `resolveAssetUrl`(`src/api/client.ts`,以 `/` 开头时前缀 `getServerOrigin()`,浏览器同源部署返回 '' 时原样透传),接入所有消费者:`useCachedAvatarSrc`(头像统一入口,`fetchedFrom` 一律存解析后的绝对形式)、`AttachmentCard`(图片/下载/ImageViewer)、markdown 图片渲染器、邮件附件下载、AgentEditor 头像预览、WorkspaceSettingsModal 成员头像、admin UsersPage/WaitlistPage、桌面与移动 composer 附件预览
 - Docker 镜像内 shell 脚本 CRLF 行尾导致 `exec /usr/local/bin/agent-entrypoint failed`(`server/docker/*.sh` 转 LF;Windows clone 的已知坑)
 - inbox-triage `max_output_tokens` 500 → 2000:思维链模型(如 deepseek vision-exp)的 reasoning 会吃光 500 预算导致空 JSON、分拣失败

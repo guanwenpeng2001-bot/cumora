@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { EditorContent, useEditor, type Editor } from '@tiptap/react'
+import { mergeAttributes } from '@tiptap/core'
 import StarterKit from '@tiptap/starter-kit'
 import Collaboration from '@tiptap/extension-collaboration'
 // In TipTap v3, CollaborationCursor was renamed to CollaborationCaret and
@@ -16,7 +17,7 @@ import { openDocument, type YDocSession } from '@/lib/yjsClient'
 import { buildMentionExtension } from '@/lib/mentionExtension'
 import { useDocuments } from '@/stores/documents'
 import { useAuth } from '@/stores/auth'
-import { api, ws } from '@/api/client'
+import { api, resolveAssetUrl, ws } from '@/api/client'
 import { cn } from '@/lib/utils'
 import { useT } from '@/lib/i18n'
 import {
@@ -69,6 +70,17 @@ const DocumentImageExtension = ImageExtension.extend({
           attrs.storageKey ? { 'data-storage-key': attrs.storageKey } : {},
       },
     }
+  },
+  renderHTML({ node, HTMLAttributes }) {
+    // The document stores the relative `/uploads/...` src (keeps the
+    // refresh-url flow and origin portability intact) — resolve against the
+    // API origin at render time so the packaged app:// page doesn't 404.
+    const attrs = node.attrs as { src?: string | null }
+    const resolved = attrs.src ? resolveAssetUrl(attrs.src) : attrs.src
+    return [
+      'img',
+      mergeAttributes(this.options.HTMLAttributes, HTMLAttributes, resolved ? { src: resolved } : {}),
+    ]
   },
 })
 

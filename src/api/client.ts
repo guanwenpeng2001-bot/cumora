@@ -59,6 +59,8 @@ export function getServerOrigin(): string {
  *  Absolute URLs (http:, data:, blob:) pass through untouched. */
 export function resolveAssetUrl(url: string | null | undefined): string {
   if (!url) return ''
+  // Protocol-relative URLs (`//cdn.example/x`) are absolute — don't prefix.
+  if (url.startsWith('//')) return url
   if (!url.startsWith('/')) return url
   return `${SERVER_ORIGIN}${url}`
 }
