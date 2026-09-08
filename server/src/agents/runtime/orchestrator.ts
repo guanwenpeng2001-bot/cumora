@@ -409,6 +409,12 @@ ${indent(env.OPENAI_MODEL_SUPPORT)}
     - name: OPENAI_COMPACTION_MODEL
       value: |-
 ${indent(env.OPENAI_COMPACTION_MODEL)}
+    - name: CUMORA_REASONING_EFFORT
+      value: |-
+${indent(process.env.CUMORA_REASONING_EFFORT ?? 'low')}
+    - name: CUMORA_AGENT_MAX_OUTPUT_TOKENS
+      value: |-
+${indent(process.env.CUMORA_AGENT_MAX_OUTPUT_TOKENS ?? '4000')}
   # Spot/Preemptible toleration: GKE Spot VM nodes are tainted
   # cloud.google.com/gke-spot=true:NoSchedule by default so cluster-
   # critical pods don't accidentally land on them. Agent pods are

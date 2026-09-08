@@ -336,6 +336,14 @@ function isModelProviderConnectionError(err: unknown): boolean {
 const MODEL_PROVIDER_CONNECTION_RETRY_LIMIT = 2
 const MODEL_PROVIDER_CONNECTION_RETRY_BASE_MS = 500
 
+/** Big-brain reasoning effort for the agent's main turn (CUMORA_REASONING_EFFORT).
+ *  Default 'low' — chat-first product, replies should feel instant. Raise to
+ *  'high'/'xhigh' for deeper turns; pair with CUMORA_AGENT_MAX_OUTPUT_TOKENS so
+ *  thinking doesn't starve the visible reply. Cerebellum gates (triage,
+ *  compaction, agenda) stay on their own low/minimal budgets deliberately. */
+const AGENT_REASONING_EFFORT = (process.env.CUMORA_REASONING_EFFORT ?? 'low') as import('openai/resources/shared.js').ReasoningEffort
+const AGENT_MAX_OUTPUT_TOKENS = Number(process.env.CUMORA_AGENT_MAX_OUTPUT_TOKENS ?? 4000)
+
 /** Defense-in-depth hard cap on `agent_turn_failed` system notices per
  *  (agent, conversation) per rolling hour. The dedupe key was supposed to
  *  prevent runaway cascades on its own, but if anything ever leaks (a future
@@ -2588,8 +2596,8 @@ Mechanics:
           tools: traceToolDefinitions(),
           request: {
             toolChoice: 'auto',
-            reasoning: { effort: 'low' },
-            maxOutputTokens: 4000,
+            reasoning: { effort: AGENT_REASONING_EFFORT },
+            maxOutputTokens: AGENT_MAX_OUTPUT_TOKENS,
           },
         },
         stage: retryKind === null
@@ -2628,8 +2636,8 @@ Mechanics:
           input: inputForAttempt,
           tools: TOOL_DEFS_RESPONSES,
           tool_choice: 'auto',
-          reasoning: { effort: 'low' },
-          max_output_tokens: 4000,
+          reasoning: { effort: AGENT_REASONING_EFFORT },
+          max_output_tokens: AGENT_MAX_OUTPUT_TOKENS,
           // No `previous_response_id` — sub2api's OAuth /v1/responses path
           // rejects it (see history block above). The full transcript is
           // re-sent via `inputForAttempt` instead.
