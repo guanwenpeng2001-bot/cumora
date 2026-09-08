@@ -56,15 +56,20 @@ const NS = process.env.CUMORA_AGENT_NAMESPACE ?? 'default'
 
 /** Rewrite a server-side URL for use inside agent pods. Pods run on the K8s
  *  network where compose service names and loopback don't resolve; they reach
- *  host services via host.docker.internal. Service-name remaps must target
- *  the host-published port, not the container-internal one. */
+ *  host services via host.docker.internal. The sub2api case swaps the
+ *  compose-internal URL for its public counterpart first, so no port is
+ *  hardcoded here — SUB2API_PUBLIC_URL is the pod-reachable form. */
 function podUrl(raw: string): string {
   try {
-    const u = new URL(raw)
-    if (u.hostname === 'sub2api') { u.hostname = 'host.docker.internal'; u.port = '8082' }
-    else if (['localhost', '127.0.0.1', '[::1]', 'db', 'redis'].includes(u.hostname)) u.hostname = 'host.docker.internal'
+    let target = raw
+    const internal = env.SUB2API_INTERNAL_URL.replace(/\/+$/, '')
+    if (internal && target.startsWith(internal) && env.SUB2API_PUBLIC_URL) {
+      target = env.SUB2API_PUBLIC_URL.replace(/\/+$/, '') + target.slice(internal.length)
+    }
+    const u = new URL(target)
+    if (['localhost', '127.0.0.1', '[::1]', 'db', 'redis'].includes(u.hostname)) u.hostname = 'host.docker.internal'
     const out = u.toString()
-    return raw.endsWith('/') || !out.endsWith('/') ? out : out.slice(0, -1)
+    return target.endsWith('/') || !out.endsWith('/') ? out : out.slice(0, -1)
   } catch { return raw }
 }
 /** Comma-separated list of imagePullSecrets to attach to the agent

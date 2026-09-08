@@ -70,3 +70,4 @@ vite.config.d.ts
 server/k8s/*.prod.yaml
 docs/HANDOFF.md
 android/app/google-services.json
+docker-compose.override.yml
