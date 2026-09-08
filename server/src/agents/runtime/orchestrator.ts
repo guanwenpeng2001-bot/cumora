@@ -397,6 +397,12 @@ ${indent(env.DATABASE_URL.replace('localhost', 'host.docker.internal').replace('
     - name: OPENAI_MODEL
       value: |-
 ${indent(env.OPENAI_MODEL)}
+    - name: OPENAI_MODEL_SUPPORT
+      value: |-
+${indent(env.OPENAI_MODEL_SUPPORT)}
+    - name: OPENAI_COMPACTION_MODEL
+      value: |-
+${indent(env.OPENAI_COMPACTION_MODEL)}
   # Spot/Preemptible toleration: GKE Spot VM nodes are tainted
   # cloud.google.com/gke-spot=true:NoSchedule by default so cluster-
   # critical pods don't accidentally land on them. Agent pods are
