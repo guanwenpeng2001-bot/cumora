@@ -53,6 +53,20 @@ const IMAGE = process.env.CUMORA_AGENT_COMPUTER_IMAGE
 const TOKEN_TTL_SECONDS = Number(process.env.CUMORA_AGENT_TOKEN_TTL_SECONDS ?? 24 * 60 * 60)
 /** K8s namespace pods land in. Default = current context's namespace. */
 const NS = process.env.CUMORA_AGENT_NAMESPACE ?? 'default'
+
+/** Rewrite a server-side URL for use inside agent pods. Pods run on the K8s
+ *  network where compose service names and loopback don't resolve; they reach
+ *  host services via host.docker.internal. Service-name remaps must target
+ *  the host-published port, not the container-internal one. */
+function podUrl(raw: string): string {
+  try {
+    const u = new URL(raw)
+    if (u.hostname === 'sub2api') { u.hostname = 'host.docker.internal'; u.port = '8082' }
+    else if (['localhost', '127.0.0.1', '[::1]', 'db', 'redis'].includes(u.hostname)) u.hostname = 'host.docker.internal'
+    const out = u.toString()
+    return raw.endsWith('/') || !out.endsWith('/') ? out : out.slice(0, -1)
+  } catch { return raw }
+}
 /** Comma-separated list of imagePullSecrets to attach to the agent
  *  Pod. Needed when the image lives in a private registry (e.g.
  *  quay.io with auth, gcr.io / Artifact Registry without Workload
@@ -378,13 +392,13 @@ ${indent(args.token)}
 ${indent(args.openaiKey)}
     - name: OPENAI_BASE_URL
       value: |-
-${indent(args.openaiBaseUrl)}
+${indent(podUrl(args.openaiBaseUrl))}
     - name: AGENT_RUNTIME_SECRET
       value: |-
 ${indent(env.AGENT_RUNTIME_SECRET)}
     - name: REDIS_URL
       value: |-
-${indent(env.REDIS_URL.replace('localhost', 'host.docker.internal').replace('127.0.0.1', 'host.docker.internal'))}
+${indent(podUrl(env.REDIS_URL))}
     - name: NOVITA_API_KEY
       value: |-
 ${indent(env.NOVITA_API_KEY)}
@@ -399,7 +413,7 @@ ${indent(env.ORCAROUTER_API_KEY)}
 ${indent(env.ORCAROUTER_BASE_URL)}
     - name: DATABASE_URL
       value: |-
-${indent(env.DATABASE_URL.replace('localhost', 'host.docker.internal').replace('127.0.0.1', 'host.docker.internal'))}
+${indent(podUrl(env.DATABASE_URL))}
     - name: OPENAI_MODEL
       value: |-
 ${indent(env.OPENAI_MODEL)}
