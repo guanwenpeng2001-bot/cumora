@@ -19,6 +19,7 @@
  */
 import type { ResponseInputItem, ResponseStreamEvent } from 'openai/resources/responses/responses'
 import { env } from '../env.js'
+import { AGENT_REASONING_EFFORT, AGENT_MAX_OUTPUT_TOKENS, SUPPORT_REASONING_EFFORT, SUPPORT_REASONING_HEADROOM } from './reasoning.js'
 import { redis } from '../redis.js'
 import { readLocalMessageAttachment } from '../local-attachment-files.js'
 import { messageAttachmentStorageKey } from '../storage-keys.js'
@@ -340,9 +341,8 @@ const MODEL_PROVIDER_CONNECTION_RETRY_BASE_MS = 500
  *  Default 'low' — chat-first product, replies should feel instant. Raise to
  *  'high'/'xhigh' for deeper turns; pair with CUMORA_AGENT_MAX_OUTPUT_TOKENS so
  *  thinking doesn't starve the visible reply. Cerebellum gates (triage,
- *  compaction, agenda) stay on their own low/minimal budgets deliberately. */
-const AGENT_REASONING_EFFORT = (process.env.CUMORA_REASONING_EFFORT ?? 'low') as import('openai/resources/shared.js').ReasoningEffort
-const AGENT_MAX_OUTPUT_TOKENS = Number(process.env.CUMORA_AGENT_MAX_OUTPUT_TOKENS ?? 4000)
+ *  compaction, agenda) stay on their own low/minimal budgets deliberately.
+ *  Knobs live in ./reasoning.js. */
 
 /** Defense-in-depth hard cap on `agent_turn_failed` system notices per
  *  (agent, conversation) per rolling hour. The dedupe key was supposed to
@@ -1249,8 +1249,8 @@ Reply ONLY as JSON: {"complete":boolean,"reason":"short factual reason","next_st
         },
       ],
       stream: true,
-      max_output_tokens: 500,
-      reasoning: { effort: 'low' },
+      max_output_tokens: 500 + SUPPORT_REASONING_HEADROOM,
+      reasoning: { effort: SUPPORT_REASONING_EFFORT },
       signal: ctrl.signal,
     } as unknown as Parameters<typeof client.responses.create>[0])
 
@@ -1384,8 +1384,8 @@ Skip narrative framing. No headings, no bullet symbols unless they aid clarity. 
         },
       ],
       stream: true,
-      max_output_tokens: 1500,
-      reasoning: { effort: 'low' },
+      max_output_tokens: 1500 + SUPPORT_REASONING_HEADROOM,
+      reasoning: { effort: SUPPORT_REASONING_EFFORT },
     } as unknown as Parameters<typeof client.responses.create>[0])
 
     let collected = ''
@@ -1543,8 +1543,8 @@ Treat the output as a private memo that will be appended to the agent's input. E
         },
       ],
       stream: true,
-      max_output_tokens: 600,
-      reasoning: { effort: 'low' },
+      max_output_tokens: 600 + SUPPORT_REASONING_HEADROOM,
+      reasoning: { effort: SUPPORT_REASONING_EFFORT },
       signal: ctrl.signal,
     } as unknown as Parameters<typeof client.responses.create>[0])
 

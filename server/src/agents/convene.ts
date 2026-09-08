@@ -1,4 +1,5 @@
-import { getTrackedLlmClient } from './llm-ledger.js'
+import { getTrackedLlmClient } from './llm-ledger.js'
+import { SUPPORT_REASONING_EFFORT, SUPPORT_REASONING_HEADROOM } from './reasoning.js'
 import type { ResponseInputItem } from 'openai/resources/responses/responses'
 import { randomUUID } from 'node:crypto'
 import { pool } from '../db/pool.js'
@@ -295,8 +296,8 @@ Topic of this convene: ${args.topic}`
       ...snapshot.transcriptHistory,
       { role: 'user', content: `[Convene moderator]: ${persona.name}, your turn.` },
     ],
-    max_output_tokens: 3000,
-    reasoning: { effort: 'low' },
+    max_output_tokens: 3000 + SUPPORT_REASONING_HEADROOM,
+    reasoning: { effort: SUPPORT_REASONING_EFFORT },
   })
   const body = sanitizeToolCallMarkup(r.output_text ?? '').trim()
   if (body) {
@@ -430,8 +431,8 @@ async function classifyDecision(args: { sessionId: string; topic: string }): Pro
       instructions: 'Reply ONLY with strict JSON: {"reached": boolean, "headline": "string", "body": "string"}. headline ≤ 12 words. body ≤ 40 words.',
       input: `Convene topic: ${args.topic}\n\nTranscript:\n${transcript}\n\nDid the team reach a decision? If yes summarize it. Reply as strict JSON.`,
       text: { format: { type: 'json_object' } },
-      max_output_tokens: 1200,
-      reasoning: { effort: 'low' },
+      max_output_tokens: 1200 + SUPPORT_REASONING_HEADROOM,
+      reasoning: { effort: SUPPORT_REASONING_EFFORT },
     })
     const parsed = JSON.parse(r.output_text ?? '{}') as { reached?: boolean; headline?: string; body?: string }
     if (parsed.reached && parsed.headline && parsed.body) {

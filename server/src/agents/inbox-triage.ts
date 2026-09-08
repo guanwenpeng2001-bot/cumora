@@ -1,4 +1,5 @@
-import type { ContextRow, InboxRow, PersonaRow, WorklogEntry } from './runtime/client.js'
+import type { ContextRow, InboxRow, PersonaRow, WorklogEntry } from './runtime/client.js'
+import { SUPPORT_REASONING_EFFORT, SUPPORT_REASONING_HEADROOM } from './reasoning.js'
 import { env } from '../env.js'
 import { getTrackedLlmClient } from './llm-ledger.js'
 import { inprocClient } from './runtime/inproc-client.js'
@@ -72,8 +73,8 @@ export async function classifyInboxTriage(args: {
       // Thinking models (e.g. deepseek vision-exp) spend part of this budget on
       // reasoning_content before emitting the JSON — 500 starves them into an
       // empty content. 2000 leaves room for brief reasoning + the verdict JSON.
-      max_output_tokens: 2000,
-      reasoning: { effort: 'low' },
+      max_output_tokens: 2000 + SUPPORT_REASONING_HEADROOM,
+      reasoning: { effort: SUPPORT_REASONING_EFFORT },
     }, {
       // Triage is a fast GATE. Do NOT retry — a rate-limited model retried (or
       // escalated to the big brain on fail-open) is exactly what burned users'
@@ -174,8 +175,8 @@ export async function gateSyntheticWake(args: {
       instructions,
       input,
       text: { format: { type: 'json_object' } },
-      max_output_tokens: 300,
-      reasoning: { effort: 'low' },
+      max_output_tokens: 300 + SUPPORT_REASONING_HEADROOM,
+      reasoning: { effort: SUPPORT_REASONING_EFFORT },
     }, { maxRetries: 0, timeout: 8_000 })
     const parsed = JSON.parse(r.output_text ?? '{}') as { act?: unknown; reason?: unknown; note?: unknown }
     return {
