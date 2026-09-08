@@ -1346,7 +1346,7 @@ export function MeView() {
       <div className="max-w-[1100px] mx-auto">
         <div className="mb-6">
           <h1 className="font-display font-medium text-[36px] tracking-tight text-ink-900 mb-1" style={{ letterSpacing: '-0.025em' }}>
-            {t('me.headline')} <em className="italic text-coral-deep" style={{ fontStyle: 'italic', fontWeight: 400 }}>{t('me.headlineEm')}</em>
+            {t('me.headline')} {t('me.headlineEm')}
           </h1>
           <div className="font-display italic font-normal text-[15px] text-ink-500">
             {t('me.subtitle')}
