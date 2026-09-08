@@ -93,9 +93,54 @@ services:
       server:
         condition: service_started
 
+  # sub2api — LLM quota gateway. cumora-server mirrors each user into it
+  # (see server/src/sub2api.ts) and routes tenant LLM traffic through it.
+  # Built from our fork, which adds POST /api/v1/admin/users/:id/api-keys
+  # (admin-side key minting; upstream only has the user-facing POST /keys).
+  sub2api:
+    build:
+      context: https://github.com/guanwenpeng2001-bot/sub2api.git#main
+    container_name: cumora-sub2api
+    restart: unless-stopped
+    environment:
+      AUTO_SETUP: "true"
+      SERVER_HOST: 0.0.0.0
+      SERVER_PORT: "8080"
+      SERVER_MODE: release
+      # Own database inside the shared pg16 instance (created once by hand:
+      # CREATE DATABASE sub2api). pg_trgm is available in the pgvector image.
+      DATABASE_HOST: db
+      DATABASE_PORT: "5432"
+      DATABASE_USER: postgres
+      DATABASE_PASSWORD: cumora
+      DATABASE_DBNAME: sub2api
+      DATABASE_SSLMODE: disable
+      # Shared redis, separate logical db (cumora uses db 0).
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_DB: "1"
+      ADMIN_EMAIL: admin@cumora.local
+      # Interpolated from the repo-root .env (compose's own substitution,
+      # NOT env_file) — all three must be set there.
+      ADMIN_PASSWORD: ${SUB2API_ADMIN_PASSWORD:?set SUB2API_ADMIN_PASSWORD in .env}
+      JWT_SECRET: ${SUB2API_JWT_SECRET:?set SUB2API_JWT_SECRET in .env}
+      TOTP_ENCRYPTION_KEY: ${SUB2API_TOTP_ENCRYPTION_KEY:?set SUB2API_TOTP_ENCRYPTION_KEY in .env}
+      TZ: Asia/Shanghai
+    volumes:
+      - sub2api-data:/app/data
+    ports:
+      # 8082 avoids clashing with Vite dev (5180), server (5181), web (8080).
+      - "8082:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
 volumes:
   # Pre-existing data — external so `compose down` never touches them.
   cumora-pgdata:
     external: true
   cumora-redis-data:
     external: true
+  sub2api-data:

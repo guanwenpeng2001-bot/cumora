@@ -45,6 +45,30 @@ docker compose up -d --force-recreate server
 - API 直达:<http://localhost:5181/api/health>(容器内 server 的发布端口,OAuth 回调走这里)
 - 宿主机 Vite dev(5180)仍可独立跑,与 8080 容器不冲突
 
+## sub2api(LLM 订阅聚合网关,可选)
+
+compose 里的 `sub2api` 服务从 fork [guanwenpeng2001-bot/sub2api](https://github.com/guanwenpeng2001-bot/sub2api) 构建(fork 补了 `POST /api/v1/admin/users/:id/api-keys`,让开通流程纯管理 API、不碰被 Turnstile 保护的 `/auth/*`)。数据库复用 cumora-postgres 里单独的 `sub2api` 库;Redis 复用 cumora-redis 的逻辑库 1;数据卷 `sub2api-data`。
+
+- 管理后台:<http://localhost:8082>,账号 `admin@cumora.local`,密码是 .env 里的 `SUB2API_ADMIN_PASSWORD`
+- 管理 API key:存于 sub2api 库 `settings.admin_api_key`,cumora 侧配在 `.env` 的 `SUB2API_ADMIN_KEY`
+- tier 组:free / pro / max 三个组,组 id 配在 `.env` 的 `SUB2API_TIER_*_GROUP_ID`
+- 重建镜像(拉 fork 最新 main):`docker compose up -d --build sub2api`
+
+**自动开通只对部署之后的新注册用户生效**(oauth/waitlist 审批的 post-commit 钩子,失败自动回退 legacy 全局 key,不阻塞注册)。
+
+**给存量账号手动开通(谨慎,有顺序要求)**:一旦写入 `sub2api_api_key`,该用户非前缀模型的 LLM 流量立刻改走 sub2api;如果对应 tier 组下没挂订阅账号,managed 大脑会全断。所以:
+
+1. 先在 sub2api 后台(8082)给 free/pro/max 组添加订阅账号(账号 → 新增,Kimi/DeepSeek 等 OpenAI 兼容渠道)
+2. 再跑:
+
+   ```bash
+   MSYS_NO_PATHCONV=1 docker compose exec server npx tsx server/src/scripts/provision-sub2api-user.ts <email> [free|pro|max]
+   ```
+
+   脚本会拒绝覆盖已有 key;要重置就先手动清 `users.sub2api_api_key` 再跑。
+
+用量页(设置 → 用量)读 sub2api 订阅快照;未开通的用户显示"不可用"而不是报错。
+
 ## 已知限制
 
 - `.env` 里 `PUBLIC_ORIGIN=http://localhost:5181`、`AUTH_DONE_URL=http://localhost:5180/` 是浏览器侧地址。如果从 8080 的容器化 UI 走 OAuth 登录,需要把 `http://localhost:8080/` 加进 `CUMORA_AUTH_RETURN_ALLOWLIST`,并把 `AUTH_DONE_URL` 指向 `http://localhost:8080/`(改完 `--force-recreate server`)。
