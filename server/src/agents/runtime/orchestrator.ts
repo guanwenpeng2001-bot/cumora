@@ -391,6 +391,12 @@ ${indent(env.NOVITA_API_KEY)}
     - name: NOVITA_BASE_URL
       value: |-
 ${indent(env.NOVITA_BASE_URL)}
+    - name: ORCAROUTER_API_KEY
+      value: |-
+${indent(env.ORCAROUTER_API_KEY)}
+    - name: ORCAROUTER_BASE_URL
+      value: |-
+${indent(env.ORCAROUTER_BASE_URL)}
     - name: DATABASE_URL
       value: |-
 ${indent(env.DATABASE_URL.replace('localhost', 'host.docker.internal').replace('127.0.0.1', 'host.docker.internal'))}
