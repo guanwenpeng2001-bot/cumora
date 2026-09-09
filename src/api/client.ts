@@ -61,10 +61,14 @@ export function getServerOrigin(): string {
  *  Absolute URLs (http:, data:, blob:) pass through untouched. */
 export function resolveAssetUrl(url: string | null | undefined): string {
   if (!url) return ''
-  // Protocol-relative URLs (`//cdn.example/x`) are absolute — don't prefix.
-  if (url.startsWith('//')) return url
+  const origin = resolveServerOrigin()
+  if (url.startsWith('//')) {
+    const protocol = /^https?:/i.exec(origin)?.[0]
+      ?? (typeof location !== 'undefined' && /^https?:$/.test(location.protocol) ? location.protocol : 'https:')
+    return `${protocol}${url}`
+  }
   if (!url.startsWith('/')) return url
-  return `${SERVER_ORIGIN}${url}`
+  return `${origin}${url}`
 }
 
 /** Origin to embed in a local computer pairing command.

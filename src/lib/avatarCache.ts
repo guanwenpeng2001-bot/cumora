@@ -2,7 +2,7 @@
  * Local avatar cache.
  *
  * Holds participants' avatars as `URL.createObjectURL(blob)` keyed by
- * participant id. Subscribed React components (via `useCachedAvatarSrc`)
+ * context, participant, URL and generation. Components (via `useCachedAvatarSrc`)
  * re-render automatically when the server broadcasts
  * `participants.avatar` for that id (the participants store calls
  * `invalidateAvatar(id)` from its WS listener).
@@ -17,77 +17,123 @@
  * with a grace window (REVOKE_GRACE_MS) so subscribers have time to
  * swap to the new objectUrl first.
  */
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
+import { useAuth } from '@/stores/auth'
 import { resolveAssetUrl } from '@/api/client'
 import { isNativePlatform } from './native'
 
 interface Entry {
-  /** The remote URL we fetched FROM — used to invalidate when the URL
-   *  changes (e.g., participant's `avatar_url` updated to a new key). */
-  fetchedFrom: string
-  /** `URL.createObjectURL(blob)` ready to drop into <img src=…>. */
   objectUrl: string
   fetchedAt: number
 }
 
-const cache = new Map<string, Entry>()
-const listeners = new Set<(participantId: string | null) => void>()
+interface Pending {
+  controller: AbortController
+  promise: Promise<string | null>
+}
 
-/** Grace window before revoking an objectUrl that has been displaced.
- *  Has to outlast React's render cycle so any <img> still pointing at
- *  the old URL gets a chance to swap. A few seconds is plenty. */
+const cache = new Map<string, Entry>()
+const inFlight = new Map<string, Pending>()
+const generations = new Map<string, number>()
+const activeKeys = new Map<string, string>()
+const listeners = new Set<() => void>()
+let cacheGeneration = 0
+let revision = 0
+const AVATAR_TTL_MS = 60_000
 const REVOKE_GRACE_MS = 5_000
 
 function scheduleRevoke(objectUrl: string): void {
   setTimeout(() => URL.revokeObjectURL(objectUrl), REVOKE_GRACE_MS)
 }
 
-async function fetchAndCache(participantId: string, url: string): Promise<string> {
-  const prev = cache.get(participantId)
-  if (prev && prev.fetchedFrom === url) return prev.objectUrl
-  try {
-    const r = await fetch(url)
-    if (!r.ok) {
-      // Fetch failed — keep prev as-is rather than orphaning the cache.
-      // Callers fall back to the raw URL for this render.
-      return url
+function requestKey(participantId: string, url: string): string {
+  const { contextEpoch, activeCompanyId } = useAuth.getState()
+  return JSON.stringify([contextEpoch, activeCompanyId, participantId, url,
+    cacheGeneration, generations.get(participantId) ?? 0])
+}
+
+function retire(key: string): void {
+  inFlight.get(key)?.controller.abort()
+  inFlight.delete(key)
+  const entry = cache.get(key)
+  if (entry) scheduleRevoke(entry.objectUrl)
+  cache.delete(key)
+}
+
+function fetchAndCache(participantId: string, url: string): Promise<string | null> {
+  const key = requestKey(participantId, url)
+  const active = activeKeys.get(participantId)
+  if (active && active !== key) retire(active)
+  activeKeys.set(participantId, key)
+  const prev = cache.get(key)
+  if (prev && Date.now() - prev.fetchedAt < AVATAR_TTL_MS) {
+    return Promise.resolve(prev.objectUrl)
+  }
+  const pending = inFlight.get(key)
+  if (pending) return pending.promise
+  const controller = new AbortController()
+  const current = () => !controller.signal.aborted
+    && requestKey(participantId, url) === key && activeKeys.get(participantId) === key
+  const promise = (async () => {
+    try {
+      // Revalidate only avatar requests, including URLs overwritten in place.
+      const response = await fetch(url, { signal: controller.signal, cache: 'no-cache' })
+      if (!current()) return null
+      if (!response.ok) return url
+      const blob = await response.blob()
+      const objectUrl = URL.createObjectURL(blob)
+      if (!current()) {
+        URL.revokeObjectURL(objectUrl)
+        return null
+      }
+      cache.set(key, { objectUrl, fetchedAt: Date.now() })
+      if (prev) scheduleRevoke(prev.objectUrl)
+      notify()
+      return objectUrl
+    } catch {
+      return current() ? url : null
+    } finally {
+      if (inFlight.get(key)?.controller === controller) inFlight.delete(key)
     }
-    const b = await r.blob()
-    const objectUrl = URL.createObjectURL(b)
-    cache.set(participantId, { fetchedFrom: url, objectUrl, fetchedAt: Date.now() })
-    // Now that the new entry is in place, retire the old one with a
-    // grace window so any mounted <img> can swap first.
-    if (prev) scheduleRevoke(prev.objectUrl)
-    return objectUrl
-  } catch {
-    return url
-  }
+  })()
+  inFlight.set(key, { controller, promise })
+  return promise
 }
 
-function notify(participantId: string | null): void {
-  for (const fn of listeners) fn(participantId)
+function notify(): void {
+  revision += 1
+  for (const fn of listeners) fn()
 }
 
-/** Drop a single participant's cached avatar — called by the
- *  participants store when a `participants.avatar` WS event lands.
- *  Subscribed hooks pick up the change and re-fetch with the new URL. */
+function subscribe(listener: () => void): () => void {
+  listeners.add(listener)
+  return () => { listeners.delete(listener) }
+}
+
+/** Invalidate after the participant's URL has been updated in the store. */
 export function invalidateAvatar(participantId: string): void {
-  const e = cache.get(participantId)
-  if (e) {
-    cache.delete(participantId)
-    scheduleRevoke(e.objectUrl)
-  }
-  notify(participantId)
+  generations.set(participantId, (generations.get(participantId) ?? 0) + 1)
+  const key = activeKeys.get(participantId)
+  if (key) retire(key)
+  activeKeys.delete(participantId)
+  notify()
 }
 
-/** Drop the entire cache. Used by workspace switch (the participants
- *  store's load() / reset path). Old objectUrls are scheduled for
- *  revoke, not revoked synchronously — see REVOKE_GRACE_MS. */
+/** Advance the generation before notifying subscribers or aborting old work. */
 export function clearAvatarCache(): void {
-  for (const e of cache.values()) scheduleRevoke(e.objectUrl)
+  cacheGeneration += 1
+  for (const pending of inFlight.values()) pending.controller.abort()
+  inFlight.clear()
+  for (const entry of cache.values()) scheduleRevoke(entry.objectUrl)
   cache.clear()
-  notify(null)
+  activeKeys.clear()
+  generations.clear()
+  notify()
 }
+
+useAuth.subscribe((state, previous) => {
+  if (state.contextEpoch !== previous.contextEpoch) clearAvatarCache()
+})
 
 /**
  * Hook: returns the cached object-URL for a participant's avatar, or
@@ -168,49 +214,43 @@ export function useCachedAvatarSrc(
   participantId: string,
   url: string | null | undefined,
 ): string | null {
-  // On native (iOS/Android) skip the fetch→blob cache entirely and hand the
-  // raw CDN URL straight to <img>. Two reasons: (1) with CapacitorHttp enabled
-  // every `fetch()` is proxied through the slow JS↔native bridge (and stampedes
-  // when many avatars mount at once), whereas <img> loads go through the
-  // WebView's native image pipeline — fast and HTTP-cached; (2) it sidesteps
-  // the cache-stampede of N components fetching the same URL before it's cached.
-  // Invalidation still works: a regenerated avatar gets a new URL, so the prop
-  // changes and <img> reloads.
   const native = isNativePlatform()
-
-  // Server payloads are relative (`/uploads/...`) — resolve them against the
-  // API origin up front so the packaged app:// origin doesn't 404, and so
-  // `fetchedFrom` comparisons always see the resolved form.
-  const resolved = url ? resolveAssetUrl(url) : url
-
-  const initial = (() => {
-    if (!resolved) return null
-    if (native) return resolved
-    const e = cache.get(participantId)
-    if (e && e.fetchedFrom === resolved) return e.objectUrl
-    return resolved
-  })()
-  const [src, setSrc] = useState<string | null>(initial)
+  const contextEpoch = useAuth((s) => s.contextEpoch)
+  useSyncExternalStore(subscribe, () => revision, () => revision)
+  const resolved = url ? resolveAssetUrl(url) : null
+  const key = requestKey(participantId, resolved ?? '')
+  const generation = generations.get(participantId) ?? 0
+  // Native images bypass fetch; a local version makes same-URL updates reload.
+  const nativeSrc = resolved && generation && !/^(data|blob):/i.test(resolved)
+    ? (() => {
+      const hashAt = resolved.indexOf('#')
+      const base = hashAt < 0 ? resolved : resolved.slice(0, hashAt)
+      const hash = hashAt < 0 ? '' : resolved.slice(hashAt)
+      return `${base}${base.includes('?') ? '&' : '?'}cumora_avatar=${cacheGeneration}-${generation}${hash}`
+    })()
+    : resolved
+  const [result, setResult] = useState<{ key: string; src: string | null } | null>(null)
+  const entry = cache.get(key)
 
   useEffect(() => {
-    if (!resolved) { setSrc(null); return }
-    if (native) { setSrc(resolved); return }
+    if (!resolved || native) return
     let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
     const refresh = () => {
-      void fetchAndCache(participantId, resolved).then((s) => {
-        if (!cancelled) setSrc(s)
+      void fetchAndCache(participantId, resolved).then((src) => {
+        if (cancelled || requestKey(participantId, resolved) !== key || src === null) return
+        setResult({ key, src })
+        timer = setTimeout(refresh, AVATAR_TTL_MS)
       })
     }
     refresh()
-    const onChange = (id: string | null) => {
-      if (id === null || id === participantId) refresh()
-    }
-    listeners.add(onChange)
     return () => {
       cancelled = true
-      listeners.delete(onChange)
+      clearTimeout(timer)
     }
-  }, [participantId, resolved, native])
+  }, [participantId, resolved, native, key, contextEpoch])
 
-  return src
+  if (!resolved) return null
+  if (native) return nativeSrc
+  return entry?.objectUrl ?? (result?.key === key ? result.src : resolved)
 }

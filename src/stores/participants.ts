@@ -154,11 +154,7 @@ export function bootParticipants() {
     } else if (e.type === 'participants.status') {
       useParticipants.getState().applyStatus(e.participantId, e.status, e.statusUpdatedAt)
     } else if (e.type === 'participants.avatar') {
-      // Drop the local image cache entry for this participant so the
-      // next render fetches the new portrait bytes — beats waiting for
-      // the URL-keyed browser cache to expire when the URL hasn't
-      // changed (e.g., overwritten-in-place Gravatar).
-      invalidateAvatar(e.participantId)
+      if (!useParticipants.getState().byId[e.participantId]) return
       // Patch the participant row's avatarUrl in place so the new
       // remote URL flows down without a full refetch.
       useParticipants.setState((s) => {
@@ -166,6 +162,7 @@ export function bootParticipants() {
         if (!cur) return {}
         return { byId: { ...s.byId, [e.participantId]: { ...cur, avatarUrl: e.avatarUrl } } }
       })
+      invalidateAvatar(e.participantId)
     } else if (e.type === 'participants.added') {
       // The socket carries every workspace this user belongs to, so a member of
       // two workspaces receives the other one's roster events while looking at

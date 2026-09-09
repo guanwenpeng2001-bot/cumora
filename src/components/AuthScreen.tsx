@@ -16,6 +16,7 @@ import { api, getPairingServerOrigin, getServerOrigin, setServerOrigin } from '@
 import { isCapacitorIOS, isElectron } from '@/lib/runtime'
 import { isNativePlatform, nativePlatform, runAppleSignIn, runOAuth } from '@/lib/native'
 import { useAuth } from '@/stores/auth'
+import { clearAvatarCache } from '@/lib/avatarCache'
 import { CloudLogo } from './Avatar'
 import { WindowDragStrip } from './WindowDragStrip'
 import { translate, useLocaleStore, useT, type MessageKey } from '@/lib/i18n'
@@ -278,6 +279,7 @@ function ServerSwitch({ open, onToggle }: { open: boolean; onToggle: () => void 
 
   function apply(origin: string | null) {
     setServerOrigin(origin)
+    clearAvatarCache()
     // Hard reload — module-init-time SERVER_ORIGIN is now stale, and any
     // pending fetch against the old origin would race confusingly.
     location.reload()
