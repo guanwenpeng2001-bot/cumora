@@ -6,21 +6,21 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
-  api, resolveAssetUrl,
-  type ApiUsageAgentRow, type ApiUsageLogPage, type ApiUsageModelRow,
-  type ApiUsageProviderRow, type ApiUsageSummary, type ApiUsageTrendPoint,
+  api, ApiError, resolveAssetUrl,
+  type ApiUsageTrendPoint,
 } from '@/api/client'
-import { useT } from '@/lib/i18n'
+import { useLocale, useT } from '@/lib/i18n'
+import { useAuth } from '@/stores/auth'
 
 type T = ReturnType<typeof useT>
 import { cn } from '@/lib/utils'
 
 type RangePreset = 'today' | 'week' | 'custom'
 
-function localDateToIso(value: string, endOfDay = false): string {
+function localDateToIso(value: string, endExclusive = false): string {
   const [year, month, day] = value.split('-').map(Number)
-  const date = endOfDay
-    ? new Date(year, month - 1, day, 23, 59, 59, 999)
+  const date = endExclusive
+    ? new Date(year, month - 1, day + 1)
     : new Date(year, month - 1, day)
   return date.toISOString()
 }
@@ -122,7 +122,42 @@ function Card({ label, value, sub }: { label: string; value: string; sub?: strin
 
 type Dim = 'agent' | 'model' | 'provider'
 
+type QueryState<D> = { loading: boolean; error: unknown; data: D | null }
+
+function useUsageQuery<D>(request: (signal: AbortSignal) => Promise<D>, enabled: boolean, epoch: number): QueryState<D> {
+  const sequence = useRef(0)
+  const [result, setResult] = useState<{ request: typeof request; epoch: number; state: QueryState<D> } | null>(null)
+  useEffect(() => {
+    const id = ++sequence.current
+    const controller = new AbortController()
+    if (enabled) {
+      const commit = (state: QueryState<D>) => {
+        if (!controller.signal.aborted && sequence.current === id && useAuth.getState().contextEpoch === epoch) {
+          setResult({ request, epoch, state })
+        }
+      }
+      commit({ loading: true, error: null, data: null })
+      void Promise.resolve().then(() => {
+        if (controller.signal.aborted) return
+        return request(controller.signal).then(
+          (data) => commit({ loading: false, error: null, data }),
+          (error: unknown) => commit({ loading: false, error, data: null }),
+        )
+      }).catch((error: unknown) => commit({ loading: false, error, data: null }))
+    }
+    return () => { controller.abort(); sequence.current++ }
+  }, [request, enabled, epoch])
+  return enabled && result?.request === request && result.epoch === epoch
+    ? result.state
+    : { loading: enabled, error: null, data: null }
+}
+
 export function UsageDashboard() {
+  const epoch = useAuth((s) => s.contextEpoch)
+  return <UsageDashboardContent key={epoch} />
+}
+
+function UsageDashboardContent() {
   const t = useT()
   const [preset, setPreset] = useState<RangePreset>('today')
   const [customFrom, setCustomFrom] = useState('')
@@ -131,39 +166,57 @@ export function UsageDashboard() {
   const [autoRefresh, setAutoRefresh] = useState(false)
   const [dim, setDim] = useState<Dim>('agent')
   const [page, setPage] = useState(1)
-  const [summary, setSummary] = useState<ApiUsageSummary | null>(null)
-  const [trend, setTrend] = useState<ApiUsageTrendPoint[]>([])
-  const [byAgent, setByAgent] = useState<ApiUsageAgentRow[]>([])
-  const [byModel, setByModel] = useState<ApiUsageModelRow[]>([])
-  const [byProvider, setByProvider] = useState<ApiUsageProviderRow[]>([])
-  const [logs, setLogs] = useState<ApiUsageLogPage | null>(null)
-  const [loadError, setLoadError] = useState<string | null>(null)
-  const timerRef = useRef<number | null>(null)
+  const epoch = useAuth((s) => s.contextEpoch)
+  const ready = useAuth((s) => s.ready)
+  const token = useAuth((s) => s.token)
+  const companyId = useAuth((s) => s.activeCompanyId)
+  const locale = useLocale()
+  const text = (zh: string, en: string) => locale === 'zh-CN' ? zh : en
+  const [refresh, setRefresh] = useState(0)
+  const range = useMemo(() => {
+    try { return rangeOf(preset, customFrom, customTo) } catch { return null }
+  }, [preset, customFrom, customTo, refresh])
+  const invalidRange = !range || Date.parse(range.from) >= Date.parse(range.to)
+  const blocked = !ready ? text('公司上下文加载中…', 'Loading company context…')
+    : !token ? text('请登录后查看用量。', 'Sign in to view usage.')
+    : !companyId ? text('请先选择公司。', 'Select a company to view usage.')
+    : invalidRange ? text('开始时间必须早于结束时间。', 'Start time must be before end time.') : null
+  const enabled = blocked === null
+  const from = range?.from ?? ''
+  const to = range?.to ?? ''
+  const summaryQuery = useUsageQuery(useCallback((signal: AbortSignal) => api.getUsageSummary(from, to, undefined, signal), [range, refresh]), enabled, epoch)
+  const trendQuery = useUsageQuery(useCallback((signal: AbortSignal) => api.getUsageTrend(from, to, granularity, signal), [range, refresh, granularity]), enabled, epoch)
+  const agentQuery = useUsageQuery(useCallback((signal: AbortSignal) => api.getUsageByAgent(from, to, signal), [range, refresh]), enabled, epoch)
+  const modelQuery = useUsageQuery(useCallback((signal: AbortSignal) => api.getUsageByModel(from, to, signal), [range, refresh]), enabled, epoch)
+  const providerQuery = useUsageQuery(useCallback((signal: AbortSignal) => api.getUsageByProvider(from, to, signal), [range, refresh]), enabled, epoch)
+  const logsQuery = useUsageQuery(useCallback((signal: AbortSignal) => api.getUsageLogs(from, to, page, 50, undefined, signal), [range, refresh, page]), enabled, epoch)
+  const summary = summaryQuery.data
+  const trend = trendQuery.data?.points ?? []
+  const byAgent = agentQuery.data?.items ?? []
+  const byModel = modelQuery.data?.items ?? []
+  const byProvider = providerQuery.data?.items ?? []
+  const logs = logsQuery.data
+  const load = useCallback(() => setRefresh((value) => value + 1), [])
 
-  const range = useMemo(() => rangeOf(preset, customFrom, customTo), [preset, customFrom, customTo])
-
-  const load = useCallback(() => {
-    const { from, to } = range
-    void Promise.all([
-      api.getUsageSummary(from, to),
-      api.getUsageTrend(from, to, granularity),
-      api.getUsageByAgent(from, to),
-      api.getUsageByModel(from, to),
-      api.getUsageByProvider(from, to),
-      api.getUsageLogs(from, to, page, 50),
-    ]).then(([s, tr, a, m, p, l]) => {
-      setSummary(s); setTrend(tr.points); setByAgent(a.items); setByModel(m.items); setByProvider(p.items); setLogs(l)
-      setLoadError(null)
-    }).catch((e) => setLoadError(e instanceof Error ? e.message : String(e)))
-  }, [range, granularity, page])
-
-  useEffect(load, [load])
   useEffect(() => {
-    if (timerRef.current !== null) window.clearInterval(timerRef.current)
-    timerRef.current = null
-    if (autoRefresh) timerRef.current = window.setInterval(load, 60_000)
-    return () => { if (timerRef.current !== null) window.clearInterval(timerRef.current) }
+    if (!autoRefresh) return
+    const timer = window.setInterval(load, 60_000)
+    return () => window.clearInterval(timer)
   }, [autoRefresh, load])
+
+  const status = (query: QueryState<unknown>, empty: boolean) => {
+    let message = blocked
+    if (!message && query.loading) message = text('加载中…', 'Loading…')
+    if (!message && query.error) {
+      const code = query.error instanceof ApiError ? query.error.status : null
+      message = code === 401 ? text('登录已失效，请重新登录。', 'Session expired. Sign in again.')
+        : code === 403 ? text('无权查看此用量区块。', 'You do not have permission to view this usage section.')
+        : code === 404 ? text('当前服务器未提供此用量接口。', 'This usage endpoint is unavailable on the current server.')
+        : text('加载失败，请点击刷新重试。', 'Loading failed. Click Refresh to retry.')
+    }
+    if (!message && empty) message = text('所选时间范围内无数据。', 'No data in the selected time range.')
+    return message ? <div role={query.error || invalidRange ? 'alert' : 'status'} className={cn('text-[11.5px] py-2', query.error || invalidRange ? 'text-coral-deep' : 'text-ink-500')}>{message}</div> : null
+  }
 
   const th = 'text-left text-[10.5px] font-bold uppercase tracking-[0.1em] text-ink-300 py-2 pr-3'
   const td = 'py-2 pr-3 text-[12px] text-ink-700 tabular-nums truncate'
@@ -181,10 +234,10 @@ export function UsageDashboard() {
         ))}
         {preset === 'custom' && (
           <>
-            <input type="date" value={customFrom} onChange={(e) => setCustomFrom(e.target.value)}
+            <input type="date" value={customFrom} onChange={(e) => { setCustomFrom(e.target.value); setPage(1) }}
               className="h-7 px-2 rounded-[7px] text-[12px] text-ink-700 bg-cloud outline-none" style={{ border: '1px solid var(--ink-100)' }} />
             <span className="text-ink-300 text-[12px]">→</span>
-            <input type="date" value={customTo} onChange={(e) => setCustomTo(e.target.value)}
+            <input type="date" value={customTo} onChange={(e) => { setCustomTo(e.target.value); setPage(1) }}
               className="h-7 px-2 rounded-[7px] text-[12px] text-ink-700 bg-cloud outline-none" style={{ border: '1px solid var(--ink-100)' }} />
           </>
         )}
@@ -200,16 +253,16 @@ export function UsageDashboard() {
           </button>
         </div>
       </div>
-      {loadError && <div className="text-[11.5px] text-coral-deep">{t('me.usage.loadFailed')}: {loadError}</div>}
+      {status(summaryQuery, summary?.requests === 0)}
 
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
-        <Card label={t('me.usage.totalTokens')} value={summary ? fmtTokens(summary.inputTokens + summary.cacheReadTokens + summary.cacheWriteTokens + summary.outputTokens) : '…'}
+        <Card label={t('me.usage.totalTokens')} value={summary ? fmtTokens(summary.inputTokens + summary.cacheReadTokens + summary.cacheWriteTokens + summary.outputTokens) : '—'}
           sub={summary ? `${t('me.usage.inShort')} ${fmtTokens(summary.inputTokens + summary.cacheReadTokens)} · ${t('me.usage.outShort')} ${fmtTokens(summary.outputTokens)}` : undefined} />
-        <Card label={t('me.usage.requests')} value={summary ? String(summary.requests) : '…'}
+        <Card label={t('me.usage.requests')} value={summary ? String(summary.requests) : '—'}
           sub={summary ? `${t('me.usage.successRate')} ${fmtPct(summary.successRate)}` : undefined} />
-        <Card label={t('me.usage.cost')} value={summary ? fmtUsd(summary.costUsd) : '…'}
+        <Card label={t('me.usage.cost')} value={summary ? fmtUsd(summary.costUsd) : '—'}
           sub={summary?.costEstimated ? t('me.usage.costEstimated') : undefined} />
-        <Card label={t('me.usage.cacheHit')} value={summary ? fmtPct(summary.cacheHitRate) : '…'}
+        <Card label={t('me.usage.cacheHit')} value={summary ? fmtPct(summary.cacheHitRate) : '—'}
           sub={summary ? `${t('me.usage.chartCacheRead')} ${fmtTokens(summary.cacheReadTokens)} · ${t('me.usage.chartCacheWrite')} ${fmtTokens(summary.cacheWriteTokens)}` : undefined} />
       </div>
 
@@ -226,6 +279,7 @@ export function UsageDashboard() {
             ))}
           </div>
         </div>
+        {status(trendQuery, trend.length === 0)}
         <TrendChart points={trend} granularity={granularity} t={t} />
       </div>
 
@@ -239,6 +293,9 @@ export function UsageDashboard() {
             </button>
           ))}
         </div>
+        {dim === 'agent' && status(agentQuery, byAgent.length === 0)}
+        {dim === 'model' && status(modelQuery, byModel.length === 0)}
+        {dim === 'provider' && status(providerQuery, byProvider.length === 0)}
         <div className="overflow-x-auto">
           {dim === 'agent' && (
             <table className="w-full border-collapse">
@@ -311,6 +368,7 @@ export function UsageDashboard() {
 
       <div className="bg-cloud rounded-[14px] p-4" style={{ border: '1px solid var(--ink-100)' }}>
         <div className="text-[12px] font-semibold text-ink-700 mb-2">{t('me.usage.logs')}</div>
+        {status(logsQuery, logs?.items.length === 0)}
         <div className="overflow-x-auto">
           <table className="w-full border-collapse">
             <thead><tr>
