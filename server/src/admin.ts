@@ -742,23 +742,40 @@ export async function unsuspendUser(args: {
  *  enforcement layer, so a failed mirror must fail the admin action
  *  instead of reporting success while the gateway keeps the old tier. */
 export async function changeUserTier(userId: string, tier: 'free' | 'pro' | 'max'): Promise<void> {
-  const { rows } = await pool.query<{ sub2api_user_id: number | null }>(
-    `SELECT sub2api_user_id FROM users WHERE id = $1`,
-    [userId],
-  )
-  if (rows.length === 0) throw new HttpError(404, 'user not found')
-  const sub2 = rows[0].sub2api_user_id
-  if (sub2 && sub2apiConfigured()) {
-    try {
-      await setUserTier(sub2, tier)
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e)
-      console.warn(`[admin] sub2api tier swap failed for user ${userId}`, msg)
-      throw new HttpError(502, `sub2api tier sync failed: ${msg}`)
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    await client.query(
+      'SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))',
+      ['cumora.user-tier', userId],
+    )
+    const { rows } = await client.query<{ sub2api_user_id: number | null }>(
+      'SELECT sub2api_user_id FROM users WHERE id = $1',
+      [userId],
+    )
+    if (rows.length === 0) throw new HttpError(404, 'user not found')
+    const sub2 = rows[0].sub2api_user_id
+    if (sub2 && sub2apiConfigured()) {
+      try {
+        await setUserTier(sub2, tier, userId)
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e)
+        console.warn('[admin] sub2api tier swap failed for user ' + userId, msg)
+        throw new HttpError(502, 'sub2api tier sync failed: ' + msg)
+      }
     }
+    // Clear any mobile-trial stamp: a manual tier change supersedes the trial,
+    // and a leftover stamp would let the trial-sweep worker auto-downgrade a
+    // genuinely-upgraded user when the old trial window lapses.
+    await client.query(
+      'UPDATE users SET tier = $2, pro_trial_expires_at = NULL WHERE id = $1',
+      [userId, tier],
+    )
+    await client.query('COMMIT')
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => { /* preserve original error */ })
+    throw e
+  } finally {
+    client.release()
   }
-  // Clear any mobile-trial stamp: a manual tier change supersedes the trial,
-  // and a leftover stamp would let the trial-sweep worker auto-downgrade a
-  // genuinely-upgraded user when the old trial window lapses.
-  await pool.query(`UPDATE users SET tier = $2, pro_trial_expires_at = NULL WHERE id = $1`, [userId, tier])
 }

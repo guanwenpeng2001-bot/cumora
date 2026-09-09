@@ -46,12 +46,10 @@ import { env } from './env.js'
 import { isNovitaModel, novitaResponsesShim } from './novita.js'
 import { resolvedChain, runWithFallback, isFallbackableError } from './agents/fallback.js'
 import { isOrcaRouterModel, orcarouterResponsesCreate } from './orcarouter.js'
-import { sub2apiRoutingConfigured, sub2apiOpenAIBaseURL, parseApiKeyMap, pickPlatformForModel, listKeyModels, SUB2API_PLATFORMS, type Platform, type ApiKeyMap } from './sub2api.js'
+import { sub2apiRoutingConfigured, sub2apiOpenAIBaseURL, parseApiKeyMap, pickPlatformForModel, listKeyModelsWithStatus, SUB2API_PLATFORMS, type Platform, type ApiKeyMap } from './sub2api.js'
 
 interface CachedClient {
   client: OpenAI
-  /** What we built the client from — used for cheap invalidation. */
-  key: string
   /** unix-ms when the cache entry was minted; expire after 5 min so a
    *  silent tier change / key rotation doesn't strand the cache forever
    *  even when the explicit invalidate path is missed. */
@@ -199,14 +197,58 @@ function prepareLlmClient(client: OpenAI, options: LlmClientOptions): OpenAI {
 
 /** Per-tenant model→platform route cache for multi-key sub2api users.
  *  Built from each platform key's gateway /v1/models view (scoped to the
- *  key's group); a fetch failure degrades to an empty set, which just
- *  routes everything to the fallback platform. */
+ *  key's group); failed refreshes retain the previous route and mark it
+ *  stale, while an initial failure falls back without caching an empty set. */
 interface ModelRouteCache {
   byPlatform: Partial<Record<Platform, ReadonlySet<string>>>
   at: number
+  stale: boolean
 }
 const MODEL_ROUTE_TTL_MS = 5 * 60_000
 const modelRouteCache = new Map<string, ModelRouteCache>()
+const modelRouteRefreshes = new Map<string, Promise<ModelRouteCache | null>>()
+const modelRouteGenerations = new Map<string, number>()
+
+async function refreshModelRouteCache(
+  baseURL: string,
+  keys: ApiKeyMap,
+  tenant: string,
+): Promise<ModelRouteCache | null> {
+  const running = modelRouteRefreshes.get(tenant)
+  if (running) return running
+
+  const existing = modelRouteCache.get(tenant)
+  const generation = modelRouteGenerations.get(tenant) ?? 0
+  const available = SUB2API_PLATFORMS.filter((p) => keys[p])
+  const refresh = (async (): Promise<ModelRouteCache | null> => {
+    const results = await Promise.all(available.map(async (platform) => ({
+      platform,
+      result: await listKeyModelsWithStatus(baseURL, keys[platform]!),
+    })))
+    if ((modelRouteGenerations.get(tenant) ?? 0) !== generation) {
+      return modelRouteCache.get(tenant) ?? existing ?? null
+    }
+
+    if (results.some(({ result }) => !result.ok)) {
+      if (!existing) return null
+      const stale = { ...existing, at: Date.now(), stale: true }
+      modelRouteCache.set(tenant, stale)
+      return stale
+    }
+
+    const byPlatform: Partial<Record<Platform, ReadonlySet<string>>> = {}
+    for (const { platform, result } of results) byPlatform[platform] = result.models
+    const fresh = { byPlatform, at: Date.now(), stale: false }
+    modelRouteCache.set(tenant, fresh)
+    return fresh
+  })()
+  modelRouteRefreshes.set(tenant, refresh)
+  try {
+    return await refresh
+  } finally {
+    if (modelRouteRefreshes.get(tenant) === refresh) modelRouteRefreshes.delete(tenant)
+  }
+}
 
 async function routePlatformForModel(
   baseURL: string,
@@ -219,14 +261,9 @@ async function routePlatformForModel(
   if (!model || available.length <= 1) return fallback
   let entry = modelRouteCache.get(tenant)
   if (!entry || Date.now() - entry.at > MODEL_ROUTE_TTL_MS) {
-    const byPlatform: Partial<Record<Platform, ReadonlySet<string>>> = {}
-    await Promise.all(available.map(async (p) => {
-      byPlatform[p] = await listKeyModels(baseURL, keys[p]!)
-    }))
-    entry = { byPlatform, at: Date.now() }
-    modelRouteCache.set(tenant, entry)
+    entry = await refreshModelRouteCache(baseURL, keys, tenant) ?? entry
   }
-  return pickPlatformForModel(entry.byPlatform, model, available)
+  return pickPlatformForModel(entry?.byPlatform ?? {}, model, available)
 }
 
 /** Build the sub2api client for a tenant. Single-key users get a plain
@@ -314,11 +351,11 @@ export async function getLlmClient(tenant: string | null, options: LlmClientOpti
       // Cache the legacy fallback briefly so we don't re-query on every
       // hop, but with a short TTL so the next backfill picks up quickly.
       const c = legacyClient()
-      cache.set(tenant, { client: c, key: 'legacy', mintedAt: Date.now() })
+      cache.set(tenant, { client: c, mintedAt: Date.now() })
       return prepareLlmClient(c, options)
     }
     const c = buildSub2apiClient(sub2apiOpenAIBaseURL(), parseApiKeyMap(rawKey), tenant)
-    cache.set(tenant, { client: c, key: rawKey, mintedAt: Date.now() })
+    cache.set(tenant, { client: c, mintedAt: Date.now() })
     return prepareLlmClient(c, options)
   } catch (e) {
     console.warn(`[llm] tenant ${tenant} client lookup failed; legacy fallback`, e instanceof Error ? e.message : e)
@@ -330,6 +367,11 @@ export async function getLlmClient(tenant: string | null, options: LlmClientOpti
  *  next LLM hop picks up the swapped key / group. */
 export function invalidateLlmClient(tenant: string): void {
   cache.delete(tenant)
+}
+
+export function invalidateModelRouteCache(tenant: string): void {
+  modelRouteGenerations.set(tenant, (modelRouteGenerations.get(tenant) ?? 0) + 1)
+  modelRouteCache.delete(tenant)
 }
 
 let _legacy: OpenAI | null = null

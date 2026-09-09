@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { env } from '../env.js'
 import {
-  setUserTier, sub2apiOpenAIBaseURL, tierGroups, parseApiKeyMap, serializeApiKeyMap,
+  setUserTier, getUserQuota, sub2apiOpenAIBaseURL, tierGroups, parseApiKeyMap, serializeApiKeyMap,
   pickPlatformForModel, provisionUser,
 } from '../sub2api.js'
 
@@ -240,7 +240,7 @@ test('provisionUser: platforms sharing a group via fallback mint a single shared
   }
 })
 
-test('provisionUser: retry reuses keys already in the right group and mints only the missing ones', async () => {
+test('provisionUser: retry reuses listed key secrets and mints only missing groups', async () => {
   configureSub2apiTestEnv()
   env.SUB2API_TIER_MAX_GROUP_OPENAI = 15
   env.SUB2API_TIER_MAX_GROUP_KIMI = 13
@@ -261,7 +261,7 @@ test('provisionUser: retry reuses keys already in the right group and mints only
     if (method === 'POST' && path === '/api/v1/admin/subscriptions/assign') return ok({ id: 2 })
     if (method === 'GET' && path === '/api/v1/admin/users/92/api-keys?page=1&page_size=1000') {
       // group 15 already has a key from a previous partial run
-      return ok({ items: [{ id: 700, group_id: 15 }], total: 1, page: 1, page_size: 1000, pages: 1 })
+      return ok({ items: [{ id: 700, group_id: 15, key: 'sk-stored' }], total: 1, page: 1, page_size: 1000, pages: 1 })
     }
     if (method === 'POST' && path === '/api/v1/admin/users/92/api-keys') return ok({ id: 701, key: 'sk-g13' })
     return new Response(JSON.stringify({ code: 404, message: `unexpected ${method} ${path}` }), { status: 404 })
@@ -270,7 +270,6 @@ test('provisionUser: retry reuses keys already in the right group and mints only
   try {
     const r = await provisionUser({
       cumoraUserId: 'u-z', email: 'dup@example.com', displayName: 'Dup', tier: 'max',
-      existingKeys: { openai: 'sk-stored' },
     })
     assert.equal(r.sub2apiUserId, 92)
     // openai's group-15 key reused from the stored map; kimi minted fresh;
@@ -316,6 +315,30 @@ test('provisionUser: reused group without a recoverable stored value mints a fre
   }
 })
 
+test('getUserQuota ignores active subscriptions past expires_at', async () => {
+  configureSub2apiTestEnv()
+  const past = new Date(Date.now() - 86_400_000).toISOString()
+  globalThis.fetch = (async () => ok([{
+    id: 31,
+    user_id: 77,
+    group_id: 3,
+    status: 'active',
+    expires_at: past,
+    daily_usage_usd: 1,
+    weekly_usage_usd: 2,
+    monthly_usage_usd: 3,
+    daily_window_start: null,
+    weekly_window_start: null,
+    monthly_window_start: null,
+    group: { id: 3, name: 'pro', daily_limit_usd: 10, weekly_limit_usd: 20, monthly_limit_usd: 30 },
+  }])) as typeof fetch
+  try {
+    assert.equal(await getUserQuota(77), null)
+  } finally {
+    restoreSub2apiTestState()
+  }
+})
+
 // ── setUserTier ───────────────────────────────────────────────────────────
 
 test('setUserTier uses subscription-group sync instead of replace-group', async () => {
@@ -331,6 +354,7 @@ test('setUserTier uses subscription-group sync instead of replace-group', async 
     const path = `${url.pathname}${url.search}`
     calls.push({ method, path, body })
 
+    if (method === 'PUT' && path === '/api/v1/admin/users/76') return ok({ id: 76 })
     if (method === 'GET' && path === '/api/v1/admin/users/76/subscriptions') {
       return ok([
         { id: 10, user_id: 76, group_id: 2, status: 'active', expires_at: future, daily_usage_usd: 0, weekly_usage_usd: 0, monthly_usage_usd: 0, daily_window_start: null, weekly_window_start: null, monthly_window_start: null },
@@ -358,6 +382,7 @@ test('setUserTier uses subscription-group sync instead of replace-group', async 
 
   assert.equal(calls.some((c) => c.path.includes('replace-group')), false)
   assert.deepEqual(calls.map((c) => `${c.method} ${c.path}`), [
+    'PUT /api/v1/admin/users/76',
     'GET /api/v1/admin/users/76/subscriptions',
     'DELETE /api/v1/admin/subscriptions/12',
     'POST /api/v1/admin/subscriptions/assign',
@@ -367,13 +392,14 @@ test('setUserTier uses subscription-group sync instead of replace-group', async 
     'GET /api/v1/admin/groups/3',
     'DELETE /api/v1/admin/subscriptions/10',
   ])
-  assert.deepEqual(calls[2]?.body, {
+  assert.deepEqual(calls[0]?.body, { allowed_groups: [3] })
+  assert.deepEqual(calls[3]?.body, {
     user_id: 76,
     group_id: 3,
     validity_days: 3650,
     notes: 'cumora auto-provision',
   })
-  assert.deepEqual(calls[5]?.body, { group_id: 3 })
+  assert.deepEqual(calls[6]?.body, { group_id: 3 })
 })
 
 test('setUserTier is idempotent when subscription and API keys already match', async () => {
@@ -386,6 +412,7 @@ test('setUserTier is idempotent when subscription and API keys already match', a
     const method = init?.method ?? 'GET'
     const path = `${url.pathname}${url.search}`
     calls.push({ method, path })
+    if (method === 'PUT' && path === '/api/v1/admin/users/76') return ok({ id: 76 })
     if (method === 'GET' && path === '/api/v1/admin/users/76/subscriptions') {
       return ok([
         { id: 20, user_id: 76, group_id: 3, status: 'active', expires_at: future, daily_usage_usd: 0, weekly_usage_usd: 0, monthly_usage_usd: 0, daily_window_start: null, weekly_window_start: null, monthly_window_start: null },
@@ -405,6 +432,7 @@ test('setUserTier is idempotent when subscription and API keys already match', a
   }
 
   assert.deepEqual(calls.map((c) => `${c.method} ${c.path}`), [
+    'PUT /api/v1/admin/users/76',
     'GET /api/v1/admin/users/76/subscriptions',
     'GET /api/v1/admin/users/76/api-keys?page=1&page_size=1000',
     'GET /api/v1/admin/groups/3',

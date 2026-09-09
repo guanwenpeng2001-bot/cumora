@@ -206,7 +206,7 @@ async function adminFetch<T = unknown>(path: string, init: RequestInit = {}): Pr
 
 interface AdminUserResponse { id: number; email: string }
 interface ApiKeyResponse    { id: number; key: string }
-interface AdminAPIKeyRow    { id: number; group_id: number | null; name?: string }
+interface AdminAPIKeyRow    { id: number; group_id: number | null; name?: string; key?: string }
 interface AdminAPIKeyList   { items: AdminAPIKeyRow[]; total: number; page: number; page_size: number; pages: number }
 
 /** End-to-end: create sub2api user + assign the primary subscription +
@@ -225,15 +225,19 @@ interface AdminAPIKeyList   { items: AdminAPIKeyRow[]; total: number; page: numb
  *  platform" — showing synthetic addresses defeats that. The sub2api
  *  admin account is provisioned out of the way (ADMIN_EMAIL something
  *  like `admin@cumora.local`) so there's no collision with real emails. */
+async function invalidateTenantLlmCaches(tenant: string): Promise<void> {
+  const { invalidateLlmClient, invalidateModelRouteCache } = await import('./llm.js')
+  invalidateLlmClient(tenant)
+  invalidateModelRouteCache(tenant)
+}
+
 export async function provisionUser(args: {
   cumoraUserId: string
   email: string
   displayName: string
   tier?: Tier
-  /** The caller's currently persisted key map (if any). Needed because a
-   *  reused sub2api key's plaintext can't be read back admin-side — its
-   *  value is only recoverable from our own storage. When a group already
-   *  has a key but no stored value covers it, we mint a fresh one. */
+  /** The caller's currently persisted key map (if any). Used as a
+   *  fallback for deployments whose admin key list masks the secret. */
   existingKeys?: ApiKeyMap
 }): Promise<ProvisionResult> {
   const tier = args.tier ?? 'free'
@@ -310,10 +314,9 @@ export async function provisionUser(args: {
   }
 
   // One key per platform group. Existing keys whose group already
-  // matches are reused when their value is recoverable from the caller's
-  // stored map (retries converge without rotation); when the value isn't
-  // recoverable we mint a fresh key — a key we can't read back is as good
-  // as lost.
+  // matches are reused from the admin list response (or the caller's
+  // stored map when that response masks the secret); only an un-recoverable
+  // existing key requires a fresh key.
   const existingKeys = await adminFetch<AdminAPIKeyList>(
     `/api/v1/admin/users/${created.id}/api-keys?page=1&page_size=1000`,
   )
@@ -328,8 +331,9 @@ export async function provisionUser(args: {
         .filter((q) => groups[q] === groupId)
         .map((q) => args.existingKeys?.[q])
         .find((v) => v)
-      if (stored) {
-        keyValueByGroup.set(groupId, stored)
+      const listed = existingKeys.items?.find((k) => k.group_id === groupId)?.key
+      if (listed || stored) {
+        keyValueByGroup.set(groupId, listed ?? stored!)
         continue
       }
     }
@@ -351,6 +355,7 @@ export async function provisionUser(args: {
     if (value) apiKeys[platform] = value
   }
 
+  await invalidateTenantLlmCaches(args.cumoraUserId)
   return { sub2apiUserId: created.id, apiKeys, groupId: primaryGroupId }
 }
 
@@ -431,7 +436,7 @@ export async function getUserQuota(sub2apiUserId: number): Promise<QuotaSnapshot
   const rows = await adminFetch<AdminSubscriptionRow[]>(
     `/api/v1/admin/users/${sub2apiUserId}/subscriptions`,
   )
-  const active = rows.filter((r) => r.status === 'active')
+  const active = rows.filter((r) => subscriptionIsActive(r))
   if (active.length === 0) return null
   // Pick the "most generous" subscription as the visible quota. sub2api
   // technically allows multiple active groups but a cumora user almost
@@ -485,20 +490,27 @@ export function pickPlatformForModel(
 }
 
 /** Fetch the model ids a user key can call (gateway /v1/models is
- *  scoped to the key's group). Any failure yields an empty set — the
- *  caller treats that platform as claiming nothing. */
-export async function listKeyModels(baseUrl: string, apiKey: string): Promise<Set<string>> {
+ *  scoped to the key's group). `listKeyModelsWithStatus` preserves whether
+ *  the fetch succeeded so route-cache refreshes can retain stale data. */
+export async function listKeyModelsWithStatus(baseUrl: string, apiKey: string): Promise<{ models: Set<string>; ok: boolean }> {
   try {
-    const r = await fetch(`${baseUrl.replace(/\/+$/, '')}/models`, {
-      headers: { authorization: `Bearer ${apiKey}`, accept: 'application/json' },
+    const r = await fetch(baseUrl.replace(/\/+$/, '') + '/models', {
+      headers: { authorization: 'Bearer ' + apiKey, accept: 'application/json' },
       signal: AbortSignal.timeout(15_000),
     })
-    if (!r.ok) return new Set()
+    if (!r.ok) return { models: new Set(), ok: false }
     const body = (await r.json()) as { data?: Array<{ id?: string }> }
-    return new Set((body.data ?? []).map((m) => m.id).filter((id): id is string => Boolean(id)))
+    return {
+      models: new Set((body.data ?? []).map((m) => m.id).filter((id): id is string => Boolean(id))),
+      ok: true,
+    }
   } catch {
-    return new Set()
+    return { models: new Set(), ok: false }
   }
+}
+
+export async function listKeyModels(baseUrl: string, apiKey: string): Promise<Set<string>> {
+  return (await listKeyModelsWithStatus(baseUrl, apiKey)).models
 }
 
 /** Tier change. Idempotent: re-calling with the same tier is fine.
@@ -512,7 +524,7 @@ export async function listKeyModels(baseUrl: string, apiKey: string): Promise<Se
  *       platform, admin-side),
  *    3. stale Cumora tier subscriptions are revoked so quota reads
  *       don't keep seeing the old tier. */
-export async function setUserTier(sub2apiUserId: number, tier: Tier): Promise<void> {
+export async function setUserTier(sub2apiUserId: number, tier: Tier, tenant?: string): Promise<void> {
   const groups = tierGroups(tier)
   const primaryGroupId = groups.openai
   if (primaryGroupId <= 0) {
@@ -521,6 +533,11 @@ export async function setUserTier(sub2apiUserId: number, tier: Tier): Promise<vo
   }
 
   const tierGroupIds = configuredTierGroupIds()
+  const allowedGroups = [...new Set(Object.values(groups).filter((id) => id > 0))]
+  await adminFetch('/api/v1/admin/users/' + sub2apiUserId, {
+    method: 'PUT',
+    body: JSON.stringify({ allowed_groups: allowedGroups }),
+  })
   const subscriptions = await adminFetch<AdminSubscriptionRow[]>(
     `/api/v1/admin/users/${sub2apiUserId}/subscriptions`,
   )
@@ -573,8 +590,9 @@ export async function setUserTier(sub2apiUserId: number, tier: Tier): Promise<vo
     && subscriptionIsActive(s, now)
   ))
   for (const sub of staleTierSubs) {
-    await adminFetch(`/api/v1/admin/subscriptions/${sub.id}`, {
+    await adminFetch('/api/v1/admin/subscriptions/' + sub.id, {
       method: 'DELETE',
     })
   }
+  if (tenant) await invalidateTenantLlmCaches(tenant)
 }
