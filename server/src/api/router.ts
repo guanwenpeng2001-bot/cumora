@@ -23,7 +23,7 @@ import { availableModels, invalidateModelCatalog } from '../models-catalog.js'
 import { parseUsageRange, usageSummary, usageTrend, usageByAgent, usageByModel, usageByProvider, usageLogs } from '../usage.js'
 import { modelPricingTable, upsertModelPricing } from '../model-pricing.js'
 import {
-  listSkills, createSkillFromPaste, deleteSkill, installFromHub, searchHub,
+  ResourceError, listSkills, createSkillFromPaste, deleteSkill, installFromHub, searchHub,
   listLocalHub, importLocalSkill, agentSkillsFor, setAgentSkills,
   skillHubUrl, localSkillHubPath,
 } from '../skill-library.js'
@@ -779,9 +779,18 @@ api.get('/usage/pricing', safe(async (req, res) => {
   res.json({ items: await modelPricingTable() })
 }))
 
+function resourceSafe(handler: (req: Request & AuthedRequest, res: Response) => Promise<void> | void) {
+  return safe(async (req, res) => {
+    try { await handler(req, res) } catch (e) {
+      if (e instanceof ResourceError) throw new HttpError(e.status, e.message)
+      throw e
+    }
+  })
+}
+
 /* ============== Company skill library ============== */
 
-api.get('/skills', safe(async (req, res) => {
+api.get('/skills', resourceSafe(async (req, res) => {
   const { companyId } = await requireCompany(req)
   res.json({
     items: await listSkills(companyId),
@@ -790,14 +799,14 @@ api.get('/skills', safe(async (req, res) => {
   })
 }))
 
-api.post('/skills/paste', safe(async (req, res) => {
+api.post('/skills/paste', resourceSafe(async (req, res) => {
   const { companyId } = await requireCompanyRole(req)
   const body = String(req.body?.skillMd ?? '')
   if (!body.trim()) throw new HttpError(400, 'skillMd required')
   res.json(await createSkillFromPaste(companyId, body))
 }))
 
-api.post('/skills/install', safe(async (req, res) => {
+api.post('/skills/install', resourceSafe(async (req, res) => {
   const { companyId } = await requireCompanyRole(req)
   const hubId = String(req.body?.hubId ?? '').trim()
   if (!hubId) throw new HttpError(400, 'hubId required')
@@ -805,26 +814,26 @@ api.post('/skills/install', safe(async (req, res) => {
 }))
 
 /** Local hub: list (flagged by imported) + import one. */
-api.get('/skills/hub/local', safe(async (req, res) => {
+api.get('/skills/hub/local', resourceSafe(async (req, res) => {
   const { companyId } = await requireCompany(req)
   res.json({ items: await listLocalHub(companyId), path: localSkillHubPath() || null })
 }))
 
-api.post('/skills/import-local', safe(async (req, res) => {
+api.post('/skills/import-local', resourceSafe(async (req, res) => {
   const { companyId } = await requireCompanyRole(req)
-  const name = String(req.body?.name ?? '').trim()
+  const name = typeof (req.body?.directory ?? req.body?.name) === 'string' ? (req.body.directory ?? req.body.name) : ''
   if (!name) throw new HttpError(400, 'name required')
   res.json(await importLocalSkill(companyId, name))
 }))
 
-api.get('/skills/hub/search', safe(async (req, res) => {
+api.get('/skills/hub/search', resourceSafe(async (req, res) => {
   await requireCompany(req)
   const q = String(req.query?.q ?? '').trim()
   if (!q) throw new HttpError(400, 'q required')
   res.json({ items: await searchHub(q) })
 }))
 
-api.delete('/skills/:id', safe(async (req, res) => {
+api.delete('/skills/:id', resourceSafe(async (req, res) => {
   const { companyId } = await requireCompanyRole(req)
   const removed = await deleteSkill(companyId, String(req.params.id))
   if (!removed) throw new HttpError(404, 'not found')
@@ -833,14 +842,14 @@ api.delete('/skills/:id', safe(async (req, res) => {
 
 /** Per-agent enablement: read flags, or set them (writes materialize the
  *  managed workspace / land in the next BYOA daemon seed). */
-api.get('/agents/:id/skills', safe(async (req, res) => {
+api.get('/agents/:id/skills', resourceSafe(async (req, res) => {
   const { companyId } = await requireCompany(req)
   res.json({ items: await agentSkillsFor(companyId, String(req.params.id)) })
 }))
 
-api.put('/agents/:id/skills', safe(async (req, res) => {
+api.put('/agents/:id/skills', resourceSafe(async (req, res) => {
   const { companyId } = await requireCompanyRole(req)
-  const ids = Array.isArray(req.body?.skillIds) ? req.body.skillIds.filter((x: unknown) => typeof x === 'string') : null
+  const ids = Array.isArray(req.body?.skillIds) && req.body.skillIds.every((x: unknown) => typeof x === 'string') ? req.body.skillIds : null
   if (!ids) throw new HttpError(400, 'skillIds must be an array of strings')
   await setAgentSkills(companyId, String(req.params.id), ids)
   res.json({ ok: true })
@@ -849,7 +858,7 @@ api.put('/agents/:id/skills', safe(async (req, res) => {
 /* ============== MCP connector registry (phase 5: registry + BYOA
  *  injection; managed agents get MCP in phase 6) ============== */
 
-api.get('/mcp-connectors', safe(async (req, res) => {
+api.get('/mcp-connectors', resourceSafe(async (req, res) => {
   const { userId, companyId } = await requireCompany(req)
   const { rows: memberships } = await pool.query<{ role: string }>(
     `SELECT role FROM company_members WHERE company_id = $1 AND user_id = $2 LIMIT 1`,
@@ -859,7 +868,7 @@ api.get('/mcp-connectors', safe(async (req, res) => {
   res.json({ items: await listConnectors(companyId, { redactSecrets }) })
 }))
 
-api.post('/mcp-connectors', safe(async (req, res) => {
+api.post('/mcp-connectors', resourceSafe(async (req, res) => {
   const { companyId } = await requireCompanyRole(req)
   const b = req.body ?? {}
   const err = validateConnector(b)
@@ -872,7 +881,7 @@ api.post('/mcp-connectors', safe(async (req, res) => {
   }))
 }))
 
-api.put('/mcp-connectors/:id', safe(async (req, res) => {
+api.put('/mcp-connectors/:id', resourceSafe(async (req, res) => {
   const { companyId } = await requireCompanyRole(req)
   const id = String(req.params.id)
   const { rows } = await pool.query(`SELECT id FROM mcp_connectors WHERE company_id = $1 AND id = $2`, [companyId, id])
@@ -892,7 +901,7 @@ api.put('/mcp-connectors/:id', safe(async (req, res) => {
   res.json(connector)
 }))
 
-api.delete('/mcp-connectors/:id', safe(async (req, res) => {
+api.delete('/mcp-connectors/:id', resourceSafe(async (req, res) => {
   const { companyId } = await requireCompanyRole(req)
   const removed = await deleteConnector(companyId, String(req.params.id))
   if (!removed) throw new HttpError(404, 'not found')
@@ -901,14 +910,18 @@ api.delete('/mcp-connectors/:id', safe(async (req, res) => {
   res.json({ ok: true })
 }))
 
-api.get('/agents/:id/mcp-connectors', safe(async (req, res) => {
-  const { companyId } = await requireCompany(req)
-  res.json({ items: await agentConnectorsFor(companyId, String(req.params.id)) })
+api.get('/agents/:id/mcp-connectors', resourceSafe(async (req, res) => {
+  const { userId, companyId } = await requireCompany(req)
+  const { rows: memberships } = await pool.query<{ role: string }>(
+    `SELECT role FROM company_members WHERE company_id = $1 AND user_id = $2 LIMIT 1`, [companyId, userId],
+  )
+  const redactSecrets = !PRIVILEGED_ROLES.has(memberships[0]?.role ?? 'member')
+  res.json({ items: await agentConnectorsFor(companyId, String(req.params.id), { redactSecrets }) })
 }))
 
-api.put('/agents/:id/mcp-connectors', safe(async (req, res) => {
+api.put('/agents/:id/mcp-connectors', resourceSafe(async (req, res) => {
   const { companyId } = await requireCompanyRole(req)
-  const ids = Array.isArray(req.body?.connectorIds) ? req.body.connectorIds.filter((x: unknown) => typeof x === 'string') : null
+  const ids = Array.isArray(req.body?.connectorIds) && req.body.connectorIds.every((x: unknown) => typeof x === 'string') ? req.body.connectorIds : null
   if (!ids) throw new HttpError(400, 'connectorIds must be an array of strings')
   await setAgentConnectors(companyId, String(req.params.id), ids)
   const { invalidatePersonaCache } = await import('../agents/personas.js')

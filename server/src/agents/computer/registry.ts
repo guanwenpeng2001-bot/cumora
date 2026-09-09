@@ -671,15 +671,15 @@ export async function listAgentsForComputer(computerId: string): Promise<
             COALESCE((
               SELECT jsonb_agg(jsonb_build_object('name', s.name, 'description', s.description, 'files', s.files))
                 FROM agent_skills a JOIN skills s ON s.id = a.skill_id
-               WHERE a.agent_id = p.id
+               WHERE a.agent_id = p.id AND s.company_id = p.company_id
             ), '[]'::jsonb) AS "skillsJson",
             COALESCE((
               SELECT jsonb_agg(jsonb_build_object('name', m.name, 'type', m.type, 'command', m.command, 'args', m.args, 'env', m.env, 'url', m.url, 'headers', m.headers))
                 FROM agent_mcp_connectors a JOIN mcp_connectors m ON m.id = a.connector_id
-               WHERE a.agent_id = p.id AND m.enabled
+               WHERE a.agent_id = p.id AND m.company_id = p.company_id AND m.enabled
             ), '[]'::jsonb) AS "mcpJson"
        FROM participants p
-       JOIN computers c ON c.id = p.computer_id
+       JOIN computers c ON c.id = p.computer_id AND c.company_id = p.company_id AND c.revoked_at IS NULL
       WHERE p.computer_id = $1 AND p.kind = 'agent' AND p.departed_at IS NULL
       ORDER BY p.name ASC`,
     [computerId],
