@@ -28,7 +28,7 @@ import { companyTier } from './tier.js'
 import { ensureCloudComputer, cloudComputerId } from './agents/computer/registry.js'
 import { mirrorAvatar } from './oauth.js'
 import { insertPersonalWorkspace } from './personal-workspace.js'
-import { provisionUser as provisionSub2apiUser, sub2apiConfigured, setUserTier } from './sub2api.js'
+import { provisionUser as provisionSub2apiUser, sub2apiConfigured, serializeApiKeyMap, setUserTier } from './sub2api.js'
 import { formatAddress, mintMessageId, sendViaProvider } from './email.js'
 
 /* ============== Bootstrap admin allow-list ============== */
@@ -600,7 +600,7 @@ export async function approveWaitlist(waitlistId: string, decidedBy: string): Pr
         })
         await pool.query(
           `UPDATE users SET sub2api_user_id = $1, sub2api_api_key = $2 WHERE id = $3`,
-          [r.sub2apiUserId, r.apiKey, userId],
+          [r.sub2apiUserId, serializeApiKeyMap(r.apiKeys), userId],
         )
       } catch (e) {
         console.warn(`[admin] sub2api provisioning failed for ${userId}; legacy fallback`, e instanceof Error ? e.message : e)

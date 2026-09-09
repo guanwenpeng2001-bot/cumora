@@ -45,7 +45,7 @@ import { pool } from './db/pool.js'
 import { env } from './env.js'
 import { isNovitaModel, novitaResponsesShim } from './novita.js'
 import { isOrcaRouterModel, orcarouterResponsesCreate } from './orcarouter.js'
-import { sub2apiConfigured, sub2apiOpenAIBaseURL } from './sub2api.js'
+import { sub2apiRoutingConfigured, sub2apiOpenAIBaseURL, parseApiKeyMap, pickPlatformForModel, listKeyModels, SUB2API_PLATFORMS, type Platform, type ApiKeyMap } from './sub2api.js'
 
 interface CachedClient {
   client: OpenAI
@@ -152,13 +152,103 @@ function withProviderRouting(client: OpenAI): OpenAI {
   })
 }
 
+/** Per-tenant model→platform route cache for multi-key sub2api users.
+ *  Built from each platform key's gateway /v1/models view (scoped to the
+ *  key's group); a fetch failure degrades to an empty set, which just
+ *  routes everything to the fallback platform. */
+interface ModelRouteCache {
+  byPlatform: Partial<Record<Platform, ReadonlySet<string>>>
+  at: number
+}
+const MODEL_ROUTE_TTL_MS = 5 * 60_000
+const modelRouteCache = new Map<string, ModelRouteCache>()
+
+async function routePlatformForModel(
+  baseURL: string,
+  keys: ApiKeyMap,
+  tenant: string,
+  model: string | undefined,
+): Promise<Platform> {
+  const available = SUB2API_PLATFORMS.filter((p) => keys[p])
+  const fallback: Platform = available.includes('openai') ? 'openai' : available[0] ?? 'openai'
+  if (!model || available.length <= 1) return fallback
+  let entry = modelRouteCache.get(tenant)
+  if (!entry || Date.now() - entry.at > MODEL_ROUTE_TTL_MS) {
+    const byPlatform: Partial<Record<Platform, ReadonlySet<string>>> = {}
+    await Promise.all(available.map(async (p) => {
+      byPlatform[p] = await listKeyModels(baseURL, keys[p]!)
+    }))
+    entry = { byPlatform, at: Date.now() }
+    modelRouteCache.set(tenant, entry)
+  }
+  return pickPlatformForModel(entry.byPlatform, model, available)
+}
+
+/** Build the sub2api client for a tenant. Single-key users get a plain
+ *  client (the pre-split behavior). Multi-key users get a proxy that
+ *  routes responses.create / chat.completions.create to the platform
+ *  whose group claims the requested model, at call time. */
+function buildSub2apiClient(baseURL: string, keys: ApiKeyMap, tenant: string): OpenAI {
+  const available = SUB2API_PLATFORMS.filter((p) => keys[p])
+  const fallback: Platform = available.includes('openai') ? 'openai' : available[0] ?? 'openai'
+  const mk = (p: Platform) => new OpenAI({
+    apiKey: keys[p]!,
+    baseURL,
+    maxRetries: SDK_MAX_RETRIES,
+    timeout: SDK_TIMEOUT_MS,
+  })
+  const base = mk(fallback)
+  if (available.length <= 1) return base
+  const platformClients = new Map<Platform, OpenAI>([[fallback, base]])
+  const clientFor = (p: Platform): OpenAI => {
+    let c = platformClients.get(p)
+    if (!c) { c = mk(p); platformClients.set(p, c) }
+    return c
+  }
+  // `create` variants return promises (a promise of a Stream when
+  // stream:true), so deferring the platform pick into .then is safe.
+  // call() receives the resolved client and must invoke the SDK method AS a
+  // method call on it (c.responses.create(...)) — extracting the function
+  // first would drop `this`, and the SDK's APIResource reads this._client.
+  const routedCreate = (call: (c: OpenAI, a: unknown, o?: unknown) => unknown) =>
+    (args: { model?: string } & Record<string, unknown>, opts?: unknown) =>
+      routePlatformForModel(baseURL, keys, tenant, args?.model).then((p) => call(clientFor(p), args, opts))
+  return new Proxy(base, {
+    get(target, prop, receiver): unknown {
+      if (prop === 'responses') {
+        return new Proxy(target.responses, {
+          get(rt, p, rr): unknown {
+            if (p !== 'create') return Reflect.get(rt, p, rr)
+            return routedCreate((c, a, o) => (c.responses.create as (a: unknown, o?: unknown) => unknown).call(c.responses, a, o))
+          },
+        })
+      }
+      if (prop === 'chat') {
+        return new Proxy(target.chat, {
+          get(ct, p, cr): unknown {
+            if (p !== 'completions') return Reflect.get(ct, p, cr)
+            return new Proxy(target.chat.completions, {
+              get(cct, pp, ccr): unknown {
+                if (pp !== 'create') return Reflect.get(cct, pp, ccr)
+                return routedCreate((c, a, o) => (c.chat.completions.create as (a: unknown, o?: unknown) => unknown).call(c.chat.completions, a, o))
+              },
+            })
+          },
+        })
+      }
+      return Reflect.get(target, prop, receiver)
+    },
+  })
+}
+
 /** Build (and cache) the OpenAI client for this tenant. Async because
  *  resolving the tenant's owner_user_id + sub2api_api_key is a DB hop.
  *  Always returns a working client — never throws on lookup failure. */
 export async function getLlmClient(tenant: string | null): Promise<OpenAI> {
   if (testLlmOverride) return testLlmOverride(tenant)
-  // No tenant context → legacy.
-  if (!tenant || !sub2apiConfigured()) return withProviderRouting(legacyClient())
+  // No tenant context → legacy. Gate on the base URL only (not the
+  // admin key): agent pods route per-platform without admin rights.
+  if (!tenant || !sub2apiRoutingConfigured()) return withProviderRouting(legacyClient())
 
   const cached = cache.get(tenant)
   if (cached && Date.now() - cached.mintedAt < CACHE_TTL_MS) {
@@ -173,8 +263,8 @@ export async function getLlmClient(tenant: string | null): Promise<OpenAI> {
         WHERE c.id = $1`,
       [tenant],
     )
-    const apiKey = rows[0]?.sub2api_api_key
-    if (!apiKey) {
+    const rawKey = rows[0]?.sub2api_api_key
+    if (!rawKey) {
       // Tenant exists but owner hasn't been provisioned in sub2api yet.
       // Cache the legacy fallback briefly so we don't re-query on every
       // hop, but with a short TTL so the next backfill picks up quickly.
@@ -182,13 +272,8 @@ export async function getLlmClient(tenant: string | null): Promise<OpenAI> {
       cache.set(tenant, { client: c, key: 'legacy', mintedAt: Date.now() })
       return withProviderRouting(c)
     }
-    const c = new OpenAI({
-      apiKey,
-      baseURL: sub2apiOpenAIBaseURL(),
-      maxRetries: SDK_MAX_RETRIES,
-      timeout: SDK_TIMEOUT_MS,
-    })
-    cache.set(tenant, { client: c, key: apiKey, mintedAt: Date.now() })
+    const c = buildSub2apiClient(sub2apiOpenAIBaseURL(), parseApiKeyMap(rawKey), tenant)
+    cache.set(tenant, { client: c, key: rawKey, mintedAt: Date.now() })
     return withProviderRouting(c)
   } catch (e) {
     console.warn(`[llm] tenant ${tenant} client lookup failed; legacy fallback`, e instanceof Error ? e.message : e)

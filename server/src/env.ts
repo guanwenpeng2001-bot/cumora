@@ -349,9 +349,27 @@ export const env = {
   SUB2API_INTERNAL_URL: (process.env.SUB2API_INTERNAL_URL ?? '').replace(/\/+$/, ''),
   SUB2API_PUBLIC_URL:   (process.env.SUB2API_PUBLIC_URL ?? '').replace(/\/+$/, ''),
   SUB2API_ADMIN_KEY:    process.env.SUB2API_ADMIN_KEY ?? '',
+  // Legacy single-value tier mapping (pre platform-split). Still honored as
+  // the last-resort fallback in tierGroups().
   SUB2API_TIER_FREE_GROUP_ID: Number(process.env.SUB2API_TIER_FREE_GROUP_ID ?? 0),
   SUB2API_TIER_PRO_GROUP_ID:  Number(process.env.SUB2API_TIER_PRO_GROUP_ID  ?? 0),
   SUB2API_TIER_MAX_GROUP_ID:  Number(process.env.SUB2API_TIER_MAX_GROUP_ID  ?? 0),
+  // Per-tier, per-platform group mapping. sub2api groups are platform-scoped
+  // (an account only serves its own platform), while cumora tiers span all
+  // platforms — so each tier maps onto one group per platform. Unset
+  // platform falls back to the tier's OPENAI group, then the legacy value.
+  SUB2API_TIER_FREE_GROUP_OPENAI:   Number(process.env.SUB2API_TIER_FREE_GROUP_OPENAI   ?? 0),
+  SUB2API_TIER_FREE_GROUP_KIMI:     Number(process.env.SUB2API_TIER_FREE_GROUP_KIMI     ?? 0),
+  SUB2API_TIER_FREE_GROUP_DEEPSEEK: Number(process.env.SUB2API_TIER_FREE_GROUP_DEEPSEEK ?? 0),
+  SUB2API_TIER_FREE_GROUP_GROK:     Number(process.env.SUB2API_TIER_FREE_GROUP_GROK     ?? 0),
+  SUB2API_TIER_PRO_GROUP_OPENAI:    Number(process.env.SUB2API_TIER_PRO_GROUP_OPENAI    ?? 0),
+  SUB2API_TIER_PRO_GROUP_KIMI:      Number(process.env.SUB2API_TIER_PRO_GROUP_KIMI      ?? 0),
+  SUB2API_TIER_PRO_GROUP_DEEPSEEK:  Number(process.env.SUB2API_TIER_PRO_GROUP_DEEPSEEK  ?? 0),
+  SUB2API_TIER_PRO_GROUP_GROK:      Number(process.env.SUB2API_TIER_PRO_GROUP_GROK      ?? 0),
+  SUB2API_TIER_MAX_GROUP_OPENAI:    Number(process.env.SUB2API_TIER_MAX_GROUP_OPENAI    ?? 0),
+  SUB2API_TIER_MAX_GROUP_KIMI:      Number(process.env.SUB2API_TIER_MAX_GROUP_KIMI      ?? 0),
+  SUB2API_TIER_MAX_GROUP_DEEPSEEK:  Number(process.env.SUB2API_TIER_MAX_GROUP_DEEPSEEK  ?? 0),
+  SUB2API_TIER_MAX_GROUP_GROK:      Number(process.env.SUB2API_TIER_MAX_GROUP_GROK      ?? 0),
   /**
    * Comma-separated allow-list of emails that are forced to `is_admin =
    * true` on every server boot. The bootstrap path so that adding a new

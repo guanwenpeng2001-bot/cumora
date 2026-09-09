@@ -99,7 +99,10 @@ services:
   # (admin-side key minting; upstream only has the user-facing POST /keys).
   sub2api:
     build:
-      context: https://github.com/guanwenpeng2001-bot/sub2api.git#main
+      # Local checkout of the fork (github.com/guanwenpeng2001-bot/sub2api) —
+      # much faster than re-cloning the git URL on every build. Push to the
+      # fork first if the image should reflect committed state.
+      context: ../sub2api
     container_name: cumora-sub2api
     restart: unless-stopped
     environment:

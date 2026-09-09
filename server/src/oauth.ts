@@ -43,7 +43,7 @@ import { onboardStarterAgents, joinAllHands } from './onboardCompany.js'
 import { companyTier } from './tier.js'
 import { ensureCloudComputer, cloudComputerId } from './agents/computer/registry.js'
 import { storage } from './storage.js'
-import { provisionUser as provisionSub2apiUser, sub2apiConfigured } from './sub2api.js'
+import { provisionUser as provisionSub2apiUser, sub2apiConfigured, serializeApiKeyMap } from './sub2api.js'
 import { isWaitlistEnabled, enqueueWaitlist, isAllowlistedAdmin } from './admin.js'
 import { insertPersonalWorkspace } from './personal-workspace.js'
 
@@ -559,7 +559,8 @@ export async function findOrCreateUserByProfile(
         })
         await pool.query(
           `UPDATE users SET sub2api_user_id = $1, sub2api_api_key = $2 WHERE id = $3`,
-          [r.sub2apiUserId, r.apiKey, userId],
+          // Fresh signup — no stored map to merge against.
+          [r.sub2apiUserId, serializeApiKeyMap(r.apiKeys), userId],
         )
       } catch (e) {
         console.warn(`[oauth] sub2api provisioning failed for ${userId}; legacy fallback`, e instanceof Error ? e.message : e)

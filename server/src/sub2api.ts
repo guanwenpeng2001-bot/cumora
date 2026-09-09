@@ -3,45 +3,63 @@
  *
  * sub2api (https://github.com/Wei-Shaw/sub2api) is the LLM quota
  * gateway sitting between cumora-server and OpenAI. Each cumora user
- * gets a mirrored sub2api account + API key + group assignment. All
+ * gets a mirrored sub2api account + API keys + group assignments. All
  * LLM calls flow through sub2api so quotas are enforced at the
  * gateway layer rather than scattered through cumora-server.
+ *
+ * Group model: sub2api groups are platform-scoped (an account only ever
+ * serves its own platform), while a cumora tier spans every platform.
+ * So a tier maps onto one group PER platform
+ * (SUB2API_TIER_<TIER>_GROUP_<PLATFORM>), and a provisioned user holds
+ * one API key per platform group. users.sub2api_api_key stores a JSON
+ * map {"openai": "sk-..", "kimi": "sk-..", ...}; legacy rows holding a
+ * bare string are read as the openai-platform key. Model → platform
+ * routing happens at call time in server/src/llm.ts.
  *
  * Provisioning flow (`provisionUser`) — every step uses the admin
  * x-api-key; no auth endpoint is ever touched:
  *   1. POST /api/v1/admin/users               — create user
- *   2. POST /api/v1/admin/subscriptions/assign — bind the tier group
- *   3. POST /api/v1/admin/users/:id/api-keys   — mint user's first key
+ *   2. POST /api/v1/admin/subscriptions/assign — bind the primary
+ *      (openai-platform) group; platform groups are `standard`
+ *      subscription_type, so their keys need no subscription record
+ *   3. POST /api/v1/admin/users/:id/api-keys   — mint one key per
+ *      platform group (reusing existing keys on retry)
  *   4. caller persists {sub2api_user_id, sub2api_api_key} on users
  *
- * Earlier this logged in AS the user (POST /auth/login) to obtain a JWT
- * and then hit the user-facing POST /keys, because upstream sub2api had
- * no admin-side mint endpoint. But /auth/* is exactly what app-level
- * Turnstile gates, so that login would break provisioning the moment
- * Turnstile is enabled. Our fork adds POST /admin/users/:id/api-keys, so
- * provisioning is now pure admin API and Turnstile-safe. We still create
- * the sub2api user with a throwaway random password (the admin create
- * endpoint requires one) but never use it to authenticate.
+ * The fork's POST /admin/users/:id/api-keys keeps provisioning pure
+ * admin API — the user-facing POST /keys would require logging in as
+ * the user via /auth/*, which app-level Turnstile gates.
  *
  * Best-effort posture: every helper here returns a Result-shaped value
  * rather than throwing. OAuth sign-in must NEVER fail because sub2api
  * provisioning hiccupped — the user just lands without a sub2api_key
- * and the LLM client falls back to the legacy global key. A background
- * job (TBD) can backfill missing keys.
+ * and the LLM client falls back to the legacy global key.
  */
 import { randomBytes } from 'node:crypto'
 import { env } from './env.js'
 
 export type Tier = 'free' | 'pro' | 'max'
 
+/** Platforms with their own sub2api account pools. `openai` doubles as
+ *  the default/fallback platform: it anchors the quota subscription and
+ *  serves anything no other platform claims (incl. DashScope, which is
+ *  an openai-platform account upstream). */
+export type Platform = 'openai' | 'kimi' | 'deepseek' | 'grok'
+export const SUB2API_PLATFORMS: readonly Platform[] = ['openai', 'kimi', 'deepseek', 'grok']
+
+/** Platform → key material for one provisioned user. */
+export type ApiKeyMap = Partial<Record<Platform, string>>
+
 export interface ProvisionResult {
   sub2apiUserId: number
-  apiKey: string
+  /** Platform → plaintext API key. Persisted (JSON) onto
+   *  users.sub2api_api_key by the caller. */
+  apiKeys: ApiKeyMap
+  /** Primary (openai-platform) group id — the subscription anchor. */
   groupId: number
 }
 
-/** Translate cumora's soft tier label to sub2api's numeric group id. */
-function tierToGroupId(tier: Tier): number {
+function legacyTierGroupId(tier: Tier): number {
   switch (tier) {
     case 'free': return env.SUB2API_TIER_FREE_GROUP_ID
     case 'pro':  return env.SUB2API_TIER_PRO_GROUP_ID
@@ -49,11 +67,98 @@ function tierToGroupId(tier: Tier): number {
   }
 }
 
+/** Read SUB2API_TIER_<TIER>_GROUP_<PLATFORM> from env. */
+function envTierPlatformGroup(tier: Tier, platform: Platform): number {
+  const table: Record<Tier, Record<Platform, number>> = {
+    free: {
+      openai:   env.SUB2API_TIER_FREE_GROUP_OPENAI,
+      kimi:     env.SUB2API_TIER_FREE_GROUP_KIMI,
+      deepseek: env.SUB2API_TIER_FREE_GROUP_DEEPSEEK,
+      grok:     env.SUB2API_TIER_FREE_GROUP_GROK,
+    },
+    pro: {
+      openai:   env.SUB2API_TIER_PRO_GROUP_OPENAI,
+      kimi:     env.SUB2API_TIER_PRO_GROUP_KIMI,
+      deepseek: env.SUB2API_TIER_PRO_GROUP_DEEPSEEK,
+      grok:     env.SUB2API_TIER_PRO_GROUP_GROK,
+    },
+    max: {
+      openai:   env.SUB2API_TIER_MAX_GROUP_OPENAI,
+      kimi:     env.SUB2API_TIER_MAX_GROUP_KIMI,
+      deepseek: env.SUB2API_TIER_MAX_GROUP_DEEPSEEK,
+      grok:     env.SUB2API_TIER_MAX_GROUP_GROK,
+    },
+  }
+  return table[tier][platform]
+}
+
+/** Resolve a tier to its per-platform group ids. An unconfigured
+ *  platform falls back to the tier's openai group, which itself falls
+ *  back to the legacy single-value SUB2API_TIER_<TIER>_GROUP_ID. All
+ *  zero when nothing is configured (provision without group access —
+ *  the staged-rollout posture). */
+export function tierGroups(tier: Tier): Record<Platform, number> {
+  const openai = envTierPlatformGroup(tier, 'openai') || legacyTierGroupId(tier)
+  return {
+    openai,
+    kimi:     envTierPlatformGroup(tier, 'kimi')     || openai,
+    deepseek: envTierPlatformGroup(tier, 'deepseek') || openai,
+    grok:     envTierPlatformGroup(tier, 'grok')     || openai,
+  }
+}
+
+/** Primary group for quota/subscription purposes: the tier's
+ *  openai-platform group. */
+export function tierPrimaryGroupId(tier: Tier): number {
+  return tierGroups(tier).openai
+}
+
+/** Parse users.sub2api_api_key into a platform→key map. Legacy rows
+ *  hold a bare key string (pre platform-split) and read as the openai
+ *  key, so old rows keep working without a migration. */
+export function parseApiKeyMap(raw: string | null | undefined): ApiKeyMap {
+  if (!raw) return {}
+  const trimmed = raw.trim()
+  if (!trimmed) return {}
+  if (trimmed.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(trimmed) as Record<string, unknown>
+      const out: ApiKeyMap = {}
+      for (const platform of SUB2API_PLATFORMS) {
+        const v = parsed[platform]
+        if (typeof v === 'string' && v) out[platform] = v
+      }
+      return out
+    } catch {
+      // fall through to legacy handling
+    }
+  }
+  return { openai: trimmed }
+}
+
+/** Serialize for users.sub2api_api_key. Single openai-only maps stay
+ *  bare strings so the row shape doesn't churn for legacy-style setups. */
+export function serializeApiKeyMap(keys: ApiKeyMap): string {
+  const platforms = SUB2API_PLATFORMS.filter((p) => keys[p])
+  if (platforms.length === 0) return ''
+  if (platforms.length === 1 && platforms[0] === 'openai') return keys.openai ?? ''
+  return JSON.stringify(keys)
+}
+
 /** True when env is wired enough that we should actually try to talk
  *  to sub2api. When false, callers should silently fall back to the
  *  legacy global OPENAI_API_KEY path. */
 export function sub2apiConfigured(): boolean {
   return Boolean(env.SUB2API_INTERNAL_URL && env.SUB2API_ADMIN_KEY)
+}
+
+/** Read-side gate for LLM routing (getLlmClient). Only needs a gateway
+ *  base URL — the admin key is required solely for the admin SDK
+ *  (provisioning/quota). Agent pods run without the admin key but still
+ *  route per-platform when this is set (they have DATABASE_URL and read
+ *  the owner's key map themselves). */
+export function sub2apiRoutingConfigured(): boolean {
+  return Boolean(env.SUB2API_INTERNAL_URL || env.SUB2API_PUBLIC_URL)
 }
 
 /** OpenAI-compatible base URL for backend agent/model traffic.
@@ -101,38 +206,47 @@ async function adminFetch<T = unknown>(path: string, init: RequestInit = {}): Pr
 
 interface AdminUserResponse { id: number; email: string }
 interface ApiKeyResponse    { id: number; key: string }
-interface AdminAPIKeyRow    { id: number; group_id: number | null }
+interface AdminAPIKeyRow    { id: number; group_id: number | null; name?: string }
 interface AdminAPIKeyList   { items: AdminAPIKeyRow[]; total: number; page: number; page_size: number; pages: number }
 
-/** End-to-end: create sub2api user + log in + mint key. Returns the
- *  numeric user id and the raw API key, both to be persisted on the
- *  cumora users row. On any step failure, throws — caller decides
- *  whether to swallow (we do during OAuth signup to never block login).
+/** End-to-end: create sub2api user + assign the primary subscription +
+ *  mint one key per platform group. Returns the numeric user id and the
+ *  platform→key map, both to be persisted on the cumora users row. On
+ *  any step failure, throws — caller decides whether to swallow (we do
+ *  during OAuth signup to never block login).
+ *
+ *  Idempotent convergence: if the sub2api user already exists, we
+ *  re-assert allowed_groups in place, and existing keys are REUSED when
+ *  their group already matches (no key rotation on retry); only missing
+ *  platform groups get fresh keys.
  *
  *  We mirror the cumora user with their REAL email. sub2api's user
  *  list is the operator's source of truth for "who is on this
  *  platform" — showing synthetic addresses defeats that. The sub2api
- *  admin account is provisioned out of the way (set ADMIN_EMAIL on
- *  the sub2api deployment to something like `admin@cumora.local`) so
- *  there's no collision with real user emails. */
+ *  admin account is provisioned out of the way (ADMIN_EMAIL something
+ *  like `admin@cumora.local`) so there's no collision with real emails. */
 export async function provisionUser(args: {
   cumoraUserId: string
   email: string
   displayName: string
   tier?: Tier
+  /** The caller's currently persisted key map (if any). Needed because a
+   *  reused sub2api key's plaintext can't be read back admin-side — its
+   *  value is only recoverable from our own storage. When a group already
+   *  has a key but no stored value covers it, we mint a fresh one. */
+  existingKeys?: ApiKeyMap
 }): Promise<ProvisionResult> {
   const tier = args.tier ?? 'free'
-  const groupId = tierToGroupId(tier)
+  const groups = tierGroups(tier)
+  const primaryGroupId = groups.openai
+  // Unique configured groups across platforms (platforms may share a
+  // group via the fallback chain).
+  const groupIds = [...new Set(SUB2API_PLATFORMS.map((p) => groups[p]).filter((id) => id > 0))]
   // 24 bytes of base64url = 32 chars — well above sub2api's min=6.
   // The admin create-user endpoint requires a password; we never store
   // it or use it to authenticate (keys are minted via the admin API).
   const throwawayPw = randomBytes(24).toString('base64url')
 
-  // Idempotent provisioning: if a sub2api user with this email already
-  // exists (e.g. a previous provisioning run created the user but
-  // crashed before we persisted the key, or the operator manually
-  // pre-created one), re-assert password + group in-place so a retry
-  // still converges instead of permanently stranding the sub2api side.
   let created: AdminUserResponse
   try {
     created = await adminFetch<AdminUserResponse>('/api/v1/admin/users', {
@@ -141,10 +255,10 @@ export async function provisionUser(args: {
         email: args.email,
         password: throwawayPw,
         username: args.displayName,
-        // 0 means "unmapped tier" — we still create the user but with no
-        // group access. They'll get gated until SUB2API_TIER_*_GROUP_ID
+        // Empty means "unmapped tier" — we still create the user but with
+        // no group access. They'll get gated until SUB2API_TIER_*_GROUP_*
         // is configured. Better than refusing signup.
-        allowed_groups: groupId > 0 ? [groupId] : [],
+        allowed_groups: groupIds,
         // Tag the sub2api row with the cumora user id so the operator
         // can grep / trace either direction.
         notes: `cumora user ${args.cumoraUserId}`,
@@ -159,33 +273,31 @@ export async function provisionUser(args: {
     )
     const existing = list.items?.find((u) => u.email.toLowerCase() === args.email.toLowerCase())
     if (!existing) throw new Error(`sub2api claims ${args.email} exists but admin search can't find it`)
-    // Reset the password so we can log in and mint a key.
+    // Re-assert group coverage (no password reset — keys are minted
+    // admin-side, so the password is never needed).
     await adminFetch(`/api/v1/admin/users/${existing.id}`, {
       method: 'PUT',
-      body: JSON.stringify({
-        password: throwawayPw,
-        allowed_groups: groupId > 0 ? [groupId] : [],
-      }),
+      body: JSON.stringify({ allowed_groups: groupIds }),
     })
     created = { id: existing.id, email: existing.email }
   }
 
-  // Assign a subscription for the group. sub2api groups marked
-  // `subscription_type: subscription` (which is the default for groups
-  // we created via the dashboard) refuse to bind an API key to the
-  // group unless the user has an active subscription record — even
-  // when the group is in allowed_groups. Default to ~10 years validity
+  // Assign a subscription for the PRIMARY (openai-platform) group.
+  // sub2api groups marked `subscription_type: subscription` refuse to
+  // bind an API key to the group without an active subscription record;
+  // the primary group anchors quota reads (getUserQuota). Platform
+  // groups are `standard` and need no subscription. ~10 years validity
   // so the subscription effectively never expires; tier downgrades go
-  // through setUserTier (which calls replace-group, not subscription).
-  if (groupId > 0) {
+  // through setUserTier.
+  if (primaryGroupId > 0) {
     try {
       await adminFetch('/api/v1/admin/subscriptions/assign', {
         method: 'POST',
         body: JSON.stringify({
           user_id: created.id,
-          group_id: groupId,
-          validity_days: 3650,
-          notes: 'cumora auto-provision',
+          group_id: primaryGroupId,
+          validity_days: TIER_SUBSCRIPTION_VALIDITY_DAYS,
+          notes: TIER_SUBSCRIPTION_NOTES,
         }),
       })
     } catch (e) {
@@ -197,25 +309,49 @@ export async function provisionUser(args: {
     }
   }
 
-  // Mint the user's key purely via the admin API (x-api-key). The old
-  // path logged in AS the user (POST /auth/login) to get a JWT, then hit
-  // the user-facing POST /keys — but /auth/* is exactly what app-level
-  // Turnstile gates, so that login would fail once Turnstile is enabled.
-  // The fork now exposes POST /admin/users/:id/api-keys, so provisioning
-  // never touches an auth endpoint. (See sub2api fork
-  // backend/internal/handler/admin/apikey_handler.go.)
-  const apiKey = await adminFetch<ApiKeyResponse>(`/api/v1/admin/users/${created.id}/api-keys`, {
-    method: 'POST',
-    body: JSON.stringify({
-      name: `cumora · ${args.displayName}`,
-      // Bind the key to the user's allowed group at creation time so
-      // upstream calls are gated immediately. If groupId is 0 the
-      // sub2api side will refuse upstream calls anyway.
-      group_id: groupId > 0 ? groupId : null,
-    }),
-  })
+  // One key per platform group. Existing keys whose group already
+  // matches are reused when their value is recoverable from the caller's
+  // stored map (retries converge without rotation); when the value isn't
+  // recoverable we mint a fresh key — a key we can't read back is as good
+  // as lost.
+  const existingKeys = await adminFetch<AdminAPIKeyList>(
+    `/api/v1/admin/users/${created.id}/api-keys?page=1&page_size=1000`,
+  )
+  const groupsWithKey = new Set<number>()
+  for (const k of existingKeys.items ?? []) {
+    if (k.group_id != null) groupsWithKey.add(k.group_id)
+  }
+  const keyValueByGroup = new Map<number, string>()
+  for (const groupId of groupIds) {
+    if (groupsWithKey.has(groupId)) {
+      const stored = SUB2API_PLATFORMS
+        .filter((q) => groups[q] === groupId)
+        .map((q) => args.existingKeys?.[q])
+        .find((v) => v)
+      if (stored) {
+        keyValueByGroup.set(groupId, stored)
+        continue
+      }
+    }
+    const apiKey = await adminFetch<ApiKeyResponse>(`/api/v1/admin/users/${created.id}/api-keys`, {
+      method: 'POST',
+      body: JSON.stringify({
+        name: `cumora · ${args.displayName} · g${groupId}`,
+        group_id: groupId,
+      }),
+    })
+    keyValueByGroup.set(groupId, apiKey.key)
+  }
 
-  return { sub2apiUserId: created.id, apiKey: apiKey.key, groupId }
+  const apiKeys: ApiKeyMap = {}
+  for (const platform of SUB2API_PLATFORMS) {
+    const groupId = groups[platform]
+    if (groupId <= 0) continue
+    const value = keyValueByGroup.get(groupId)
+    if (value) apiKeys[platform] = value
+  }
+
+  return { sub2apiUserId: created.id, apiKeys, groupId: primaryGroupId }
 }
 
 /** sub2api subscription window — used + limit per period, in USD. `null`
@@ -263,11 +399,16 @@ const TIER_SUBSCRIPTION_VALIDITY_DAYS = 3650
 const TIER_SUBSCRIPTION_NOTES = 'cumora auto-provision'
 
 function configuredTierGroupIds(): Set<number> {
-  return new Set([
-    env.SUB2API_TIER_FREE_GROUP_ID,
-    env.SUB2API_TIER_PRO_GROUP_ID,
-    env.SUB2API_TIER_MAX_GROUP_ID,
-  ].filter((id) => id > 0))
+  const ids = new Set<number>()
+  for (const tier of ['free', 'pro', 'max'] as const) {
+    for (const platform of SUB2API_PLATFORMS) {
+      const id = tierGroups(tier)[platform]
+      if (id > 0) ids.add(id)
+    }
+    const legacy = legacyTierGroupId(tier)
+    if (legacy > 0) ids.add(legacy)
+  }
+  return ids
 }
 
 function subscriptionIsActive(row: AdminSubscriptionRow, now = Date.now()): boolean {
@@ -321,40 +462,81 @@ export async function getUserQuota(sub2apiUserId: number): Promise<QuotaSnapshot
   }
 }
 
+/** Platform preference when a model is claimed by several groups'
+ *  model lists (e.g. a deepseek-* model exists on both the native
+ *  deepseek group and an openai-platform reseller): native platforms
+ *  first, openai as the universal fallback. */
+export const MODEL_PLATFORM_PRIORITY: readonly Platform[] = ['kimi', 'deepseek', 'grok', 'openai']
+
+/** Pick the platform whose model list claims `model`. Falls back to
+ *  `openai` when no list claims it (unknown models keep historical
+ *  behavior) or when openai is the only platform available. */
+export function pickPlatformForModel(
+  modelsByPlatform: Partial<Record<Platform, ReadonlySet<string>>>,
+  model: string,
+  available: readonly Platform[],
+): Platform {
+  for (const platform of MODEL_PLATFORM_PRIORITY) {
+    if (!available.includes(platform)) continue
+    if (modelsByPlatform[platform]?.has(model)) return platform
+  }
+  if (available.includes('openai')) return 'openai'
+  return available[0] ?? 'openai'
+}
+
+/** Fetch the model ids a user key can call (gateway /v1/models is
+ *  scoped to the key's group). Any failure yields an empty set — the
+ *  caller treats that platform as claiming nothing. */
+export async function listKeyModels(baseUrl: string, apiKey: string): Promise<Set<string>> {
+  try {
+    const r = await fetch(`${baseUrl.replace(/\/+$/, '')}/models`, {
+      headers: { authorization: `Bearer ${apiKey}`, accept: 'application/json' },
+      signal: AbortSignal.timeout(15_000),
+    })
+    if (!r.ok) return new Set()
+    const body = (await r.json()) as { data?: Array<{ id?: string }> }
+    return new Set((body.data ?? []).map((m) => m.id).filter((id): id is string => Boolean(id)))
+  } catch {
+    return new Set()
+  }
+}
+
 /** Tier change. Idempotent: re-calling with the same tier is fine.
  *
- * sub2api's `replace-group` endpoint is only for non-subscription
- * exclusive groups. Cumora's tiers are subscription groups, so tier
- * changes must keep three records in sync:
- *   1. target user subscription is active,
- *   2. the user's API keys point at the target group,
- *   3. stale Cumora tier subscriptions are revoked so quota reads don't
- *      keep seeing the old tier.
- */
+ *  sub2api's `replace-group` endpoint is only for non-subscription
+ *  exclusive groups. Cumora's primary tier groups are subscription
+ *  groups, so tier changes must keep three records in sync:
+ *    1. target primary subscription is active,
+ *    2. the user's API keys point at the target tier's group for the
+ *       platform each key currently serves (resolved via the group's
+ *       platform, admin-side),
+ *    3. stale Cumora tier subscriptions are revoked so quota reads
+ *       don't keep seeing the old tier. */
 export async function setUserTier(sub2apiUserId: number, tier: Tier): Promise<void> {
-  const groupId = tierToGroupId(tier)
-  if (groupId <= 0) {
+  const groups = tierGroups(tier)
+  const primaryGroupId = groups.openai
+  if (primaryGroupId <= 0) {
     console.warn(`[sub2api] tier=${tier} has no group_id mapped; skip`)
     return
   }
 
-  const tierGroups = configuredTierGroupIds()
+  const tierGroupIds = configuredTierGroupIds()
   const subscriptions = await adminFetch<AdminSubscriptionRow[]>(
     `/api/v1/admin/users/${sub2apiUserId}/subscriptions`,
   )
   const now = Date.now()
-  const staleTargetSubs = subscriptions.filter((s) => s.group_id === groupId && !subscriptionIsActive(s, now))
+  const staleTargetSubs = subscriptions.filter((s) => s.group_id === primaryGroupId && !subscriptionIsActive(s, now))
   for (const sub of staleTargetSubs) {
     await adminFetch(`/api/v1/admin/subscriptions/${sub.id}`, { method: 'DELETE' })
   }
 
-  const hasActiveTarget = subscriptions.some((s) => s.group_id === groupId && subscriptionIsActive(s, now))
+  const hasActiveTarget = subscriptions.some((s) => s.group_id === primaryGroupId && subscriptionIsActive(s, now))
   if (!hasActiveTarget) {
     await adminFetch('/api/v1/admin/subscriptions/assign', {
       method: 'POST',
       body: JSON.stringify({
         user_id: sub2apiUserId,
-        group_id: groupId,
+        group_id: primaryGroupId,
         validity_days: TIER_SUBSCRIPTION_VALIDITY_DAYS,
         notes: TIER_SUBSCRIPTION_NOTES,
       }),
@@ -364,17 +546,30 @@ export async function setUserTier(sub2apiUserId: number, tier: Tier): Promise<vo
   const keys = await adminFetch<AdminAPIKeyList>(
     `/api/v1/admin/users/${sub2apiUserId}/api-keys?page=1&page_size=1000`,
   )
+  // Resolve each key's platform from the group it currently points at,
+  // then retarget to the new tier's group for that platform.
+  const groupPlatformCache = new Map<number, string | null>()
   for (const key of keys.items ?? []) {
-    if (key.group_id === groupId) continue
+    if (key.group_id == null) continue
+    let platform = groupPlatformCache.get(key.group_id)
+    if (platform === undefined) {
+      const g = await adminFetch<{ id: number; platform?: string }>(`/api/v1/admin/groups/${key.group_id}`).catch(() => null)
+      platform = g?.platform ?? null
+      groupPlatformCache.set(key.group_id, platform)
+    }
+    const target = platform && SUB2API_PLATFORMS.includes(platform as Platform)
+      ? groups[platform as Platform]
+      : primaryGroupId
+    if (target <= 0 || key.group_id === target) continue
     await adminFetch(`/api/v1/admin/api-keys/${key.id}`, {
       method: 'PUT',
-      body: JSON.stringify({ group_id: groupId }),
+      body: JSON.stringify({ group_id: target }),
     })
   }
 
   const staleTierSubs = subscriptions.filter((s) => (
-    s.group_id !== groupId
-    && tierGroups.has(s.group_id)
+    s.group_id !== primaryGroupId
+    && tierGroupIds.has(s.group_id)
     && subscriptionIsActive(s, now)
   ))
   for (const sub of staleTierSubs) {

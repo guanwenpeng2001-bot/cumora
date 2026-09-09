@@ -47,25 +47,25 @@ docker compose up -d --force-recreate server
 
 ## sub2api(LLM 订阅聚合网关,可选)
 
-compose 里的 `sub2api` 服务从 fork [guanwenpeng2001-bot/sub2api](https://github.com/guanwenpeng2001-bot/sub2api) 构建(fork 补了 `POST /api/v1/admin/users/:id/api-keys`,让开通流程纯管理 API、不碰被 Turnstile 保护的 `/auth/*`)。数据库复用 cumora-postgres 里单独的 `sub2api` 库;Redis 复用 cumora-redis 的逻辑库 1;数据卷 `sub2api-data`。
+compose 里的 `sub2api` 服务从本地 fork 检出(`../sub2api`,对应 [guanwenpeng2001-bot/sub2api](https://github.com/guanwenpeng2001-bot/sub2api))构建——fork 补了 `POST /api/v1/admin/users/:id/api-keys`(开通流程纯管理 API、不碰被 Turnstile 保护的 `/auth/*`)、`upstream_user_agent`(管理面上游请求 UA)、每日上游模型目录同步(`UPSTREAM_MODEL_SYNC_*` 环境变量)。数据库复用 cumora-postgres 里单独的 `sub2api` 库;Redis 复用 cumora-redis 的逻辑库 1;数据卷 `sub2api-data`。
 
 - 管理后台:<http://localhost:8082>,账号 `admin@cumora.local`,密码是 .env 里的 `SUB2API_ADMIN_PASSWORD`
 - 管理 API key:存于 sub2api 库 `settings.admin_api_key`,cumora 侧配在 `.env` 的 `SUB2API_ADMIN_KEY`
-- tier 组:free / pro / max 三个组,组 id 配在 `.env` 的 `SUB2API_TIER_*_GROUP_ID`
-- 重建镜像(拉 fork 最新 main):`docker compose up -d --build sub2api`
+- 分组按平台:kimi / deepseek / openai / grok 各一个组,账号挂本平台组;openai 组是 quota 锚点(subscription 类型,订阅分配落这里),其余平台组是 standard。cumora 的 free/pro/max 是套餐档,每档经 `SUB2API_TIER_<TIER>_GROUP_<PLATFORM>` 映射到各平台组(未配的平台回落该档 openai 组);每个开通用户持每平台一把 key,users.sub2api_api_key 存 JSON map,`llm.ts` 在调用时按模型所属平台选 key(各平台组的 /v1/models 视图,5 分钟缓存,原生平台优先于 openai 转售)
+- 重建镜像(本地 fork 代码):`docker compose up -d --build sub2api`
 
 **自动开通只对部署之后的新注册用户生效**(oauth/waitlist 审批的 post-commit 钩子,失败自动回退 legacy 全局 key,不阻塞注册)。
 
-**给存量账号手动开通(谨慎,有顺序要求)**:一旦写入 `sub2api_api_key`,该用户非前缀模型的 LLM 流量立刻改走 sub2api;如果对应 tier 组下没挂订阅账号,managed 大脑会全断。所以:
+**给存量账号手动开通(谨慎,有顺序要求)**:一旦写入 `sub2api_api_key`,该用户非前缀模型的 LLM 流量立刻改走 sub2api;如果对应平台组下没挂账号,managed 大脑会全断。所以:
 
-1. 先在 sub2api 后台(8082)给 free/pro/max 组添加订阅账号(账号 → 新增,Kimi/DeepSeek 等 OpenAI 兼容渠道)
+1. 先在 sub2api 后台(8082)给各平台组(kimi/deepseek/openai/grok)添加账号(Kimi/DeepSeek 等 OpenAI 兼容渠道)
 2. 再跑:
 
    ```bash
    MSYS_NO_PATHCONV=1 docker compose exec server npx tsx server/src/scripts/provision-sub2api-user.ts <email> [free|pro|max]
    ```
 
-   脚本会拒绝覆盖已有 key;要重置就先手动清 `users.sub2api_api_key` 再跑。
+   脚本是收敛式的:已在正确组的 sub2api key 直接复用(不轮换),只补缺失平台的 key;存量裸串 key(平台拆分前)会原地迁移成 JSON map。
 
 用量页(设置 → 用量)读 sub2api 订阅快照;未开通的用户显示"不可用"而不是报错。
 

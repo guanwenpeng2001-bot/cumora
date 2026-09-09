@@ -24,7 +24,7 @@
 import { spawn } from 'node:child_process'
 import { env } from '../../env.js'
 import { pool } from '../../db/pool.js'
-import { sub2apiConfigured, sub2apiOpenAIBaseURL } from '../../sub2api.js'
+import { sub2apiConfigured, sub2apiOpenAIBaseURL, parseApiKeyMap, SUB2API_PLATFORMS } from '../../sub2api.js'
 import { inprocClient } from './inproc-client.js'
 import { signAgentToken } from './jwt.js'
 import { notifyAlert } from '../../alerting.js'
@@ -419,6 +419,9 @@ ${indent(env.ORCAROUTER_BASE_URL)}
     - name: DATABASE_URL
       value: |-
 ${indent(podUrl(env.DATABASE_URL))}
+    - name: SUB2API_INTERNAL_URL
+      value: |-
+${indent(podUrl(env.SUB2API_INTERNAL_URL))}
     - name: OPENAI_MODEL
       value: |-
 ${indent(env.OPENAI_MODEL)}
@@ -952,6 +955,12 @@ async function ensurePodImpl(agentId: string): Promise<EnsurePodResult> {
   // in llm.ts but pods don't share memory with the server process —
   // we have to bake the resolved key into the manifest env at
   // pod-spawn time.
+  //
+  // Platform split: users.sub2api_api_key may hold a JSON
+  // platform→key map. The pod's OWN getLlmClient does the per-platform
+  // routing (it has DATABASE_URL); the env var is the fallback key for
+  // legacy/direct readers, which is the openai-platform key by
+  // definition of the fallback chain.
   let resolvedKey = env.OPENAI_API_KEY
   let resolvedBaseUrl = process.env.OPENAI_BASE_URL ?? '' // empty → OpenAI SDK uses its default (api.openai.com/v1)
   if (sub2apiConfigured()) {
@@ -964,8 +973,12 @@ async function ensurePodImpl(agentId: string): Promise<EnsurePodResult> {
       )
       const k = rows[0]?.sub2api_api_key
       if (k) {
-        resolvedKey = k
-        resolvedBaseUrl = sub2apiOpenAIBaseURL()
+        const keys = parseApiKeyMap(k)
+        const fallback = keys.openai ?? SUB2API_PLATFORMS.map((p) => keys[p]).find((v) => v)
+        if (fallback) {
+          resolvedKey = fallback
+          resolvedBaseUrl = sub2apiOpenAIBaseURL()
+        }
       }
     } catch (e) {
       console.warn(`[orchestrator] sub2api key lookup failed for ${persona.companyId}; legacy fallback`, e instanceof Error ? e.message : e)
