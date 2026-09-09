@@ -432,6 +432,13 @@ interface AgentInfo {
   /** Company-library skills enabled for this agent (server: agent_skills
    *  join skills). Empty when the daemon predates the field. */
   skills?: Array<{ name: string; description: string; files: Array<{ path: string; body: string }> }>
+  /** MCP connectors enabled for this agent (server: agent_mcp_connectors
+   *  join mcp_connectors). */
+  mcpConnectors?: Array<{
+    name: string; type: 'stdio' | 'http'
+    command?: string | null; args?: string[]; env?: Record<string, string>
+    url?: string | null; headers?: Record<string, string>
+  }>
 }
 
 /** One line's worth of "there is a file on this message".
@@ -1805,7 +1812,11 @@ class AgentRunner {
   }
 
   async start(): Promise<void> {
-    await this.adapter.seedHome(this.home, { id: this.agent.id, name: this.agent.name, role: this.agent.role, systemPrompt: this.agent.systemPrompt, skills: this.agent.skills ?? [] })
+    await this.adapter.seedHome(this.home, { id: this.agent.id, name: this.agent.name, role: this.agent.role, systemPrompt: this.agent.systemPrompt, skills: this.agent.skills ?? [], mcpConnectors: this.agent.mcpConnectors ?? [] })
+    const mcpCount = this.agent.mcpConnectors?.length ?? 0
+    if (mcpCount > 0 && this.agent.engine && !['claude', 'codex'].includes(this.agent.engine)) {
+      console.log(`[computer] ${this.agent.id}: ${mcpCount} MCP connector(s) enabled but engine "${this.agent.engine}" has no defined injection point — skipped`)
+    }
     if (allowUnsandboxedByoa()) await writeShim(this.binDir)
     await writeShim(this.trustedCliDir)
     // Versions before the broker stored a live bearer token beside the shim.
@@ -1959,6 +1970,7 @@ class AgentRunner {
       CUMORA_AGENT_IPC_DIR: this.ipcDir,
       CUMORA_AGENT_MCP_SHIM: join(this.trustedCliDir, 'cumora-mcp'),
       CUMORA_AGENT_ID: this.agent.id,
+      CUMORA_MCP_CONNECTORS_JSON: JSON.stringify(this.agent.mcpConnectors ?? []),
     }
   }
 

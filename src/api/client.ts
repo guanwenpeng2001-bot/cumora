@@ -271,6 +271,25 @@ export interface ApiUsageLogPage {
 }
 
 /** Company skill library row. */
+/** MCP connector registry row. */
+export interface ApiMcpConnector {
+  id: string
+  companyId: string
+  name: string
+  type: 'stdio' | 'http'
+  command: string | null
+  args: string[]
+  env: Record<string, string>
+  url: string | null
+  headers: Record<string, string>
+  enabled: boolean
+  createdAt: string
+}
+export interface ApiAgentConnectorState {
+  connector: ApiMcpConnector
+  enabled: boolean
+}
+
 export interface ApiSkill {
   id: string
   companyId: string
@@ -1449,6 +1468,19 @@ export const api = {
     http<ApiSkill>('/skills/import-local', { method: 'POST', body: JSON.stringify({ name }) }),
   searchSkillHub: (q: string) =>
     http<{ items: Array<{ id: string; name?: string; description?: string }> }>(`/skills/hub/search?q=${encodeURIComponent(q)}`),
+  /** MCP connectors. */
+  getMcpConnectors: () =>
+    http<{ items: ApiMcpConnector[] }>('/mcp-connectors'),
+  createMcpConnector: (input: Omit<ApiMcpConnector, 'id' | 'companyId' | 'createdAt'>) =>
+    http<ApiMcpConnector>('/mcp-connectors', { method: 'POST', body: JSON.stringify(input) }),
+  updateMcpConnector: (id: string, input: Omit<ApiMcpConnector, 'id' | 'companyId' | 'createdAt'>) =>
+    http<ApiMcpConnector>(`/mcp-connectors/${encodeURIComponent(id)}`, { method: 'PUT', body: JSON.stringify(input) }),
+  deleteMcpConnector: (id: string) =>
+    http<{ ok: boolean }>(`/mcp-connectors/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  getAgentMcpConnectors: (agentId: string) =>
+    http<{ items: ApiAgentConnectorState[] }>(`/agents/${encodeURIComponent(agentId)}/mcp-connectors`),
+  setAgentMcpConnectors: (agentId: string, connectorIds: string[]) =>
+    http<{ ok: boolean }>(`/agents/${encodeURIComponent(agentId)}/mcp-connectors`, { method: 'PUT', body: JSON.stringify({ connectorIds }) }),
   getAgentSkills: (agentId: string) =>
     http<{ items: ApiAgentSkillState[] }>(`/agents/${encodeURIComponent(agentId)}/skills`),
   setAgentSkills: (agentId: string, skillIds: string[]) =>

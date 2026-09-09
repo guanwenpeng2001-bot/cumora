@@ -27,6 +27,10 @@ import {
   listLocalHub, importLocalSkill, agentSkillsFor, setAgentSkills,
   skillHubUrl, localSkillHubPath,
 } from '../skill-library.js'
+import {
+  listConnectors, upsertConnector, deleteConnector, validateConnector,
+  agentConnectorsFor, setAgentConnectors,
+} from '../mcp-connectors.js'
 import { getTriageEconomics, getWakeEconomics } from '../agents/observability.js'
 import { resolveKanbanAssigneeChange, wakeKanbanAgents } from '../agents/kanban-wake.js'
 import { AgentCreationError, createAgentRecord } from '../agents/create.js'
@@ -841,6 +845,64 @@ api.put('/agents/:id/skills', safe(async (req, res) => {
   const ids = Array.isArray(req.body?.skillIds) ? req.body.skillIds.filter((x: unknown) => typeof x === 'string') : null
   if (!ids) throw new HttpError(400, 'skillIds must be an array of strings')
   await setAgentSkills(companyId, String(req.params.id), ids)
+  res.json({ ok: true })
+}))
+
+/* ============== MCP connector registry (phase 5: registry + BYOA
+ *  injection; managed agents get MCP in phase 6) ============== */
+
+api.get('/mcp-connectors', safe(async (req, res) => {
+  const { companyId } = await requireCompany(req)
+  res.json({ items: await listConnectors(companyId) })
+}))
+
+api.post('/mcp-connectors', safe(async (req, res) => {
+  const { companyId } = await requireCompanyRole(req)
+  const b = req.body ?? {}
+  const err = validateConnector(b)
+  if (err) throw new HttpError(400, err)
+  res.json(await upsertConnector(companyId, {
+    name: String(b.name).trim(), type: b.type,
+    command: b.command ?? null, args: b.args ?? [], env: b.env ?? {},
+    url: b.url ?? null, headers: b.headers ?? {},
+    enabled: b.enabled ?? true,
+  }))
+}))
+
+api.put('/mcp-connectors/:id', safe(async (req, res) => {
+  const { companyId } = await requireCompanyRole(req)
+  const id = String(req.params.id)
+  const { rows } = await pool.query(`SELECT id FROM mcp_connectors WHERE company_id = $1 AND id = $2`, [companyId, id])
+  if (!rows[0]) throw new HttpError(404, 'not found')
+  const b = req.body ?? {}
+  const err = validateConnector(b)
+  if (err) throw new HttpError(400, err)
+  res.json(await upsertConnector(companyId, {
+    id,
+    name: String(b.name).trim(), type: b.type,
+    command: b.command ?? null, args: b.args ?? [], env: b.env ?? {},
+    url: b.url ?? null, headers: b.headers ?? {},
+    enabled: b.enabled ?? true,
+  }))
+}))
+
+api.delete('/mcp-connectors/:id', safe(async (req, res) => {
+  const { companyId } = await requireCompanyRole(req)
+  const removed = await deleteConnector(companyId, String(req.params.id))
+  if (!removed) throw new HttpError(404, 'not found')
+  res.json({ ok: true })
+}))
+
+api.get('/agents/:id/mcp-connectors', safe(async (req, res) => {
+  const { companyId } = await requireCompany(req)
+  res.json({ items: await agentConnectorsFor(companyId, String(req.params.id)) })
+}))
+
+api.put('/agents/:id/mcp-connectors', safe(async (req, res) => {
+  const { companyId } = await requireCompanyRole(req)
+  const ids = Array.isArray(req.body?.connectorIds) ? req.body.connectorIds.filter((x: unknown) => typeof x === 'string') : null
+  if (!ids) throw new HttpError(400, 'connectorIds must be an array of strings')
+  await setAgentConnectors(companyId, String(req.params.id), ids)
   res.json({ ok: true })
 }))
 

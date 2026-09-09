@@ -439,6 +439,89 @@ export async function evaluateRunnableEngines(
   return { runnable, blocked }
 }
 
+/** Operator-registered MCP connector (mcp_connectors row shape, DB-free
+ *  mirror so the daemon bundle stays clean of pg). */
+export interface EngineMcpConnector {
+  name: string
+  type: 'stdio' | 'http'
+  command?: string | null
+  args?: string[]
+  env?: Record<string, string>
+  url?: string | null
+  headers?: Record<string, string>
+}
+
+/** Claude mcpServers map for the given connectors (http → {type,url,
+ *  headers?}, stdio → {command,args?,env?}). */
+export function buildEngineMcpServers(connectors: EngineMcpConnector[]): Record<string, unknown> {
+  const out: Record<string, unknown> = {}
+  for (const c of connectors) {
+    if (c.type === 'http') {
+      out[c.name] = { type: 'http', url: c.url, ...(c.headers && Object.keys(c.headers).length ? { headers: c.headers } : {}) }
+    } else {
+      out[c.name] = {
+        command: c.command,
+        ...(c.args?.length ? { args: c.args } : {}),
+        ...(c.env && Object.keys(c.env).length ? { env: c.env } : {}),
+      }
+    }
+  }
+  return out
+}
+
+/** Merge operator connectors into the daemon-built secure --mcp-config
+ *  JSON. The cumora bridge entry wins name clashes — connectors can never
+ *  shadow it. Malformed existing JSON passes through unchanged. */
+export function mergeEngineSecureMcpConfig(existingJson: string, connectors: EngineMcpConnector[]): string {
+  if (connectors.length === 0) return existingJson
+  let parsed: { mcpServers?: Record<string, unknown> }
+  try {
+    parsed = JSON.parse(existingJson) as { mcpServers?: Record<string, unknown> }
+  } catch {
+    return existingJson
+  }
+  const merged = { ...buildEngineMcpServers(connectors), ...(parsed.mcpServers ?? {}) }
+  return JSON.stringify({ ...parsed, mcpServers: merged })
+}
+
+function mcpTomlEscape(v: string): string {
+  return `"${v.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
+}
+
+/** Codex secure-mode args: one `-c mcp_servers.<name>={…}` per connector
+ *  (its user config is ignored via --ignore-user-config). http connectors
+ *  use {url=…}; headers have no codex-argv equivalent and are dropped. */
+export function buildEngineCodexMcpArgs(connectors: EngineMcpConnector[]): string[] {
+  const out: string[] = []
+  for (const c of connectors) {
+    const key = c.name.replace(/-/g, '_')
+    if (c.type === 'stdio') {
+      const parts = [`command=${mcpTomlEscape(c.command ?? '')}`]
+      if (c.args?.length) parts.push(`args=[${c.args.map(mcpTomlEscape).join(',')}]`)
+      const envEntries = Object.entries(c.env ?? {})
+      if (envEntries.length) {
+        parts.push(`env={${envEntries.map(([k, v]) => `${k}=${mcpTomlEscape(v)}`).join(',')}}`)
+      }
+      out.push('-c', `mcp_servers.${key}={${parts.join(',')}}`)
+    } else {
+      out.push('-c', `mcp_servers.${key}={url=${mcpTomlEscape(c.url ?? '')}}`)
+    }
+  }
+  return out
+}
+
+/** Read the daemon-provided connector list from the engine env. */
+export function engineMcpConnectorsFromEnv(env: NodeJS.ProcessEnv): EngineMcpConnector[] {
+  const raw = env.CUMORA_MCP_CONNECTORS_JSON
+  if (!raw) return []
+  try {
+    const parsed = JSON.parse(raw) as unknown
+    return Array.isArray(parsed) ? (parsed as EngineMcpConnector[]) : []
+  } catch {
+    return []
+  }
+}
+
 export interface EngineSkill {
   name: string
   description: string
@@ -455,6 +538,12 @@ export interface EnginePersona {
    *  `.cursor/skills`) get the files written there on seed; AGENTS.md-only
    *  engines get a name+description index appended to the persona file. */
   skills?: EngineSkill[]
+  /** Operator-registered MCP connectors enabled for this agent. Injected
+   *  per engine: Claude secure merges them into the daemon-built
+   *  --mcp-config, Claude compat gets <home>/.mcp.json, Codex secure gets
+   *  `-c mcp_servers.<name>=…` args. Engines without a defined injection
+   *  point skip them (daemon logs a note). */
+  mcpConnectors?: EngineMcpConnector[]
 }
 
 export interface EngineRunArgs {
@@ -1437,7 +1526,7 @@ function claudeSecureSettings(agentHome: string, env: NodeJS.ProcessEnv): string
 function claudeSecureMcpConfig(env: NodeJS.ProcessEnv): string {
   const mcpShim = env.CUMORA_AGENT_MCP_SHIM
   if (!mcpShim) throw new Error('secure Cumora MCP bridge is not configured')
-  return JSON.stringify({
+  const bridge = JSON.stringify({
     mcpServers: {
       cumora: {
         command: process.execPath,
@@ -1448,6 +1537,9 @@ function claudeSecureMcpConfig(env: NodeJS.ProcessEnv): string {
       },
     },
   })
+  // Operator-registered connectors merge into the daemon-built config —
+  // secure mode ignores user config, so this argv is the only channel.
+  return mergeEngineSecureMcpConfig(bridge, engineMcpConnectorsFromEnv(env))
 }
 
 function claudeSecureFlags(agentHome: string, env: NodeJS.ProcessEnv): string[] {
@@ -1620,6 +1712,9 @@ class ClaudeAdapter implements EngineAdapter {
     await ensureAgentDirectory(join(home, '.claude'))
     await ensureAgentDirectory(join(home, '.claude', 'skills'))
     await seedEngineSkills(home, '.claude/skills', persona.skills ?? [])
+    // Compat mode reads <home>/.mcp.json natively; secure mode ignores it
+    // (connectors arrive via --mcp-config instead, see claudeSecureMcpConfig).
+    await atomicAgentWrite(join(home, '.mcp.json'), JSON.stringify({ mcpServers: buildEngineMcpServers(persona.mcpConnectors ?? []) }, null, 2))
     // Always (re)written from the DB's name/role/systemPrompt — this file is
     // system-owned, not agent-editable, so it's safe to overwrite on every
     // start()/restart (including the restart configMatches() triggers when
@@ -1845,6 +1940,8 @@ function codexSecureExecArgs(args: { home: string; env: NodeJS.ProcessEnv }, rea
     if (!mcpShim || !ipcDir) throw new Error('secure Cumora MCP bridge is not configured')
     const mcp = `mcp_servers.cumora={command=${tomlString(process.execPath)},args=[${tomlString(mcpShim)}],env={CUMORA_AGENT_IPC_DIR=${tomlString(ipcDir)}},required=true,enabled_tools=["cli"],default_tools_approval_mode="approve"}`
     secureArgs.push('-c', mcp)
+    // Operator-registered connectors ride along as extra -c overrides.
+    secureArgs.push(...buildEngineCodexMcpArgs(engineMcpConnectorsFromEnv(args.env)))
   }
   return [...secureArgs, '-a', 'never', 'exec', '--ignore-user-config', '--ignore-rules']
 }

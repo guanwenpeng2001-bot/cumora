@@ -49,6 +49,10 @@ import {
   SKILL_TABLES_SQL,
   skillTablesChecksum,
 } from './migrations/0009-skill-tables.js'
+import {
+  MCP_TABLES_SQL,
+  mcpTablesChecksum,
+} from './migrations/0010-mcp-tables.js'
 
 /** Frozen data backfill embedded in migration 0001. Exported so its behavior
  * can be exercised against PostgreSQL without replaying the whole migration. */
@@ -2568,6 +2572,10 @@ async function applySkillTables(client: import('pg').PoolClient): Promise<void> 
   await client.query(SKILL_TABLES_SQL)
 }
 
+async function applyMcpTables(client: import('pg').PoolClient): Promise<void> {
+  await client.query(MCP_TABLES_SQL)
+}
+
 const VERSIONED_MIGRATIONS: readonly VersionedMigration[] = [
   {
     ...SCHEMA_MIGRATIONS[0],
@@ -2624,6 +2632,12 @@ const VERSIONED_MIGRATIONS: readonly VersionedMigration[] = [
     sourceChecksum: skillTablesChecksum(),
     transactional: true,
     up: applySkillTables,
+  },
+  {
+    ...SCHEMA_MIGRATIONS[9],
+    sourceChecksum: mcpTablesChecksum(),
+    transactional: true,
+    up: applyMcpTables,
   },
 ]
 

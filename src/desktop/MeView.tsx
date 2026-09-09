@@ -14,6 +14,7 @@ import { ModelsTab } from './ModelsTab'
 import { cn } from '@/lib/utils'
 import { UsageDashboard } from './UsageDashboard'
 import { SkillsTab } from './SkillsTab'
+import { ConnectorsTab } from './ConnectorsTab'
 import { api, getPairingServerOrigin, getServerOrigin, type ApiProject, type ApiQuotaSnapshot, type ApiQuotaWindow } from '@/api/client'
 import { ENGINE_BIN, ENGINE_LABEL, RUNNABLE_ENGINES, RUNNABLE_ENGINE_IDS, engineLabel, type RunnableEngineId } from '@/lib/engines'
 import type { Computer, EngineId } from '@/types'
@@ -26,6 +27,7 @@ const tabs = [
   { key: 'usage', label: 'me.tab.usage' },
   { key: 'models', label: 'me.tab.models' },
   { key: 'skills', label: 'me.tab.skills' },
+  { key: 'connectors', label: 'me.tab.connectors' },
   { key: 'computers', label: 'me.tab.computers' },
   { key: 'projects', label: 'me.tab.projects' },
   { key: 'trust', label: 'me.tab.trust' },
@@ -1393,6 +1395,7 @@ export function MeView() {
         {tab === 'usage' && <UsageTab />}
         {tab === 'models' && <ModelsTab />}
         {tab === 'skills' && <SkillsTab />}
+        {tab === 'connectors' && <ConnectorsTab />}
         {tab === 'computers' && <ComputersTab />}
         {tab === 'projects' && <ProjectsTab />}
         {tab === 'trust' && <TrustTab />}

@@ -75,6 +75,8 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
   // enablement, create mode saves after creation.
   const [skillChoices, setSkillChoices] = useState<Array<{ id: string; name: string; description: string }>>([])
   const [skillChecked, setSkillChecked] = useState<Set<string>>(new Set())
+  const [connectorChoices, setConnectorChoices] = useState<Array<{ id: string; name: string; type: 'stdio' | 'http' }>>([])
+  const [connectorChecked, setConnectorChecked] = useState<Set<string>>(new Set())
   useEffect(() => {
     let cancelled = false
     const load = editing && agent
@@ -85,6 +87,14 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
       setSkillChoices(items.map(({ id, name, description }) => ({ id, name, description })))
       setSkillChecked(new Set(items.filter((x) => x.enabled).map((x) => x.id)))
     }).catch(() => { /* skills are optional chrome */ })
+    const loadMcp = editing && agent
+      ? api.getAgentMcpConnectors(agent.id).then((r) => r.items.map((x) => ({ id: x.connector.id, name: x.connector.name, type: x.connector.type, enabled: x.enabled })))
+      : api.getMcpConnectors().then((r) => r.items.filter((x) => x.enabled).map((x) => ({ id: x.id, name: x.name, type: x.type, enabled: false })))
+    void loadMcp.then((items) => {
+      if (cancelled) return
+      setConnectorChoices(items.map(({ id, name, type }) => ({ id, name, type })))
+      setConnectorChecked(new Set(items.filter((x) => x.enabled).map((x) => x.id)))
+    }).catch(() => { /* connectors are optional chrome */ })
     return () => { cancelled = true }
   }, [editing, agent])
   const [busy, setBusy] = useState(false)
@@ -304,7 +314,10 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
       const skillPersist = agentId
         ? api.setAgentSkills(agentId, [...skillChecked]).then(() => undefined)
         : Promise.resolve(undefined)
-      await skillPersist
+      const connectorPersist = agentId
+        ? api.setAgentMcpConnectors(agentId, [...connectorChecked]).then(() => undefined)
+        : Promise.resolve(undefined)
+      await Promise.all([skillPersist, connectorPersist])
       if (editing && agentId && target && assignmentChanged) {
         const out = await api.assignAgentComputer(
           agentId,
@@ -565,6 +578,33 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
                     }}
                     label={sk.name}
                     description={sk.description}
+                  />
+                ))}
+              </div>
+            </div>
+          )}
+
+          {connectorChoices.length > 0 && (
+            <div className="rounded-[10px] border border-ink-100 bg-paper/60 px-3.5 py-2.5">
+              <div className="text-[12.5px] font-semibold text-ink-700 mb-1.5">{t('agent.connectorsTitle')}</div>
+              <div className="text-[10.5px] text-ink-400 italic mb-1.5">
+                {isByoa ? t('agent.connectorsByoaNote') : t('agent.connectorsManagedNote')}
+              </div>
+              <div className="space-y-1">
+                {connectorChoices.map((c) => (
+                  <Checkbox
+                    key={c.id}
+                    checked={connectorChecked.has(c.id)}
+                    onCheckedChange={(next) => {
+                      setConnectorChecked((prev) => {
+                        const copy = new Set(prev)
+                        if (next) copy.add(c.id)
+                        else copy.delete(c.id)
+                        return copy
+                      })
+                    }}
+                    label={c.name}
+                    description={c.type}
                   />
                 ))}
               </div>

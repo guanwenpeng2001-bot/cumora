@@ -644,14 +644,26 @@ export interface AgentSkillPayload {
   files: Array<{ path: string; body: string }>
 }
 
+/** mcp_connectors row shape as carried to the daemon (DB-free mirror). */
+export interface AgentMcpConnectorPayload {
+  name: string
+  type: 'stdio' | 'http'
+  command: string | null
+  args: string[]
+  env: Record<string, string>
+  url: string | null
+  headers: Record<string, string>
+}
+
 export async function listAgentsForComputer(computerId: string): Promise<
-  Array<{ id: string; name: string; role: string | null; systemPrompt: string | null; engine: EngineId | null; model: string | null; fastModel: string | null; skills: AgentSkillPayload[] }>
+  Array<{ id: string; name: string; role: string | null; systemPrompt: string | null; engine: EngineId | null; model: string | null; fastModel: string | null; skills: AgentSkillPayload[]; mcpConnectors: AgentMcpConnectorPayload[] }>
 > {
   const { rows } = await pool.query<{
     id: string; name: string; role: string | null; systemPrompt: string | null
     engine: EngineId | null; model: string | null; fastModel: string | null
     availableEngines?: string[]; detectedEngines?: unknown
     skillsJson?: unknown
+    mcpJson?: unknown
   }>(
     `SELECT p.id, p.name, p.role, p.system_prompt AS "systemPrompt", p.engine, p.model,
             p.fast_model AS "fastModel", c.available_engines AS "availableEngines",
@@ -660,7 +672,12 @@ export async function listAgentsForComputer(computerId: string): Promise<
               SELECT jsonb_agg(jsonb_build_object('name', s.name, 'description', s.description, 'files', s.files))
                 FROM agent_skills a JOIN skills s ON s.id = a.skill_id
                WHERE a.agent_id = p.id
-            ), '[]'::jsonb) AS "skillsJson"
+            ), '[]'::jsonb) AS "skillsJson",
+            COALESCE((
+              SELECT jsonb_agg(jsonb_build_object('name', m.name, 'type', m.type, 'command', m.command, 'args', m.args, 'env', m.env, 'url', m.url, 'headers', m.headers))
+                FROM agent_mcp_connectors a JOIN mcp_connectors m ON m.id = a.connector_id
+               WHERE a.agent_id = p.id AND m.enabled
+            ), '[]'::jsonb) AS "mcpJson"
        FROM participants p
        JOIN computers c ON c.id = p.computer_id
       WHERE p.computer_id = $1 AND p.kind = 'agent' AND p.departed_at IS NULL
@@ -677,9 +694,10 @@ export async function listAgentsForComputer(computerId: string): Promise<
   const qwenDefault = process.env.CUMORA_DEFAULT_QWEN_MODEL?.trim() || null
   const antigravityDefault = process.env.CUMORA_DEFAULT_ANTIGRAVITY_MODEL?.trim() || null
   return rows.map((r) => {
-    const { availableEngines, detectedEngines, skillsJson, ...rest } = r
+    const { availableEngines, detectedEngines, skillsJson, mcpJson, ...rest } = r
     const skills = (Array.isArray(skillsJson) ? skillsJson : []) as AgentSkillPayload[]
-    const agent = { ...rest, skills }
+    const mcpConnectors = (Array.isArray(mcpJson) ? mcpJson : []) as AgentMcpConnectorPayload[]
+    const agent = { ...rest, skills, mcpConnectors }
     const localCatalog = sanitizeDetectedEngines(detectedEngines, availableEngines ?? [])
       .find((entry) => entry.id === agent.engine)?.modelCatalog
     // A custom Claude endpoint owns its model namespace. Its reported defaults
