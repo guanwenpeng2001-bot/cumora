@@ -53,8 +53,10 @@ test('no Electron icon is decoded from an SVG data URL', () => {
 
 test('the dock unread icon is built from a bitmap', () => {
   // The positive half: it is not enough that the SVG is gone, the dot must
-  // actually be composited into the icon.
-  const src = readFileSync(MAIN_CJS, 'utf8')
+  // actually be composited into the icon. Normalize line endings: the working
+  // tree is CRLF on a default Windows checkout (the file carries no eol
+  // attribute), and the `\n}\n` body slice below must still terminate.
+  const src = readFileSync(MAIN_CJS, 'utf8').replaceAll('\r\n', '\n')
   const fn = src.slice(src.indexOf('function getDockUnreadIcon'))
   const body = fn.slice(0, fn.indexOf('\n}\n') + 3)
   assert.match(body, /createFromBitmap/, 'getDockUnreadIcon must composite via a raw bitmap')

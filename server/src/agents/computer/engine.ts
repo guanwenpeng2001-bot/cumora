@@ -2435,6 +2435,8 @@ function resolveGrokBin(env: NodeJS.ProcessEnv = process.env): string | null {
     if (!dir) continue
     const candidate = join(dir, IS_WIN ? 'grok.exe' : 'grok')
     if (existsSync(candidate)) return candidate
+    // npm-style Windows installs ship a .cmd launcher, not an .exe.
+    if (IS_WIN && existsSync(join(dir, 'grok.cmd'))) return join(dir, 'grok.cmd')
     if (IS_WIN && existsSync(join(dir, 'grok'))) return join(dir, 'grok')
   }
   const homeBin = join(homedir(), '.grok', 'bin', IS_WIN ? 'grok.exe' : 'grok')

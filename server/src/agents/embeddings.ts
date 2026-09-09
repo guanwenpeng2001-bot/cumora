@@ -24,7 +24,16 @@ const EMBED_DIM = 1536
  *  recent inbox messages. */
 const MAX_INPUT_CHARS = 8000
 
-const client = new OpenAI({ apiKey: process.env.OPENAI_EMBED_API_KEY ?? env.OPENAI_API_KEY, baseURL: process.env.OPENAI_EMBED_BASE_URL || undefined })
+const client = new OpenAI({
+  apiKey: process.env.OPENAI_EMBED_API_KEY ?? env.OPENAI_API_KEY,
+  baseURL: process.env.OPENAI_EMBED_BASE_URL || undefined,
+  // Best-effort auxiliary call: an unreachable/slow embedding endpoint
+  // must degrade memory to recency-only, not hang the wake (the SDK
+  // default is a 10-minute timeout with 2 retries — longer than the
+  // pod-side runtime read budget, which kills the whole turn).
+  timeout: 10_000,
+  maxRetries: 1,
+})
 
 /** Test-only override. When set, every {@link embedText} call returns
  *  whatever this function produces — bypassing the real OpenAI

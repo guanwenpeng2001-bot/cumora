@@ -493,6 +493,14 @@ export async function tBash(
         try {
           if (child.pid) child.kill('SIGTERM')
         } catch { /* race with close — ignore */ }
+        // Windows/MSYS: `bash -c '<single command>'` does not exec — bash
+        // stays alive as the parent of the real command, and TerminateProcess
+        // on bash leaves the grandchild holding our stdout/stderr pipe
+        // handles, so 'close' would only fire when the grandchild exits on
+        // its own. Destroy the streams so 'close' is gated only on the
+        // process we actually killed; output already received is kept.
+        child.stdout?.destroy()
+        child.stderr?.destroy()
         // 2 second grace, then escalate. Tracked separately so we don't
         // leak a timer if the child closes cleanly after SIGTERM.
         const killer = setTimeout(() => {

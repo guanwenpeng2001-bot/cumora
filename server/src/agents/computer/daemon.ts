@@ -22,7 +22,7 @@
 import { execFile, spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, constants as FS_CONSTANTS, type FSWatcher, watch } from 'node:fs'
-import { chmod, copyFile, lstat, mkdir, open, readdir, readFile, rename, rm, stat, truncate, writeFile } from 'node:fs/promises'
+import { chmod, copyFile, lstat, mkdir, open, readdir, readFile, realpath, rename, rm, stat, truncate, writeFile } from 'node:fs/promises'
 import { homedir, hostname } from 'node:os'
 import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { promisify } from 'node:util'
@@ -1176,7 +1176,12 @@ export class RuntimeCliBroker {
     // computer hosts many agents. A slow fallback poll covers dropped watcher
     // events and filesystems where fs.watch is unavailable or unreliable.
     try {
-      this.watcher = watch(this.requestsDir, { persistent: false }, () => {
+      // Windows: watching an 8.3-short path (e.g. ADMINI~1 from os.tmpdir())
+      // makes libuv report event filenames as full long paths and trip its
+      // own `!_wcsnicmp(filename, dir, dirlen)` assert, killing the process.
+      // realpath resolves to the long form before watching.
+      const watchDir = process.platform === 'win32' ? await realpath(this.requestsDir) : this.requestsDir
+      this.watcher = watch(watchDir, { persistent: false }, () => {
         void this.poll().catch((err) => this.logPollFailure(err))
       })
       this.watcher.on('error', () => {

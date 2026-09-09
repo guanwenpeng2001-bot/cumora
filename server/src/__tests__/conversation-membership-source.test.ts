@@ -25,8 +25,11 @@ test('production authorization and routing never use the JSONB membership projec
   const violations: string[] = []
   for (const path of await productionTypeScriptFiles(serverSource)) {
     // Migration 0001 is frozen historical SQL and deliberately retains its
-    // old containment index and compatibility helpers.
-    if (relative(serverSource, path) === 'db/migrate.ts') continue
+    // old containment index and compatibility helpers. Normalize to POSIX
+    // separators — path.relative() yields backslashes on Windows and the
+    // comparison below must hold on every dev machine.
+    const rel = relative(serverSource, path).replaceAll('\\', '/')
+    if (rel === 'db/migrate.ts') continue
     const source = await readFile(path, 'utf8')
     for (const pattern of [
       /members\s*@>/g,
@@ -34,7 +37,7 @@ test('production authorization and routing never use the JSONB membership projec
       /jsonb_array_elements_text\([^\n]*members/g,
       /\.members\.includes\(/g,
     ]) {
-      if (pattern.test(source)) violations.push(`${relative(serverSource, path)}: ${pattern.source}`)
+      if (pattern.test(source)) violations.push(`${rel}: ${pattern.source}`)
     }
   }
   assert.deepEqual(violations, [])
