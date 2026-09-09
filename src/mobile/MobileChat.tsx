@@ -1,3 +1,4 @@
+import { useVoiceInput } from '@/lib/useVoiceInput'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso'
 import { Pressable } from './Pressable'
@@ -24,8 +25,6 @@ import { SKYPE_EMOJIS, findSkypeByShortcode } from '@/lib/skypeEmojis'
 import { TwEmoji } from '@/components/TwEmoji'
 import { SkypeEmoji } from '@/components/SkypeEmoji'
 import { useT, type MessageKey } from '@/lib/i18n'
-
-const VOICE_MAX_SECONDS = 120
 
 export function MobileChat() {
   const t = useT()
@@ -98,17 +97,9 @@ export function MobileChat() {
   const editorRef = useRef<RichInputHandle>(null)
   const fileRef = useRef<HTMLInputElement>(null)
   const streamRef = useRef<HTMLDivElement>(null)
-  const [voiceState, setVoiceState] = useState<'idle' | 'recording' | 'transcribing'>('idle')
-  const [voiceSeconds, setVoiceSeconds] = useState(0)
-  const [voiceError, setVoiceError] = useState<string | null>(null)
-  const recorderRef = useRef<MediaRecorder | null>(null)
-  const voiceStreamRef = useRef<MediaStream | null>(null)
-  const voiceTimerRef = useRef<number | null>(null)
-  const voiceMaxTimerRef = useRef<number | null>(null)
-  const voiceErrorTimerRef = useRef<number | null>(null)
-  const voiceUnmountedRef = useRef(false)
-  const startingRef = useRef(false)
-
+  const { voiceState, voiceSeconds, voiceError, voiceActionLabel, onVoiceClick } = useVoiceInput(convoId, (text) => {
+    editorRef.current?.insertText(text)
+  })
 
   // Members the user can @-mention. Excludes self. Safe when `c` is
   // undefined (convo not yet loaded) — picker just stays empty.
@@ -373,125 +364,6 @@ export function MobileChat() {
     e.target.value = ''
     if (f) await upload(f)
   }
-
-  const stopVoiceTimers = () => {
-    if (voiceTimerRef.current !== null) {
-      window.clearInterval(voiceTimerRef.current)
-      voiceTimerRef.current = null
-    }
-    if (voiceMaxTimerRef.current !== null) {
-      window.clearTimeout(voiceMaxTimerRef.current)
-      voiceMaxTimerRef.current = null
-    }
-  }
-  const stopVoiceTracks = () => {
-    voiceStreamRef.current?.getTracks().forEach((track) => track.stop())
-    voiceStreamRef.current = null
-  }
-  const showVoiceError = (msg: string) => {
-    setVoiceError(msg)
-    if (voiceErrorTimerRef.current !== null) window.clearTimeout(voiceErrorTimerRef.current)
-    voiceErrorTimerRef.current = window.setTimeout(() => {
-      voiceErrorTimerRef.current = null
-      setVoiceError(null)
-    }, 4500)
-  }
-  const transcribeVoice = async (blob: Blob) => {
-    if (blob.size === 0) {
-      setVoiceState('idle')
-      showVoiceError(t('chat.voiceFailed'))
-      return
-    }
-    setVoiceState('transcribing')
-    try {
-      const bytes = new Uint8Array(await blob.arrayBuffer())
-      let binary = ''
-      for (let i = 0; i < bytes.length; i += 0x8000) {
-        binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000))
-      }
-      const format = /audio\/(\w+)/.exec(blob.type)?.[1] ?? 'webm'
-      const { text } = await api.transcribeAudio(btoa(binary), format)
-      if (text.trim()) editorRef.current?.insertText(text.trim())
-    } catch (err) {
-      console.warn('[voice] transcription failed', err instanceof Error ? err.message : err)
-      showVoiceError(t('chat.voiceFailed'))
-    } finally {
-      setVoiceState('idle')
-      setVoiceSeconds(0)
-    }
-  }
-  const onVoiceClick = async () => {
-    if (voiceState === 'recording') {
-      const rec = recorderRef.current
-      recorderRef.current = null
-      if (rec && rec.state !== 'inactive') rec.stop()
-      setVoiceState('transcribing')
-      return
-    }
-    if (voiceState === 'transcribing' || startingRef.current) return
-    startingRef.current = true
-    setVoiceError(null)
-    try {
-      if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
-        showVoiceError(t('chat.voiceNoSupport'))
-        return
-      }
-      let stream: MediaStream
-      try {
-        stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-      } catch {
-        showVoiceError(t('chat.voiceNoMic'))
-        return
-      }
-      if (voiceUnmountedRef.current) {
-        stream.getTracks().forEach((track) => track.stop())
-        return
-      }
-      let rec: MediaRecorder
-      try {
-        rec = MediaRecorder.isTypeSupported('audio/webm')
-          ? new MediaRecorder(stream, { mimeType: 'audio/webm' })
-          : new MediaRecorder(stream)
-      } catch {
-        stream.getTracks().forEach((track) => track.stop())
-        showVoiceError(t('chat.voiceNoSupport'))
-        return
-      }
-      const chunks: Blob[] = []
-      rec.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data) }
-      rec.onstop = () => {
-        stopVoiceTracks()
-        stopVoiceTimers()
-        void transcribeVoice(new Blob(chunks, { type: rec.mimeType || 'audio/webm' }))
-      }
-      recorderRef.current = rec
-      voiceStreamRef.current = stream
-      rec.start()
-      setVoiceSeconds(0)
-      voiceTimerRef.current = window.setInterval(() => setVoiceSeconds((s) => s + 1), 1000)
-      voiceMaxTimerRef.current = window.setTimeout(() => {
-        const r = recorderRef.current
-        recorderRef.current = null
-        if (r && r.state !== 'inactive') r.stop()
-        showVoiceError(t('chat.voiceMaxDuration'))
-      }, VOICE_MAX_SECONDS * 1000)
-      setVoiceState('recording')
-    } finally {
-      startingRef.current = false
-    }
-  }
-  useEffect(() => () => {
-    voiceUnmountedRef.current = true
-    stopVoiceTimers()
-    if (voiceErrorTimerRef.current !== null) window.clearTimeout(voiceErrorTimerRef.current)
-    const rec = recorderRef.current
-    if (rec && rec.state !== 'inactive') {
-      rec.ondataavailable = null
-      rec.onstop = null
-      rec.stop()
-    }
-    stopVoiceTracks()
-  }, [])
 
   // Recompute mention state when the draft or caret moves. Mirrors the
   // desktop logic in ChatPane.tsx so the behaviour stays consistent:
@@ -995,13 +867,13 @@ export function MobileChat() {
           </Pressable>
           <Pressable
             onClick={onVoiceClick}
-            disabled={voiceState === 'transcribing'}
+            disabled={voiceState === 'stopping'}
             className={cn(
               'w-9 h-9 grid place-items-center rounded-full active:bg-sky2-50',
               voiceState === 'recording' ? 'text-coral-deep bg-coral-soft animate-pulse' : 'text-ink-500',
-              voiceState === 'transcribing' && 'opacity-60',
+              (voiceState === 'requesting' || voiceState === 'transcribing') && 'opacity-60',
             )}
-            aria-label={voiceState === 'recording' ? t('chat.voiceStop') : t('chat.voiceInput')}
+            aria-label={voiceActionLabel}
           >
             <IMic className="w-[20px] h-[20px]" />
             {voiceState === 'recording' && (
