@@ -69,8 +69,7 @@ export type LlmCallPurpose =
   // Image generation — two distinct cost drivers:
   //   - 'avatar-image' fires at agent CREATION (or explicit avatar regen).
   //   - 'agent-image'  fires when an agent uses the image-gen tool mid-turn.
-  // Bundle them under one purpose makes the "why did images cost $X?" rollup
-  // impossible — they're driven by completely different actions.
+  // Keep them separate so the rollup can distinguish these different actions.
   | 'avatar-image'
   | 'agent-image'
 

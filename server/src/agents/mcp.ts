@@ -164,6 +164,7 @@ function connectStdio(spec: McpConnectorSpec, cwd: string): { pump: RpcPump; chi
     stdio: ['pipe', 'pipe', 'pipe'],
   })
   const pump = new RpcPump()
+  child.stdin?.on('error', (e) => pump.failAll(e))
   let buf = ''
   child.stdout?.on('data', (chunk: Buffer) => {
     buf += chunk.toString('utf8')
@@ -236,7 +237,18 @@ export async function connectMcpConnector(
     const s = connectStdio(spec, opts.cwd)
     pump = s.pump
     child = s.child
-    send = (p) => child?.stdin?.write(p + '\n')
+    send = (p) => {
+      const stdin = child?.stdin
+      if (!stdin || !stdin.writable) {
+        pump.failAll(new McpError('MCP server stdin is not writable'))
+        return
+      }
+      try {
+        stdin.write(p + '\n')
+      } catch (e) {
+        pump.failAll(e instanceof Error ? e : new Error(String(e)))
+      }
+    }
   } else {
     const h = connectHttp(spec)
     pump = h.pump

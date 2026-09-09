@@ -2468,13 +2468,32 @@ async function generateAndUploadImage(opts: {
   // model but the spend driver is very different (per agent action vs per
   // agent creation), and the operator will want to slice them apart.
   const { getImageClient } = await import('../llm.js')
+  const { recordLlmCall, classifyLlmCallError } = await import('./llm-ledger.js')
   const client = getImageClient()
-  const r = await client.images.generate({
-    model: getImageModel(),
-    prompt: opts.prompt,
-    size,
-    n: 1,
-  })
+  const model = getImageModel()
+  const t0 = Date.now()
+  let r: Awaited<ReturnType<typeof client.images.generate>>
+  try {
+    r = await client.images.generate({
+      model,
+      prompt: opts.prompt,
+      size,
+      n: 1,
+    })
+    void recordLlmCall({
+      purpose: 'agent-image', companyId: opts.tenant, agentId: opts.agentId,
+      model, usage: null, latencyMs: Date.now() - t0, status: 'ok',
+      extras: { n: 1, size },
+    })
+  } catch (e) {
+    void recordLlmCall({
+      purpose: 'agent-image', companyId: opts.tenant, agentId: opts.agentId,
+      model, usage: null, latencyMs: Date.now() - t0,
+      status: classifyLlmCallError(e), error: e instanceof Error ? e.message : String(e),
+      extras: { n: 1, size },
+    })
+    throw e
+  }
   const first = r.data?.[0]
   const b64 = first?.b64_json
   const remoteUrl = first?.url

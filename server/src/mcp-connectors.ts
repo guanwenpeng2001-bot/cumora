@@ -41,15 +41,17 @@ interface DbRow {
   created_at: Date | string
 }
 
-function toRow(r: DbRow): McpConnectorRow {
+function toRow(r: DbRow, redactSecrets = false): McpConnectorRow {
+  const env = (r.env && typeof r.env === 'object' && !Array.isArray(r.env) ? r.env : {}) as Record<string, string>
+  const headers = (r.headers && typeof r.headers === 'object' && !Array.isArray(r.headers) ? r.headers : {}) as Record<string, string>
   return {
     id: r.id, companyId: r.company_id, name: r.name,
     type: r.type === 'http' ? 'http' : 'stdio',
     command: r.command,
     args: Array.isArray(r.args) ? r.args.filter((x): x is string => typeof x === 'string') : [],
-    env: (r.env && typeof r.env === 'object' && !Array.isArray(r.env) ? r.env : {}) as Record<string, string>,
+    env: redactSecrets ? Object.fromEntries(Object.keys(env).map((key) => [key, '***'])) : env,
     url: r.url,
-    headers: (r.headers && typeof r.headers === 'object' && !Array.isArray(r.headers) ? r.headers : {}) as Record<string, string>,
+    headers: redactSecrets ? Object.fromEntries(Object.keys(headers).map((key) => [key, '***'])) : headers,
     enabled: r.enabled,
     createdAt: new Date(r.created_at).toISOString(),
   }
@@ -76,11 +78,11 @@ export function validateConnector(input: {
   return null
 }
 
-export async function listConnectors(companyId: string): Promise<McpConnectorRow[]> {
+export async function listConnectors(companyId: string, opts: { redactSecrets?: boolean } = {}): Promise<McpConnectorRow[]> {
   const { rows } = await pool.query<DbRow>(
     `SELECT * FROM mcp_connectors WHERE company_id = $1 ORDER BY name ASC`, [companyId],
   )
-  return rows.map(toRow)
+  return rows.map((row) => toRow(row, opts.redactSecrets === true))
 }
 
 export async function upsertConnector(companyId: string, input: {
@@ -164,7 +166,7 @@ export async function enabledConnectorsForAgent(agentId: string): Promise<McpCon
       ORDER BY c.name ASC`,
     [agentId],
   )
-  return rows.map(toRow)
+  return rows.map((row) => toRow(row))
 }
 
 /* ── per-engine config generation ──────────────────────────────────────

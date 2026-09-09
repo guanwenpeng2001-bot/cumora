@@ -852,8 +852,13 @@ api.put('/agents/:id/skills', safe(async (req, res) => {
  *  injection; managed agents get MCP in phase 6) ============== */
 
 api.get('/mcp-connectors', safe(async (req, res) => {
-  const { companyId } = await requireCompany(req)
-  res.json({ items: await listConnectors(companyId) })
+  const { userId, companyId } = await requireCompany(req)
+  const { rows: memberships } = await pool.query<{ role: string }>(
+    `SELECT role FROM company_members WHERE company_id = $1 AND user_id = $2 LIMIT 1`,
+    [companyId, userId],
+  )
+  const redactSecrets = !PRIVILEGED_ROLES.has(memberships[0]?.role ?? 'member')
+  res.json({ items: await listConnectors(companyId, { redactSecrets }) })
 }))
 
 api.post('/mcp-connectors', safe(async (req, res) => {
@@ -877,19 +882,24 @@ api.put('/mcp-connectors/:id', safe(async (req, res) => {
   const b = req.body ?? {}
   const err = validateConnector(b)
   if (err) throw new HttpError(400, err)
-  res.json(await upsertConnector(companyId, {
+  const connector = await upsertConnector(companyId, {
     id,
     name: String(b.name).trim(), type: b.type,
     command: b.command ?? null, args: b.args ?? [], env: b.env ?? {},
     url: b.url ?? null, headers: b.headers ?? {},
     enabled: b.enabled ?? true,
-  }))
+  })
+  const { invalidatePersonaCache } = await import('../agents/personas.js')
+  invalidatePersonaCache()
+  res.json(connector)
 }))
 
 api.delete('/mcp-connectors/:id', safe(async (req, res) => {
   const { companyId } = await requireCompanyRole(req)
   const removed = await deleteConnector(companyId, String(req.params.id))
   if (!removed) throw new HttpError(404, 'not found')
+  const { invalidatePersonaCache } = await import('../agents/personas.js')
+  invalidatePersonaCache()
   res.json({ ok: true })
 }))
 
@@ -903,6 +913,8 @@ api.put('/agents/:id/mcp-connectors', safe(async (req, res) => {
   const ids = Array.isArray(req.body?.connectorIds) ? req.body.connectorIds.filter((x: unknown) => typeof x === 'string') : null
   if (!ids) throw new HttpError(400, 'connectorIds must be an array of strings')
   await setAgentConnectors(companyId, String(req.params.id), ids)
+  const { invalidatePersonaCache } = await import('../agents/personas.js')
+  invalidatePersonaCache(String(req.params.id))
   res.json({ ok: true })
 }))
 
@@ -3470,13 +3482,32 @@ export async function generateAndPersistAvatar(args: {
   ].filter(Boolean).join('\n')
 
   const { getImageClient } = await import('../llm.js')
+  const { recordLlmCall, classifyLlmCallError } = await import('../agents/llm-ledger.js')
   const client = getImageClient()
-  const r = await client.images.generate({
-    model: getImageModel(),
-    prompt,
-    size: '1024x1024',
-    n: 1,
-  })
+  const model = getImageModel()
+  const t0 = Date.now()
+  let r: Awaited<ReturnType<typeof client.images.generate>>
+  try {
+    r = await client.images.generate({
+      model,
+      prompt,
+      size: '1024x1024',
+      n: 1,
+    })
+    void recordLlmCall({
+      purpose: 'avatar-image', companyId: tenant, agentId: id,
+      model, usage: null, latencyMs: Date.now() - t0, status: 'ok',
+      extras: { n: 1, size: '1024x1024' },
+    })
+  } catch (e) {
+    void recordLlmCall({
+      purpose: 'avatar-image', companyId: tenant, agentId: id,
+      model, usage: null, latencyMs: Date.now() - t0,
+      status: classifyLlmCallError(e), error: e instanceof Error ? e.message : String(e),
+      extras: { n: 1, size: '1024x1024' },
+    })
+    throw e
+  }
   const first = r.data?.[0]
   const b64 = first?.b64_json
   const remoteUrl = first?.url
