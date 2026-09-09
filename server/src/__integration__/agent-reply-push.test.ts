@@ -27,6 +27,8 @@ import assert from 'node:assert/strict'
 import { pool } from '../db/pool.js'
 import { ensureSchemaOnce, resetAllTables, seedCompanyWithAgent, teardownAll } from './_helpers.js'
 import { runCli } from '../agents/cli.js'
+import { startPrivateChat } from '../agents/private_chat.js'
+import { startPulledGroup } from '../agents/scanner_helper.js'
 import { __setNotifyHookForTesting } from '../push.js'
 
 interface Captured {
@@ -142,4 +144,73 @@ test('[integration] a muted conversation is still muted', async () => {
 
   const withRecipients = sent.filter((s) => s.recipientUserIds.length > 0)
   assert.equal(withRecipients.length, 0, 'pushed into a muted conversation')
+})
+
+// ─── an agent can also START the conversation ───────────────────────────────
+//
+// A reply lands in a thread the human already knows about. The `dm_with` and
+// `pull_group` tools open a brand-new one, so their opening line is the message
+// a human has the least other way to discover — and both wrote the row and
+// enqueued the broadcast without ever dispatching a push. In-app they toast
+// like anything else (NotificationToasts skips only system rows); the phone was
+// the one surface that stayed quiet, which is the same asymmetry the reply
+// fix above was about.
+
+test('[integration] an agent opening a DM reaches the phone', async () => {
+  const { companyId, agentId } = await seedCompanyWithAgent()
+  const humanId = 'u-dm-target'
+  await seedOfflineHuman(companyId, humanId)
+
+  const { messageId } = await startPrivateChat({
+    instigatorId: agentId,
+    partnerId: humanId,
+    topic: 'the migration window',
+    opening: 'I need ten minutes on the migration window before Friday.',
+  })
+  await new Promise((r) => setTimeout(r, 150))
+
+  assert.equal(sent.length, 1, 'an agent-opened DM produced no push')
+  assert.deepEqual(sent[0].recipientUserIds, [humanId])
+  assert.match(sent[0].body, /migration window/)
+  assert.equal(sent[0].authorName, `Agent ${agentId}`, 'pushed with a raw agent id as the title')
+  assert.ok(messageId)
+})
+
+test('[integration] an agent pulling a group reaches the phone', async () => {
+  // A pull exists to interrupt someone — there is a six-hour cooldown on it for
+  // that reason — so it reaching every surface except the phone was backwards.
+  const { companyId, agentId } = await seedCompanyWithAgent()
+  const humanId = 'u-pulled'
+  await seedOfflineHuman(companyId, humanId)
+
+  await startPulledGroup({
+    instigatorId: agentId,
+    title: 'Friday migration',
+    members: [humanId],
+    reason: 'two teams are about to touch the same table',
+    opening: 'Pulling you in: two teams are about to touch the same table.',
+  })
+  await new Promise((r) => setTimeout(r, 150))
+
+  assert.equal(sent.length, 1, 'an agent-pulled group produced no push')
+  assert.deepEqual(sent[0].recipientUserIds, [humanId])
+  assert.match(sent[0].body, /same table/)
+})
+
+test('[integration] an agent-only conversation still pushes to nobody', async () => {
+  // The guard rail: this must not become "push on every agent write". Recipients
+  // are computed by joining `users`, and agents have no row there.
+  const { companyId, agentId } = await seedCompanyWithAgent()
+  const { agentId: peerId } = await seedCompanyWithAgent({ companyId })
+
+  await startPrivateChat({
+    instigatorId: agentId, partnerId: peerId, topic: 'handoff', opening: 'taking the deploy',
+  })
+  await startPulledGroup({
+    instigatorId: agentId, members: [peerId], title: 'deploy', reason: 'handoff', opening: 'ditto',
+  })
+  await new Promise((r) => setTimeout(r, 150))
+
+  const withRecipients = sent.filter((s) => s.recipientUserIds.length > 0)
+  assert.deepEqual(withRecipients, [], 'pushed for a conversation with no humans in it')
 })

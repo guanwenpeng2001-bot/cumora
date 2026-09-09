@@ -13,6 +13,7 @@ import { randomUUID } from 'node:crypto'
 import type { PoolClient } from 'pg'
 import { pool } from '../db/pool.js'
 import { CH_MESSAGE_NEW } from '../redis.js'
+import { dispatchMessagePush } from '../push.js'
 import { enqueueBroadcast, nudgeRealtimeOutbox } from '../realtime-outbox.js'
 
 /** Find an existing direct conversation between two participants, or
@@ -235,6 +236,17 @@ export async function startPrivateChat(args: {
   } finally {
     client.release()
   }
+
+  // #199 gave `cumora reply` the push it was missing, but an agent can also
+  // START a conversation, and this opening line is the one a human has the
+  // least other way to learn about: a brand-new thread they were not looking
+  // at, whose first message is authored by an agent. In-app it toasts like any
+  // other — NotificationToasts skips only system rows — so the phone was the
+  // one surface that stayed quiet. Fire-and-forget after COMMIT, for the same
+  // reason the other two dispatches are: a push must never hold up the write.
+  // A DM between two agents pushes to nobody on its own, because
+  // computeMessageRecipients joins `users`.
+  void dispatchMessagePush({ conversationId, authorId: instigatorId, messageId, body: opening, companyId })
 
   return { conversationId, messageId }
 }

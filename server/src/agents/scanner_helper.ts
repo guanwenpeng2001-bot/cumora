@@ -1,6 +1,7 @@
 /** Helper for tool-driven group pulls (separate from the periodic scanner). */
 import { randomUUID } from 'node:crypto'
 import { pool } from '../db/pool.js'
+import { dispatchMessagePush } from '../push.js'
 import { CH_GROUP_PULLED, CH_MESSAGE_NEW, publish } from '../redis.js'
 
 /** Hours an agent must wait between human-interrupting group pulls. */
@@ -142,6 +143,13 @@ export async function startPulledGroup(args: {
   }).catch((error) => {
     console.warn(`[pull_group] durable message ${messageId} committed but publish failed`, error)
   })
+
+  // The point of a pull is to interrupt someone — there is a six-hour cooldown
+  // on it for exactly that reason. Yet the interruption reached the websocket
+  // and the desktop toast and no phone, the same gap #199 closed for `cumora
+  // reply`. An agent-only pull pushes to nobody on its own, because
+  // computeMessageRecipients joins `users`.
+  void dispatchMessagePush({ conversationId, authorId: instigatorId, messageId, body: opening, companyId })
 
   console.log(`[pull_group] ${instigatorId} pulled ${conversationId}: ${title}`)
   return { conversationId }
