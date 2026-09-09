@@ -24,6 +24,9 @@ export function SkillsTab() {
   const [skills, setSkills] = useState<ApiSkill[] | null>(null)
   const [hubConfigured, setHubConfigured] = useState(false)
   const [localPath, setLocalPath] = useState<string | null>(null)
+  const [localPathDraft, setLocalPathDraft] = useState('')
+  const [localPathSaving, setLocalPathSaving] = useState(false)
+  const [localPathSaved, setLocalPathSaved] = useState(false)
   const [localHub, setLocalHub] = useState<ApiLocalHubEntry[]>([])
   const [pasteOpen, setPasteOpen] = useState(false)
   const [pasteBody, setPasteBody] = useState('')
@@ -37,8 +40,10 @@ export function SkillsTab() {
       setSkills(r.items)
       setHubConfigured(r.hubConfigured)
       setLocalPath(r.localHubPath)
+      setLocalPathDraft((current) => current || r.localHubPath || '')
     }).catch((e) => setError(e instanceof Error ? e.message : String(e)))
     void api.getLocalHubSkills().then((r) => setLocalHub(r.items)).catch(() => {})
+    void api.getModelSettings().then((r) => setLocalPathDraft(r.settings.local_skillhub_path ?? '')).catch(() => {})
   }, [])
 
   useEffect(load, [load])
@@ -53,6 +58,24 @@ export function SkillsTab() {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
       setBusy(null)
+    }
+  }
+
+  const saveLocalPath = async () => {
+    setLocalPathSaving(true)
+    setError(null)
+    try {
+      const value = localPathDraft.trim()
+      await api.putModelSettings({ local_skillhub_path: value })
+      setLocalPath(value || null)
+      setLocalPathDraft(value)
+      setLocalPathSaved(true)
+      window.setTimeout(() => setLocalPathSaved(false), 3200)
+      await api.getLocalHubSkills().then((r) => setLocalHub(r.items)).catch(() => {})
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setLocalPathSaving(false)
     }
   }
 
@@ -73,6 +96,28 @@ export function SkillsTab() {
       {/* install paths */}
       <div className="bg-cloud rounded-[14px] p-4 space-y-3" style={{ border: '1px solid var(--ink-100)' }}>
         <div className="font-semibold text-[13px] text-ink-900">{t('me.skills.installTitle')}</div>
+
+        {/* local hub path */}
+        <div className="space-y-2 border-b border-ink-100 pb-3">
+          <div className="font-semibold text-[12px] text-ink-700">{t('me.skills.localPathLabel')}</div>
+          <div className="flex gap-2">
+            <input
+              value={localPathDraft}
+              onChange={(e) => setLocalPathDraft(e.target.value)}
+              placeholder={t('me.skills.localPathPlaceholder')}
+              className="flex-1 h-8 px-2.5 rounded-[8px] text-[12.5px] text-ink-900 bg-paper outline-none focus:ring-2 focus:ring-skype/30"
+              style={{ border: '1px solid var(--ink-100)' }}
+            />
+            <button type="button" disabled={localPathSaving}
+              onClick={() => void saveLocalPath()}
+              className="h-8 px-3.5 rounded-[8px] text-[12px] font-semibold text-white transition disabled:cursor-not-allowed"
+              style={{ background: localPathSaving ? 'var(--ink-200)' : 'var(--skype)' }}>
+              {localPathSaving ? t('me.skills.localPathSaving') : t('me.skills.localPathSave')}
+            </button>
+          </div>
+          <div className="text-[11px] text-ink-400 italic">{t('me.skills.localPathHint')}</div>
+          {localPathSaved && <div className="text-[11px] text-skype-deep">{t('me.skills.localPathSaved')}</div>}
+        </div>
 
         {/* SkillHub */}
         <div className="space-y-2">

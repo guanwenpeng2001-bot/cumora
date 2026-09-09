@@ -868,6 +868,7 @@ const mcpConnectorFailureCache = new Map<string, number>()
  * enormous CLI result cannot explode the next Responses input. Keep the output
  * self-describing instead of silently slicing JSON. */
 const MODEL_TOOL_OUTPUT_BYTES = 8_000
+const MCP_TOOL_SCHEMA_MAX_BYTES = 8_000
 
 function utf8Head(value: string, maxBytes: number): string {
   if (Buffer.byteLength(value, 'utf8') <= maxBytes) return value
@@ -2486,7 +2487,15 @@ Mechanics:
     if (result.status === 'fulfilled') {
       mcpConnectorFailureCache.delete(runCompanyId + ':' + spec.name)
       mcpClients.push(result.value)
-      mcpToolDefs.push(...result.value.tools.map((t) => mcpToolToFunctionTool(spec.name, t)))
+      for (const tool of result.value.tools) {
+        const definition = mcpToolToFunctionTool(spec.name, tool)
+        const schemaBytes = Buffer.byteLength(JSON.stringify(definition), 'utf8')
+        if (schemaBytes > MCP_TOOL_SCHEMA_MAX_BYTES) {
+          console.warn('[turn] skipping MCP tool ' + spec.name + '/' + tool.name + ': schema is ' + schemaBytes + ' bytes (limit ' + MCP_TOOL_SCHEMA_MAX_BYTES + ')')
+          continue
+        }
+        mcpToolDefs.push(definition)
+      }
       continue
     }
     mcpConnectorFailureCache.set(runCompanyId + ':' + spec.name, Date.now() + MCP_CONNECT_FAILURE_CACHE_MS)

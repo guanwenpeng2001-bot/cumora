@@ -146,6 +146,12 @@ export const en = {
   'me.mcp.enable': 'Enable',
   'me.mcp.disable': 'Disable',
 
+  'me.skills.localPathLabel': 'Local skill directory',
+  'me.skills.localPathPlaceholder': 'Absolute path to a skills directory',
+  'me.skills.localPathHint': 'Used by local skill import. Changes apply to the next load.',
+  'me.skills.localPathSave': 'Save path',
+  'me.skills.localPathSaving': 'Saving…',
+  'me.skills.localPathSaved': 'Path saved',
   'me.skills.installTitle': 'Install skills',
   'me.skills.hubSearchPh': 'Search SkillHub…',
   'me.skills.hubSearch': 'Search hub',

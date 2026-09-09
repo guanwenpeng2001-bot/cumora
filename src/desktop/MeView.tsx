@@ -324,120 +324,89 @@ function UsageTab() {
   }
   useEffect(load, [])
 
-  if (state.kind === 'loading') {
-    return (
-      <div className="space-y-6">
-        <Section title={t('me.sectionQuota')}>
-          <div className="grid grid-cols-3 gap-3">
-            {PERIOD_META.map((p) => (
-              <div key={p.key} className="bg-cloud rounded-[14px] p-5 h-[140px]"
-                style={{ border: '1px solid var(--ink-100)' }}>
-                <div className="font-display font-semibold text-[14px] text-ink-300">{t(p.label)}</div>
-                <div className="font-display italic text-[12px] text-ink-300 mt-2">{t('common.loading')}</div>
-              </div>
-            ))}
-          </div>
-        </Section>
-
-      <UsageDashboard />
-      </div>
-    )
-  }
-
-  if (state.kind === 'error') {
-    return (
-      <div className="space-y-6">
-        <Section title={t('me.sectionQuota')}>
-          <div className="bg-cloud rounded-[14px] p-6 text-center"
+  const quotaContent = state.kind === 'loading' ? (
+    <Section title={t('me.sectionQuota')}>
+      <div className="grid grid-cols-3 gap-3">
+        {PERIOD_META.map((p) => (
+          <div key={p.key} className="bg-cloud rounded-[14px] p-5 h-[140px]"
             style={{ border: '1px solid var(--ink-100)' }}>
-            <div className="font-display text-[14px] text-ink-700 mb-1">{t('me.quotaFetchFailed')}</div>
-            <div className="font-display italic text-[12px] text-coral-deep mb-3">{state.message}</div>
-            <button type="button" onClick={load}
-              className="px-4 py-1.5 rounded-[8px] text-[12px] font-semibold text-white"
-              style={{ background: 'var(--skype)' }}>
-              {t('common.tryAgain')}
-            </button>
+            <div className="font-display font-semibold text-[14px] text-ink-300">{t(p.label)}</div>
+            <div className="font-display italic text-[12px] text-ink-300 mt-2">{t('common.loading')}</div>
           </div>
-        </Section>
-
-      <UsageDashboard />
+        ))}
       </div>
-    )
-  }
-
-  // ready
-  const { configured, snapshot, error } = state
-  if (!configured) {
-    return (
-      <div className="space-y-6">
-        <Section title={t('me.sectionQuota')}>
-          <div className="bg-cloud rounded-[14px] p-6"
-            style={{ border: '1px dashed var(--ink-100)' }}>
-            <div className="font-display text-[14px] text-ink-700">{t('me.noQuotaGateway')}</div>
-            <div className="font-display italic text-[12px] text-ink-500 mt-1 max-w-xl">
-              {t('me.noQuotaHint')}
-            </div>
-          </div>
-        </Section>
-
-      <UsageDashboard />
+    </Section>
+  ) : state.kind === 'error' ? (
+    <Section title={t('me.sectionQuota')}>
+      <div className="bg-cloud rounded-[14px] p-6 text-center"
+        style={{ border: '1px solid var(--ink-100)' }}>
+        <div className="font-display text-[14px] text-ink-700 mb-1">{t('me.quotaFetchFailed')}</div>
+        <div className="font-display italic text-[12px] text-coral-deep mb-3">{state.message}</div>
+        <button type="button" onClick={load}
+          className="px-4 py-1.5 rounded-[8px] text-[12px] font-semibold text-white"
+          style={{ background: 'var(--skype)' }}>
+          {t('common.tryAgain')}
+        </button>
       </div>
-    )
-  }
-
-  if (!snapshot) {
-    return (
-      <div className="space-y-6">
-        <Section title={t('me.sectionQuota')}>
-          <div className="bg-cloud rounded-[14px] p-6"
-            style={{ border: '1px dashed var(--ink-100)' }}>
-            <div className="font-display text-[14px] text-ink-700">
-              {error ? t('me.quotaUnreachable') : t('me.noActiveSub')}
-            </div>
-            <div className="font-display italic text-[12px] text-ink-500 mt-1 max-w-xl">
-              {error ? t('me.quotaGatewayUnreachHint') : t('me.subNotProvisioned')}
-            </div>
-            <button type="button" onClick={load}
-              className="mt-3 px-4 py-1.5 rounded-[8px] text-[12px] font-semibold text-skype-deep bg-cloud hover:bg-sky2-50 transition"
-              style={{ border: '1px dashed var(--sky2-300)' }}>
-              {t('me.refresh')}
-            </button>
-          </div>
-        </Section>
-
-      <UsageDashboard />
+    </Section>
+  ) : !state.configured ? (
+    <Section title={t('me.sectionQuota')}>
+      <div className="bg-cloud rounded-[14px] p-6"
+        style={{ border: '1px dashed var(--ink-100)' }}>
+        <div className="font-display text-[14px] text-ink-700">{t('me.noQuotaGateway')}</div>
+        <div className="font-display italic text-[12px] text-ink-500 mt-1 max-w-xl">
+          {t('me.noQuotaHint')}
+        </div>
       </div>
-    )
-  }
+    </Section>
+  ) : !state.snapshot ? (
+    <Section title={t('me.sectionQuota')}>
+      <div className="bg-cloud rounded-[14px] p-6"
+        style={{ border: '1px dashed var(--ink-100)' }}>
+        <div className="font-display text-[14px] text-ink-700">
+          {state.error ? t('me.quotaUnreachable') : t('me.noActiveSub')}
+        </div>
+        <div className="font-display italic text-[12px] text-ink-500 mt-1 max-w-xl">
+          {state.error ? t('me.quotaGatewayUnreachHint') : t('me.subNotProvisioned')}
+        </div>
+        <button type="button" onClick={load}
+          className="mt-3 px-4 py-1.5 rounded-[8px] text-[12px] font-semibold text-skype-deep bg-cloud hover:bg-sky2-50 transition"
+          style={{ border: '1px dashed var(--sky2-300)' }}>
+          {t('me.refresh')}
+        </button>
+      </div>
+    </Section>
+  ) : (
+    <Section title={t('me.sectionQuota')}>
+      <div className="text-[13px] text-ink-500 leading-[1.55] mb-4 max-w-2xl font-display italic">
+        {t('me.quotaIntro')}
+        {state.snapshot.groupName ? <> {t('me.quotaIntroPlan', { plan: state.snapshot.groupName })}</> : null}
+      </div>
+      <div className="grid grid-cols-3 gap-3">
+        {PERIOD_META.map((p) => (
+          <QuotaCard
+            key={p.key}
+            period={p.key}
+            label={p.label}
+            sub={p.sub}
+            window={state.snapshot![p.key]}
+          />
+        ))}
+      </div>
+      <div className="mt-4 flex items-center gap-3">
+        <button type="button" onClick={load}
+          className="px-4 py-1.5 rounded-[8px] text-[12px] font-semibold text-skype-deep bg-cloud hover:bg-sky2-50 transition"
+          style={{ border: '1px solid var(--ink-100)' }}>
+          {t('me.refresh')}
+        </button>
+        {state.error && <span className="text-[11.5px] text-coral-deep font-display italic">{t('me.refreshFailed', { msg: state.error })}</span>}
+      </div>
+    </Section>
+  )
 
   return (
     <div className="space-y-6">
-      <Section title={t('me.sectionQuota')}>
-        <div className="text-[13px] text-ink-500 leading-[1.55] mb-4 max-w-2xl font-display italic">
-          {t('me.quotaIntro')}
-          {snapshot.groupName ? <> {t('me.quotaIntroPlan', { plan: snapshot.groupName })}</> : null}
-        </div>
-        <div className="grid grid-cols-3 gap-3">
-          {PERIOD_META.map((p) => (
-            <QuotaCard
-              key={p.key}
-              period={p.key}
-              label={p.label}
-              sub={p.sub}
-              window={snapshot[p.key]}
-            />
-          ))}
-        </div>
-        <div className="mt-4 flex items-center gap-3">
-          <button type="button" onClick={load}
-            className="px-4 py-1.5 rounded-[8px] text-[12px] font-semibold text-skype-deep bg-cloud hover:bg-sky2-50 transition"
-            style={{ border: '1px solid var(--ink-100)' }}>
-            {t('me.refresh')}
-          </button>
-          {error && <span className="text-[11.5px] text-coral-deep font-display italic">{t('me.refreshFailed', { msg: error })}</span>}
-        </div>
-      </Section>
-
+      {quotaContent}
       <UsageDashboard />
     </div>
   )

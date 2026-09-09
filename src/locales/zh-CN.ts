@@ -151,6 +151,12 @@ export const zhCN: Partial<Record<keyof typeof en, string>> = {
   'me.mcp.enable': '启用',
   'me.mcp.disable': '停用',
 
+  'me.skills.localPathLabel': '本地技能目录',
+  'me.skills.localPathPlaceholder': '技能目录的绝对路径',
+  'me.skills.localPathHint': '用于导入本地技能，保存后重新加载生效。',
+  'me.skills.localPathSave': '保存路径',
+  'me.skills.localPathSaving': '保存中…',
+  'me.skills.localPathSaved': '路径已保存',
   'me.skills.installTitle': '安装技能',
   'me.skills.hubSearchPh': '搜索 SkillHub…',
   'me.skills.hubSearch': '搜索',

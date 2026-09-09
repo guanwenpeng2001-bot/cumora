@@ -211,10 +211,34 @@ export async function importLocalSkill(companyId: string, name: string): Promise
 }
 
 export async function deleteSkill(companyId: string, id: string): Promise<boolean> {
-  const { rowCount } = await pool.query(
-    `DELETE FROM skills WHERE company_id = $1 AND id = $2`, [companyId, id],
-  )
-  return (rowCount ?? 0) > 0
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    // Delete the materialized tree in the same transaction as the library
+    // row. The agent_skills FK cascade handles enablement rows, while this
+    // explicit cleanup handles their already-materialized workspace files.
+    const { rowCount } = await client.query(
+      `DELETE FROM agent_workspace aw
+        USING skills s
+       WHERE s.company_id = $1 AND s.id = $2
+         AND aw.company_id = s.company_id
+         AND aw.path LIKE 'skills/' || s.name || '/%'`,
+      [companyId, id],
+    )
+    const deleted = await client.query(
+      `DELETE FROM skills WHERE company_id = $1 AND id = $2`, [companyId, id],
+    )
+    await client.query('COMMIT')
+    if ((rowCount ?? 0) > 0) {
+      console.info('[skills] removed ' + rowCount + ' materialized file(s) for deleted skill ' + id)
+    }
+    return (deleted.rowCount ?? 0) > 0
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw e
+  } finally {
+    client.release()
+  }
 }
 
 /* ── per-agent enablement ─────────────────────────────────────────────── */
@@ -281,7 +305,44 @@ export async function setAgentSkills(companyId: string, agentId: string, skillId
   } finally {
     client.release()
   }
-  await materializeAgentSkills(agentId)
+  // Enablement is the source of truth. Materialization is deliberately
+  // asynchronous and serialized per agent so rapid checkbox changes cannot
+  // overlap destructive rewrite passes; each pass reads the latest DB state
+  // and is safe to repeat.
+  scheduleAgentSkillsMaterialization(agentId)
+}
+
+interface MaterializationState {
+  revision: number
+  appliedRevision: number
+  running: Promise<void> | null
+}
+
+const materializationStates = new Map<string, MaterializationState>()
+
+/** Queue an idempotent, latest-state materialization for one agent. */
+export function scheduleAgentSkillsMaterialization(agentId: string): void {
+  const state = materializationStates.get(agentId) ?? { revision: 0, appliedRevision: 0, running: null }
+  state.revision += 1
+  materializationStates.set(agentId, state)
+  if (state.running) return
+
+  state.running = (async () => {
+    while (state.appliedRevision < state.revision) {
+      const targetRevision = state.revision
+      try {
+        await materializeAgentSkills(agentId)
+        state.appliedRevision = targetRevision
+      } catch (e) {
+        console.warn('[skills] materialization failed for ' + agentId + '; retrying', e instanceof Error ? e.message : e)
+        await new Promise<void>((resolve) => setTimeout(resolve, 1_000))
+      }
+    }
+  })().finally(() => {
+    state.running = null
+    // A revision can arrive between the final loop check and cleanup.
+    if (state.appliedRevision < state.revision) scheduleAgentSkillsMaterialization(agentId)
+  })
 }
 
 /** Rewrite the agent's managed-workspace skills/ tree from agent_skills.

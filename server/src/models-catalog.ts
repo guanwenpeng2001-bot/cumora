@@ -11,8 +11,9 @@
  *      (server_settings with env fallback), so a hand-typed model that's
  *      not in any live list is still selectable
  *
- * Bucketed by capability (text/image/audio/embedding) with a 5-minute
- * per-user cache; ?refresh=1 forces a rebuild.
+ * Bucketed by capability (text/image/audio/embedding) with a 5-minute cache.
+ * The BYOA/configured portion is global; only the gateway portion is keyed by
+ * user because it depends on that user's sub2api credentials.
  */
 import { pool } from './db/pool.js'
 import { SETTING_DEFS, getServerSetting, getServerSettingList } from './settings.js'
@@ -39,11 +40,16 @@ function bucketOf(id: string): Bucket {
 }
 
 const CACHE_TTL_MS = 5 * 60_000
-const cache = new Map<string, { catalog: ModelCatalog; at: number }>()
+const globalCache: { models: Set<string>; at: number } = { models: new Set(), at: 0 }
+const gatewayCache = new Map<string, { models: Set<string>; at: number }>()
 
 export function invalidateModelCatalog(userId?: string): void {
-  if (userId) cache.delete(userId)
-  else cache.clear()
+  if (userId) gatewayCache.delete(userId)
+  else {
+    globalCache.models = new Set()
+    globalCache.at = 0
+    gatewayCache.clear()
+  }
 }
 
 async function gatewayModels(userId: string): Promise<Set<string>> {
@@ -102,22 +108,28 @@ function configuredModels(): Set<string> {
 }
 
 export async function availableModels(userId: string, refresh: boolean): Promise<ModelCatalog> {
-  const hit = cache.get(userId)
-  if (!refresh && hit && Date.now() - hit.at < CACHE_TTL_MS) return hit.catalog
-
-  const [gateway, byoa, configured] = await Promise.all([
-    gatewayModels(userId),
-    byoaModels(),
-    Promise.resolve(configuredModels()),
+  const now = Date.now()
+  const gatewayHit = !refresh ? gatewayCache.get(userId) : undefined
+  const globalHit = !refresh && now - globalCache.at < CACHE_TTL_MS ? globalCache.models : null
+  const [gateway, global] = await Promise.all([
+    gatewayHit && now - gatewayHit.at < CACHE_TTL_MS ? gatewayHit.models : gatewayModels(userId),
+    globalHit ?? Promise.all([byoaModels(), Promise.resolve(configuredModels())]).then(([byoa, configured]) => {
+      const models = new Set<string>([...byoa, ...configured])
+      globalCache.models = models
+      globalCache.at = Date.now()
+      return models
+    }),
   ])
+  if (!gatewayHit || now - gatewayHit.at >= CACHE_TTL_MS || refresh) {
+    gatewayCache.set(userId, { models: gateway, at: Date.now() })
+  }
   const catalog: ModelCatalog = { text: [], image: [], audio: [], embedding: [], gateway: gateway.size > 0 }
   const buckets: Record<Bucket, Set<string>> = { text: new Set(), image: new Set(), audio: new Set(), embedding: new Set() }
-  for (const source of [gateway, byoa, configured]) {
+  for (const source of [gateway, global]) {
     for (const m of source) buckets[bucketOf(m)].add(m)
   }
   for (const b of ['text', 'image', 'audio', 'embedding'] as const) {
     catalog[b] = [...buckets[b]].sort()
   }
-  cache.set(userId, { catalog, at: Date.now() })
   return catalog
 }

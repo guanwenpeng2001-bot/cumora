@@ -17,6 +17,14 @@ import { cn } from '@/lib/utils'
 
 type RangePreset = 'today' | 'week' | 'custom'
 
+function localDateToIso(value: string, endOfDay = false): string {
+  const [year, month, day] = value.split('-').map(Number)
+  const date = endOfDay
+    ? new Date(year, month - 1, day, 23, 59, 59, 999)
+    : new Date(year, month - 1, day)
+  return date.toISOString()
+}
+
 function rangeOf(preset: RangePreset, customFrom: string, customTo: string): { from: string; to: string } {
   const now = new Date()
   const to = new Date(now.getTime() + 60_000)
@@ -29,8 +37,8 @@ function rangeOf(preset: RangePreset, customFrom: string, customTo: string): { f
     return { from: d.toISOString(), to: to.toISOString() }
   }
   return {
-    from: customFrom ? new Date(customFrom).toISOString() : new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString(),
-    to: customTo ? new Date(new Date(customTo).getTime() + 86_399_000).toISOString() : to.toISOString(),
+    from: customFrom ? localDateToIso(customFrom) : new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString(),
+    to: customTo ? localDateToIso(customTo, true) : to.toISOString(),
   }
 }
 

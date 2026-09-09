@@ -27,13 +27,13 @@ export interface SettingDef {
 /** The full key inventory. Values are always stored as strings; list-typed
  *  keys are comma-separated. */
 export const SETTING_DEFS: readonly SettingDef[] = [
-  { key: 'brain_model',                 envValue: () => env.OPENAI_MODEL },
+  { key: 'brain_model',                 envValue: () => env.OPENAI_MODEL ?? '' },
   { key: 'brain_fallback_models',       envValue: () => '' },
-  { key: 'support_model',               envValue: () => env.OPENAI_MODEL_SUPPORT },
+  { key: 'support_model',               envValue: () => env.OPENAI_MODEL_SUPPORT ?? '' },
   { key: 'support_fallback_models',     envValue: () => '' },
-  { key: 'compaction_model',            envValue: () => env.OPENAI_COMPACTION_MODEL },
+  { key: 'compaction_model',            envValue: () => env.OPENAI_COMPACTION_MODEL ?? '' },
   { key: 'compaction_fallback_models',  envValue: () => '' },
-  { key: 'image_model',                 envValue: () => env.OPENAI_IMAGE_MODEL },
+  { key: 'image_model',                 envValue: () => env.OPENAI_IMAGE_MODEL ?? '' },
   { key: 'image_fallback_models',       envValue: () => process.env.OPENAI_IMAGE_FALLBACK_MODELS ?? '' },
   { key: 'audio_model',                 envValue: () => process.env.OPENAI_AUDIO_MODEL ?? '' },
   { key: 'audio_fallback_models',       envValue: () => process.env.OPENAI_AUDIO_FALLBACK_MODELS ?? '' },
@@ -53,9 +53,11 @@ const KNOWN_KEYS = new Set(SETTING_DEFS.map((d) => d.key))
 export const KNOWN_SETTING_KEYS: ReadonlySet<string> = KNOWN_KEYS
 
 const REFRESH_MS = 30_000
+const REFRESH_FAILURE_BACKOFF_MS = 5_000
 
 let snapshot: Map<string, string> | null = null
 let snapshotAt = 0
+let lastRefreshFailureAt = 0
 let refreshing: Promise<void> | null = null
 
 async function loadFromDb(): Promise<Map<string, string>> {
@@ -67,13 +69,16 @@ async function loadFromDb(): Promise<Map<string, string>> {
  *  previous snapshot (env fallback still applies per key). */
 export async function refreshServerSettings(force = false): Promise<void> {
   if (!force && snapshot && Date.now() - snapshotAt < REFRESH_MS) return
+  if (!force && lastRefreshFailureAt && Date.now() - lastRefreshFailureAt < REFRESH_FAILURE_BACKOFF_MS) return
   if (refreshing) return refreshing
   refreshing = (async () => {
     try {
       snapshot = await loadFromDb()
       snapshotAt = Date.now()
+      lastRefreshFailureAt = 0
     } catch (e) {
       // DB down / table missing during boot races — keep serving env values.
+      lastRefreshFailureAt = Date.now()
       console.warn('[settings] refresh failed; serving previous/env values', e instanceof Error ? e.message : e)
     } finally {
       refreshing = null
@@ -104,7 +109,7 @@ export async function seedServerSettingsFromEnv(): Promise<void> {
     `INSERT INTO server_settings (key, value)
      SELECT * FROM jsonb_each_text($1::jsonb)
      ON CONFLICT (key) DO NOTHING`,
-    [JSON.stringify(Object.fromEntries(SETTING_DEFS.map((d) => [d.key, d.envValue()])))],
+    [JSON.stringify(Object.fromEntries(SETTING_DEFS.map((d) => [d.key, d.envValue() ?? ''])))],
   )
 }
 
