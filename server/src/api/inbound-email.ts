@@ -103,6 +103,10 @@ interface InboundPayload {
   references?: string[] | null
   /** Each address is a "Name <addr@host>" or just "addr@host" string. */
   from: string
+  /** The envelope recipient — the address SMTP actually delivered to, which
+   *  the gate already checked is one of ours before admitting the message.
+   *  Optional so a gate deployed before this field still works. */
+  envelopeTo?: string | null
   to?: string[]
   cc?: string[]
   subject?: string
@@ -265,7 +269,14 @@ inboundEmailRouter.post('/inbound', async (req: Request, res: Response) => {
     res.status(400).json({ error: `unparseable from: ${payload.from}` })
     return
   }
-  const rawRecipients = [...(payload.to ?? []), ...(payload.cc ?? [])]
+  // The envelope recipient belongs in this set, not just the headers. A Bcc'd
+  // agent appears in no header at all; so does one reached through an alias, a
+  // list expansion or a forwarding rule. Matching on To/Cc alone resolved
+  // nobody for those, which is a 404 here and `setReject` in the gate — a
+  // permanent 550 telling the sender the address does not exist, for mail the
+  // gate had already confirmed was addressed to us. Dedup below folds it away
+  // in the ordinary case where it is also in To.
+  const rawRecipients = [...(payload.to ?? []), ...(payload.cc ?? []), ...(payload.envelopeTo ? [payload.envelopeTo] : [])]
     .map((s) => parseAddress(s))
     .filter((x): x is { addr: string; name: string | null } => Boolean(x))
   if (rawRecipients.length === 0) {
@@ -355,17 +366,35 @@ inboundEmailRouter.post('/inbound', async (req: Request, res: Response) => {
   // findOrCreateEmailConversation), so this only fires on the "received
   // a copy of what we just sent" case, not on real replies.
   const fromAddrFull = formatAddress(fromParsed.addr, fromParsed.name)
-  const inboundToJson = JSON.stringify((payload.to ?? []).map((s) => s))
+  const inboundTo = (payload.to ?? []).map((s) => s)
+  // Compare the recipients as a set, not as rendered JSON text. `to_addrs` is
+  // jsonb, and jsonb::text puts a space after every comma while JSON.stringify
+  // does not — so the old `LOWER(to_addrs::text) = LOWER($3)` matched only for
+  // a SINGLE recipient, where the two renderings happen to coincide:
+  //
+  //   1 recipient   jsonb::text ["a@x.com"]              stringify ["a@x.com"]
+  //   2 recipients  jsonb::text ["a@x.com", "b@x.com"]   stringify ["a@x.com","b@x.com"]
+  //
+  // Every boomerang of a mail sent to two or more addresses therefore fell
+  // through to a fresh conversation containing our own message — the exact
+  // thing this pass exists to stop. Sorting also drops the assumption that the
+  // header comes back in the order we sent it.
   const echo = await pool.query<{ message_id: string; conversation_id: string }>(
     `SELECT message_id, conversation_id FROM email_messages
       WHERE direction = 'out'
         AND created_at > NOW() - INTERVAL '10 minutes'
         AND LOWER(subject) = LOWER($1)
         AND LOWER(from_addr) = LOWER($2)
-        AND LOWER(to_addrs::text) = LOWER($3)
+        AND COALESCE(
+              (SELECT array_agg(LOWER(a) ORDER BY LOWER(a))
+                 FROM jsonb_array_elements_text(to_addrs) AS a), '{}'
+            ) = COALESCE(
+              (SELECT array_agg(LOWER(a) ORDER BY LOWER(a))
+                 FROM unnest($3::text[]) AS a), '{}'
+            )
       ORDER BY created_at DESC
       LIMIT 1`,
-    [subject || '(no subject)', fromAddrFull, inboundToJson],
+    [subject || '(no subject)', fromAddrFull, inboundTo],
   )
   if (echo.rows[0]) {
     console.log(JSON.stringify({

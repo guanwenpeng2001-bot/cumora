@@ -469,3 +469,90 @@ test('[integration] cleans up newly created conversation if message persistence 
   )
   assert.equal(remaining.length, 0, 'empty conversation should be cleaned up')
 })
+
+// ─── the envelope recipient ────────────────────────────────────────────────
+//
+// The gate admits a message on `recipientAccepted(message.to, …)` — the
+// ENVELOPE recipient, the address SMTP actually delivered to — and then used to
+// forward every field except that one. Whenever the agent is Bcc'd, or reached
+// through an alias, a list expansion or a forwarding rule, its address is in no
+// header, so matching on To/Cc alone resolved nobody: a 404 here, `setReject`
+// in the gate, and a permanent SMTP 550 telling the sender the address does not
+// exist — for mail the gate had already confirmed was addressed to us.
+
+test('[integration] a Bcc\'d agent is delivered to, not bounced', async () => {
+  const { agentId, agentEmail } = await seedCompanyWithAgent()
+
+  const smtpId = `bcc-${randomUUID()}@external.com`
+  const r = await postInbound({
+    messageId: smtpId,
+    from: 'alice@external.com',
+    // The visible header names someone else entirely — that is what Bcc means.
+    to: ['bob@external.com'],
+    envelopeTo: agentEmail,
+    subject: 'quietly looping you in',
+    text: 'no header carries your address',
+  })
+
+  assert.equal(r.status, 200, `a Bcc'd agent was bounced: ${JSON.stringify(r.body)}`)
+  assert.equal(r.body.deliveries.length, 1)
+  // …and it reached the agent's own thread, not merely "some 200".
+  const { rows } = await pool.query<{ members: string[] }>(
+    `SELECT c.members FROM email_messages e
+       JOIN conversations c ON c.id = e.conversation_id
+      WHERE e.smtp_message_id = $1`,
+    [smtpId],
+  )
+  assert.equal(rows.length, 1, 'no inbound email row was written')
+  assert.ok(rows[0].members.includes(agentId), `the thread does not include the Bcc'd agent: ${JSON.stringify(rows[0].members)}`)
+})
+
+test('[integration] the envelope recipient does not duplicate a visible one', async () => {
+  // The ordinary case: the agent is in To AND is the envelope recipient. It
+  // must resolve once, not twice.
+  const { agentEmail } = await seedCompanyWithAgent()
+
+  const r = await postInbound({
+    messageId: `plain-${randomUUID()}@external.com`,
+    from: 'alice@external.com',
+    to: [`Agent <${agentEmail.toUpperCase()}>`],
+    envelopeTo: agentEmail,
+    subject: 'hello',
+    text: 'body',
+  })
+
+  assert.equal(r.status, 200)
+  const { rows } = await pool.query<{ n: number }>(
+    `SELECT count(*)::int AS n FROM email_messages`,
+  )
+  assert.equal(rows[0].n, 1, 'the same recipient resolved twice')
+})
+
+test('[integration] an envelope recipient that is nobody still bounces', async () => {
+  // The 404 must survive for genuinely unknown addresses, or the gate loses the
+  // signal it uses to send a real 550.
+  await seedCompanyWithAgent()
+  const r = await postInbound({
+    messageId: `nobody-${randomUUID()}@external.com`,
+    from: 'alice@external.com',
+    to: ['bob@external.com'],
+    envelopeTo: 'ghost@cumora.local',
+    subject: 'hello',
+    text: 'body',
+  })
+  assert.equal(r.status, 404)
+})
+
+test('[integration] a gate that predates the field still works', async () => {
+  // envelopeTo is optional: the worker and the server deploy independently, so
+  // a payload without it must behave exactly as before.
+  const { agentEmail } = await seedCompanyWithAgent()
+  const r = await postInbound({
+    messageId: `old-${randomUUID()}@external.com`,
+    from: 'alice@external.com',
+    to: [agentEmail],
+    subject: 'hello',
+    text: 'body',
+  })
+  assert.equal(r.status, 200)
+})
