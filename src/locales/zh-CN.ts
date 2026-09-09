@@ -131,7 +131,7 @@ export const zhCN: Partial<Record<keyof typeof en, string>> = {
   'me.tab.models': '模型',
   'me.tab.skills': '技能',
   'me.tab.connectors': '连接器',
-  'me.mcp.intro': '这里注册的 MCP 连接器可按智能体启用。BYOA 智能体经 daemon 注入引擎配置(Claude / Codex 注入路径)。云端智能体的 MCP 支持将在后续版本提供。',
+  'me.mcp.intro': '这里注册的 MCP 连接器可按智能体启用。BYOA 智能体经 daemon 注入引擎配置(Claude / Codex 注入路径);云端智能体在每次运行回合开始时连接已勾选的连接器。',
   'me.mcp.empty': '还没有连接器——在下方新增。',
   'me.mcp.add': '新增连接器',
   'me.mcp.addTitle': '新建连接器',
@@ -579,7 +579,7 @@ export const zhCN: Partial<Record<keyof typeof en, string>> = {
   'agent.skillsTitle': '技能',
   'agent.connectorsTitle': '连接器',
   'agent.connectorsByoaNote': '下次启动时由 daemon 注入引擎配置(Claude / Codex 路径)。',
-  'agent.connectorsManagedNote': '云端智能体的 MCP 支持将在后续版本提供——这里保存仅记录选择。',
+  'agent.connectorsManagedNote': '云端智能体在每次运行回合开始时连接已勾选的连接器,工具以 mcp__<连接器>__<工具> 暴露给模型。',
 
 
   'agent.advancedModelSettings': '高级设置',

@@ -126,7 +126,7 @@ export const en = {
   'me.tab.models': 'Models',
   'me.tab.skills': 'Skills',
   'me.tab.connectors': 'Connectors',
-  'me.mcp.intro': 'MCP connectors registered here can be enabled per agent. BYOA agents receive them via the daemon (Claude / Codex injection paths). MCP for cloud agents ships in a later version.',
+  'me.mcp.intro': 'MCP connectors registered here can be enabled per agent. BYOA agents receive them via the daemon (Claude / Codex injection paths); cloud agents connect their enabled connectors at the start of each run turn.',
   'me.mcp.empty': 'No connectors yet — add one below.',
   'me.mcp.add': 'Add connector',
   'me.mcp.addTitle': 'New connector',
@@ -577,7 +577,7 @@ export const en = {
   'agent.skillsTitle': 'Skills',
   'agent.connectorsTitle': 'Connectors',
   'agent.connectorsByoaNote': 'Injected into the engine config by the daemon on the next start (Claude / Codex paths).',
-  'agent.connectorsManagedNote': 'MCP for cloud agents ships in a later version — saving here only records the choice.',
+  'agent.connectorsManagedNote': 'Cloud agents connect their enabled connectors at the start of each run turn; tools surface to the model as mcp__<connector>__<tool>.',
 
 
   'agent.advancedModelSettings': 'Advanced settings',
