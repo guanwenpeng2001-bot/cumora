@@ -32,6 +32,7 @@
  *     not the caller.
  */
 
+import type { AgentModelConfig } from '../model-config.js'
 export interface InboxAttachment {
   url: string
   name: string
@@ -142,6 +143,8 @@ export interface PersonaRow {
   style: string
   /** Per-agent model override; null = use system default. */
   model: string | null
+  /** Advanced per-agent model settings; null = inherit the global brain role. */
+  modelConfig?: AgentModelConfig | null
   companyId: string
 }
 

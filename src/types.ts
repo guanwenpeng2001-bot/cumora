@@ -68,6 +68,16 @@ export interface Computer {
   daemonOutdated?: boolean
 }
 
+/** Per-agent model settings (participants.model_config). All fields
+ *  optional — absent means "inherit the global role's setting". */
+export interface AgentModelConfig {
+  effort?: string
+  contextWindow?: number
+  maxOutputTokens?: number
+  thinking?: boolean
+  fallbackModels?: string[]
+}
+
 export interface Participant {
   id: string
   kind: ParticipantKind
@@ -86,6 +96,9 @@ export interface Participant {
   systemPrompt?: string
   /** big-brain (main) model override; null/undefined = use system default */
   model?: string | null
+  /** Advanced per-agent model settings (managed agents only; BYOA is
+   *  engine-managed). Mirrors server/src/agents/model-config.ts. */
+  modelConfig?: AgentModelConfig | null
   /** small-brain (fast/auxiliary) model override */
   fastModel?: string | null
   /** id of the Computer this agent runs on (null/undefined = Cumora Cloud) */

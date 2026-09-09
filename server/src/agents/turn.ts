@@ -20,6 +20,8 @@
 import type { ResponseInputItem, ResponseStreamEvent } from 'openai/resources/responses/responses'
 import { env } from '../env.js'
 import { agentReasoningEffort, agentMaxOutputTokens, supportReasoningEffort, supportReasoningHeadroom } from './reasoning.js'
+import { agentTurnChain, type AgentModelConfig } from './model-config.js'
+import { resolvedChain, runWithFallback } from './fallback.js'
 import { getBrainModel, getCompactionModel } from '../settings.js'
 import { redis } from '../redis.js'
 import { readLocalMessageAttachment } from '../local-attachment-files.js'
@@ -936,8 +938,8 @@ function contextWindowFor(model: string | null): number {
  *  tool-call pairs are SUMMARIZED into a concise paragraph, NOT just
  *  dropped, so the agent retains semantic continuity across very long
  *  turns. */
-function compactThresholdFor(model: string | null): number {
-  return Math.floor(contextWindowFor(model) * 0.75)
+function compactThresholdFor(model: string | null, windowOverride?: number): number {
+  return Math.floor((windowOverride ?? contextWindowFor(model)) * 0.75)
 }
 
 /** Absolute ceiling: 95% of the model's context window. Even after
@@ -945,8 +947,8 @@ function compactThresholdFor(model: string | null): number {
  *  only when the original user input itself is huge (a giant
  *  attachment dump) — we break the loop and let the next wake start
  *  fresh. Should be ultra-rare in practice. */
-function hardLimitFor(model: string | null): number {
-  return Math.floor(contextWindowFor(model) * 0.95)
+function hardLimitFor(model: string | null, windowOverride?: number): number {
+  return Math.floor((windowOverride ?? contextWindowFor(model)) * 0.95)
 }
 // `COMPACTED_OUTPUT_BYTES` + `KEEP_RECENT_PAIRS` live in turn-compaction.ts
 // — turn.ts only needs the token budgets above.
@@ -1580,6 +1582,14 @@ Treat the output as a private memo that will be appended to the agent's input. E
 export async function runAgentTurn(agentId: string, options: AgentTurnOptions = {}): Promise<void> {
   const persona = await runtime.loadPersona(agentId)
   if (!persona) return
+
+  // Per-agent model settings (participants.model_config). Absent fields
+  // inherit the global brain role (server_settings → env).
+  const agentMc: AgentModelConfig | null = persona.modelConfig ?? null
+  const turnEffort = agentMc?.effort ?? agentReasoningEffort()
+  const turnMaxOutputTokens = agentMc?.maxOutputTokens ?? agentMaxOutputTokens()
+  const turnThinking = agentMc?.thinking ?? true
+  const turnContextWindow = agentMc?.contextWindow
 
   const inbox = await loadInbox(agentId)
   const wake = classifyWake(options, inbox.length)
@@ -2448,8 +2458,8 @@ Mechanics:
     // dump). In that case the next wake will start fresh, which IS the
     // ultimate compaction.
     const modelInUse = persona.model ?? getBrainModel()
-    const compactThreshold = compactThresholdFor(modelInUse)
-    const hardLimit = hardLimitFor(modelInUse)
+    const compactThreshold = compactThresholdFor(modelInUse, turnContextWindow)
+    const hardLimit = hardLimitFor(modelInUse, turnContextWindow)
     if (totalTokensThisTurn > compactThreshold) {
       // The compaction predicate runs against a CJK-aware token
       // estimate (estimateTokens), so Chinese/Japanese turns trigger
@@ -2597,8 +2607,8 @@ Mechanics:
           tools: traceToolDefinitions(),
           request: {
             toolChoice: 'auto',
-            reasoning: { effort: agentReasoningEffort() },
-            maxOutputTokens: agentMaxOutputTokens(),
+            reasoning: turnThinking ? { effort: turnEffort } : null,
+            maxOutputTokens: turnMaxOutputTokens,
           },
         },
         stage: retryKind === null
@@ -2629,21 +2639,35 @@ Mechanics:
       }
       let stream
       try {
-        stream = await client.responses.create({
+        // Agent-level fallback chain: explicit model_config.fallback_models
+        // wins; otherwise follow the global brain chain behind the pinned
+        // model. When the agent is unpinned the client-side
+        // withModelFallback already matches the global primary, so a null
+        // chain here avoids double-wrapping.
+        const hopChain = hopModel !== getBrainModel()
+          ? agentTurnChain(hopModel, agentMc, resolvedChain('brain'))
+          : (agentMc?.fallbackModels?.length ? agentTurnChain(hopModel, agentMc, []) : null)
+        const createArgs = {
           // THE real task: the agent's main turn responding to a conversation.
           // The one sanctioned big-model call site (per-agent override wins).
           model: hopModel,
           instructions,
           input: inputForAttempt,
           tools: TOOL_DEFS_RESPONSES,
-          tool_choice: 'auto',
-          reasoning: { effort: agentReasoningEffort() },
-          max_output_tokens: agentMaxOutputTokens(),
+          tool_choice: 'auto' as const,
+          // thinking=false omits the reasoning field entirely (provider
+          // default); effort/maxOutputTokens inherit from the global brain
+          // role unless model_config pins them.
+          ...(turnThinking ? { reasoning: { effort: turnEffort } } : {}),
+          max_output_tokens: turnMaxOutputTokens,
           // No `previous_response_id` — sub2api's OAuth /v1/responses path
           // rejects it (see history block above). The full transcript is
           // re-sent via `inputForAttempt` instead.
-          stream: true,
-        })
+          stream: true as const,
+        }
+        stream = await (hopChain
+          ? runWithFallback(hopChain, (m) => client.responses.create({ ...createArgs, model: m }))
+          : client.responses.create(createArgs))
       } catch (err) {
         // Record the failed attempt: no usage (the SDK error preceded any
         // stream events), classified by error shape. Even retried attempts

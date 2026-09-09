@@ -69,6 +69,7 @@ function fromApi(p: ApiParticipant): Participant {
     systemPrompt: p.systemPrompt ?? undefined,
     model: p.model ?? null,
     fastModel: p.fastModel ?? null,
+    modelConfig: p.modelConfig ?? null,
     email: p.email ?? null,
     departedAt: p.departedAt ?? null,
     computerId: p.computerId ?? null,

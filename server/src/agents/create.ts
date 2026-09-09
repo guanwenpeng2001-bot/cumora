@@ -32,6 +32,8 @@ export interface CreateAgentRecordInput {
   avatarBg?: string
   model?: string | null
   fastModel?: string | null
+  /** Advanced model settings (effort/tokens/thinking/context/fallbacks). */
+  modelConfig?: unknown
   tools?: string[]
   computerId?: string | null
   engine?: string
@@ -201,10 +203,10 @@ export async function createAgentRecord(
         `INSERT INTO participants
            (id, kind, name, role, initial, avatar_bg, status, bio, tools,
             system_prompt, model, fast_model, company_id, computer_id, engine,
-            engine_inherit, creation_request_id, creation_request_hash)
+            engine_inherit, creation_request_id, creation_request_hash, model_config)
          VALUES
            ($1, 'agent', $2, $3, $4, $5, 'avail', $6, $7::jsonb,
-            $8, $9, $10, $11, $12, $13, $14, $15, $16)
+            $8, $9, $10, $11, $12, $13, $14, $15, $16, $17::jsonb)
          ON CONFLICT DO NOTHING
          RETURNING id`,
         [
@@ -213,6 +215,7 @@ export async function createAgentRecord(
           input.fastModel ?? null, input.companyId, computerId,
           placement?.engine ?? null, placement?.inherit ?? true,
           requestId, requestHash,
+          input.modelConfig ? JSON.stringify(input.modelConfig) : null,
         ],
       )
       if (rows[0]) {

@@ -1,5 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
 import { api, getPairingServerOrigin, resolveAssetUrl, type AgentInput } from '@/api/client'
+import { ModelInput, FallbackChainEditor } from '@/components/ModelFields'
+import { Checkbox } from '@/components/Checkbox'
+import { cn } from '@/lib/utils'
+import type { AgentModelConfig } from '@/types'
 import { isNativePlatform } from '@/lib/native'
 import { useParticipants } from '@/stores/participants'
 import { useComputers } from '@/stores/computers'
@@ -58,6 +62,15 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
   const [avatarBg, setAvatarBg] = useState(agent?.avatarBg ?? PALETTE[0])
   const [model, setModel] = useState(agent?.model ?? '')
   const [fastModel, setFastModel] = useState(agent?.fastModel ?? '')
+  // Advanced model settings (participants.model_config). Empty/'' fields
+  // mean "inherit the global role setting". Managed agents only — BYOA is
+  // engine-managed.
+  const [mcEffort, setMcEffort] = useState(agent?.modelConfig?.effort ?? '')
+  const [mcContextWindow, setMcContextWindow] = useState(agent?.modelConfig?.contextWindow ? String(agent.modelConfig.contextWindow) : '')
+  const [mcMaxTokens, setMcMaxTokens] = useState(agent?.modelConfig?.maxOutputTokens ? String(agent.modelConfig.maxOutputTokens) : '')
+  const [mcThinking, setMcThinking] = useState(agent?.modelConfig?.thinking ?? true)
+  const [mcFallbacks, setMcFallbacks] = useState<string[]>(agent?.modelConfig?.fallbackModels ?? [])
+  const [advancedOpen, setAdvancedOpen] = useState(false)
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
   const [avatarUrl, setAvatarUrl] = useState<string | null>(agent?.avatarUrl ?? null)
@@ -127,6 +140,25 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
       ].filter(Boolean).join(' · ') || undefined,
     })),
   ]
+  // Managed agents pick from the global models catalog (text bucket);
+  // BYOA keeps using the host engine's reported catalog (modelOptions).
+  const [catalogText, setCatalogText] = useState<string[]>([])
+  useEffect(() => {
+    if (isByoa) return
+    let cancelled = false
+    void api.getAvailableModels()
+      .then((c) => { if (!cancelled) setCatalogText(c.text) })
+      .catch(() => { /* catalog is a nicety; free input still works */ })
+    return () => { cancelled = true }
+  }, [isByoa])
+  /** Effort options follow the selected model's provider family. */
+  const effortOptions = ((): string[] => {
+    const m = (model || '').toLowerCase()
+    if (/^(k3|kimi|moonshot)/.test(m)) return ['low', 'high', 'max']
+    if (/^deepseek/.test(m)) return ['low', 'high', 'max']
+    return ['none', 'minimal', 'low', 'medium', 'high', 'xhigh']
+  })()
+
   const origin = getPairingServerOrigin()
   const repairCommand = repairCode
     ? `npx cumora@latest agent computer --pair ${repairCode}${origin ? ` --server ${origin}` : ''}`
@@ -202,10 +234,25 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
       const inheritChanged = isByoaTarget && inherit !== (savedChoice === INHERIT_ENGINE)
       const engineChanged = isByoaTarget && !inherit && pinned !== ((agent?.engine as EngineId) ?? null)
       const assignmentChanged = Boolean(target && (target !== current || inheritChanged || engineChanged))
+      // BYOA agents are engine-managed — never send modelConfig for them.
+      // Managed: build the object; null clears a previously saved config.
+      const modelConfigPayload = ((): AgentModelConfig | null | undefined => {
+        if (isByoaTarget) return undefined
+        const mc: AgentModelConfig = {}
+        if (mcEffort) mc.effort = mcEffort
+        const cw = Number(mcContextWindow)
+        if (mcContextWindow.trim() && Number.isFinite(cw) && cw > 0) mc.contextWindow = Math.floor(cw)
+        const mt = Number(mcMaxTokens)
+        if (mcMaxTokens.trim() && Number.isFinite(mt) && mt > 0) mc.maxOutputTokens = Math.floor(mt)
+        if (!mcThinking) mc.thinking = false
+        if (mcFallbacks.length > 0) mc.fallbackModels = mcFallbacks
+        return Object.keys(mc).length > 0 ? mc : null
+      })()
       const payload: AgentInput = {
         name, role, systemPrompt, bio, avatarBg,
         model: model.trim() || null,
         fastModel: fastModel.trim() || null,
+        modelConfig: modelConfigPayload,
       }
       // A host/engine change persists these pins in the assignment's single
       // SQL UPDATE. Do not clear them earlier if that assignment may fail.
@@ -372,13 +419,17 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
                 customLabel={(value) => t('agent.useCustomModel', { model: value })}
               />
             ) : (
-              <Input
-                type="text"
+              <Combobox
+                ariaLabel={t('agent.modelLabel')}
                 value={model}
-                onChange={(e) => setModel(e.target.value)}
-                placeholder={t('agent.defaultPh')}
-                className="font-mono"
-                spellCheck={false}
+                onValueChange={setModel}
+                options={[
+                  { value: '', label: t('agent.followGlobalDefault') },
+                  ...catalogText.map((m) => ({ value: m, label: m })),
+                ]}
+                searchPlaceholder={t('agent.searchModels')}
+                allowCustom
+                customLabel={(value) => t('agent.useCustomModel', { model: value })}
               />
             )}
           </Field>
@@ -399,6 +450,80 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
               />
             </Field>
           )}
+
+          <div className="rounded-[10px] border border-ink-100 bg-paper/60">
+            <button
+              type="button"
+              onClick={() => setAdvancedOpen((v) => !v)}
+              className="w-full flex items-center gap-2 px-3.5 py-2.5 text-left"
+              aria-expanded={advancedOpen}
+            >
+              <span className={cn('text-[10px] text-ink-400 transition-transform inline-block', advancedOpen && 'rotate-90')}>▶</span>
+              <span className="text-[12.5px] font-semibold text-ink-700">{t('agent.advancedModelSettings')}</span>
+              {isByoa && (
+                <span className="ml-auto text-[10.5px] text-ink-400 italic">{t('agent.engineManagedTag')}</span>
+              )}
+            </button>
+            {advancedOpen && (
+              <div className="px-3.5 pb-3.5 pt-1 space-y-3 border-t border-ink-100">
+                {isByoa ? (
+                  <div className="text-[11.5px] text-ink-500 italic">{t('agent.engineManagedNote')}</div>
+                ) : (
+                  <>
+                    <div className="grid grid-cols-[96px_1fr] items-center gap-x-3 gap-y-2.5">
+                      <label className="text-[11.5px] font-semibold text-ink-500">{t('agent.mcEffort')}</label>
+                      <select
+                        value={mcEffort}
+                        onChange={(e) => setMcEffort(e.target.value)}
+                        className="h-8 px-2 rounded-[8px] text-[12.5px] text-ink-900 bg-paper outline-none focus:ring-2 focus:ring-skype/30"
+                        style={{ border: '1px solid var(--ink-100)' }}
+                      >
+                        <option value="">{t('agent.mcFollowGlobal')}</option>
+                        {effortOptions.map((o) => <option key={o} value={o}>{o}</option>)}
+                      </select>
+                      <label className="text-[11.5px] font-semibold text-ink-500">{t('agent.mcContextWindow')}</label>
+                      <input
+                        type="number" min={0}
+                        value={mcContextWindow}
+                        onChange={(e) => setMcContextWindow(e.target.value)}
+                        placeholder={t('agent.mcContextWindowPh')}
+                        className="h-8 px-2.5 rounded-[8px] text-[12.5px] text-ink-900 bg-paper outline-none focus:ring-2 focus:ring-skype/30 font-mono"
+                        style={{ border: '1px solid var(--ink-100)' }}
+                      />
+                      <label className="text-[11.5px] font-semibold text-ink-500">{t('agent.mcMaxTokens')}</label>
+                      <input
+                        type="number" min={0}
+                        value={mcMaxTokens}
+                        onChange={(e) => setMcMaxTokens(e.target.value)}
+                        placeholder={t('agent.mcMaxTokensPh')}
+                        className="h-8 px-2.5 rounded-[8px] text-[12.5px] text-ink-900 bg-paper outline-none focus:ring-2 focus:ring-skype/30 font-mono"
+                        style={{ border: '1px solid var(--ink-100)' }}
+                      />
+                      <label className="text-[11.5px] font-semibold text-ink-500">{t('agent.mcThinking')}</label>
+                      <div>
+                        <Checkbox
+                          checked={mcThinking}
+                          onCheckedChange={(next) => setMcThinking(next)}
+                          label=""
+                        />
+                      </div>
+                    </div>
+                    <div>
+                      <div className="text-[11.5px] font-semibold text-ink-500 mb-1.5">{t('agent.mcFallbacks')}</div>
+                      <div className="text-[10.5px] text-ink-400 mb-1.5 italic">{t('agent.mcFallbacksHint')}</div>
+                      <FallbackChainEditor
+                        value={mcFallbacks}
+                        onChange={setMcFallbacks}
+                        options={catalogText}
+                        listId="agent-mc-fallbacks"
+                        t={t}
+                      />
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
+          </div>
 
           <Field
             label={t('agent.runsOnLabel')}

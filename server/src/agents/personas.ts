@@ -13,6 +13,7 @@
 import { pool } from '../db/pool.js'
 import { SKYPE_EMOTICONS_GUIDE } from './skype-emoticons.js'
 import { AGENT_VOICE_RULES } from './agent-voice.js'
+import { parseAgentModelConfig, type AgentModelConfig } from './model-config.js'
 
 export interface Persona {
   id: string
@@ -22,6 +23,9 @@ export interface Persona {
   style: string
   /** Optional per-agent model override; null = use system default. */
   model: string | null
+  /** Advanced per-agent model settings (effort/tokens/thinking/context/
+   *  fallback chain). null = inherit the global brain role. */
+  modelConfig: AgentModelConfig | null
   /** The tenant this persona belongs to. */
   companyId: string
 }
@@ -38,16 +42,16 @@ export async function getPersona(id: string): Promise<Persona | null> {
   if (personaCache.has(id)) return personaCache.get(id) ?? null
   const { rows } = await pool.query<{
     id: string; name: string; role: string | null; style: string | null;
-    model: string | null; company_id: string
+    model: string | null; model_config: unknown; company_id: string
   }>(
-    `SELECT id, name, role, system_prompt AS style, model, company_id
+    `SELECT id, name, role, system_prompt AS style, model, model_config, company_id
        FROM participants
       WHERE id = $1 AND kind = 'agent' AND departed_at IS NULL`,
     [id],
   )
   const r = rows[0]
   const persona: Persona | null = r
-    ? { id: r.id, name: r.name, role: r.role ?? '', style: r.style ?? '', model: r.model ?? null, companyId: r.company_id }
+    ? { id: r.id, name: r.name, role: r.role ?? '', style: r.style ?? '', model: r.model ?? null, modelConfig: parseAgentModelConfig(r.model_config), companyId: r.company_id }
     : null
   personaCache.set(id, persona)
   return persona
@@ -62,9 +66,9 @@ export async function isAgent(id: string): Promise<boolean> {
 export async function getAllAgentPersonas(companyId: string): Promise<Persona[]> {
   const { rows } = await pool.query<{
     id: string; name: string; role: string | null; style: string | null;
-    model: string | null; company_id: string
+    model: string | null; model_config: unknown; company_id: string
   }>(
-    `SELECT id, name, role, system_prompt AS style, model, company_id
+    `SELECT id, name, role, system_prompt AS style, model, model_config, company_id
        FROM participants
       WHERE kind = 'agent' AND departed_at IS NULL AND company_id = $1
       ORDER BY name ASC`,
@@ -72,6 +76,7 @@ export async function getAllAgentPersonas(companyId: string): Promise<Persona[]>
   )
   return rows.map((r) => ({
     id: r.id, name: r.name, role: r.role ?? '', style: r.style ?? '', model: r.model ?? null,
+    modelConfig: parseAgentModelConfig(r.model_config),
     companyId: r.company_id,
   }))
 }

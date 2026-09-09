@@ -12,6 +12,7 @@ import { collectDocumentStorageKeys, evictDocumentRoom } from '../documents/room
 import { createPoll, castVote, closePoll, PollError } from '../polls.js'
 import { env } from '../env.js'
 import { getImageModel, getSupportModel } from '../settings.js'
+import { parseAgentModelConfig } from '../agents/model-config.js'
 import { publicBodyParserError } from '../body-parser-errors.js'
 import { startConvene } from '../agents/convene.js'
 import { ensureDirectConversation } from '../agents/private_chat.js'
@@ -2500,7 +2501,7 @@ api.get('/participants', async (req, res) => {
             p.avatar_bg AS "avatarBg", p.avatar_url AS "avatarUrl",
             p.status, p.status_updated_at AS "statusUpdatedAt",
             p.bio, p.tools, p.system_prompt AS "systemPrompt", p.model,
-            p.computer_id AS "computerId", p.engine, p.fast_model AS "fastModel",
+            p.model_config AS "modelConfig", p.computer_id AS "computerId", p.engine, p.fast_model AS "fastModel",
             p.engine_inherit AS "engineInherit",
             -- Email resolution differs by kind:
             --  - agents carry their own minted address on participants.email
@@ -2937,6 +2938,8 @@ interface AgentBody {
   systemPrompt?: unknown; bio?: unknown
   initial?: unknown; avatarBg?: unknown; avatarUrl?: unknown
   model?: unknown; fastModel?: unknown
+  /** Advanced model settings object; null clears. */
+  modelConfig?: unknown
   tools?: unknown
 }
 function readAgentBody(b: AgentBody): {
@@ -2949,6 +2952,8 @@ function readAgentBody(b: AgentBody): {
   model?: string | null
   /** small-brain model override; same semantics as `model` */
   fastModel?: string | null
+  /** Advanced model settings (validated via parseAgentModelConfig); null clears. */
+  modelConfig?: unknown
   tools?: string[] | null
 } {
   const out: Record<string, unknown> = {}
@@ -2965,6 +2970,8 @@ function readAgentBody(b: AgentBody): {
   else if (typeof b.model === 'string')   out.model = b.model.trim() || null
   if (b.fastModel === null)               out.fastModel = null
   else if (typeof b.fastModel === 'string') out.fastModel = b.fastModel.trim() || null
+  if (b.modelConfig === null)             out.modelConfig = null
+  else if (b.modelConfig !== undefined)   out.modelConfig = parseAgentModelConfig(b.modelConfig)
   if (Array.isArray(b.tools))             out.tools = b.tools.map((x) => String(x))
   return out as ReturnType<typeof readAgentBody>
 }
@@ -3005,6 +3012,7 @@ api.post('/agents', async (req, res) => {
       avatarBg: data.avatarBg,
       model: data.model,
       fastModel: data.fastModel,
+      modelConfig: data.modelConfig,
       tools: data.tools ?? undefined,
       computerId,
       engine,
@@ -3119,6 +3127,7 @@ api.put('/agents/:id', async (req, res) => {
   if (data.avatarUrl !== undefined)    push('avatar_url', data.avatarUrl)   // null clears it
   if (data.model !== undefined)        push('model', data.model)             // null clears it (use default)
   if (data.fastModel !== undefined)    push('fast_model', data.fastModel)    // small-brain model; null clears
+  if (data.modelConfig !== undefined)  push('model_config', data.modelConfig === null ? null : JSON.stringify(data.modelConfig))
   if (data.tools !== undefined)        push('tools', JSON.stringify(data.tools))
   if (sets.length === 0) { res.status(400).json({ error: 'nothing to update' }); return }
   params.push(id, tenant)

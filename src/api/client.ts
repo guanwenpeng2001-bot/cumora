@@ -1,4 +1,5 @@
 import { getActiveCompanyId, getAuthToken, useAuth } from '@/stores/auth'
+import type { AgentModelConfig } from '@/types'
 import type {
   BoardCardComment, BoardCardLookup, BoardSnapshot, BoardSummary,
   CalendarDispatch, CalendarEvent, CalendarEventKind, CalendarEventStatus,
@@ -253,6 +254,7 @@ export interface ApiParticipant {
   engine?: string | null
   engineInherit?: boolean | null
   fastModel?: string | null
+  modelConfig?: AgentModelConfig | null
 }
 
 /** A Computer (agent host) as returned by GET /api/computers. */
@@ -335,6 +337,8 @@ export interface AgentInput {
   model?: string | null
   /** per-agent small-brain (fast) model override; null clears it */
   fastModel?: string | null
+  /** advanced model settings; null clears (managed agents only) */
+  modelConfig?: AgentModelConfig | null
   tools?: string[]
 }
 
