@@ -53,6 +53,11 @@ import {
   MCP_TABLES_SQL,
   mcpTablesChecksum,
 } from './migrations/0010-mcp-tables.js'
+import {
+  USAGE_LOGS_INDEX_NAME,
+  USAGE_LOGS_INDEX_SQL,
+  usageLogsIndexChecksum,
+} from './migrations/0011-usage-logs-company-created-index.js'
 
 /** Frozen data backfill embedded in migration 0001. Exported so its behavior
  * can be exercised against PostgreSQL without replaying the whole migration. */
@@ -2576,6 +2581,11 @@ async function applyMcpTables(client: import('pg').PoolClient): Promise<void> {
   await client.query(MCP_TABLES_SQL)
 }
 
+/** The index is built concurrently because llm_calls is a hot append-only table. */
+async function applyUsageLogsIndex(client: import('pg').PoolClient): Promise<void> {
+  await ensureConcurrentIndex(client, USAGE_LOGS_INDEX_NAME, USAGE_LOGS_INDEX_SQL)
+}
+
 const VERSIONED_MIGRATIONS: readonly VersionedMigration[] = [
   {
     ...SCHEMA_MIGRATIONS[0],
@@ -2638,6 +2648,12 @@ const VERSIONED_MIGRATIONS: readonly VersionedMigration[] = [
     sourceChecksum: mcpTablesChecksum(),
     transactional: true,
     up: applyMcpTables,
+  },
+  {
+    ...SCHEMA_MIGRATIONS[10],
+    sourceChecksum: usageLogsIndexChecksum(),
+    transactional: false,
+    up: applyUsageLogsIndex,
   },
 ]
 
@@ -2906,6 +2922,7 @@ const BASELINE_REQUIRED_SCHEMA_INDEXES = [
 
 export const REQUIRED_SCHEMA_INDEXES = [
   ...BASELINE_REQUIRED_SCHEMA_INDEXES,
+  USAGE_LOGS_INDEX_NAME,
   'conversation_members_conversation_ordinal_key',
   'idx_conversation_members_participant',
   SEARCH_TRIGRAM_INDEX_NAME,

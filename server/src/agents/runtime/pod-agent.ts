@@ -61,6 +61,8 @@ const state: RunnerState = {
 }
 
 let pendingTurnOptions: AgentTurnOptions | null = null
+let inboxProbeTimer: NodeJS.Timeout | null = null
+let inboxProbeInFlight = false
 
 function mergeTurnOptions(next: AgentTurnOptions | null): void {
   pendingTurnOptions = mergeWakeTurnOptions(pendingTurnOptions, next)
@@ -89,6 +91,36 @@ async function drain(agentId: string, options: AgentTurnOptions | null = null): 
   } finally {
     state.busy = false
   }
+}
+
+/** Periodic self-heal for the managed Pod. A wake can be lost while the
+ * server is restarting or while the first loadInbox call fails; the inbox is
+ * durable, so probing it is enough to re-enter the normal serialized drain
+ * path without creating another turn when the fingerprint is unchanged. */
+function stopInboxProbe(): void {
+  if (inboxProbeTimer) {
+    clearInterval(inboxProbeTimer)
+    inboxProbeTimer = null
+  }
+}
+
+function startInboxProbe(agentId: string, intervalMs = 30_000): void {
+  stopInboxProbe()
+  const probe = async (): Promise<void> => {
+    if (state.shuttingDown || inboxProbeInFlight) return
+    inboxProbeInFlight = true
+    try {
+      const inbox = await runtime.loadInbox(agentId)
+      if (inbox.length > 0 && !state.busy) void drain(agentId)
+    } catch (err) {
+      console.warn('[pod-agent] inbox probe failed:',
+        err instanceof Error ? err.message : String(err))
+    } finally {
+      inboxProbeInFlight = false
+    }
+  }
+  inboxProbeTimer = setInterval(() => { void probe() }, intervalMs)
+  inboxProbeTimer.unref?.()
 }
 
 // parseSseStream + SseEvent moved to ./sse-parse.ts so the test
@@ -228,7 +260,8 @@ async function gracefulExit(reason: string, finalStatus: 'resting' | null): Prom
     await new Promise<void>(() => { /* never resolve */ })
   }
   state.shuttingDown = true
-  console.log(`[pod-agent] shutting down: ${reason}`)
+  stopInboxProbe()
+  console.log('[pod-agent] shutting down: ' + reason)
   // Wait for in-flight turn to finish, capped at 60s.
   const deadline = Date.now() + 60_000
   while (state.busy && Date.now() < deadline) {
@@ -286,6 +319,7 @@ async function main(): Promise<void> {
 
   // Idle timer: ONLY this path sets status=resting.
   startIdleWatcher(agentId, idleMs, noWorkMs, (reason) => { void gracefulExit(reason, 'resting') })
+  startInboxProbe(agentId)
 
   // Connect-loop with exponential backoff. SSE disconnects (server
   // restart, transient network blip) shouldn't kill the Pod.

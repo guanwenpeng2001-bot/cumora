@@ -88,22 +88,11 @@ export function _wakeRetryDelayMs(attempt: number): number {
   return Math.min(60_000, 5_000 * 2 ** n)
 }
 
+const TRANSIENT_ENSURE_POD_FAILURE = /\b(?:capacity_denied|pod_apply_failed|watchdog_timeout)\b/i
+const MESSAGE_WAKE_RETRY_MAX_ATTEMPTS = 5
+
 export function _shouldRetryEnsurePodFailure(reason: WakeReason, ensureReason: string): boolean {
-  // message.new wakes are DURABLE because the message itself is already
-  // committed to the messages table. Whenever the agent's pod next
-  // attaches its wake-stream it runs drain() unconditionally, which
-  // calls loadInbox — picking up everything since the agent's last
-  // read cursor including any wake we "missed". Queuing a separate
-  // retry on top means the pod can receive the same wake twice (once
-  // via the original SSE delivery once it's healthy, once via the
-  // retry), trigger an extra turn through pendingRerun, and post a
-  // duplicate reply — exactly the "Nova says 3 then 1" bug.
-  //
-  // Synthetic wakes (idle / background_scan) don't have a backing DB
-  // row, so they ARE handled here too — but via the inline poll loop
-  // at the end of wakeOne, not via this scheduled-retry queue. The
-  // queue is left to `manual` only (CLI/admin pokes that explicitly
-  // want delivery guarantees).
+  if (reason === 'message.new') return TRANSIENT_ENSURE_POD_FAILURE.test(ensureReason)
   if (reason !== 'manual') return false
   if (/no such agent/i.test(ensureReason)) return false
   return true
@@ -125,6 +114,33 @@ function wakeRetryId(agentId: string, reason: WakeReason, conversationId: string
   return `${agentId}:${reason}:${conversationId ?? '-'}`
 }
 
+async function postWakeRetryExhaustedNotice(
+  agentId: string,
+  conversationId: string | null,
+  attempt: number,
+  failureReason: string,
+): Promise<void> {
+  if (!conversationId) return
+  try {
+    const result = await inprocClient.postSystemNotice({
+      conversationId,
+      agentId,
+      noticeKind: 'ensure_pod_retry_exhausted',
+      text: 'Managed agent Pod could not start after ' + Math.max(0, attempt - 1) +
+        ' retries. The message remains in the inbox; please try again later or contact an administrator. ' +
+        'Last error: ' + failureReason.slice(0, 300),
+      dedupeKey: 'ensure_pod_retry_exhausted:' + agentId + ':' + conversationId,
+      dedupeTtlSec: 3600,
+    })
+    if (result.posted) {
+      console.warn('[scheduler] posted ensurePod exhaustion notice for ' + agentId + ' in ' + conversationId)
+    }
+  } catch (err) {
+    console.warn('[scheduler] failed to post ensurePod exhaustion notice for ' + agentId + ':',
+      err instanceof Error ? err.message : err)
+  }
+}
+
 async function scheduleWakeRetry(
   agentId: string,
   reason: WakeReason,
@@ -137,16 +153,22 @@ async function scheduleWakeRetry(
 ): Promise<void> {
   if (!_shouldRetryWakeFailure(reason, failureReason, failureClass)) return
   const id = wakeRetryId(agentId, reason, conversationId)
-  if (attempt > WAKE_RETRY_MAX_ATTEMPTS) {
+  const maxAttempts = reason === 'message.new'
+    ? MESSAGE_WAKE_RETRY_MAX_ATTEMPTS
+    : WAKE_RETRY_MAX_ATTEMPTS
+  if (attempt > maxAttempts) {
     await redis.hdel(WAKE_RETRY_JOB_KEY, id).catch(() => { /* ignore */ })
+    if (reason === 'message.new') {
+      await postWakeRetryExhaustedNotice(agentId, conversationId, attempt, failureReason)
+    }
     void notifyAlert({
       label: 'scheduler.wake_retry_exhausted',
-      error: new Error(`wake retry exhausted for ${agentId}: ${failureReason}`),
+      error: new Error('wake retry exhausted for ' + agentId + ': ' + failureReason),
       extras: { agentId, reason, conversationId, attempt, failureReason },
     })
     return
   }
-  const dueAt = Date.now() + _wakeRetryDelayMs(attempt)
+  const dueAt = Date.now() + _wakeRetryDelayMs(attempt) + Math.floor(Math.random() * 1_000)
   const job: WakeRetryJob = {
     id, agentId, reason, conversationId, steerPayload, options,
     attempt,
@@ -499,14 +521,12 @@ async function wakeOne(
   // truth.
   const r = await ensurePod(agentId)
   if (r.created) {
-    console.log(`[scheduler] ${agentId} resting → spinning up pod (${reason})`)
-    // A successful kubectl apply does not guarantee the pod will ever
-    // reach the runtime wake stream: kubelet can reject allocation
-    // immediately after scheduling (for example a transient unhealthy
-    // devic.es/fuse device). Queue one delayed health retry for
-    // durable wakes; if the pod is healthy, the retry just delivers a
-    // wake and the inbox fingerprint makes the turn no-op.
-    await scheduleWakeRetry(agentId, reason, conversationId, steerPayload, options, Math.max(1, retryAttempt + 1), 'post-spawn health check')
+    console.log('[scheduler] ' + agentId + ' resting → spinning up pod (' + reason + ')')
+    // Synthetic/message wakes are durable in the inbox. Only the explicit
+    // manual wake path needs a delayed replay after a successful apply.
+    if (reason === 'manual') {
+      await scheduleWakeRetry(agentId, reason, conversationId, steerPayload, options, Math.max(1, retryAttempt + 1), 'post-spawn health check')
+    }
   } else if (!r.ok) {
     console.error(`[scheduler] ${agentId} ensurePod failed: ${r.reason}`)
     await scheduleWakeRetry(
@@ -516,7 +536,7 @@ async function wakeOne(
       steerPayload,
       options,
       retryAttempt + 1,
-      r.reason,
+      r.code + ': ' + r.reason,
       r.code === 'placement_lookup_failed' ? 'host_resolution' : 'ensure_pod',
     )
     return false

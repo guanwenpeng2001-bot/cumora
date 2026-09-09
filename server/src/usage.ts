@@ -1,5 +1,5 @@
 /**
- * Usage dashboard aggregation — pure reads over the llm_calls ledger,
+ * Usage dashboard aggregation — pure reads over the llm_calls rollup,
  * scoped to the tenant. Powers the settings-page usage dashboard
  * (totals cards, trend chart, per-agent/model/provider breakdowns,
  * paginated request log). Never writes.
@@ -65,17 +65,17 @@ interface SummaryRow {
 
 export async function usageSummary(tenant: string, range: UsageRange, source?: string): Promise<UsageSummary> {
   const { rows } = await pool.query<SummaryRow>(
-    `SELECT COUNT(*)::text AS requests,
+    `SELECT COALESCE(SUM(calls), 0)::text AS requests,
             COALESCE(SUM(input_tokens), 0)::text           AS input_tokens,
             COALESCE(SUM(output_tokens), 0)::text          AS output_tokens,
             COALESCE(SUM(cached_input_tokens), 0)::text    AS cache_read,
             COALESCE(SUM(cache_creation_tokens), 0)::text  AS cache_write,
             COALESCE(SUM(reasoning_tokens), 0)::text       AS reasoning,
             COALESCE(SUM(cost_usd), 0)::text               AS cost_usd,
-            BOOL_OR(cost_estimated)                        AS cost_estimated,
-            COUNT(*) FILTER (WHERE status = 'ok')::text    AS ok
-       FROM llm_calls
-      WHERE company_id = $1 AND created_at >= $2 AND created_at < $3
+            COALESCE(BOOL_OR(cost_estimated), false)      AS cost_estimated,
+            COALESCE(SUM(ok_calls), 0)::text            AS ok
+       FROM llm_calls_rollup
+      WHERE company_id = $1 AND bucket_hour >= $2 AND bucket_hour < $3
         AND ($4::text IS NULL OR source = $4)`,
     [tenant, range.from.toISOString(), range.to.toISOString(), source ?? null],
   )
@@ -108,13 +108,13 @@ export interface TrendPoint {
 
 export async function usageTrend(tenant: string, range: UsageRange, granularity: 'hour' | 'day'): Promise<TrendPoint[]> {
   const { rows } = await pool.query<{ bucket: Date; cost_usd: string; input_tokens: string; output_tokens: string; cache_read: string }>(
-    `SELECT date_trunc($4, created_at) AS bucket,
+    `SELECT date_trunc($4, bucket_hour) AS bucket,
             COALESCE(SUM(cost_usd), 0)::text            AS cost_usd,
             COALESCE(SUM(input_tokens), 0)::text        AS input_tokens,
             COALESCE(SUM(output_tokens), 0)::text       AS output_tokens,
             COALESCE(SUM(cached_input_tokens), 0)::text AS cache_read
-       FROM llm_calls
-      WHERE company_id = $1 AND created_at >= $2 AND created_at < $3
+       FROM llm_calls_rollup
+      WHERE company_id = $1 AND bucket_hour >= $2 AND bucket_hour < $3
       GROUP BY 1 ORDER BY 1`,
     [tenant, range.from.toISOString(), range.to.toISOString(), granularity],
   )
@@ -156,15 +156,15 @@ export async function usageByAgent(tenant: string, range: UsageRange): Promise<A
     `SELECT l.agent_id,
             p.name, p.avatar_url, c.kind
             ,
-            COUNT(*)::text                          AS requests,
+            COALESCE(SUM(l.calls), 0)::text          AS requests,
             COALESCE(SUM(l.input_tokens + l.cached_input_tokens), 0)::text  AS input_tokens,
             COALESCE(SUM(l.output_tokens), 0)::text  AS output_tokens,
             COALESCE(SUM(l.cost_usd), 0)::text       AS cost_usd,
-            COUNT(*) FILTER (WHERE l.status = 'ok')::text AS ok
-       FROM llm_calls l
+            COALESCE(SUM(l.ok_calls), 0)::text       AS ok
+       FROM llm_calls_rollup l
        LEFT JOIN participants p ON p.id = l.agent_id
        LEFT JOIN computers c ON c.id = p.computer_id
-      WHERE l.company_id = $1 AND l.created_at >= $2 AND l.created_at < $3
+      WHERE l.company_id = $1 AND l.bucket_hour >= $2 AND l.bucket_hour < $3
       GROUP BY l.agent_id, p.name, p.avatar_url, c.kind
       ORDER BY SUM(l.cost_usd) DESC NULLS LAST`,
     [tenant, range.from.toISOString(), range.to.toISOString()],
@@ -192,22 +192,34 @@ export interface ModelUsageRow {
   costEstimated: boolean
 }
 
-export async function usageByModel(tenant: string, range: UsageRange): Promise<ModelUsageRow[]> {
-  const { rows } = await pool.query<{
-    model: string; requests: string; input_tokens: string; output_tokens: string; cost_usd: string; cost_estimated: boolean
-  }>(
+interface ModelRollupRow {
+  model: string
+  requests: string
+  input_tokens: string
+  output_tokens: string
+  cost_usd: string
+  cost_estimated: boolean
+}
+
+async function queryUsageByModelRows(tenant: string, range: UsageRange): Promise<ModelRollupRow[]> {
+  const { rows } = await pool.query<ModelRollupRow>(
     `SELECT model,
-            COUNT(*)::text                          AS requests,
+            COALESCE(SUM(calls), 0)::text AS requests,
             COALESCE(SUM(input_tokens + cached_input_tokens), 0)::text AS input_tokens,
-            COALESCE(SUM(output_tokens), 0)::text   AS output_tokens,
-            COALESCE(SUM(cost_usd), 0)::text        AS cost_usd,
-            BOOL_OR(cost_estimated)                 AS cost_estimated
-       FROM llm_calls
-      WHERE company_id = $1 AND created_at >= $2 AND created_at < $3
+            COALESCE(SUM(output_tokens), 0)::text AS output_tokens,
+            COALESCE(SUM(cost_usd), 0)::text AS cost_usd,
+            COALESCE(BOOL_OR(cost_estimated), false) AS cost_estimated
+       FROM llm_calls_rollup
+      WHERE company_id = $1 AND bucket_hour >= $2 AND bucket_hour < $3
       GROUP BY model
       ORDER BY SUM(cost_usd) DESC NULLS LAST`,
     [tenant, range.from.toISOString(), range.to.toISOString()],
   )
+  return rows
+}
+
+export async function usageByModel(tenant: string, range: UsageRange): Promise<ModelUsageRow[]> {
+  const rows = await queryUsageByModelRows(tenant, range)
   return rows.map((r) => ({
     model: r.model,
     provider: providerForModel(r.model),
@@ -228,15 +240,16 @@ export interface ProviderUsageRow {
 }
 
 export async function usageByProvider(tenant: string, range: UsageRange): Promise<ProviderUsageRow[]> {
-  const models = await usageByModel(tenant, range)
+  const models = await queryUsageByModelRows(tenant, range)
   const acc = new Map<string, ProviderUsageRow>()
-  for (const m of models) {
-    const row = acc.get(m.provider) ?? { provider: m.provider, requests: 0, inputTokens: 0, outputTokens: 0, costUsd: 0 }
-    row.requests += m.requests
-    row.inputTokens += m.inputTokens
-    row.outputTokens += m.outputTokens
-    row.costUsd += m.costUsd
-    acc.set(m.provider, row)
+  for (const model of models) {
+    const provider = providerForModel(model.model)
+    const row = acc.get(provider) ?? { provider, requests: 0, inputTokens: 0, outputTokens: 0, costUsd: 0 }
+    row.requests += Number(model.requests)
+    row.inputTokens += Number(model.input_tokens)
+    row.outputTokens += Number(model.output_tokens)
+    row.costUsd += Number(model.cost_usd)
+    acc.set(provider, row)
   }
   return [...acc.values()].sort((a, b) => b.costUsd - a.costUsd)
 }

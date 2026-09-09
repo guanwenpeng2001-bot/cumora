@@ -120,7 +120,7 @@ export function UsageDashboard() {
   const [customFrom, setCustomFrom] = useState('')
   const [customTo, setCustomTo] = useState('')
   const [granularity, setGranularity] = useState<'hour' | 'day'>('hour')
-  const [autoRefresh, setAutoRefresh] = useState(true)
+  const [autoRefresh, setAutoRefresh] = useState(false)
   const [dim, setDim] = useState<Dim>('agent')
   const [page, setPage] = useState(1)
   const [summary, setSummary] = useState<ApiUsageSummary | null>(null)
@@ -153,7 +153,7 @@ export function UsageDashboard() {
   useEffect(() => {
     if (timerRef.current !== null) window.clearInterval(timerRef.current)
     timerRef.current = null
-    if (autoRefresh) timerRef.current = window.setInterval(load, 5000)
+    if (autoRefresh) timerRef.current = window.setInterval(load, 60_000)
     return () => { if (timerRef.current !== null) window.clearInterval(timerRef.current) }
   }, [autoRefresh, load])
 
