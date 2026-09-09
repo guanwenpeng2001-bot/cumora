@@ -21,6 +21,8 @@ export interface AuthUser {
   email: string
   name: string
   emailVerified?: boolean
+  /** Site-wide admin permission; absent on older servers. Require === true. */
+  isAdmin?: boolean
   /** OAuth providers linked to this account, e.g. ['google'] or
    *  ['google', 'github']. Populated by /auth/me. */
   providers?: string[]

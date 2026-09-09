@@ -1,4 +1,5 @@
 import { getActiveCompanyId, getAuthToken, useAuth } from '@/stores/auth'
+import { isApiAbortError } from '@/lib/apiErrors'
 import type { AgentModelConfig } from '@/types'
 import type {
   BoardCardComment, BoardCardLookup, BoardSnapshot, BoardSummary,
@@ -118,37 +119,49 @@ export class ApiError extends Error {
 }
 
 export async function http<T>(path: string, init?: RequestInit): Promise<T> {
-  const headers: Record<string, string> = { 'content-type': 'application/json' }
-  const token = getAuthToken()
-  if (token) headers.authorization = `Bearer ${token}`
-  const company = getActiveCompanyId()
-  if (company) headers['x-company-id'] = company
-  if (getDevModeEnabled()) headers['x-cumora-dev-mode'] = '1'
-  const res = await fetch(`${API}${path}`, {
-    headers: { ...headers, ...(init?.headers ?? {}) },
-    ...init,
-  })
-  // Auto-clear session on 401 so the AuthGate boots back to the login screen.
-  if (res.status === 401 && !path.startsWith('/auth/')) {
-    useAuth.getState().clear()
-  }
-  if (!res.ok) {
-    // Surface the server's actual error message — most endpoints return a
-    // JSON body like `{error: "..."}` on failure. Falls back to a body text
-    // snippet if it isn't JSON, then to status only as last resort.
-    let detail: string | null = null
-    try {
-      const text = await res.text()
-      if (text) {
-        try {
-          const j = JSON.parse(text) as { error?: string; message?: string }
-          detail = j.error ?? j.message ?? text.slice(0, 200)
-        } catch { detail = text.slice(0, 200) }
+  const { token, activeCompanyId: company, contextEpoch } = useAuth.getState()
+  const headers = new Headers({ 'content-type': 'application/json' })
+  if (token) headers.set('authorization', `Bearer ${token}`)
+  if (company) headers.set('x-company-id', company)
+  if (getDevModeEnabled()) headers.set('x-cumora-dev-mode', '1')
+  new Headers(init?.headers).forEach((value, key) => headers.set(key, value))
+  const signal = init?.signal
+  try {
+    signal?.throwIfAborted()
+    const res = await fetch(`${API}${path}`, { ...init, headers })
+    signal?.throwIfAborted()
+    if (!res.ok) {
+      let detail: string | null = null
+      try {
+        const text = await res.text()
+        if (text) {
+          try {
+            const j = JSON.parse(text) as { error?: string; message?: string }
+            detail = j.error ?? j.message ?? text.slice(0, 200)
+          } catch { detail = text.slice(0, 200) }
+        }
+      } catch (error) {
+        if (isApiAbortError(error, signal)) throw error
       }
-    } catch { /* ignore */ }
-    throw new ApiError(detail ? `${detail} (${res.status})` : `${res.status} ${res.statusText}`, res.status)
+      signal?.throwIfAborted()
+      // A late response may only expire the context whose credentials it carried.
+      if (res.status === 401 && !path.startsWith('/auth/')
+        && token && headers.get('authorization') === `Bearer ${token}`
+        && useAuth.getState().contextEpoch === contextEpoch
+        && useAuth.getState().token === token) {
+        useAuth.getState().clear()
+      }
+      throw new ApiError(detail ? `${detail} (${res.status})` : `${res.status} ${res.statusText}`, res.status)
+    }
+    const value = await res.json() as T
+    signal?.throwIfAborted()
+    return value
+  } catch (error) {
+    if (isApiAbortError(error, signal)) {
+      throw new DOMException('The request was aborted.', 'AbortError')
+    }
+    throw error
   }
-  return res.json() as Promise<T>
 }
 
 export interface ApiMessage extends Message {
@@ -190,15 +203,78 @@ export interface ApiConversation {
   } | null
 }
 
-/** Available-models catalog (settings page "models" tab). Buckets are
- *  capability-sorted model ids; `gateway: false` means sub2api contributed
- *  nothing and the UI should show the env-fallback banner. */
+/** Legacy capability buckets remain available alongside optional discovery metadata.
+ *  An empty gateway catalog does not establish which route a request will use. */
 export interface ApiModelCatalog {
   text: string[]
   image: string[]
   audio: string[]
   embedding: string[]
   gateway: boolean
+  models?: ApiCatalogModel[]
+  platforms?: ApiCatalogPlatformStatus[]
+  fetchedAt?: string
+}
+
+export type ApiModelRole = 'brain' | 'support' | 'compaction' | 'image' | 'audio' | 'embed'
+export type ApiModelPlatform = 'openai' | 'kimi' | 'deepseek' | 'grok'
+
+export interface ApiCatalogModel {
+  id: string
+  source?: 'managed' | 'byoa' | 'configured'
+  platform?: ApiModelPlatform
+  roles?: ApiModelRole[]
+  computerId?: string
+  engine?: EngineId
+  selectable?: boolean
+}
+
+export interface ApiCatalogPlatformStatus {
+  platform: ApiModelPlatform
+  status?: 'ready' | 'unconfigured' | 'unprovisioned' | 'failed'
+  errorCode?: string | null
+  fetchedAt?: string | null
+}
+
+export interface ApiSettingMetadata {
+  type?: 'string' | 'number' | 'boolean' | 'list'
+  source?: 'db' | 'env' | 'default' | 'inherited'
+  scope?: 'global' | 'company' | 'agent'
+  allowedValues?: string[]
+  sensitive?: boolean
+  readOnly?: boolean
+  applyMode?: 'immediate' | 'next_turn' | 'next_create' | 'restart'
+}
+
+export interface ApiModelSettings {
+  settings: Record<string, string>
+  revision?: number
+  metadata?: Record<string, ApiSettingMetadata>
+}
+
+export interface ApiSettingsWriteResult {
+  ok: boolean
+  revision?: number
+}
+
+export interface ApiSyncStatus {
+  status?: 'saved' | 'pending' | 'applied' | 'failed'
+  desiredRevision?: number
+  appliedRevision?: number
+  updatedAt?: string | null
+  errorCode?: string | null
+}
+
+export interface ApiBindingWriteResult {
+  ok: boolean
+  sync?: ApiSyncStatus
+}
+
+export interface ApiUsageRollupStatus {
+  enabled?: boolean
+  paused?: boolean
+  healthy?: boolean
+  processedThrough?: string | null
 }
 
 /** Usage dashboard rows (GET /api/usage/*). */
@@ -213,6 +289,7 @@ export interface ApiUsageSummary {
   costEstimated: boolean
   cacheHitRate: number
   successRate: number
+  rollup?: ApiUsageRollupStatus
 }
 export interface ApiUsageTrendPoint {
   bucket: string
@@ -262,12 +339,30 @@ export interface ApiUsageLogRow {
   costUsd: number
   latencyMs: number | null
   status: string
+  measured?: boolean
+  costEstimated?: boolean
+  measurementQuality?: string
+  errorCode?: string | null
+  failureStage?: string | null
+  runId?: string | null
+  executionId?: string | null
+  attemptId?: string | null
+  attemptIndex?: number
+  actualModel?: string | null
+  role?: ApiModelRole
+  routeId?: string | null
+  routeSource?: 'sub2api' | 'env'
+  platform?: ApiModelPlatform
+  cacheReadTokens?: number
+  cacheWriteTokens?: number
+  reasoningTokens?: number
 }
 export interface ApiUsageLogPage {
   items: ApiUsageLogRow[]
   total: number
   page: number
   pageSize: number
+  rollup?: ApiUsageRollupStatus
 }
 
 /** Company skill library row. */
@@ -288,6 +383,7 @@ export interface ApiMcpConnector {
 export interface ApiAgentConnectorState {
   connector: ApiMcpConnector
   enabled: boolean
+  sync?: ApiSyncStatus
 }
 
 export interface ApiSkill {
@@ -308,6 +404,7 @@ export interface ApiLocalHubEntry {
 export interface ApiAgentSkillState {
   skill: ApiSkill
   enabled: boolean
+  sync?: ApiSyncStatus
 }
 
 export interface ApiQuotaWindow {
@@ -713,7 +810,7 @@ export interface ApiAgentWorkspaceFileContent extends ApiAgentWorkspaceFile {
 }
 
 interface MeResponse {
-  user: { id: string; email: string; name: string; emailVerified: boolean; providers: string[] }
+  user: { id: string; email: string; name: string; emailVerified: boolean; providers: string[]; isAdmin?: boolean }
   companies: Array<{ id: string; name: string; slug: string; role: string; tier?: string }>
   activeCompanyId: string | null
   serverCapabilities: ServerCapabilities
@@ -990,8 +1087,8 @@ export const api = {
    *  is null when the user has no active subscription (e.g. provisioning
    *  hasn't completed yet). Both states render as "unavailable" in the
    *  Usage tab rather than as errors. */
-  getQuota: () =>
-    http<ApiQuotaResponse>('/me/quota'),
+  getQuota: (signal?: AbortSignal) =>
+    http<ApiQuotaResponse>('/me/quota', { signal }),
   listCompanies: () =>
     http<Array<{ id: string; name: string; slug: string; createdAt: string; role: string }>>('/companies'),
   listProjects: () => http<ApiProject[]>('/projects'),
@@ -1427,66 +1524,68 @@ export const api = {
       body: JSON.stringify(typeof input === 'string' ? { url: input } : input),
     }),
   /** Voice input: base64 audio clip → server-side ASR → plain text. */
-  transcribeAudio: (audio: string, format: string) =>
+  transcribeAudio: (audio: string, format: string, signal?: AbortSignal) =>
     http<{ text: string }>('/audio/transcription', {
+      signal,
       method: 'POST',
       body: JSON.stringify({ audio, format }),
     }),
   /** Settings page "models" tab. */
-  getModelSettings: () =>
-    http<{ settings: Record<string, string> }>('/settings/models'),
-  putModelSettings: (settings: Record<string, string>) =>
-    http<{ ok: boolean }>('/settings/models', {
+  getModelSettings: (signal?: AbortSignal) =>
+    http<ApiModelSettings>('/settings/models', { signal }),
+  putModelSettings: (settings: Record<string, string | null>, signal?: AbortSignal) =>
+    http<ApiSettingsWriteResult>('/settings/models', {
+      signal,
       method: 'PUT',
       body: JSON.stringify({ settings }),
     }),
-  getAvailableModels: (refresh = false) =>
-    http<ApiModelCatalog>(`/models/available${refresh ? '?refresh=1' : ''}`),
+  getAvailableModels: (refresh = false, signal?: AbortSignal) =>
+    http<ApiModelCatalog>(`/models/available${refresh ? '?refresh=1' : ''}`, { signal }),
   /** Usage dashboard. `range` = ISO from/to; `source` filters ledger source. */
-  getUsageSummary: (from: string, to: string, source?: string) =>
-    http<ApiUsageSummary>(`/usage/summary?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}${source ? `&source=${encodeURIComponent(source)}` : ''}`),
-  getUsageTrend: (from: string, to: string, granularity: 'hour' | 'day') =>
-    http<{ granularity: string; points: ApiUsageTrendPoint[] }>(`/usage/trend?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&granularity=${granularity}`),
-  getUsageByAgent: (from: string, to: string) =>
-    http<{ items: ApiUsageAgentRow[] }>(`/usage/by-agent?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`),
-  getUsageByModel: (from: string, to: string) =>
-    http<{ items: ApiUsageModelRow[] }>(`/usage/by-model?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`),
-  getUsageByProvider: (from: string, to: string) =>
-    http<{ items: ApiUsageProviderRow[] }>(`/usage/by-provider?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`),
+  getUsageSummary: (from: string, to: string, source?: string, signal?: AbortSignal) =>
+    http<ApiUsageSummary>(`/usage/summary?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}${source ? `&source=${encodeURIComponent(source)}` : ''}`, { signal }),
+  getUsageTrend: (from: string, to: string, granularity: 'hour' | 'day', signal?: AbortSignal) =>
+    http<{ granularity: string; points: ApiUsageTrendPoint[] }>(`/usage/trend?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&granularity=${granularity}`, { signal }),
+  getUsageByAgent: (from: string, to: string, signal?: AbortSignal) =>
+    http<{ items: ApiUsageAgentRow[] }>(`/usage/by-agent?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`, { signal }),
+  getUsageByModel: (from: string, to: string, signal?: AbortSignal) =>
+    http<{ items: ApiUsageModelRow[] }>(`/usage/by-model?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`, { signal }),
+  getUsageByProvider: (from: string, to: string, signal?: AbortSignal) =>
+    http<{ items: ApiUsageProviderRow[] }>(`/usage/by-provider?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`, { signal }),
   /** Skills library + per-agent enablement. */
-  getSkills: () =>
-    http<{ items: ApiSkill[]; hubConfigured: boolean; localHubPath: string | null }>('/skills'),
-  createSkillFromPaste: (skillMd: string) =>
-    http<ApiSkill>('/skills/paste', { method: 'POST', body: JSON.stringify({ skillMd }) }),
-  installSkillFromHub: (hubId: string) =>
-    http<ApiSkill>('/skills/install', { method: 'POST', body: JSON.stringify({ hubId }) }),
-  deleteSkill: (id: string) =>
-    http<{ ok: boolean }>(`/skills/${encodeURIComponent(id)}`, { method: 'DELETE' }),
-  getLocalHubSkills: () =>
-    http<{ items: ApiLocalHubEntry[]; path: string | null }>('/skills/hub/local'),
-  importLocalSkill: (name: string) =>
-    http<ApiSkill>('/skills/import-local', { method: 'POST', body: JSON.stringify({ name }) }),
-  searchSkillHub: (q: string) =>
-    http<{ items: Array<{ id: string; name?: string; description?: string }> }>(`/skills/hub/search?q=${encodeURIComponent(q)}`),
+  getSkills: (signal?: AbortSignal) =>
+    http<{ items: ApiSkill[]; hubConfigured: boolean; localHubPath: string | null }>('/skills', { signal }),
+  createSkillFromPaste: (skillMd: string, signal?: AbortSignal) =>
+    http<ApiSkill>('/skills/paste', { signal, method: 'POST', body: JSON.stringify({ skillMd }) }),
+  installSkillFromHub: (hubId: string, signal?: AbortSignal) =>
+    http<ApiSkill>('/skills/install', { signal, method: 'POST', body: JSON.stringify({ hubId }) }),
+  deleteSkill: (id: string, signal?: AbortSignal) =>
+    http<{ ok: boolean }>(`/skills/${encodeURIComponent(id)}`, { signal, method: 'DELETE' }),
+  getLocalHubSkills: (signal?: AbortSignal) =>
+    http<{ items: ApiLocalHubEntry[]; path: string | null }>('/skills/hub/local', { signal }),
+  importLocalSkill: (name: string, signal?: AbortSignal) =>
+    http<ApiSkill>('/skills/import-local', { signal, method: 'POST', body: JSON.stringify({ name }) }),
+  searchSkillHub: (q: string, signal?: AbortSignal) =>
+    http<{ items: Array<{ id: string; name?: string; description?: string }> }>(`/skills/hub/search?q=${encodeURIComponent(q)}`, { signal }),
   /** MCP connectors. */
-  getMcpConnectors: () =>
-    http<{ items: ApiMcpConnector[] }>('/mcp-connectors'),
-  createMcpConnector: (input: Omit<ApiMcpConnector, 'id' | 'companyId' | 'createdAt'>) =>
-    http<ApiMcpConnector>('/mcp-connectors', { method: 'POST', body: JSON.stringify(input) }),
-  updateMcpConnector: (id: string, input: Omit<ApiMcpConnector, 'id' | 'companyId' | 'createdAt'>) =>
-    http<ApiMcpConnector>(`/mcp-connectors/${encodeURIComponent(id)}`, { method: 'PUT', body: JSON.stringify(input) }),
-  deleteMcpConnector: (id: string) =>
-    http<{ ok: boolean }>(`/mcp-connectors/${encodeURIComponent(id)}`, { method: 'DELETE' }),
-  getAgentMcpConnectors: (agentId: string) =>
-    http<{ items: ApiAgentConnectorState[] }>(`/agents/${encodeURIComponent(agentId)}/mcp-connectors`),
-  setAgentMcpConnectors: (agentId: string, connectorIds: string[]) =>
-    http<{ ok: boolean }>(`/agents/${encodeURIComponent(agentId)}/mcp-connectors`, { method: 'PUT', body: JSON.stringify({ connectorIds }) }),
-  getAgentSkills: (agentId: string) =>
-    http<{ items: ApiAgentSkillState[] }>(`/agents/${encodeURIComponent(agentId)}/skills`),
-  setAgentSkills: (agentId: string, skillIds: string[]) =>
-    http<{ ok: boolean }>(`/agents/${encodeURIComponent(agentId)}/skills`, { method: 'PUT', body: JSON.stringify({ skillIds }) }),
-  getUsageLogs: (from: string, to: string, page: number, pageSize: number, source?: string) =>
-    http<ApiUsageLogPage>(`/usage/logs?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&page=${page}&pageSize=${pageSize}${source ? `&source=${encodeURIComponent(source)}` : ''}`),
+  getMcpConnectors: (signal?: AbortSignal) =>
+    http<{ items: ApiMcpConnector[] }>('/mcp-connectors', { signal }),
+  createMcpConnector: (input: Omit<ApiMcpConnector, 'id' | 'companyId' | 'createdAt'>, signal?: AbortSignal) =>
+    http<ApiMcpConnector>('/mcp-connectors', { signal, method: 'POST', body: JSON.stringify(input) }),
+  updateMcpConnector: (id: string, input: Omit<ApiMcpConnector, 'id' | 'companyId' | 'createdAt'>, signal?: AbortSignal) =>
+    http<ApiMcpConnector>(`/mcp-connectors/${encodeURIComponent(id)}`, { signal, method: 'PUT', body: JSON.stringify(input) }),
+  deleteMcpConnector: (id: string, signal?: AbortSignal) =>
+    http<{ ok: boolean }>(`/mcp-connectors/${encodeURIComponent(id)}`, { signal, method: 'DELETE' }),
+  getAgentMcpConnectors: (agentId: string, signal?: AbortSignal) =>
+    http<{ items: ApiAgentConnectorState[]; sync?: ApiSyncStatus }>(`/agents/${encodeURIComponent(agentId)}/mcp-connectors`, { signal }),
+  setAgentMcpConnectors: (agentId: string, connectorIds: string[], signal?: AbortSignal) =>
+    http<ApiBindingWriteResult>(`/agents/${encodeURIComponent(agentId)}/mcp-connectors`, { signal, method: 'PUT', body: JSON.stringify({ connectorIds }) }),
+  getAgentSkills: (agentId: string, signal?: AbortSignal) =>
+    http<{ items: ApiAgentSkillState[]; sync?: ApiSyncStatus }>(`/agents/${encodeURIComponent(agentId)}/skills`, { signal }),
+  setAgentSkills: (agentId: string, skillIds: string[], signal?: AbortSignal) =>
+    http<ApiBindingWriteResult>(`/agents/${encodeURIComponent(agentId)}/skills`, { signal, method: 'PUT', body: JSON.stringify({ skillIds }) }),
+  getUsageLogs: (from: string, to: string, page: number, pageSize: number, source?: string, signal?: AbortSignal) =>
+    http<ApiUsageLogPage>(`/usage/logs?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&page=${page}&pageSize=${pageSize}${source ? `&source=${encodeURIComponent(source)}` : ''}`, { signal }),
   markRead: (conversationId: string) =>
     http<{ ok: boolean }>(`/conversations/${encodeURIComponent(conversationId)}/read`, {
       method: 'POST',
