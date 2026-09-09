@@ -19,9 +19,9 @@
  */
 import type { ResponseInputItem, ResponseStreamEvent } from 'openai/resources/responses/responses'
 import { env } from '../env.js'
-import { agentReasoningEffort, agentMaxOutputTokens, supportReasoningEffort, supportReasoningHeadroom } from './reasoning.js'
+import { agentReasoningEffort, agentMaxOutputTokens, supportReasoningOptions, supportReasoningHeadroom, reasoningOptions } from './reasoning.js'
 import { agentTurnChain, type AgentModelConfig } from './model-config.js'
-import { resolvedChain, runWithFallback } from './fallback.js'
+import { resolvedChain, runWithFallbackResult } from './fallback.js'
 import { getBrainModel, getCompactionModel } from '../settings.js'
 import { redis } from '../redis.js'
 import { readLocalMessageAttachment } from '../local-attachment-files.js'
@@ -317,10 +317,12 @@ export function hasAllMention(body: string): boolean {
  *  notice in the affected conversations, so silence doesn't read as a bug. */
 function isQuotaExhaustedError(err: unknown): boolean {
   const errObj = err as { status?: number; code?: string } | undefined
-  if (errObj && typeof errObj.status === 'number' && errObj.status === 429) return true
+  if (errObj && typeof errObj.status === 'number' && (errObj.status === 402 || errObj.status === 429)) return true
   const text = errorText(err).toLowerCase()
   if (text.includes('429')) return true
   if (text.includes('rate_limit') || text.includes('rate limit')) return true
+  if (text.includes('insufficient_quota') || text.includes('insufficient quota') ||
+    text.includes('insufficient balance') || text.includes('insufficient credit')) return true
   if (text.includes('quota') && (text.includes('exceeded') || text.includes('exhausted'))) return true
   return false
 }
@@ -1262,7 +1264,7 @@ Reply ONLY as JSON: {"complete":boolean,"reason":"short factual reason","next_st
       ],
       stream: true,
       max_output_tokens: 500 + supportReasoningHeadroom(),
-      reasoning: { effort: supportReasoningEffort() },
+      ...supportReasoningOptions(),
       signal: ctrl.signal,
     } as unknown as Parameters<typeof client.responses.create>[0])
 
@@ -1397,7 +1399,7 @@ Skip narrative framing. No headings, no bullet symbols unless they aid clarity. 
       ],
       stream: true,
       max_output_tokens: 1500 + supportReasoningHeadroom(),
-      reasoning: { effort: supportReasoningEffort() },
+      ...supportReasoningOptions(),
     } as unknown as Parameters<typeof client.responses.create>[0])
 
     let collected = ''
@@ -1556,7 +1558,7 @@ Treat the output as a private memo that will be appended to the agent's input. E
       ],
       stream: true,
       max_output_tokens: 600 + supportReasoningHeadroom(),
-      reasoning: { effort: supportReasoningEffort() },
+      ...supportReasoningOptions(),
       signal: ctrl.signal,
     } as unknown as Parameters<typeof client.responses.create>[0])
 
@@ -2642,7 +2644,7 @@ Mechanics:
           tools: traceToolDefinitions(mcpToolDefs),
           request: {
             toolChoice: 'auto',
-            reasoning: turnThinking ? { effort: turnEffort } : null,
+            reasoning: turnThinking && turnEffort !== 'none' ? { effort: turnEffort } : null,
             maxOutputTokens: turnMaxOutputTokens,
           },
         },
@@ -2652,14 +2654,19 @@ Mechanics:
             ? `model_hop_${hop + 1}_no_images`
             : `model_hop_${hop + 1}_retry`,
       })
-      const client = await getLlmClient(runCompanyId)
+      const hopModel = enforceModelPolicy(realTaskModel(persona.model), 'agent-turn')
+      const hopChain = agentTurnChain(hopModel, agentMc, resolvedChain('brain'))
+      // An explicit turn chain owns fallback selection. Ask the client factory
+      // for provider routing only, otherwise the role wrapper would retry the
+      // same chain inside this one and amplify every failure.
+      const client = await getLlmClient(runCompanyId, { skipModelFallback: Boolean(hopChain) })
       // Per-hop ledger state. Each model hop is a separately-billed call (the
       // existing addUsage() sums them for the turn total), so each gets its
       // own llm_calls row with purpose='agent-turn'. This makes "which hop
       // burned the most tokens" queryable AND gives a clean cross-purpose
       // breakdown for the same turn (agent-turn rows + the verify/compaction
       // rows already recorded above).
-      const hopModel = enforceModelPolicy(realTaskModel(persona.model), 'agent-turn')
+      let effectiveHopModel = hopModel
       const hopT0 = Date.now()
       let hopRecorded = false
       const recordHop = (status: 'ok' | 'rate_limited' | 'timeout' | 'failed', usage: TokenUsage | null, error?: string) => {
@@ -2667,21 +2674,13 @@ Mechanics:
         hopRecorded = true
         void recordLlmCall({
           purpose: 'agent-turn', companyId: runCompanyId, agentId, runId,
-          model: hopModel, usage,
+          model: effectiveHopModel, usage,
           latencyMs: Date.now() - hopT0, status, error,
           extras: { hop: hop + 1, imageStripRetryUsed, retryKind },
         })
       }
       let stream
       try {
-        // Agent-level fallback chain: explicit model_config.fallback_models
-        // wins; otherwise follow the global brain chain behind the pinned
-        // model. When the agent is unpinned the client-side
-        // withModelFallback already matches the global primary, so a null
-        // chain here avoids double-wrapping.
-        const hopChain = hopModel !== getBrainModel()
-          ? agentTurnChain(hopModel, agentMc, resolvedChain('brain'))
-          : (agentMc?.fallbackModels?.length ? agentTurnChain(hopModel, agentMc, []) : null)
         const createArgs = {
           // THE real task: the agent's main turn responding to a conversation.
           // The one sanctioned big-model call site (per-agent override wins).
@@ -2693,16 +2692,20 @@ Mechanics:
           // thinking=false omits the reasoning field entirely (provider
           // default); effort/maxOutputTokens inherit from the global brain
           // role unless model_config pins them.
-          ...(turnThinking ? { reasoning: { effort: turnEffort } } : {}),
+          ...(turnThinking ? reasoningOptions(turnEffort) : {}),
           max_output_tokens: turnMaxOutputTokens,
           // No `previous_response_id` — sub2api's OAuth /v1/responses path
           // rejects it (see history block above). The full transcript is
           // re-sent via `inputForAttempt` instead.
           stream: true as const,
         }
-        stream = await (hopChain
-          ? runWithFallback(hopChain, (m) => client.responses.create({ ...createArgs, model: m }))
-          : client.responses.create(createArgs))
+        if (hopChain) {
+          const fallbackResult = await runWithFallbackResult(hopChain, (m) => client.responses.create({ ...createArgs, model: m }))
+          effectiveHopModel = fallbackResult.model
+          stream = fallbackResult.value
+        } else {
+          stream = await client.responses.create(createArgs)
+        }
       } catch (err) {
         // Record the failed attempt: no usage (the SDK error preceded any
         // stream events), classified by error shape. Even retried attempts

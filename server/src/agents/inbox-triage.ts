@@ -1,5 +1,5 @@
 import type { ContextRow, InboxRow, PersonaRow, WorklogEntry } from './runtime/client.js'
-import { supportReasoningEffort, supportReasoningHeadroom } from './reasoning.js'
+import { supportReasoningOptions, supportReasoningHeadroom } from './reasoning.js'
 import { getSupportModel } from '../settings.js'
 import { env } from '../env.js'
 import { getTrackedLlmClient } from './llm-ledger.js'
@@ -75,7 +75,7 @@ export async function classifyInboxTriage(args: {
       // reasoning_content before emitting the JSON — 500 starves them into an
       // empty content. 2000 leaves room for brief reasoning + the verdict JSON.
       max_output_tokens: 2000 + supportReasoningHeadroom(),
-      reasoning: { effort: supportReasoningEffort() },
+      ...supportReasoningOptions(),
     }, {
       // Triage is a fast GATE. Do NOT retry — a rate-limited model retried (or
       // escalated to the big brain on fail-open) is exactly what burned users'
@@ -177,7 +177,7 @@ export async function gateSyntheticWake(args: {
       input,
       text: { format: { type: 'json_object' } },
       max_output_tokens: 300 + supportReasoningHeadroom(),
-      reasoning: { effort: supportReasoningEffort() },
+      ...supportReasoningOptions(),
     }, { maxRetries: 0, timeout: 8_000 })
     const parsed = JSON.parse(r.output_text ?? '{}') as { act?: unknown; reason?: unknown; note?: unknown }
     return {

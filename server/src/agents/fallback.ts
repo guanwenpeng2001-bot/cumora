@@ -38,17 +38,24 @@ export function resolvedChain(role: FallbackRole): string[] {
   return [...new Set([primary, ...fallbacks].filter(Boolean))]
 }
 
-/** Run `fn` against each model in the chain, advancing on fallbackable
- *  errors. Throws the last error when the chain is exhausted. */
-export async function runWithFallback<T>(
+export interface FallbackResult<T> {
+  value: T
+  model: string
+}
+
+/** Run `fn` against each model and return the model that produced the value. */
+export async function runWithFallbackResult<T>(
   chain: string[],
   fn: (model: string) => Promise<T>,
   onAdvance?: (from: string, to: string, err: unknown) => void,
-): Promise<T> {
+): Promise<FallbackResult<T>> {
+  if (chain.length === 0) {
+    throw new Error('Fallback chain is empty: no primary model or fallback model is configured')
+  }
   let lastErr: unknown = null
   for (let i = 0; i < chain.length; i++) {
     try {
-      return await fn(chain[i]!)
+      return { value: await fn(chain[i]!), model: chain[i]! }
     } catch (e) {
       lastErr = e
       if (!isFallbackableError(e) || i === chain.length - 1) throw e
@@ -57,4 +64,13 @@ export async function runWithFallback<T>(
     }
   }
   throw lastErr instanceof Error ? lastErr : new Error(String(lastErr))
+}
+
+/** Backwards-compatible value-only fallback helper. */
+export async function runWithFallback<T>(
+  chain: string[],
+  fn: (model: string) => Promise<T>,
+  onAdvance?: (from: string, to: string, err: unknown) => void,
+): Promise<T> {
+  return (await runWithFallbackResult(chain, fn, onAdvance)).value
 }

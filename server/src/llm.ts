@@ -66,12 +66,12 @@ const cache = new Map<string, CachedClient>()
  *  every run failed → fingerprint locks them out" sequences caused by
  *  brief upstream flakiness on sub2api / the model provider. The OpenAI
  *  SDK retries on 5xx + 408 + 429 + network errors out of the box, but
- *  its default ceiling (2) is too thin for the bursty 502 windows we
- *  see; 5 absorbs short outages without making the wall-clock pathological.
+ *  its default ceiling (2) is enough for a single SDK-level retry; higher
+ *  values multiply the application-level fallback attempts.
  *  Timeout is 5 min — model responses (especially with reasoning) can
  *  legitimately take a couple minutes; the SDK aborts and retries within
  *  this budget. */
-const SDK_MAX_RETRIES = 5
+const SDK_MAX_RETRIES = 1
 const SDK_TIMEOUT_MS = 5 * 60_000
 
 /** Test-only override. When set, every {@link getLlmClient} call returns
@@ -170,9 +170,9 @@ function withModelFallback(client: OpenAI): OpenAI {
           return (args: { model?: string } & Record<string, unknown>, opts?: unknown) => {
             let chain: string[] = []
             const model = args?.model
-            // Only unprefixed role primaries get a chain — provider-prefixed
-            // models (novita/, orcarouter/) route out of sub2api entirely.
-            if (model && !model.includes('/')) {
+            // Provider-prefixed models can still be role primaries. The
+            // provider router below decides where each hop is sent.
+            if (model) {
               for (const role of ['brain', 'support', 'compaction'] as const) {
                 const c = resolvedChain(role)
                 if (c[0] && c[0] === model) { chain = c; break }
@@ -185,6 +185,16 @@ function withModelFallback(client: OpenAI): OpenAI {
       })
     },
   })
+}
+
+interface LlmClientOptions {
+  /** The caller owns an explicit hop chain and must avoid a second wrapper. */
+  skipModelFallback?: boolean
+}
+
+function prepareLlmClient(client: OpenAI, options: LlmClientOptions): OpenAI {
+  const routed = withProviderRouting(client)
+  return options.skipModelFallback ? routed : withModelFallback(routed)
 }
 
 /** Per-tenant model→platform route cache for multi-key sub2api users.
@@ -279,15 +289,15 @@ function buildSub2apiClient(baseURL: string, keys: ApiKeyMap, tenant: string): O
 /** Build (and cache) the OpenAI client for this tenant. Async because
  *  resolving the tenant's owner_user_id + sub2api_api_key is a DB hop.
  *  Always returns a working client — never throws on lookup failure. */
-export async function getLlmClient(tenant: string | null): Promise<OpenAI> {
+export async function getLlmClient(tenant: string | null, options: LlmClientOptions = {}): Promise<OpenAI> {
   if (testLlmOverride) return testLlmOverride(tenant)
   // No tenant context → legacy. Gate on the base URL only (not the
   // admin key): agent pods route per-platform without admin rights.
-  if (!tenant || !sub2apiRoutingConfigured()) return withModelFallback(withProviderRouting(legacyClient()))
+  if (!tenant || !sub2apiRoutingConfigured()) return prepareLlmClient(legacyClient(), options)
 
   const cached = cache.get(tenant)
   if (cached && Date.now() - cached.mintedAt < CACHE_TTL_MS) {
-    return withModelFallback(withProviderRouting(cached.client))
+    return prepareLlmClient(cached.client, options)
   }
 
   try {
@@ -305,14 +315,14 @@ export async function getLlmClient(tenant: string | null): Promise<OpenAI> {
       // hop, but with a short TTL so the next backfill picks up quickly.
       const c = legacyClient()
       cache.set(tenant, { client: c, key: 'legacy', mintedAt: Date.now() })
-      return withModelFallback(withProviderRouting(c))
+      return prepareLlmClient(c, options)
     }
     const c = buildSub2apiClient(sub2apiOpenAIBaseURL(), parseApiKeyMap(rawKey), tenant)
     cache.set(tenant, { client: c, key: rawKey, mintedAt: Date.now() })
-    return withModelFallback(withProviderRouting(c))
+    return prepareLlmClient(c, options)
   } catch (e) {
     console.warn(`[llm] tenant ${tenant} client lookup failed; legacy fallback`, e instanceof Error ? e.message : e)
-    return withModelFallback(withProviderRouting(legacyClient()))
+    return prepareLlmClient(legacyClient(), options)
   }
 }
 
@@ -353,12 +363,16 @@ interface DashscopeTaskResponse {
 function dashscopeImageClient(apiKey: string): OpenAI {
   const base = 'https://dashscope.aliyuncs.com/api/v1'
 
+  function dashscopeHttpError(message: string, status: number): Error & { status: number } {
+    return Object.assign(new Error(message), { status })
+  }
+
   async function downloadAsB64(url: string): Promise<{ b64_json: string }> {
     // Download here and return b64_json instead of the URL: the caller's
     // fetchImageBytes SSRF guard DNS-pins the host, which breaks on fake-ip
     // VPN DNS (resolves to reserved ranges).
     const img = await fetch(url, { signal: AbortSignal.timeout(30_000) })
-    if (!img.ok) throw new Error(`dashscope result download failed: ${img.status}`)
+    if (!img.ok) throw dashscopeHttpError(`dashscope result download failed: ${img.status}`, img.status)
     return { b64_json: Buffer.from(await img.arrayBuffer()).toString('base64') }
   }
 
@@ -375,7 +389,7 @@ function dashscopeImageClient(apiKey: string): OpenAI {
       }),
       signal: AbortSignal.timeout(180_000),
     })
-    if (!resp.ok) throw new Error(`dashscope multimodal-generation failed: ${resp.status} ${await resp.text()}`)
+    if (!resp.ok) throw dashscopeHttpError(`dashscope multimodal-generation failed: ${resp.status} ${await resp.text()}`, resp.status)
     const body = (await resp.json()) as {
       output?: { choices?: { message?: { content?: { image?: string }[] } }[] }
     }
@@ -397,8 +411,9 @@ function dashscopeImageClient(apiKey: string): OpenAI {
         input: { prompt },
         parameters: { size: (size ?? '1024x1024').replace('x', '*'), n: n ?? 1 },
       }),
+      signal: AbortSignal.timeout(30_000),
     })
-    if (!create.ok) throw new Error(`dashscope task create failed: ${create.status} ${await create.text()}`)
+    if (!create.ok) throw dashscopeHttpError(`dashscope task create failed: ${create.status} ${await create.text()}`, create.status)
     const created = (await create.json()) as DashscopeTaskResponse
     const taskId = created.output?.task_id
     if (!taskId) throw new Error(`dashscope task create returned no task_id: ${JSON.stringify(created)}`)
@@ -406,8 +421,11 @@ function dashscopeImageClient(apiKey: string): OpenAI {
     const deadline = Date.now() + 180_000
     for (;;) {
       await new Promise((r) => setTimeout(r, 2000))
-      const poll = await fetch(`${base}/tasks/${taskId}`, { headers: { Authorization: `Bearer ${apiKey}` } })
-      if (!poll.ok) throw new Error(`dashscope task poll failed: ${poll.status}`)
+      const poll = await fetch(`${base}/tasks/${taskId}`, {
+        headers: { Authorization: `Bearer ${apiKey}` },
+        signal: AbortSignal.timeout(30_000),
+      })
+      if (!poll.ok) throw dashscopeHttpError(`dashscope task poll failed: ${poll.status}`, poll.status)
       const status = (await poll.json()) as DashscopeTaskResponse
       const state = status.output?.task_status
       if (state === 'SUCCEEDED') {
@@ -416,7 +434,7 @@ function dashscopeImageClient(apiKey: string): OpenAI {
         return { data: [await downloadAsB64(url)] }
       }
       if (state === 'FAILED' || state === 'CANCELED') {
-        throw new Error(`dashscope task ${state}: ${status.output?.message ?? 'no message'}`)
+        throw dashscopeHttpError(`dashscope task ${state}: ${status.output?.message ?? 'no message'}`, 400)
       }
       if (Date.now() > deadline) throw new Error('dashscope task timed out after 180s')
     }

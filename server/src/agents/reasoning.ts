@@ -7,21 +7,43 @@
 import type { ReasoningEffort } from 'openai/resources/shared.js'
 import { getServerSetting } from '../settings.js'
 
-export function agentReasoningEffort(): ReasoningEffort {
-  return (getServerSetting('agent_reasoning_effort') || 'low') as ReasoningEffort
+export type ConfiguredReasoningEffort = Exclude<ReasoningEffort, null>
+
+const REASONING_EFFORTS = new Set<ConfiguredReasoningEffort>(['none', 'minimal', 'low', 'medium', 'high', 'xhigh'])
+
+function readReasoningEffort(key: string, fallback: ConfiguredReasoningEffort): ConfiguredReasoningEffort {
+  const value = getServerSetting(key)?.trim().toLowerCase() ?? ''
+  if (!value) return fallback
+  return REASONING_EFFORTS.has(value as ConfiguredReasoningEffort)
+    ? value as ConfiguredReasoningEffort
+    : fallback
+}
+
+export function agentReasoningEffort(): ConfiguredReasoningEffort {
+  return readReasoningEffort('agent_reasoning_effort', 'low')
 }
 
 export function agentMaxOutputTokens(): number {
-  return Number(getServerSetting('agent_max_output_tokens') || 4000)
+  const value = Number(getServerSetting('agent_max_output_tokens'))
+  return Number.isFinite(value) && value > 0 ? value : 4000
 }
 
-export function supportReasoningEffort(): ReasoningEffort {
-  return (getServerSetting('support_reasoning_effort') || 'low') as ReasoningEffort
+export function supportReasoningEffort(): ConfiguredReasoningEffort {
+  return readReasoningEffort('support_reasoning_effort', 'none')
+}
+
+export function reasoningOptions(effort: ConfiguredReasoningEffort): { reasoning?: { effort: ReasoningEffort } } {
+  return effort === 'none' ? {} : { reasoning: { effort: effort as ReasoningEffort } }
+}
+
+export function supportReasoningOptions(): { reasoning?: { effort: ReasoningEffort } } {
+  return reasoningOptions(supportReasoningEffort())
 }
 
 /** Additive token headroom for cerebellum calls, so a cranked effort level's
  *  reasoning doesn't eat the entire output budget. Each call site keeps its
  *  own base budget and adds this on top. */
 export function supportReasoningHeadroom(): number {
-  return Number(getServerSetting('support_reasoning_headroom') || 0)
+  const value = Number(getServerSetting('support_reasoning_headroom'))
+  return Number.isFinite(value) && value >= 0 ? value : 0
 }
