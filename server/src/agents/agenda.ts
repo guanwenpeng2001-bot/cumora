@@ -30,7 +30,8 @@
 import { pool } from '../db/pool.js'
 import { env } from '../env.js'
 import { getTrackedLlmClient } from './llm-ledger.js'
-import { SUPPORT_REASONING_EFFORT, SUPPORT_REASONING_HEADROOM } from './reasoning.js'
+import { supportReasoningEffort, supportReasoningHeadroom } from './reasoning.js'
+import { getSupportModel } from '../settings.js'
 import { redis } from '../redis.js'
 
 /** A Kanban card that the agent should plausibly act on. */
@@ -482,7 +483,7 @@ Reply as strict JSON.`
       },
     })
     const r = await client.responses.create({
-      model: env.OPENAI_MODEL_SUPPORT,
+      model: getSupportModel(),
       instructions,
       input,
       text: { format: { type: 'json_object' } },
@@ -490,8 +491,8 @@ Reply as strict JSON.`
       // reasoning. A 300-token cap then truncates the JSON to one character,
       // which made every minute-level BYOA agenda check fail closed. Leave
       // enough room for reasoning plus the small structured verdict.
-      max_output_tokens: 2000 + SUPPORT_REASONING_HEADROOM,
-      reasoning: { effort: SUPPORT_REASONING_EFFORT },
+      max_output_tokens: 2000 + supportReasoningHeadroom(),
+      reasoning: { effort: supportReasoningEffort() },
     })
     const parsed = parseAgendaVerdict(r.output_text ?? '')
     if (!parsed) throw new Error('agenda classifier returned no recoverable verdict')

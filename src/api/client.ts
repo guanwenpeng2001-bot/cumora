@@ -189,6 +189,17 @@ export interface ApiConversation {
   } | null
 }
 
+/** Available-models catalog (settings page "models" tab). Buckets are
+ *  capability-sorted model ids; `gateway: false` means sub2api contributed
+ *  nothing and the UI should show the env-fallback banner. */
+export interface ApiModelCatalog {
+  text: string[]
+  image: string[]
+  audio: string[]
+  embedding: string[]
+  gateway: boolean
+}
+
 export interface ApiQuotaWindow {
   usedUsd: number
   limitUsd: number | null
@@ -1308,6 +1319,16 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ audio, format }),
     }),
+  /** Settings page "models" tab. */
+  getModelSettings: () =>
+    http<{ settings: Record<string, string> }>('/settings/models'),
+  putModelSettings: (settings: Record<string, string>) =>
+    http<{ ok: boolean }>('/settings/models', {
+      method: 'PUT',
+      body: JSON.stringify({ settings }),
+    }),
+  getAvailableModels: (refresh = false) =>
+    http<ApiModelCatalog>(`/models/available${refresh ? '?refresh=1' : ''}`),
   markRead: (conversationId: string) =>
     http<{ ok: boolean }>(`/conversations/${encodeURIComponent(conversationId)}/read`, {
       method: 'POST',

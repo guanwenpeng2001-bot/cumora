@@ -19,6 +19,7 @@
 
 import { randomUUID } from 'node:crypto'
 import { env } from '../env.js'
+import { getSupportModel } from '../settings.js'
 import { getTrackedLlmClient } from './llm-ledger.js'
 import { pool } from '../db/pool.js'
 import { enqueueBroadcast, nudgeRealtimeOutbox } from '../realtime-outbox.js'
@@ -312,7 +313,7 @@ async function tPalette(args: Record<string, unknown>, companyId: string | null,
   const r = await openai.responses.create({
     // Palette is a tiny JSON-only utility: 5 hex codes, no reasoning required.
     // Route through the cerebellum (support) model, not the agent's brain.
-    model: env.OPENAI_MODEL_SUPPORT,
+    model: getSupportModel(),
     instructions: 'You produce 5-color hex palettes. Reply ONLY with JSON: {"colors":["#RRGGBB", ...]}. No prose.',
     input: `Design brief: ${brief}\n\nReply with JSON only.`,
     text: { format: { type: 'json_object' } },

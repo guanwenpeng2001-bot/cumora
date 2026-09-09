@@ -12,6 +12,7 @@ import { storage, UPLOAD_DIR } from './storage.js'
 import { attachWebSocket, resetHumanPresenceOnBoot } from './ws.js'
 import { bootDocumentBus } from './documents/rooms.js'
 import { pool } from './db/pool.js'
+import { getBrainModel, initServerSettings, startServerSettingsRefresher } from './settings.js'
 import { redis } from './redis.js'
 import { startScanner } from './agents/scanner.js'
 import { startScheduler } from './agents/scheduler.js'
@@ -228,8 +229,16 @@ async function main() {
   // doc redis channels here so two server instances stay convergent.
   bootDocumentBus()
 
+  // Runtime model settings: seed from env on first boot, warm the snapshot,
+  // then keep it fresh so settings-page edits apply without a restart.
+  // Fire-and-forget with its own error containment — a settings-table hiccup
+  // must never block the listener (env fallbacks serve meanwhile).
+  void initServerSettings()
+    .then(() => startServerSettingsRefresher())
+    .catch((e) => console.warn('[settings] init failed; env fallbacks in effect', e instanceof Error ? e.message : e))
+
   server.listen(env.PORT, () => {
-    console.log(`[boot] cumora server :${env.PORT} · instance ${env.INSTANCE_ID} · model ${env.OPENAI_MODEL}`)
+    console.log(`[boot] cumora server :${env.PORT} · instance ${env.INSTANCE_ID} · model ${getBrainModel()}`)
   })
 
   // Demote any 'avail' humans left over from the previous run; real

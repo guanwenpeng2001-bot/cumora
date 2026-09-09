@@ -29,6 +29,7 @@
  *   3  unrecoverable stream error (couldn't connect after N retries)
  */
 import { pool } from '../../db/pool.js'
+import { initServerSettings, startServerSettingsRefresher } from '../../settings.js'
 import { runAgentTurn, type AgentTurnOptions } from '../turn.js'
 import { runtime } from './select.js'
 import { notifyAlert } from '../../alerting.js'
@@ -264,6 +265,12 @@ async function main(): Promise<void> {
     process.exit(2)
   }
   console.log(`[pod-agent] starting · agent=${agentId} idleMs=${idleMs} noWorkMs=${noWorkMs} pid=${process.pid}`)
+
+  // Model settings follow the server_settings table (pods have DATABASE_URL);
+  // env fallbacks serve until the first load lands.
+  void initServerSettings()
+    .then(() => startServerSettingsRefresher())
+    .catch((e) => console.warn('[settings] init failed; env fallbacks in effect', e instanceof Error ? e.message : e))
 
   // Announce "I'm awake" — agent shows up in UI as `avail` while
   // waiting for wakes. The turn loop itself flips status to

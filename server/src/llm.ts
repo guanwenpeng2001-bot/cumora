@@ -44,6 +44,7 @@ import OpenAI from 'openai'
 import { pool } from './db/pool.js'
 import { env } from './env.js'
 import { isNovitaModel, novitaResponsesShim } from './novita.js'
+import { resolvedChain, runWithFallback, isFallbackableError } from './agents/fallback.js'
 import { isOrcaRouterModel, orcarouterResponsesCreate } from './orcarouter.js'
 import { sub2apiRoutingConfigured, sub2apiOpenAIBaseURL, parseApiKeyMap, pickPlatformForModel, listKeyModels, SUB2API_PLATFORMS, type Platform, type ApiKeyMap } from './sub2api.js'
 
@@ -152,6 +153,40 @@ function withProviderRouting(client: OpenAI): OpenAI {
   })
 }
 
+/** Text-role fallback wrapper: when the requested model IS a role primary
+ *  (brain/support/compaction), retry the call down the role's chain on
+ *  fallbackable errors (402/429/5xx/network). Chain hops re-enter the
+ *  wrapped client's normal routing (provider prefixes, then per-platform
+ *  sub2api keys), so a hop can live on a different platform group. */
+function withModelFallback(client: OpenAI): OpenAI {
+  return new Proxy(client, {
+    get(target, prop, receiver): unknown {
+      if (prop !== 'responses') return Reflect.get(target, prop, receiver)
+      const real = target.responses
+      return new Proxy(real, {
+        get(rt, p, rr): unknown {
+          if (p !== 'create') return Reflect.get(rt, p, rr)
+          const realCreate = real.create as (a: unknown, o?: unknown) => unknown
+          return (args: { model?: string } & Record<string, unknown>, opts?: unknown) => {
+            let chain: string[] = []
+            const model = args?.model
+            // Only unprefixed role primaries get a chain — provider-prefixed
+            // models (novita/, orcarouter/) route out of sub2api entirely.
+            if (model && !model.includes('/')) {
+              for (const role of ['brain', 'support', 'compaction'] as const) {
+                const c = resolvedChain(role)
+                if (c[0] && c[0] === model) { chain = c; break }
+              }
+            }
+            if (chain.length <= 1) return realCreate.call(real, args, opts)
+            return runWithFallback(chain, (m) => realCreate.call(real, { ...args, model: m }, opts) as Promise<unknown>)
+          }
+        },
+      })
+    },
+  })
+}
+
 /** Per-tenant model→platform route cache for multi-key sub2api users.
  *  Built from each platform key's gateway /v1/models view (scoped to the
  *  key's group); a fetch failure degrades to an empty set, which just
@@ -248,11 +283,11 @@ export async function getLlmClient(tenant: string | null): Promise<OpenAI> {
   if (testLlmOverride) return testLlmOverride(tenant)
   // No tenant context → legacy. Gate on the base URL only (not the
   // admin key): agent pods route per-platform without admin rights.
-  if (!tenant || !sub2apiRoutingConfigured()) return withProviderRouting(legacyClient())
+  if (!tenant || !sub2apiRoutingConfigured()) return withModelFallback(withProviderRouting(legacyClient()))
 
   const cached = cache.get(tenant)
   if (cached && Date.now() - cached.mintedAt < CACHE_TTL_MS) {
-    return withProviderRouting(cached.client)
+    return withModelFallback(withProviderRouting(cached.client))
   }
 
   try {
@@ -270,14 +305,14 @@ export async function getLlmClient(tenant: string | null): Promise<OpenAI> {
       // hop, but with a short TTL so the next backfill picks up quickly.
       const c = legacyClient()
       cache.set(tenant, { client: c, key: 'legacy', mintedAt: Date.now() })
-      return withProviderRouting(c)
+      return withModelFallback(withProviderRouting(c))
     }
     const c = buildSub2apiClient(sub2apiOpenAIBaseURL(), parseApiKeyMap(rawKey), tenant)
     cache.set(tenant, { client: c, key: rawKey, mintedAt: Date.now() })
-    return withProviderRouting(c)
+    return withModelFallback(withProviderRouting(c))
   } catch (e) {
     console.warn(`[llm] tenant ${tenant} client lookup failed; legacy fallback`, e instanceof Error ? e.message : e)
-    return withProviderRouting(legacyClient())
+    return withModelFallback(withProviderRouting(legacyClient()))
   }
 }
 
@@ -388,12 +423,14 @@ function dashscopeImageClient(apiKey: string): OpenAI {
   }
 
   async function generate(args: { model: string; prompt: string; size?: string; n?: number }) {
-    // Fallback chain: primary model from the caller, then OPENAI_IMAGE_FALLBACK_MODELS
-    // in order. Quota exhaustion / unknown model / transient failure all advance
-    // the chain; the last error surfaces if every model fails.
-    const fallbacks = (process.env.OPENAI_IMAGE_FALLBACK_MODELS ?? '')
-      .split(',').map((s) => s.trim()).filter(Boolean)
-    const chain = [args.model, ...fallbacks.filter((m) => m !== args.model)]
+    // Chain from runtime settings (server_settings, env fallback): the image
+    // role's primary + ordered fallbacks. A caller-passed model that differs
+    // from the settings primary is honored as the first hop. Only
+    // fallbackable errors (402/429/5xx/network) advance the chain.
+    const settingsChain = resolvedChain('image')
+    const chain = args.model && !settingsChain.includes(args.model)
+      ? [args.model, ...settingsChain]
+      : settingsChain.length > 0 ? settingsChain : [args.model]
     let lastErr: unknown = null
     for (const model of chain) {
       try {
@@ -403,6 +440,7 @@ function dashscopeImageClient(apiKey: string): OpenAI {
         return await generateAsync(model, args.prompt, args.size, args.n)
       } catch (e) {
         lastErr = e
+        if (!isFallbackableError(e)) throw e
         console.warn(`[image] ${model} failed, trying next:`, e instanceof Error ? e.message.slice(0, 200) : e)
       }
     }
@@ -432,20 +470,17 @@ export function getImageClient(): OpenAI {
  *  endpoint — the qwen3-asr models accept an `input_audio` content part
  *  carrying a base64 data URL.
  *
- *  Fallback chain mirrors dashscopeImageClient: primary model from
- *  OPENAI_AUDIO_MODEL, then OPENAI_AUDIO_FALLBACK_MODELS (comma-separated)
- *  in order; the last error surfaces if every model fails.
+ *  Chain comes from runtime settings (server_settings audio_model +
+ *  audio_fallback_models, env fallback); only fallbackable errors
+ *  (402/429/5xx/network) advance — 400/401 surface immediately.
  *  Key comes from OPENAI_AUDIO_API_KEY, falling back to
  *  OPENAI_IMAGE_API_KEY (same Bailian key on this deployment). */
 export async function transcribeAudio(audioBase64: string, format: string): Promise<string> {
   const apiKey = (process.env.OPENAI_AUDIO_API_KEY ?? '').trim() || (process.env.OPENAI_IMAGE_API_KEY ?? '').trim()
   if (!apiKey) throw new Error('OPENAI_AUDIO_API_KEY is not set (and no OPENAI_IMAGE_API_KEY fallback)')
-  const primary = (process.env.OPENAI_AUDIO_MODEL ?? '').trim()
-  if (!primary) throw new Error('OPENAI_AUDIO_MODEL is not set')
+  const chain = resolvedChain('audio')
+  if (chain.length === 0) throw new Error('audio_model is not set (OPENAI_AUDIO_MODEL)')
   const base = (process.env.OPENAI_AUDIO_BASE_URL || 'https://dashscope.aliyuncs.com/compatible-mode/v1').replace(/\/+$/, '')
-  const fallbacks = (process.env.OPENAI_AUDIO_FALLBACK_MODELS ?? '')
-    .split(',').map((s) => s.trim()).filter(Boolean)
-  const chain = [primary, ...fallbacks.filter((m) => m !== primary)]
   let lastErr: unknown = null
   for (const model of chain) {
     try {
@@ -461,13 +496,16 @@ export async function transcribeAudio(audioBase64: string, format: string): Prom
         }),
         signal: AbortSignal.timeout(120_000),
       })
-      if (!resp.ok) throw new Error(`asr request failed: ${resp.status} ${(await resp.text()).slice(0, 300)}`)
+      // Carry the status so isFallbackableError can tell 401/400 (fatal)
+      // from 429/5xx (advance the chain).
+      if (!resp.ok) throw Object.assign(new Error(`asr request failed: ${resp.status} ${(await resp.text()).slice(0, 300)}`), { status: resp.status })
       const body = (await resp.json()) as { choices?: { message?: { content?: string } }[] }
       const text = body.choices?.[0]?.message?.content?.trim()
       if (!text) throw new Error(`asr returned no text: ${JSON.stringify(body).slice(0, 300)}`)
       return text
     } catch (e) {
       lastErr = e
+      if (!isFallbackableError(e)) throw e
       console.warn(`[asr] ${model} failed, trying next:`, e instanceof Error ? e.message.slice(0, 200) : e)
     }
   }

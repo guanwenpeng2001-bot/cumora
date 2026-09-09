@@ -19,7 +19,8 @@
  */
 import type { ResponseInputItem, ResponseStreamEvent } from 'openai/resources/responses/responses'
 import { env } from '../env.js'
-import { AGENT_REASONING_EFFORT, AGENT_MAX_OUTPUT_TOKENS, SUPPORT_REASONING_EFFORT, SUPPORT_REASONING_HEADROOM } from './reasoning.js'
+import { agentReasoningEffort, agentMaxOutputTokens, supportReasoningEffort, supportReasoningHeadroom } from './reasoning.js'
+import { getBrainModel, getCompactionModel } from '../settings.js'
 import { redis } from '../redis.js'
 import { readLocalMessageAttachment } from '../local-attachment-files.js'
 import { messageAttachmentStorageKey } from '../storage-keys.js'
@@ -1196,7 +1197,7 @@ async function verifyTerminalCompletion(args: {
 }): Promise<CompletionVerification> {
   const client = await getLlmClient(args.tenant)
   // Completion verification is auxiliary judgment, not a real task — small model.
-  const model = enforceModelPolicy(env.OPENAI_COMPACTION_MODEL || supportModel(), 'completion-verify')
+  const model = enforceModelPolicy(getCompactionModel() || supportModel(), 'completion-verify')
   const instructions = `You are Cumora's turn-completion verifier. Decide whether agent "${args.persona.name}" may safely end this turn.
 
 Use semantic judgment, not keyword rules. Read the actual conversation and the actual side effects. A reaction can be a valid lightweight response only when the human did not ask for a deliverable, answer, artifact, image, file, external action, or status report that remains missing. If the human asked for work and the side effects only acknowledge it, completion is false.
@@ -1249,8 +1250,8 @@ Reply ONLY as JSON: {"complete":boolean,"reason":"short factual reason","next_st
         },
       ],
       stream: true,
-      max_output_tokens: 500 + SUPPORT_REASONING_HEADROOM,
-      reasoning: { effort: SUPPORT_REASONING_EFFORT },
+      max_output_tokens: 500 + supportReasoningHeadroom(),
+      reasoning: { effort: supportReasoningEffort() },
       signal: ctrl.signal,
     } as unknown as Parameters<typeof client.responses.create>[0])
 
@@ -1341,7 +1342,7 @@ async function summarizeHistoryItems(
   // cheaper model without affecting the agent's main reasoning quality.
   // Falls back to the agent's own model so unset == "current behavior".
   // Summarizing earlier tool work is auxiliary, not a real task — small model.
-  const model = enforceModelPolicy(env.OPENAI_COMPACTION_MODEL || supportModel(), 'compaction')
+  const model = enforceModelPolicy(getCompactionModel() || supportModel(), 'compaction')
   const instructions = `You are summarizing earlier tool work that agent "${persona.name}" did during a single turn, so the agent can continue without seeing the raw history. Write a concise, factual "what I've done so far" note (≤ 800 words) that includes:
 
 - Which tools were called, and what each returned (paths, IDs, key strings, error messages — keep the SPECIFIC data, not the generalities)
@@ -1384,8 +1385,8 @@ Skip narrative framing. No headings, no bullet symbols unless they aid clarity. 
         },
       ],
       stream: true,
-      max_output_tokens: 1500 + SUPPORT_REASONING_HEADROOM,
-      reasoning: { effort: SUPPORT_REASONING_EFFORT },
+      max_output_tokens: 1500 + supportReasoningHeadroom(),
+      reasoning: { effort: supportReasoningEffort() },
     } as unknown as Parameters<typeof client.responses.create>[0])
 
     let collected = ''
@@ -1496,7 +1497,7 @@ async function summarizeSteerBatch(
   const flattened = batch.map((s) => `@${s.authorName} in ${s.conversationId}:\n${s.body}`).join('\n\n---\n\n')
   const client = await getLlmClient(tenant)
   // Digesting a mid-turn steer batch is auxiliary, not a real task — small model.
-  const model = enforceModelPolicy(env.OPENAI_COMPACTION_MODEL || supportModel(), 'steer-summary')
+  const model = enforceModelPolicy(getCompactionModel() || supportModel(), 'steer-summary')
   const draft = (draftAssistantText ?? '').trim()
   const draftBlock = draft
     ? `\n\nThe agent was ABOUT TO SEND this reply when the new messages arrived:\n---\n${draft}\n---\nFlag explicitly if any new message changes the answer they were about to give.`
@@ -1543,8 +1544,8 @@ Treat the output as a private memo that will be appended to the agent's input. E
         },
       ],
       stream: true,
-      max_output_tokens: 600 + SUPPORT_REASONING_HEADROOM,
-      reasoning: { effort: SUPPORT_REASONING_EFFORT },
+      max_output_tokens: 600 + supportReasoningHeadroom(),
+      reasoning: { effort: supportReasoningEffort() },
       signal: ctrl.signal,
     } as unknown as Parameters<typeof client.responses.create>[0])
 
@@ -2059,7 +2060,7 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
     kind: 'prompt.ready',
     title: 'System prompt ready',
     data: {
-      model: persona.model ?? env.OPENAI_MODEL,
+      model: persona.model ?? getBrainModel(),
       toolCount: TOOL_DEFS_RESPONSES.length,
       instructions: traceText(instructions),
     },
@@ -2446,7 +2447,7 @@ Mechanics:
     // AND the original user input alone is huge (e.g. a giant attachment
     // dump). In that case the next wake will start fresh, which IS the
     // ultimate compaction.
-    const modelInUse = persona.model ?? env.OPENAI_MODEL
+    const modelInUse = persona.model ?? getBrainModel()
     const compactThreshold = compactThresholdFor(modelInUse)
     const hardLimit = hardLimitFor(modelInUse)
     if (totalTokensThisTurn > compactThreshold) {
@@ -2588,7 +2589,7 @@ Mechanics:
         data: {
           hop: hop + 1,
           attempt: attempt + 1,
-          model: persona.model ?? env.OPENAI_MODEL,
+          model: persona.model ?? getBrainModel(),
           inputItems: inputForAttempt.length,
           historyItems: history.length,
           instructions: traceText(instructions),
@@ -2596,8 +2597,8 @@ Mechanics:
           tools: traceToolDefinitions(),
           request: {
             toolChoice: 'auto',
-            reasoning: { effort: AGENT_REASONING_EFFORT },
-            maxOutputTokens: AGENT_MAX_OUTPUT_TOKENS,
+            reasoning: { effort: agentReasoningEffort() },
+            maxOutputTokens: agentMaxOutputTokens(),
           },
         },
         stage: retryKind === null
@@ -2636,8 +2637,8 @@ Mechanics:
           input: inputForAttempt,
           tools: TOOL_DEFS_RESPONSES,
           tool_choice: 'auto',
-          reasoning: { effort: AGENT_REASONING_EFFORT },
-          max_output_tokens: AGENT_MAX_OUTPUT_TOKENS,
+          reasoning: { effort: agentReasoningEffort() },
+          max_output_tokens: agentMaxOutputTokens(),
           // No `previous_response_id` — sub2api's OAuth /v1/responses path
           // rejects it (see history block above). The full transcript is
           // re-sent via `inputForAttempt` instead.
@@ -2758,7 +2759,7 @@ Mechanics:
       title: toolCalls.length > 0 ? `Model requested ${toolCalls.length} tool call${toolCalls.length === 1 ? '' : 's'}` : 'Model completed with no tool calls',
       data: {
         hop: hop + 1,
-        model: persona.model ?? env.OPENAI_MODEL,
+        model: persona.model ?? getBrainModel(),
         responseId: streamState.responseId,
         status: streamState.responseStatus,
         outputText: traceText(Array.from(streamState.responseTextByPart.values()).join('\n')),
@@ -3548,7 +3549,7 @@ Mechanics:
       error: finalError,
       toolCallCount,
       tokenCount: totalTokensThisTurn,
-      model: persona.model ?? env.OPENAI_MODEL,
+      model: persona.model ?? getBrainModel(),
       usage: turnUsage,
     }).catch((err) => console.error(`[turn] ${agentId} failed to finish observability run`, err))
   }

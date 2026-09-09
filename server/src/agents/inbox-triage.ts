@@ -1,5 +1,6 @@
 import type { ContextRow, InboxRow, PersonaRow, WorklogEntry } from './runtime/client.js'
-import { SUPPORT_REASONING_EFFORT, SUPPORT_REASONING_HEADROOM } from './reasoning.js'
+import { supportReasoningEffort, supportReasoningHeadroom } from './reasoning.js'
+import { getSupportModel } from '../settings.js'
 import { env } from '../env.js'
 import { getTrackedLlmClient } from './llm-ledger.js'
 import { inprocClient } from './runtime/inproc-client.js'
@@ -66,15 +67,15 @@ export async function classifyInboxTriage(args: {
 
   try {
     const r = await client.responses.create({
-      model: env.OPENAI_MODEL_SUPPORT,
+      model: getSupportModel(),
       instructions: req.instructions,
       input: req.input,
       text: { format: { type: 'json_object' } },
       // Thinking models (e.g. deepseek vision-exp) spend part of this budget on
       // reasoning_content before emitting the JSON — 500 starves them into an
       // empty content. 2000 leaves room for brief reasoning + the verdict JSON.
-      max_output_tokens: 2000 + SUPPORT_REASONING_HEADROOM,
-      reasoning: { effort: SUPPORT_REASONING_EFFORT },
+      max_output_tokens: 2000 + supportReasoningHeadroom(),
+      reasoning: { effort: supportReasoningEffort() },
     }, {
       // Triage is a fast GATE. Do NOT retry — a rate-limited model retried (or
       // escalated to the big brain on fail-open) is exactly what burned users'
@@ -92,7 +93,7 @@ export async function classifyInboxTriage(args: {
         agentId: args.agentId,
         companyId: args.companyId,
         source: 'cloud',
-        model: env.OPENAI_MODEL_SUPPORT,
+        model: getSupportModel(),
         actionable: verdict.actionable,
         reason: verdict.reason,
         usage: usageFromOpenAI(r.usage),
@@ -171,12 +172,12 @@ export async function gateSyntheticWake(args: {
       extras: { kind: args.kind, persona: args.personaName },
     })
     const r = await client.responses.create({
-      model: env.OPENAI_MODEL_SUPPORT,
+      model: getSupportModel(),
       instructions,
       input,
       text: { format: { type: 'json_object' } },
-      max_output_tokens: 300 + SUPPORT_REASONING_HEADROOM,
-      reasoning: { effort: SUPPORT_REASONING_EFFORT },
+      max_output_tokens: 300 + supportReasoningHeadroom(),
+      reasoning: { effort: supportReasoningEffort() },
     }, { maxRetries: 0, timeout: 8_000 })
     const parsed = JSON.parse(r.output_text ?? '{}') as { act?: unknown; reason?: unknown; note?: unknown }
     return {

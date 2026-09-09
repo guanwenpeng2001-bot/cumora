@@ -37,6 +37,10 @@ import {
   EMAIL_MESSAGES_COMPANY_SMTP_ID_SQL,
   emailMessagesCompanySmtpIdChecksum,
 } from './migrations/0006-email-messages-company-smtp-id.js'
+import {
+  SERVER_SETTINGS_SQL,
+  serverSettingsChecksum,
+} from './migrations/0007-server-settings.js'
 
 /** Frozen data backfill embedded in migration 0001. Exported so its behavior
  * can be exercised against PostgreSQL without replaying the whole migration. */
@@ -2542,6 +2546,12 @@ async function applyEmailMessagesCompanySmtpId(client: import('pg').PoolClient):
   await client.query(DROP_LEGACY_EMAIL_MESSAGES_SMTP_ID_SQL)
 }
 
+/** Plain DDL, safe in a transaction: CREATE TABLE IF NOT EXISTS +
+ *  ADD COLUMN IF NOT EXISTS are both idempotent on retry. */
+async function applyServerSettings(client: import('pg').PoolClient): Promise<void> {
+  await client.query(SERVER_SETTINGS_SQL)
+}
+
 const VERSIONED_MIGRATIONS: readonly VersionedMigration[] = [
   {
     ...SCHEMA_MIGRATIONS[0],
@@ -2580,6 +2590,12 @@ const VERSIONED_MIGRATIONS: readonly VersionedMigration[] = [
     // CREATE/DROP INDEX CONCURRENTLY cannot run inside a transaction block.
     transactional: false,
     up: applyEmailMessagesCompanySmtpId,
+  },
+  {
+    ...SCHEMA_MIGRATIONS[6],
+    sourceChecksum: serverSettingsChecksum(),
+    transactional: true,
+    up: applyServerSettings,
   },
 ]
 

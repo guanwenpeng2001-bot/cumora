@@ -11,11 +11,14 @@ import { enqueueWorkspaceCleanup, nudgeWorkspaceCleanupWorker } from '../workspa
 import { collectDocumentStorageKeys, evictDocumentRoom } from '../documents/rooms.js'
 import { createPoll, castVote, closePoll, PollError } from '../polls.js'
 import { env } from '../env.js'
+import { getImageModel, getSupportModel } from '../settings.js'
 import { publicBodyParserError } from '../body-parser-errors.js'
 import { startConvene } from '../agents/convene.js'
 import { ensureDirectConversation } from '../agents/private_chat.js'
 import { fetchImageBytes } from '../agents/image-fetcher.js'
 import { transcribeAudio } from '../llm.js'
+import { SETTING_DEFS, getServerSetting, writeServerSettings, KNOWN_SETTING_KEYS } from '../settings.js'
+import { availableModels, invalidateModelCatalog } from '../models-catalog.js'
 import { getTriageEconomics, getWakeEconomics } from '../agents/observability.js'
 import { resolveKanbanAssigneeChange, wakeKanbanAgents } from '../agents/kanban-wake.js'
 import { AgentCreationError, createAgentRecord } from '../agents/create.js'
@@ -675,6 +678,50 @@ api.post('/audio/transcription', requireAuthBeforeLargeBody, audioJsonParser, sa
   }
   const text = await transcribeAudio(audio, format)
   res.json({ text })
+}))
+
+/** Site-admin gate for server-global settings (users.is_admin). */
+async function requireSiteAdmin(req: Request & AuthedRequest): Promise<string> {
+  const userId = requireAuth(req)
+  const { rows } = await pool.query<{ is_admin: boolean }>(`SELECT is_admin FROM users WHERE id = $1`, [userId])
+  if (!rows[0]?.is_admin) throw new HttpError(403, 'admin only')
+  return userId
+}
+
+/** Model settings (settings page "models" tab). GET reads the resolved
+ *  snapshot (DB → env fallback); PUT writes server_settings and takes
+ *  effect without a restart. */
+api.get('/settings/models', safe(async (req, res) => {
+  await requireSiteAdmin(req)
+  const settings: Record<string, string> = {}
+  for (const def of SETTING_DEFS) settings[def.key] = getServerSetting(def.key)
+  res.json({ settings })
+}))
+
+api.put('/settings/models', safe(async (req, res) => {
+  await requireSiteAdmin(req)
+  const body = (req.body ?? {}) as { settings?: unknown }
+  const entries = body.settings
+  if (!entries || typeof entries !== 'object' || Array.isArray(entries)) {
+    throw new HttpError(400, 'settings must be an object of key → string')
+  }
+  const clean: Record<string, string> = {}
+  for (const [k, v] of Object.entries(entries as Record<string, unknown>)) {
+    if (!KNOWN_SETTING_KEYS.has(k)) throw new HttpError(400, `unknown setting key: ${k}`)
+    if (typeof v !== 'string') throw new HttpError(400, `setting ${k} must be a string`)
+    clean[k] = v
+  }
+  await writeServerSettings(clean)
+  invalidateModelCatalog()
+  res.json({ ok: true })
+}))
+
+/** Available-models catalog: sub2api live (caller's keys) + BYOA computer
+ *  catalogs + configured settings, bucketed by capability. 5min cache,
+ *  ?refresh=1 forces a rebuild. */
+api.get('/models/available', safe(async (req, res) => {
+  const userId = requireAuth(req)
+  res.json(await availableModels(userId, req.query?.refresh === '1'))
 }))
 
 // Liveness: "is this process alive?" — MUST NOT touch the DB. A slow or
@@ -2814,7 +2861,7 @@ async function inferAgentGender(args: {
       extras: { agentName: name, role: role.slice(0, 60) },
     })
     const r = await client.responses.create({
-      model: env.OPENAI_MODEL_SUPPORT,
+      model: getSupportModel(),
       // Lean STRONGLY COMMITTAL toward feminine/masculine. The androgynous
       // branch's pools (short hair + menswear) drift the output toward a
       // butch register the project doesn't want, so reserve androgynous for
@@ -3212,7 +3259,7 @@ export async function generateAndPersistAvatar(args: {
   const { getImageClient } = await import('../llm.js')
   const client = getImageClient()
   const r = await client.images.generate({
-    model: env.OPENAI_IMAGE_MODEL,
+    model: getImageModel(),
     prompt,
     size: '1024x1024',
     n: 1,

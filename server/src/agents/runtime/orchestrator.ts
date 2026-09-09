@@ -25,6 +25,8 @@ import { spawn } from 'node:child_process'
 import { env } from '../../env.js'
 import { pool } from '../../db/pool.js'
 import { sub2apiConfigured, sub2apiOpenAIBaseURL, parseApiKeyMap, SUB2API_PLATFORMS } from '../../sub2api.js'
+import { getBrainModel, getSupportModel, getCompactionModel } from '../../settings.js'
+import { agentReasoningEffort, agentMaxOutputTokens, supportReasoningEffort, supportReasoningHeadroom } from '../reasoning.js'
 import { inprocClient } from './inproc-client.js'
 import { signAgentToken } from './jwt.js'
 import { notifyAlert } from '../../alerting.js'
@@ -424,25 +426,25 @@ ${indent(podUrl(env.DATABASE_URL))}
 ${indent(podUrl(env.SUB2API_INTERNAL_URL))}
     - name: OPENAI_MODEL
       value: |-
-${indent(env.OPENAI_MODEL)}
+${indent(getBrainModel())}
     - name: OPENAI_MODEL_SUPPORT
       value: |-
-${indent(env.OPENAI_MODEL_SUPPORT)}
+${indent(getSupportModel())}
     - name: OPENAI_COMPACTION_MODEL
       value: |-
-${indent(env.OPENAI_COMPACTION_MODEL)}
+${indent(getCompactionModel())}
     - name: CUMORA_REASONING_EFFORT
       value: |-
-${indent(process.env.CUMORA_REASONING_EFFORT ?? 'low')}
+${indent(agentReasoningEffort() ?? 'low')}
     - name: CUMORA_AGENT_MAX_OUTPUT_TOKENS
       value: |-
-${indent(process.env.CUMORA_AGENT_MAX_OUTPUT_TOKENS ?? '4000')}
+${indent(String(agentMaxOutputTokens()))}
     - name: CUMORA_SUPPORT_REASONING_EFFORT
       value: |-
-${indent(process.env.CUMORA_SUPPORT_REASONING_EFFORT ?? 'low')}
+${indent(supportReasoningEffort() ?? 'low')}
     - name: CUMORA_SUPPORT_REASONING_HEADROOM
       value: |-
-${indent(process.env.CUMORA_SUPPORT_REASONING_HEADROOM ?? '0')}
+${indent(String(supportReasoningHeadroom()))}
   # Spot/Preemptible toleration: GKE Spot VM nodes are tainted
   # cloud.google.com/gke-spot=true:NoSchedule by default so cluster-
   # critical pods don't accidentally land on them. Agent pods are

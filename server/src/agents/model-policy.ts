@@ -10,7 +10,7 @@
  * caught immediately ("及时发现") and contained rather than silently burning
  * brain-model tokens.
  */
-import { env } from '../env.js'
+import { getBrainModel, getSupportModel } from '../settings.js'
 import { notifyAlert } from '../alerting.js'
 
 export type ModelPurpose =
@@ -35,12 +35,12 @@ const REAL_TASK_PURPOSES: ReadonlySet<ModelPurpose> = new Set<ModelPurpose>([
 
 /** The small/cerebellum model for all auxiliary work. */
 export function supportModel(): string {
-  return env.OPENAI_MODEL_SUPPORT
+  return getSupportModel()
 }
 
 /** The big/brain model for a real task (a per-agent override wins). */
 export function realTaskModel(personaModel?: string | null): string {
-  return personaModel ?? env.OPENAI_MODEL
+  return personaModel ?? getBrainModel()
 }
 
 /**
@@ -49,20 +49,20 @@ export function realTaskModel(personaModel?: string | null): string {
  * fall back to the support model so the misuse is both surfaced and contained.
  */
 export function enforceModelPolicy(model: string, purpose: ModelPurpose): string {
-  if (!REAL_TASK_PURPOSES.has(purpose) && model === env.OPENAI_MODEL) {
+  if (!REAL_TASK_PURPOSES.has(purpose) && model === getBrainModel()) {
     const msg =
       `[model-policy] VIOLATION: purpose "${purpose}" attempted the BIG model "${model}". ` +
       `Only real tasks (${[...REAL_TASK_PURPOSES].join(', ')}) may use the big model; ` +
-      `forcing the support model "${env.OPENAI_MODEL_SUPPORT}".`
+      `forcing the support model "${getSupportModel()}".`
     console.error(msg)
     // P0: an unnecessary big-brain selection reached runtime — page immediately.
     // notifyAlert never throws/blocks; fire-and-forget so the policy stays sync.
     void notifyAlert({
       label: 'model-policy.violation',
       error: new Error(`big model used for non-real-task purpose "${purpose}"`),
-      extras: { purpose, attemptedModel: model, forcedModel: env.OPENAI_MODEL_SUPPORT },
+      extras: { purpose, attemptedModel: model, forcedModel: getSupportModel() },
     })
-    return env.OPENAI_MODEL_SUPPORT
+    return getSupportModel()
   }
   return model
 }

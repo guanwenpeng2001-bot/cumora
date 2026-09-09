@@ -13,6 +13,7 @@ import { pool } from '../db/pool.js'
 import type { PoolClient } from 'pg'
 import { storage, freshenAttachmentUrl, type StoredAttachment } from '../storage.js'
 import { env } from '../env.js'
+import { getImageModel } from '../settings.js'
 import type { CliResult, CliSideEffect } from './cli-result.js'
 import { fetchImageBytes } from './image-fetcher.js'
 import { stripLoneSurrogates } from './text-safety.js'
@@ -2469,7 +2470,7 @@ async function generateAndUploadImage(opts: {
   const { getImageClient } = await import('../llm.js')
   const client = getImageClient()
   const r = await client.images.generate({
-    model: env.OPENAI_IMAGE_MODEL,
+    model: getImageModel(),
     prompt: opts.prompt,
     size,
     n: 1,
@@ -2559,7 +2560,7 @@ async function cmdImage(parsed: ParsedArgs): Promise<CliResult> {
       : size === 'tall' ? '1024×1536'
       : '1024×1024'
     return ok([
-      `generated ${dim} · ${Math.round(att.size / 1024)}KB · ${env.OPENAI_IMAGE_MODEL}`,
+      `generated ${dim} · ${Math.round(att.size / 1024)}KB · ${getImageModel()}`,
       `name: ${att.name}`,
       `url:  ${att.url}`,
       `key:  ${att.key}`,

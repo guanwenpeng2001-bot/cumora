@@ -10,6 +10,7 @@ import { Checkbox } from '@/components/Checkbox'
 import { AppearancePicker, ChatLayoutPicker } from '@/components/AppearancePicker'
 import { LanguagePicker } from '@/components/LanguagePicker'
 import { useT, type MessageKey } from '@/lib/i18n'
+import { ModelsTab } from './ModelsTab'
 import { cn } from '@/lib/utils'
 import { api, getPairingServerOrigin, getServerOrigin, type ApiProject, type ApiQuotaSnapshot, type ApiQuotaWindow } from '@/api/client'
 import { ENGINE_BIN, ENGINE_LABEL, RUNNABLE_ENGINES, RUNNABLE_ENGINE_IDS, engineLabel, type RunnableEngineId } from '@/lib/engines'
@@ -21,6 +22,7 @@ import type { Computer, EngineId } from '@/types'
 const tabs = [
   { key: 'profile', label: 'me.tab.profile' },
   { key: 'usage', label: 'me.tab.usage' },
+  { key: 'models', label: 'me.tab.models' },
   { key: 'computers', label: 'me.tab.computers' },
   { key: 'projects', label: 'me.tab.projects' },
   { key: 'trust', label: 'me.tab.trust' },
@@ -1376,6 +1378,7 @@ export function MeView() {
 
         {tab === 'profile' && <ProfileTab />}
         {tab === 'usage' && <UsageTab />}
+        {tab === 'models' && <ModelsTab />}
         {tab === 'computers' && <ComputersTab />}
         {tab === 'projects' && <ProjectsTab />}
         {tab === 'trust' && <TrustTab />}

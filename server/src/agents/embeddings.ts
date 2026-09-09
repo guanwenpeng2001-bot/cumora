@@ -17,7 +17,7 @@ import OpenAI from 'openai'
 import { env } from '../env.js'
 import { pool } from '../db/pool.js'
 
-const EMBED_MODEL = process.env.OPENAI_EMBED_MODEL ?? 'text-embedding-3-small'
+import { getEmbedModel } from '../settings.js'
 const EMBED_DIM = 1536
 /** OpenAI accepts up to ~8K tokens per input; we cap at 8K characters
  *  (~2K tokens) which is plenty for a single memory entry or a few
@@ -45,7 +45,7 @@ export async function embedText(text: string): Promise<string | null> {
   if (testEmbedOverride) return testEmbedOverride(trimmed)
   try {
     const resp = await client.embeddings.create({
-      model: EMBED_MODEL,
+      model: getEmbedModel() || 'text-embedding-3-small',
       dimensions: EMBED_DIM,
       input: trimmed.length > MAX_INPUT_CHARS ? trimmed.slice(0, MAX_INPUT_CHARS) : trimmed,
     })
