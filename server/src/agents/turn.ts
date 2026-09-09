@@ -29,6 +29,7 @@ import { messageAttachmentStorageKey } from '../storage-keys.js'
 import { classifyInboxTriage, gateSyntheticWake } from './inbox-triage.js'
 import { GLANCE_YIELD_RULES } from './glance-protocol.js'
 import { TOOL_DEFS_RESPONSES, executePodTool } from './runtime/pod-tools.js'
+import { connectMcpConnector, mcpToolToFunctionTool, splitPrefixedToolName, type McpClientHandle } from './mcp.js'
 import {
   TURN_STATUS_VALUES,
   bashOutputHasReplySideEffect,
@@ -1042,12 +1043,20 @@ function traceInput(items: ResponseInputItem[]): Record<string, unknown>[] {
   return items.map(traceInputItem)
 }
 
-function traceToolDefinitions(): Record<string, unknown>[] {
-  return TOOL_DEFS_RESPONSES.map((tool) => ({
-    type: tool.type,
-    name: tool.name,
-    description: traceText(tool.description ?? ''),
-  }))
+function traceToolDefinitions(extras: { name: string; description: string }[] = []): Record<string, unknown>[] {
+  return [
+    ...TOOL_DEFS_RESPONSES.map((tool) => ({
+      type: tool.type,
+      name: tool.name,
+      description: traceText(tool.description ?? ''),
+    })),
+    ...extras.map((tool) => ({
+      type: 'function',
+      name: tool.name,
+      description: traceText(tool.description),
+      mcp: true,
+    })),
+  ]
 }
 
 function traceResponseOutputItem(item: unknown): Record<string, unknown> {
@@ -1854,6 +1863,10 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
   const steeredMessageIds = new Map<string, string>() // messageId → conversationId
   let steerSaturatedEmitted = false
   let steerByteCapEmitted = false
+  // MCP connectors (phase 6): connected right before the hop loop, closed
+  // in the finally below. Outer scope so finally can always reach them.
+  const mcpClients: McpClientHandle[] = []
+  let mcpToolDefs: ReturnType<typeof mcpToolToFunctionTool>[] = []
 
   try {
     // Steering: discard any stale items left over from a previous turn
@@ -2443,6 +2456,28 @@ Mechanics:
   // `responseId` is tracked per-hop below purely for observability events;
   // we no longer feed it back as previous_response_id.
 
+  // ─── MCP connectors (phase 6) ──────────────────────────────────────
+  // Connect every enabled connector and merge its tools into the tool
+  // surface as mcp__<connector>__<tool>. A connector that fails to
+  // connect is skipped for this turn (warn event) — never fatal. All
+  // clients are closed in the turn's finally block.
+  for (const spec of persona.mcpConnectors ?? []) {
+    try {
+      const client = await connectMcpConnector(spec, { cwd: process.env.CUMORA_PERSONA_DIR ?? '/workspace' })
+      mcpClients.push(client)
+      mcpToolDefs.push(...client.tools.map((t) => mcpToolToFunctionTool(spec.name, t)))
+    } catch (err) {
+      await runtime.recordEvent({
+        runId, agentId, companyId: runCompanyId,
+        kind: 'mcp.connector_failed',
+        level: 'warn',
+        title: `MCP connector ${spec.name} unavailable; continuing without it`,
+        data: { connector: spec.name, error: errorText(err) },
+        stage: 'mcp_connector_failed',
+      }).catch(() => { /* observability best-effort */ })
+    }
+  }
+
   for (let hop = 0; hop < MAX_HOPS; hop++) {
     // Auto-compaction: when the previous hop's reported usage crosses the
     // soft threshold, reshape `history` BEFORE sending it. compactHistory()
@@ -2604,7 +2639,7 @@ Mechanics:
           historyItems: history.length,
           instructions: traceText(instructions),
           input: traceInput(inputForAttempt),
-          tools: traceToolDefinitions(),
+          tools: traceToolDefinitions(mcpToolDefs),
           request: {
             toolChoice: 'auto',
             reasoning: turnThinking ? { effort: turnEffort } : null,
@@ -2653,7 +2688,7 @@ Mechanics:
           model: hopModel,
           instructions,
           input: inputForAttempt,
-          tools: TOOL_DEFS_RESPONSES,
+          tools: mcpToolDefs.length > 0 ? [...TOOL_DEFS_RESPONSES, ...mcpToolDefs] : TOOL_DEFS_RESPONSES,
           tool_choice: 'auto' as const,
           // thinking=false omits the reasoning field entirely (provider
           // default); effort/maxOutputTokens inherit from the global brain
@@ -2960,6 +2995,30 @@ Mechanics:
         stage: `tool_${tc.name}`,
       }).catch(() => { /* observability best-effort */ })
       try {
+        // MCP tools (mcp__<connector>__<tool>) route to their connector
+        // client instead of the pod tool table. A missing/failed call
+        // returns ok:false to the model — it must not crash the turn.
+        const mcpSplit = splitPrefixedToolName(tc.name)
+        if (mcpSplit) {
+          const client = mcpClients.find((c) => c.connector === mcpSplit.connector)
+          if (!client) throw new Error(`MCP connector ${mcpSplit.connector} is not connected this turn`)
+          const mcpRes = await client.callTool(mcpSplit.tool, parsedArgs as Record<string, unknown>)
+          return {
+            tc,
+            result: {
+              ok: !mcpRes.isError,
+              output: mcpRes.text,
+              error: mcpRes.isError ? mcpRes.text : undefined,
+              durationMs: Date.now() - t0,
+              display: {
+                name: tc.name,
+                arg: '',
+                status: mcpRes.isError ? 'failed' : 'done',
+                detail: `mcp:${mcpSplit.connector}`,
+              },
+            } satisfies ToolResult,
+          }
+        }
         const result = await executePodTool({
           agentId, name: tc.name, argsJson: tc.arguments, ns: namespace,
           signal: batchAbortController.signal,
@@ -2999,6 +3058,7 @@ Mechanics:
           display: result.display,
           error: result.error,
           output: result.output,
+          mcp: splitPrefixedToolName(tc.name) ? true : undefined,
         },
         stage: result.ok ? 'tool_done' : 'tool_error',
       }).catch(() => { /* observability best-effort */ })
@@ -3487,6 +3547,12 @@ Mechanics:
         }).catch(() => { /* swallow */ })
       }
       await teardownFs(namespace).catch(() => { /* swallow */ })
+    }
+    // MCP clients (phase 6): SIGTERM stdio children / drop http sessions.
+    // Best-effort — the turn's outcome is already decided here.
+    for (const client of mcpClients) {
+      await client.close().catch((err) =>
+        console.warn(`[turn] ${agentId} mcp close failed`, err instanceof Error ? err.message : err))
     }
     if (typingStarted && recentConvo) {
       await runtime.publishTyping({

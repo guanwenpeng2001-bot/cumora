@@ -14,6 +14,8 @@ import { pool } from '../db/pool.js'
 import { SKYPE_EMOTICONS_GUIDE } from './skype-emoticons.js'
 import { AGENT_VOICE_RULES } from './agent-voice.js'
 import { parseAgentModelConfig, type AgentModelConfig } from './model-config.js'
+import { enabledConnectorsForAgent } from '../mcp-connectors.js'
+import type { EngineMcpConnector } from './computer/engine.js'
 
 export interface Persona {
   id: string
@@ -26,6 +28,10 @@ export interface Persona {
   /** Advanced per-agent model settings (effort/tokens/thinking/context/
    *  fallback chain). null = inherit the global brain role. */
   modelConfig: AgentModelConfig | null
+  /** Enabled MCP connectors (agent_mcp_connectors join). Managed runtime
+   *  connects these at turn start (phase 6); BYOA daemons get them via the
+   *  computers payload. */
+  mcpConnectors: EngineMcpConnector[]
   /** The tenant this persona belongs to. */
   companyId: string
 }
@@ -51,8 +57,16 @@ export async function getPersona(id: string): Promise<Persona | null> {
   )
   const r = rows[0]
   const persona: Persona | null = r
-    ? { id: r.id, name: r.name, role: r.role ?? '', style: r.style ?? '', model: r.model ?? null, modelConfig: parseAgentModelConfig(r.model_config), companyId: r.company_id }
+    ? { id: r.id, name: r.name, role: r.role ?? '', style: r.style ?? '', model: r.model ?? null, modelConfig: parseAgentModelConfig(r.model_config), companyId: r.company_id, mcpConnectors: [] }
     : null
+  if (persona) {
+    try {
+      persona.mcpConnectors = await enabledConnectorsForAgent(id)
+    } catch (e) {
+      console.warn(`[persona] ${id} mcp connector load failed`, e instanceof Error ? e.message : e)
+      persona.mcpConnectors = []
+    }
+  }
   personaCache.set(id, persona)
   return persona
 }
@@ -78,6 +92,7 @@ export async function getAllAgentPersonas(companyId: string): Promise<Persona[]>
     id: r.id, name: r.name, role: r.role ?? '', style: r.style ?? '', model: r.model ?? null,
     modelConfig: parseAgentModelConfig(r.model_config),
     companyId: r.company_id,
+    mcpConnectors: [],
   }))
 }
 

@@ -33,6 +33,7 @@
  */
 
 import type { AgentModelConfig } from '../model-config.js'
+import type { EngineMcpConnector } from '../computer/engine.js'
 export interface InboxAttachment {
   url: string
   name: string
@@ -145,6 +146,8 @@ export interface PersonaRow {
   model: string | null
   /** Advanced per-agent model settings; null = inherit the global brain role. */
   modelConfig?: AgentModelConfig | null
+  /** Enabled MCP connectors; turn.ts connects these at turn start. */
+  mcpConnectors?: EngineMcpConnector[]
   companyId: string
 }
 
