@@ -32,6 +32,7 @@
 
 ### Notes
 
+- **迁移号冲突策略(决策)**:fork 迁移 0007-0010 与上游未来号段可能冲突;下次上游同步前手工协调号段,已部署库不重编号。
 - 本地部署模型矩阵:大脑 Kimi k3(OPENAI_BASE_URL 指向 Kimi coding 端点)、小脑/压缩 DeepSeek(经 `novita/` 前缀路由)、图像 DashScope、embedding DashScope text-embedding-v4
 - K8s 使用 Docker Desktop 内置集群(context `docker-desktop`)+ squat/generic-device-plugin 提供 `/dev/fuse`
 - 数据库容器使用 `pgvector/pgvector:pg16`(语义记忆);记账修复后 pod 可直连数据库(单租户本机环境接受的隔离让步)

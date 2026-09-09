@@ -40,6 +40,8 @@ const ALLOW = {
   // The engine adapter is the ONLY place that spawns a supported engine binary
   // (and it splits classify=small vs run=big internally).
   engineSpawn: ['server/src/agents/computer/engine.ts'],
+  // Static pricing data is not a model selection callsite.
+  hardcodedModelData: ['server/src/model-pricing.ts'],
 }
 
 function walk(dir) {
@@ -72,7 +74,8 @@ export function lineViolations(rel, raw) {
     out.push('selects the BIG model env (OPENAI_MODEL) directly — must go through enforceModelPolicy or use OPENAI_MODEL_SUPPORT')
   }
   // R2b — a hardcoded big-model string used AS a model (bypasses the env+policy).
-  if (/\bmodel\s*:\s*['"`](gpt-5\.5|gpt-5-codex|claude-opus|o1|o3|gpt-4)/i.test(code)) {
+  if (/\bmodel\s*:\s*['"`](gpt-5\.5|gpt-5-codex|claude-opus|o1|o3|gpt-4)/i.test(code) &&
+      !ALLOW.hardcodedModelData.includes(rel)) {
     out.push('hardcoded big-model name as a model selection — use realTaskModel()/enforceModelPolicy or the support model')
   }
   // R3 — adapter.run( (BYOA big brain) only in the gated daemon path.

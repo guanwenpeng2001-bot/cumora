@@ -1,4 +1,4 @@
-import type { ContextRow, InboxRow, PersonaRow, WorklogEntry } from './runtime/client.js'
+import type { ContextRow, InboxRow, PersonaRow, WorklogEntry } from './runtime/client.js'
 import { supportReasoningEffort, supportReasoningHeadroom } from './reasoning.js'
 import { getSupportModel } from '../settings.js'
 import { env } from '../env.js'
