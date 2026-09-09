@@ -29,7 +29,7 @@
  *   3  unrecoverable stream error (couldn't connect after N retries)
  */
 import { pool } from '../../db/pool.js'
-import { initServerSettings, startServerSettingsRefresher } from '../../settings.js'
+import { loadServerSettings, startServerSettingsRefresher } from '../../settings.js'
 import { runAgentTurn, type AgentTurnOptions } from '../turn.js'
 import { runtime } from './select.js'
 import { notifyAlert } from '../../alerting.js'
@@ -301,7 +301,7 @@ async function main(): Promise<void> {
 
   // Model settings follow the server_settings table (pods have DATABASE_URL);
   // env fallbacks serve until the first load lands.
-  void initServerSettings()
+  void loadServerSettings()
     .then(() => startServerSettingsRefresher())
     .catch((e) => console.warn('[settings] init failed; env fallbacks in effect', e instanceof Error ? e.message : e))
 

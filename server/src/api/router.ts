@@ -18,7 +18,7 @@ import { startConvene } from '../agents/convene.js'
 import { ensureDirectConversation } from '../agents/private_chat.js'
 import { fetchImageBytes } from '../agents/image-fetcher.js'
 import { transcribeAudio } from '../llm.js'
-import { SETTING_DEFS, getServerSetting, writeServerSettings, KNOWN_SETTING_KEYS } from '../settings.js'
+import { getServerSettingsSnapshot, writeServerSettings, validateServerSettings, InvalidServerSettingError } from '../settings.js'
 import { availableModels, invalidateModelCatalog } from '../models-catalog.js'
 import { parseUsageRange, usageSummary, usageTrend, usageByAgent, usageByModel, usageByProvider, usageLogs } from '../usage.js'
 import { modelPricingTable, upsertModelPricing } from '../model-pricing.js'
@@ -705,9 +705,7 @@ async function requireSiteAdmin(req: Request & AuthedRequest): Promise<string> {
  *  effect without a restart. */
 api.get('/settings/models', safe(async (req, res) => {
   await requireSiteAdmin(req)
-  const settings: Record<string, string> = {}
-  for (const def of SETTING_DEFS) settings[def.key] = getServerSetting(def.key)
-  res.json({ settings })
+  res.json(getServerSettingsSnapshot())
 }))
 
 api.put('/settings/models', safe(async (req, res) => {
@@ -715,17 +713,17 @@ api.put('/settings/models', safe(async (req, res) => {
   const body = (req.body ?? {}) as { settings?: unknown }
   const entries = body.settings
   if (!entries || typeof entries !== 'object' || Array.isArray(entries)) {
-    throw new HttpError(400, 'settings must be an object of key → string')
+    throw new HttpError(400, 'settings must be an object of key → string or null')
   }
-  const clean: Record<string, string> = {}
-  for (const [k, v] of Object.entries(entries as Record<string, unknown>)) {
-    if (!KNOWN_SETTING_KEYS.has(k)) throw new HttpError(400, `unknown setting key: ${k}`)
-    if (typeof v !== 'string') throw new HttpError(400, `setting ${k} must be a string`)
-    clean[k] = v
+  try {
+    validateServerSettings(entries as Record<string, unknown>)
+    const committed = await writeServerSettings(entries as Record<string, string | null>)
+    invalidateModelCatalog()
+    res.json({ ok: true, ...committed })
+  } catch (e) {
+    if (e instanceof InvalidServerSettingError) throw new HttpError(400, e.message)
+    throw e
   }
-  await writeServerSettings(clean)
-  invalidateModelCatalog()
-  res.json({ ok: true })
 }))
 
 /** Available-models catalog: sub2api live (caller's keys) + BYOA computer

@@ -2,8 +2,8 @@
  * Server-wide model settings — runtime-editable, no restart.
  *
  * Storage: `server_settings` key-value table (migration 0007). Read side
- * is a sync in-memory snapshot with a 30s refresh; write side upserts and
- * invalidates immediately. Every key falls back to its env var when the
+ * is a sync in-memory snapshot with a 30s refresh; writes commit atomically
+ * and install a complete versioned snapshot before returning. Every key falls back to its env var when the
  * DB has no row (fresh installs, or a pod that booted before the first
  * refresh landed), so behavior without the table is exactly the pre-DB
  * behavior.
@@ -15,11 +15,14 @@
  * switching embedding models changes the vector space, so a silent
  * fallback would corrupt semantic memory recall (see fallback.ts).
  */
+import type { PoolClient } from 'pg'
 import { pool } from './db/pool.js'
 import { env } from './env.js'
 
 export interface SettingDef {
   key: string
+  type: 'model' | 'list' | 'string' | 'integer' | 'reasoning'
+  required?: boolean
   /** Env fallback when the DB has no row. */
   envValue: () => string
 }
@@ -27,23 +30,23 @@ export interface SettingDef {
 /** The full key inventory. Values are always stored as strings; list-typed
  *  keys are comma-separated. */
 export const SETTING_DEFS: readonly SettingDef[] = [
-  { key: 'brain_model',                 envValue: () => env.OPENAI_MODEL ?? '' },
-  { key: 'brain_fallback_models',       envValue: () => '' },
-  { key: 'support_model',               envValue: () => env.OPENAI_MODEL_SUPPORT ?? '' },
-  { key: 'support_fallback_models',     envValue: () => '' },
-  { key: 'compaction_model',            envValue: () => env.OPENAI_COMPACTION_MODEL ?? '' },
-  { key: 'compaction_fallback_models',  envValue: () => '' },
-  { key: 'image_model',                 envValue: () => env.OPENAI_IMAGE_MODEL ?? '' },
-  { key: 'image_fallback_models',       envValue: () => process.env.OPENAI_IMAGE_FALLBACK_MODELS ?? '' },
-  { key: 'audio_model',                 envValue: () => process.env.OPENAI_AUDIO_MODEL ?? '' },
-  { key: 'audio_fallback_models',       envValue: () => process.env.OPENAI_AUDIO_FALLBACK_MODELS ?? '' },
-  { key: 'embed_model',                 envValue: () => process.env.OPENAI_EMBED_MODEL ?? '' },
-  { key: 'agent_reasoning_effort',      envValue: () => process.env.CUMORA_REASONING_EFFORT ?? 'low' },
-  { key: 'agent_max_output_tokens',     envValue: () => process.env.CUMORA_AGENT_MAX_OUTPUT_TOKENS ?? '4000' },
-  { key: 'support_reasoning_effort',    envValue: () => process.env.CUMORA_SUPPORT_REASONING_EFFORT ?? 'low' },
-  { key: 'support_reasoning_headroom',  envValue: () => process.env.CUMORA_SUPPORT_REASONING_HEADROOM ?? '0' },
+  { key: 'brain_model', type: 'model', required: true, envValue: () => env.OPENAI_MODEL ?? '' },
+  { key: 'brain_fallback_models', type: 'list', envValue: () => '' },
+  { key: 'support_model', type: 'model', required: true, envValue: () => env.OPENAI_MODEL_SUPPORT ?? '' },
+  { key: 'support_fallback_models', type: 'list', envValue: () => '' },
+  { key: 'compaction_model', type: 'model', required: true, envValue: () => env.OPENAI_COMPACTION_MODEL ?? '' },
+  { key: 'compaction_fallback_models', type: 'list', envValue: () => '' },
+  { key: 'image_model', type: 'model', required: true, envValue: () => env.OPENAI_IMAGE_MODEL ?? '' },
+  { key: 'image_fallback_models', type: 'list', envValue: () => process.env.OPENAI_IMAGE_FALLBACK_MODELS ?? '' },
+  { key: 'audio_model', type: 'model', required: true, envValue: () => process.env.OPENAI_AUDIO_MODEL ?? '' },
+  { key: 'audio_fallback_models', type: 'list', envValue: () => process.env.OPENAI_AUDIO_FALLBACK_MODELS ?? '' },
+  { key: 'embed_model', type: 'model', required: true, envValue: () => process.env.OPENAI_EMBED_MODEL ?? '' },
+  { key: 'agent_reasoning_effort', type: 'reasoning', envValue: () => process.env.CUMORA_REASONING_EFFORT ?? 'low' },
+  { key: 'agent_max_output_tokens', type: 'integer', envValue: () => process.env.CUMORA_AGENT_MAX_OUTPUT_TOKENS ?? '4000' },
+  { key: 'support_reasoning_effort', type: 'reasoning', envValue: () => process.env.CUMORA_SUPPORT_REASONING_EFFORT ?? 'low' },
+  { key: 'support_reasoning_headroom', type: 'integer', envValue: () => process.env.CUMORA_SUPPORT_REASONING_HEADROOM ?? '0' },
   // Not a model — the skills tab's local hub directory.
-  { key: 'local_skillhub_path',         envValue: () => process.env.LOCAL_SKILLHUB_PATH ?? '' },
+  { key: 'local_skillhub_path', type: 'string', envValue: () => process.env.LOCAL_SKILLHUB_PATH ?? '' },
 ]
 
 const KNOWN_KEYS = new Set(SETTING_DEFS.map((d) => d.key))
@@ -55,30 +58,60 @@ export const KNOWN_SETTING_KEYS: ReadonlySet<string> = KNOWN_KEYS
 const REFRESH_MS = 30_000
 const REFRESH_FAILURE_BACKOFF_MS = 5_000
 
-let snapshot: Map<string, string> | null = null
+const REVISION_KEY = '__settings_revision'
+const INHERIT_PREFIX = '__settings_inherit:'
+
+export interface ServerSettingsSnapshot {
+  /** Decimal string: preserves PostgreSQL bigint precision across JSON. */
+  revision: string
+  settings: Readonly<Record<string, string>>
+  sources: Readonly<Record<string, 'db' | 'env'>>
+}
+
+let snapshot: ServerSettingsSnapshot | null = null
 let snapshotAt = 0
 let lastRefreshFailureAt = 0
 let refreshing: Promise<void> | null = null
+let generation = 0
+let writing: Promise<unknown> = Promise.resolve()
 
-async function loadFromDb(): Promise<Map<string, string>> {
-  const { rows } = await pool.query<{ key: string; value: string }>(`SELECT key, value FROM server_settings`)
-  return new Map(rows.map((r) => [r.key, r.value]))
+function makeSnapshot(rows: { key: string; value: string }[]): ServerSettingsSnapshot {
+  const values = new Map(rows.map((r) => [r.key, r.value]))
+  const revision = values.get(REVISION_KEY) ?? '0'
+  if (!/^\d+$/.test(revision)) throw new Error('invalid settings revision')
+  const settings: Record<string, string> = {}
+  const sources: Record<string, 'db' | 'env'> = {}
+  for (const def of SETTING_DEFS) {
+    settings[def.key] = values.get(def.key) ?? def.envValue()
+    sources[def.key] = values.has(def.key) ? 'db' : 'env'
+  }
+  return Object.freeze({ revision, settings: Object.freeze(settings), sources: Object.freeze(sources) })
 }
 
-/** Refresh the snapshot. Concurrent calls coalesce; failures keep the
- *  previous snapshot (env fallback still applies per key). */
+function installSnapshot(next: ServerSettingsSnapshot): void {
+  if (snapshot && BigInt(next.revision) < BigInt(snapshot.revision)) return
+  snapshot = next
+  snapshotAt = Date.now()
+  lastRefreshFailureAt = 0
+}
+
+/** Forced refreshes wait for older queries, then perform their own read. */
 export async function refreshServerSettings(force = false): Promise<void> {
+  if (refreshing) {
+    if (!force) return refreshing
+    await refreshing
+    return refreshServerSettings(true)
+  }
   if (!force && snapshot && Date.now() - snapshotAt < REFRESH_MS) return
   if (!force && lastRefreshFailureAt && Date.now() - lastRefreshFailureAt < REFRESH_FAILURE_BACKOFF_MS) return
-  if (refreshing) return refreshing
+  const startedGeneration = generation
   refreshing = (async () => {
     try {
-      snapshot = await loadFromDb()
-      snapshotAt = Date.now()
-      lastRefreshFailureAt = 0
+      const { rows } = await pool.query<{ key: string; value: string }>('SELECT key, value FROM server_settings')
+      const next = makeSnapshot(rows)
+      if (startedGeneration === generation) installSnapshot(next)
     } catch (e) {
-      // DB down / table missing during boot races — keep serving env values.
-      lastRefreshFailureAt = Date.now()
+      if (startedGeneration === generation) lastRefreshFailureAt = Date.now()
       console.warn('[settings] refresh failed; serving previous/env values', e instanceof Error ? e.message : e)
     } finally {
       refreshing = null
@@ -87,14 +120,14 @@ export async function refreshServerSettings(force = false): Promise<void> {
   return refreshing
 }
 
-/** Sync read: DB value when present, else the env fallback. Triggers a
- *  background refresh when the snapshot is empty or stale. */
-export function getServerSetting(key: string): string {
+export function getServerSettingsSnapshot(): ServerSettingsSnapshot {
   if (!snapshot || Date.now() - snapshotAt >= REFRESH_MS) void refreshServerSettings()
-  const v = snapshot?.get(key)
-  if (v !== undefined) return v
-  const def = SETTING_DEFS.find((d) => d.key === key)
-  return def ? def.envValue() : ''
+  return snapshot ?? makeSnapshot([])
+}
+
+/** Sync read from one complete, immutable snapshot. */
+export function getServerSetting(key: string): string {
+  return getServerSettingsSnapshot().settings[key] ?? ''
 }
 
 /** List-typed read: comma-separated → trimmed string array. */
@@ -105,17 +138,23 @@ export function getServerSettingList(key: string): string[] {
 /** First-boot seed: copy env values into the table, never overwriting
  *  existing rows (operator edits win over later .env changes). */
 export async function seedServerSettingsFromEnv(): Promise<void> {
-  await pool.query(
-    `INSERT INTO server_settings (key, value)
-     SELECT * FROM jsonb_each_text($1::jsonb)
-     ON CONFLICT (key) DO NOTHING`,
-    [JSON.stringify(Object.fromEntries(SETTING_DEFS.map((d) => [d.key, d.envValue() ?? ''])))],
-  )
+  await commitSettings(async (client) => {
+    await client.query(
+      `INSERT INTO server_settings (key, value)
+       SELECT e.key, e.value FROM jsonb_each_text($1::jsonb) e
+       WHERE NOT EXISTS (SELECT 1 FROM server_settings s WHERE s.key = $2 || e.key)
+       ON CONFLICT (key) DO NOTHING`,
+      [JSON.stringify(Object.fromEntries(SETTING_DEFS.map((d) => [d.key, d.envValue()]))), INHERIT_PREFIX],
+    )
+  })
 }
 
-/** Boot hook: seed + warm the snapshot. */
+/** Main-service boot hook; Pods must use the read-only loader. */
 export async function initServerSettings(): Promise<void> {
   await seedServerSettingsFromEnv()
+}
+
+export async function loadServerSettings(): Promise<void> {
   await refreshServerSettings(true)
 }
 
@@ -134,19 +173,69 @@ export function getImageModel(): string { return getServerSetting('image_model')
 export function getAudioModel(): string { return getServerSetting('audio_model') }
 export function getEmbedModel(): string { return getServerSetting('embed_model') }
 
-/** Write path (settings API). Unknown keys are rejected. Invalidates the
- *  snapshot immediately so the next read sees the write. */
-export async function writeServerSettings(entries: Record<string, string>): Promise<void> {
+export class InvalidServerSettingError extends Error {}
+
+export function validateServerSettings(entries: Record<string, unknown>): asserts entries is Record<string, string | null> {
+  for (const [key, value] of Object.entries(entries)) {
+    const def = SETTING_DEFS.find((d) => d.key === key)
+    if (!def) throw new InvalidServerSettingError('unknown setting key: ' + key)
+    if (value === null) {
+      if (def.required && !def.envValue().trim()) throw new InvalidServerSettingError('setting ' + key + ' has no inherited value')
+      continue
+    }
+    if (typeof value !== 'string') throw new InvalidServerSettingError('setting ' + key + ' must be a string or null to inherit')
+    if (def.required && !value.trim()) throw new InvalidServerSettingError('setting ' + key + ' must not be empty; use null to inherit')
+    if (def.type === 'integer' && (!/^\d+$/.test(value) || !Number.isSafeInteger(Number(value)) || (key === 'agent_max_output_tokens' && Number(value) === 0))) {
+      throw new InvalidServerSettingError('invalid integer setting: ' + key)
+    }
+    if (def.type === 'reasoning' && !['none', 'minimal', 'low', 'medium', 'high', 'xhigh'].includes(value)) {
+      throw new InvalidServerSettingError('invalid reasoning setting: ' + key)
+    }
+  }
+}
+
+function commitSettings(mutate: (client: PoolClient) => Promise<void>): Promise<ServerSettingsSnapshot> {
+  const pending = writing.then(async () => {
+    const client = await pool.connect()
+    try {
+      await client.query('BEGIN')
+      // Serialize all settings writers, including first-boot seed, across processes.
+      await client.query('LOCK TABLE server_settings IN SHARE ROW EXCLUSIVE MODE')
+      await mutate(client)
+      await client.query(
+        `INSERT INTO server_settings (key, value) VALUES ($1, '1')
+         ON CONFLICT (key) DO UPDATE SET value = (server_settings.value::bigint + 1)::text, updated_at = NOW()`,
+        [REVISION_KEY],
+      )
+      const { rows } = await client.query<{ key: string; value: string }>('SELECT key, value FROM server_settings')
+      const next = makeSnapshot(rows)
+      await client.query('COMMIT')
+      generation++
+      installSnapshot(next)
+      return next
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {})
+      throw e
+    } finally {
+      client.release()
+    }
+  })
+  writing = pending.catch(() => {})
+  return pending
+}
+
+/** Null restores inheritance; explicit empty strings remain valid only for optional values. */
+export async function writeServerSettings(entries: Record<string, string | null>): Promise<ServerSettingsSnapshot> {
+  validateServerSettings(entries)
   const rows = Object.entries(entries)
-  for (const [key] of rows) {
-    if (!KNOWN_KEYS.has(key)) throw new Error(`unknown setting key: ${key}`)
-  }
-  for (const [key, value] of rows) {
-    await pool.query(
-      `INSERT INTO server_settings (key, value, updated_at) VALUES ($1, $2, NOW())
-       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
-      [key, value],
-    )
-  }
-  await refreshServerSettings(true)
+  return commitSettings(async (client) => {
+    for (const [key, value] of rows) {
+      await client.query('DELETE FROM server_settings WHERE key = $1', [value === null ? key : INHERIT_PREFIX + key])
+      await client.query(
+        `INSERT INTO server_settings (key, value, updated_at) VALUES ($1, $2, NOW())
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+        [value === null ? INHERIT_PREFIX + key : key, value ?? 'true'],
+      )
+    }
+  })
 }
