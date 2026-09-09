@@ -429,6 +429,9 @@ interface AgentInfo {
   engine: EngineId | null
   model: string | null
   fastModel: string | null
+  /** Company-library skills enabled for this agent (server: agent_skills
+   *  join skills). Empty when the daemon predates the field. */
+  skills?: Array<{ name: string; description: string; files: Array<{ path: string; body: string }> }>
 }
 
 /** One line's worth of "there is a file on this message".
@@ -1802,7 +1805,7 @@ class AgentRunner {
   }
 
   async start(): Promise<void> {
-    await this.adapter.seedHome(this.home, { id: this.agent.id, name: this.agent.name, role: this.agent.role, systemPrompt: this.agent.systemPrompt })
+    await this.adapter.seedHome(this.home, { id: this.agent.id, name: this.agent.name, role: this.agent.role, systemPrompt: this.agent.systemPrompt, skills: this.agent.skills ?? [] })
     if (allowUnsandboxedByoa()) await writeShim(this.binDir)
     await writeShim(this.trustedCliDir)
     // Versions before the broker stored a live bearer token beside the shim.

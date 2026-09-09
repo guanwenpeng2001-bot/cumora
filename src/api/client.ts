@@ -270,6 +270,27 @@ export interface ApiUsageLogPage {
   pageSize: number
 }
 
+/** Company skill library row. */
+export interface ApiSkill {
+  id: string
+  companyId: string
+  name: string
+  description: string
+  source: 'skillhub' | 'local' | 'paste'
+  hubId: string | null
+  files: Array<{ path: string; body: string }>
+  createdAt: string
+}
+export interface ApiLocalHubEntry {
+  name: string
+  description: string
+  imported: boolean
+}
+export interface ApiAgentSkillState {
+  skill: ApiSkill
+  enabled: boolean
+}
+
 export interface ApiQuotaWindow {
   usedUsd: number
   limitUsd: number | null
@@ -1413,6 +1434,25 @@ export const api = {
     http<{ items: ApiUsageModelRow[] }>(`/usage/by-model?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`),
   getUsageByProvider: (from: string, to: string) =>
     http<{ items: ApiUsageProviderRow[] }>(`/usage/by-provider?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`),
+  /** Skills library + per-agent enablement. */
+  getSkills: () =>
+    http<{ items: ApiSkill[]; hubConfigured: boolean; localHubPath: string | null }>('/skills'),
+  createSkillFromPaste: (skillMd: string) =>
+    http<ApiSkill>('/skills/paste', { method: 'POST', body: JSON.stringify({ skillMd }) }),
+  installSkillFromHub: (hubId: string) =>
+    http<ApiSkill>('/skills/install', { method: 'POST', body: JSON.stringify({ hubId }) }),
+  deleteSkill: (id: string) =>
+    http<{ ok: boolean }>(`/skills/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  getLocalHubSkills: () =>
+    http<{ items: ApiLocalHubEntry[]; path: string | null }>('/skills/hub/local'),
+  importLocalSkill: (name: string) =>
+    http<ApiSkill>('/skills/import-local', { method: 'POST', body: JSON.stringify({ name }) }),
+  searchSkillHub: (q: string) =>
+    http<{ items: Array<{ id: string; name?: string; description?: string }> }>(`/skills/hub/search?q=${encodeURIComponent(q)}`),
+  getAgentSkills: (agentId: string) =>
+    http<{ items: ApiAgentSkillState[] }>(`/agents/${encodeURIComponent(agentId)}/skills`),
+  setAgentSkills: (agentId: string, skillIds: string[]) =>
+    http<{ ok: boolean }>(`/agents/${encodeURIComponent(agentId)}/skills`, { method: 'PUT', body: JSON.stringify({ skillIds }) }),
   getUsageLogs: (from: string, to: string, page: number, pageSize: number, source?: string) =>
     http<ApiUsageLogPage>(`/usage/logs?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&page=${page}&pageSize=${pageSize}${source ? `&source=${encodeURIComponent(source)}` : ''}`),
   markRead: (conversationId: string) =>

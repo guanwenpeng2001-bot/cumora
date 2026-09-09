@@ -22,6 +22,11 @@ import { SETTING_DEFS, getServerSetting, writeServerSettings, KNOWN_SETTING_KEYS
 import { availableModels, invalidateModelCatalog } from '../models-catalog.js'
 import { parseUsageRange, usageSummary, usageTrend, usageByAgent, usageByModel, usageByProvider, usageLogs } from '../usage.js'
 import { modelPricingTable, upsertModelPricing } from '../model-pricing.js'
+import {
+  listSkills, createSkillFromPaste, deleteSkill, installFromHub, searchHub,
+  listLocalHub, importLocalSkill, agentSkillsFor, setAgentSkills,
+  skillHubUrl, localSkillHubPath,
+} from '../skill-library.js'
 import { getTriageEconomics, getWakeEconomics } from '../agents/observability.js'
 import { resolveKanbanAssigneeChange, wakeKanbanAgents } from '../agents/kanban-wake.js'
 import { AgentCreationError, createAgentRecord } from '../agents/create.js'
@@ -770,6 +775,73 @@ api.get('/usage/logs', safe(async (req, res) => {
 api.get('/usage/pricing', safe(async (req, res) => {
   await requireCompany(req)
   res.json({ items: await modelPricingTable() })
+}))
+
+/* ============== Company skill library ============== */
+
+api.get('/skills', safe(async (req, res) => {
+  const { companyId } = await requireCompany(req)
+  res.json({
+    items: await listSkills(companyId),
+    hubConfigured: Boolean(skillHubUrl()),
+    localHubPath: localSkillHubPath() || null,
+  })
+}))
+
+api.post('/skills/paste', safe(async (req, res) => {
+  const { companyId } = await requireCompanyRole(req)
+  const body = String(req.body?.skillMd ?? '')
+  if (!body.trim()) throw new HttpError(400, 'skillMd required')
+  res.json(await createSkillFromPaste(companyId, body))
+}))
+
+api.post('/skills/install', safe(async (req, res) => {
+  const { companyId } = await requireCompanyRole(req)
+  const hubId = String(req.body?.hubId ?? '').trim()
+  if (!hubId) throw new HttpError(400, 'hubId required')
+  res.json(await installFromHub(companyId, hubId))
+}))
+
+/** Local hub: list (flagged by imported) + import one. */
+api.get('/skills/hub/local', safe(async (req, res) => {
+  const { companyId } = await requireCompany(req)
+  res.json({ items: await listLocalHub(companyId), path: localSkillHubPath() || null })
+}))
+
+api.post('/skills/import-local', safe(async (req, res) => {
+  const { companyId } = await requireCompanyRole(req)
+  const name = String(req.body?.name ?? '').trim()
+  if (!name) throw new HttpError(400, 'name required')
+  res.json(await importLocalSkill(companyId, name))
+}))
+
+api.get('/skills/hub/search', safe(async (req, res) => {
+  await requireCompany(req)
+  const q = String(req.query?.q ?? '').trim()
+  if (!q) throw new HttpError(400, 'q required')
+  res.json({ items: await searchHub(q) })
+}))
+
+api.delete('/skills/:id', safe(async (req, res) => {
+  const { companyId } = await requireCompanyRole(req)
+  const removed = await deleteSkill(companyId, String(req.params.id))
+  if (!removed) throw new HttpError(404, 'not found')
+  res.json({ ok: true })
+}))
+
+/** Per-agent enablement: read flags, or set them (writes materialize the
+ *  managed workspace / land in the next BYOA daemon seed). */
+api.get('/agents/:id/skills', safe(async (req, res) => {
+  const { companyId } = await requireCompany(req)
+  res.json({ items: await agentSkillsFor(companyId, String(req.params.id)) })
+}))
+
+api.put('/agents/:id/skills', safe(async (req, res) => {
+  const { companyId } = await requireCompanyRole(req)
+  const ids = Array.isArray(req.body?.skillIds) ? req.body.skillIds.filter((x: unknown) => typeof x === 'string') : null
+  if (!ids) throw new HttpError(400, 'skillIds must be an array of strings')
+  await setAgentSkills(companyId, String(req.params.id), ids)
+  res.json({ ok: true })
 }))
 
 api.put('/usage/pricing', safe(async (req, res) => {

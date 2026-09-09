@@ -638,17 +638,29 @@ export async function mintAgentRuntimeToken(args: {
  *  agent behavior on every user's machine unless we pin here. A custom
  *  provider can explicitly make its unnamed local default authoritative so a
  *  vendor-specific deploy pin never crosses into the wrong namespace. */
+export interface AgentSkillPayload {
+  name: string
+  description: string
+  files: Array<{ path: string; body: string }>
+}
+
 export async function listAgentsForComputer(computerId: string): Promise<
-  Array<{ id: string; name: string; role: string | null; systemPrompt: string | null; engine: EngineId | null; model: string | null; fastModel: string | null }>
+  Array<{ id: string; name: string; role: string | null; systemPrompt: string | null; engine: EngineId | null; model: string | null; fastModel: string | null; skills: AgentSkillPayload[] }>
 > {
   const { rows } = await pool.query<{
     id: string; name: string; role: string | null; systemPrompt: string | null
     engine: EngineId | null; model: string | null; fastModel: string | null
     availableEngines?: string[]; detectedEngines?: unknown
+    skillsJson?: unknown
   }>(
     `SELECT p.id, p.name, p.role, p.system_prompt AS "systemPrompt", p.engine, p.model,
             p.fast_model AS "fastModel", c.available_engines AS "availableEngines",
-            COALESCE(c.detected_engines, '[]'::jsonb) AS "detectedEngines"
+            COALESCE(c.detected_engines, '[]'::jsonb) AS "detectedEngines",
+            COALESCE((
+              SELECT jsonb_agg(jsonb_build_object('name', s.name, 'description', s.description, 'files', s.files))
+                FROM agent_skills a JOIN skills s ON s.id = a.skill_id
+               WHERE a.agent_id = p.id
+            ), '[]'::jsonb) AS "skillsJson"
        FROM participants p
        JOIN computers c ON c.id = p.computer_id
       WHERE p.computer_id = $1 AND p.kind = 'agent' AND p.departed_at IS NULL
@@ -665,7 +677,9 @@ export async function listAgentsForComputer(computerId: string): Promise<
   const qwenDefault = process.env.CUMORA_DEFAULT_QWEN_MODEL?.trim() || null
   const antigravityDefault = process.env.CUMORA_DEFAULT_ANTIGRAVITY_MODEL?.trim() || null
   return rows.map((r) => {
-    const { availableEngines, detectedEngines, ...agent } = r
+    const { availableEngines, detectedEngines, skillsJson, ...rest } = r
+    const skills = (Array.isArray(skillsJson) ? skillsJson : []) as AgentSkillPayload[]
+    const agent = { ...rest, skills }
     const localCatalog = sanitizeDetectedEngines(detectedEngines, availableEngines ?? [])
       .find((entry) => entry.id === agent.engine)?.modelCatalog
     // A custom Claude endpoint owns its model namespace. Its reported defaults

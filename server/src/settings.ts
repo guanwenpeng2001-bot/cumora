@@ -42,6 +42,8 @@ export const SETTING_DEFS: readonly SettingDef[] = [
   { key: 'agent_max_output_tokens',     envValue: () => process.env.CUMORA_AGENT_MAX_OUTPUT_TOKENS ?? '4000' },
   { key: 'support_reasoning_effort',    envValue: () => process.env.CUMORA_SUPPORT_REASONING_EFFORT ?? 'low' },
   { key: 'support_reasoning_headroom',  envValue: () => process.env.CUMORA_SUPPORT_REASONING_HEADROOM ?? '0' },
+  // Not a model — the skills tab's local hub directory.
+  { key: 'local_skillhub_path',         envValue: () => process.env.LOCAL_SKILLHUB_PATH ?? '' },
 ]
 
 const KNOWN_KEYS = new Set(SETTING_DEFS.map((d) => d.key))

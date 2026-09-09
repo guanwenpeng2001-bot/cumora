@@ -71,6 +71,22 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
   const [mcThinking, setMcThinking] = useState(agent?.modelConfig?.thinking ?? true)
   const [mcFallbacks, setMcFallbacks] = useState<string[]>(agent?.modelConfig?.fallbackModels ?? [])
   const [advancedOpen, setAdvancedOpen] = useState(false)
+  // Skills: checkbox over the company library; edit mode loads the agent's
+  // enablement, create mode saves after creation.
+  const [skillChoices, setSkillChoices] = useState<Array<{ id: string; name: string; description: string }>>([])
+  const [skillChecked, setSkillChecked] = useState<Set<string>>(new Set())
+  useEffect(() => {
+    let cancelled = false
+    const load = editing && agent
+      ? api.getAgentSkills(agent.id).then((r) => r.items.map((x) => ({ id: x.skill.id, name: x.skill.name, description: x.skill.description, enabled: x.enabled })))
+      : api.getSkills().then((r) => r.items.map((x) => ({ id: x.id, name: x.name, description: x.description, enabled: false })))
+    void load.then((items) => {
+      if (cancelled) return
+      setSkillChoices(items.map(({ id, name, description }) => ({ id, name, description })))
+      setSkillChecked(new Set(items.filter((x) => x.enabled).map((x) => x.id)))
+    }).catch(() => { /* skills are optional chrome */ })
+    return () => { cancelled = true }
+  }, [editing, agent])
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
   const [avatarUrl, setAvatarUrl] = useState<string | null>(agent?.avatarUrl ?? null)
@@ -283,6 +299,12 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
       // (Engine lives in the same assign call; gating only on the computer
       // would silently drop a Claude→Codex switch on the same machine.) Still
       // skipped on a plain style edit to avoid the owner/admin-gated call.
+      // Skill enablement is a separate record (agent_skills), not part of
+      // the profile payload — persist it on its own endpoint.
+      const skillPersist = agentId
+        ? api.setAgentSkills(agentId, [...skillChecked]).then(() => undefined)
+        : Promise.resolve(undefined)
+      await skillPersist
       if (editing && agentId && target && assignmentChanged) {
         const out = await api.assignAgentComputer(
           agentId,
@@ -524,6 +546,30 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
               </div>
             )}
           </div>
+
+          {skillChoices.length > 0 && (
+            <div className="rounded-[10px] border border-ink-100 bg-paper/60 px-3.5 py-2.5">
+              <div className="text-[12.5px] font-semibold text-ink-700 mb-1.5">{t('agent.skillsTitle')}</div>
+              <div className="space-y-1">
+                {skillChoices.map((sk) => (
+                  <Checkbox
+                    key={sk.id}
+                    checked={skillChecked.has(sk.id)}
+                    onCheckedChange={(next) => {
+                      setSkillChecked((prev) => {
+                        const copy = new Set(prev)
+                        if (next) copy.add(sk.id)
+                        else copy.delete(sk.id)
+                        return copy
+                      })
+                    }}
+                    label={sk.name}
+                    description={sk.description}
+                  />
+                ))}
+              </div>
+            </div>
+          )}
 
           <Field
             label={t('agent.runsOnLabel')}

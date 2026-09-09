@@ -25,7 +25,7 @@
 import { type ChildProcess, execFile, execFileSync, spawn as nodeSpawn, type SpawnOptions } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { existsSync, renameSync, rmSync, writeFileSync } from 'node:fs'
-import { access, lstat, mkdir, mkdtemp, rename, rm, writeFile } from 'node:fs/promises'
+import { access, lstat, mkdir, mkdtemp, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join, delimiter as PATH_DELIMITER } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
@@ -439,11 +439,22 @@ export async function evaluateRunnableEngines(
   return { runnable, blocked }
 }
 
+export interface EngineSkill {
+  name: string
+  description: string
+  files: Array<{ path: string; body: string }>
+}
+
 export interface EnginePersona {
   id: string
   name: string
   role: string | null
   systemPrompt: string | null
+  /** Company-library skills the operator enabled for this agent. Engines
+   *  with a native skills dir (Claude `.claude/skills`, Cursor
+   *  `.cursor/skills`) get the files written there on seed; AGENTS.md-only
+   *  engines get a name+description index appended to the persona file. */
+  skills?: EngineSkill[]
 }
 
 export interface EngineRunArgs {
@@ -1067,6 +1078,47 @@ function unsafeEngineArgs(envVar: string): string[] {
   return allowUnsandboxedByoa() ? extraArgs(envVar) : []
 }
 
+/** Write operator-enabled company-library skills into an engine's native
+ *  skills dir (`<skillsDir>/<name>/<file>`). Skill names and file paths are
+ *  validated against traversal (`..`, absolute, separators in the name) —
+ *  content comes from the operator, but a bad row must never escape the
+ *  agent's home. Stale skill dirs (disabled since the last seed) are removed. */
+export async function seedEngineSkills(home: string, skillsDir: string, skills: EngineSkill[]): Promise<void> {
+  const root = join(home, skillsDir)
+  const wanted = new Set<string>()
+  for (const skill of skills) {
+    if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(skill.name)) continue
+    wanted.add(skill.name)
+    const dir = join(root, skill.name)
+    await ensureAgentDirectory(dir, true)
+    for (const f of skill.files) {
+      if (typeof f.path !== 'string' || typeof f.body !== 'string') continue
+      if (f.path.startsWith('/') || f.path.startsWith('./') || f.path.includes('..') || f.path.includes('//') || /[\\:*?<>"|]/.test(f.path)) continue
+      const target = join(dir, f.path)
+      await ensureAgentDirectory(dirname(target), true)
+      await atomicAgentWrite(target, f.body)
+    }
+  }
+  let existing: string[] = []
+  try {
+    existing = (await readdir(root, { withFileTypes: true }))
+      .filter((e) => e.isDirectory())
+      .map((e) => e.name)
+  } catch { /* dir may not exist yet */ }
+  for (const name of existing) {
+    if (!wanted.has(name)) await rm(join(root, name), { recursive: true, force: true })
+  }
+}
+
+/** Progressive-disclosure index for engines without a native skills dir:
+ *  name + description inline in the persona file. Engines with one get the
+ *  real files via seedEngineSkills instead. */
+function skillsIndexText(skills: EngineSkill[]): string {
+  if (skills.length === 0) return ''
+  const lines = skills.map((s) => `- **${s.name}** — ${s.description}`).join('\n')
+  return `\n## Skills (enabled by your operator)\n${lines}\n`
+}
+
 const PERSONA_HEADER = (
   p: EnginePersona,
   opts: { personaFile?: string; skillsDir?: string } = {},
@@ -1086,6 +1138,7 @@ const PERSONA_HEADER = (
   `  \`memory/MEMORY.md\` (and the files it points to) to recall what you know.\n` +
   `- \`notes/\` — scratch notes and drafts.\n` +
   `- \`${skillsDir}\` — your skills.\n` +
+  skillsIndexText(p.skills ?? []) +
   `- \`workspace/\` — **put all project files and scratch here**: git clones, builds,\n` +
   `  downloads, temp files. Always \`cd workspace\` (or use \`workspace/…\` paths) for\n` +
   `  that work — do NOT clutter your home root with project files.\n\n` +
@@ -1566,6 +1619,7 @@ class ClaudeAdapter implements EngineAdapter {
     await ensureCommonHome(home)
     await ensureAgentDirectory(join(home, '.claude'))
     await ensureAgentDirectory(join(home, '.claude', 'skills'))
+    await seedEngineSkills(home, '.claude/skills', persona.skills ?? [])
     // Always (re)written from the DB's name/role/systemPrompt — this file is
     // system-owned, not agent-editable, so it's safe to overwrite on every
     // start()/restart (including the restart configMatches() triggers when
@@ -3026,6 +3080,7 @@ class CursorAdapter implements EngineAdapter {
   async seedHome(home: string, persona: EnginePersona): Promise<void> {
     await ensureCommonHome(home)
     await mkdir(join(home, '.cursor', 'skills'), { recursive: true })
+    await seedEngineSkills(home, '.cursor/skills', persona.skills ?? [])
     // Always rewrite AGENTS.md so persona edits land without requiring a fresh
     // home (matches Claude and Codex). Cursor discovers AGENTS.md from its cwd.
     await writeFile(
