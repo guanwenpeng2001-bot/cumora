@@ -151,6 +151,7 @@ test('secure adapters reject linked state directories', {
 })
 
 test('local engine failure returns stderr tail for observability', async () => {
+  delete process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED
   const root = await mkdtemp(join(tmpdir(), 'cumora-engine-'))
   tempDirs.push(root)
   const binDir = join(root, 'bin')
@@ -411,6 +412,7 @@ if (argv.includes('--input-format')) {
 })
 
 test('persistent Claude startup failure keeps stderr for first send', async () => {
+  delete process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED
   const root = await mkdtemp(join(tmpdir(), 'cumora-engine-session-'))
   tempDirs.push(root)
   const binDir = join(root, 'bin')
@@ -528,6 +530,7 @@ test('resolveSpawn runs a native Windows executable without cmd.exe', { skip: !I
 })
 
 test('Codex one-shot paths send prompts through stdin', async () => {
+  delete process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED
   const root = await mkdtemp(join(tmpdir(), 'cumora-codex-stdin-'))
   tempDirs.push(root)
   const binDir = join(root, 'bin')
