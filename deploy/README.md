@@ -1,12 +1,14 @@
 # Docker 化部署(自托管,一条命令起全部)
 
-仓库根的 `docker-compose.yml` 起四个服务:
+仓库根的 `docker-compose.yml` 起六个服务(含一次性迁移服务):
 
 | 服务 | 镜像 | 端口 | 说明 |
 |---|---|---|---|
 | db | pgvector/pgvector:pg16 | 5432 | 复用外部卷 `cumora-pgdata`(数据不丢) |
 | redis | redis:7 | 6379 | 复用外部卷 `cumora-redis-data` |
-| server | 本地 build(`server/docker/cumora-server.Dockerfile`) | 5181 | API + 调度器 + orchestrator;启动前先跑 `npm run migrate` |
+| server | 本地 build(`server/docker/cumora-server.Dockerfile`) | 5181 | API + 调度器 + orchestrator;依赖 `migrate` 成功退出 |
+| migrate | 同 server 镜像 | — | 一次性运行 `npm run migrate`,成功退出后 server 才启动 |
+| sub2api | 本地 fork build(`../sub2api`) | 8082 | 固定到已审计 fork revision 的本地镜像标签 |
 | web | 本地 build(`deploy/web.Dockerfile`) | 8080 | nginx serve SPA dist,反代 `/api`、`/ws`(WebSocket)、`/uploads` 到 server |
 
 ## 前提
@@ -28,7 +30,8 @@
 docker compose up -d                # 起全栈(首次会自动 build)
 docker compose build                # 改了代码后重新构建镜像
 docker compose up -d --build        # build + 重启受影响服务
-docker compose logs -f server       # 看 server 日志(migrate 输出在最前面)
+docker compose logs -f migrate      # 看一次性迁移日志
+docker compose logs -f server       # 看 API 日志
 docker compose logs -f web db redis
 docker compose down                 # 停掉所有容器(卷保留,数据不丢)
 ```
@@ -36,7 +39,7 @@ docker compose down                 # 停掉所有容器(卷保留,数据不丢)
 改了 `.env` 后(env_file 不会热加载):
 
 ```bash
-docker compose up -d --force-recreate server
+docker compose up -d --force-recreate migrate server
 ```
 
 ## 访问入口

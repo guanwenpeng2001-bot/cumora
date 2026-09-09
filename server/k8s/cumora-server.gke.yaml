@@ -59,6 +59,30 @@ rules:
   resources: ["persistentvolumeclaims"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 ---
+# Nodes are cluster-scoped, so the FUSE admission probe needs a narrow
+# ClusterRole in addition to the namespaced Pod/PVC Role above.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cumora-server-node-read
+rules:
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cumora-server-node-read
+subjects:
+- kind: ServiceAccount
+  name: cumora-server
+  namespace: default
+roleRef:
+  kind: ClusterRole
+  name: cumora-server-node-read
+  apiGroup: rbac.authorization.k8s.io
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
@@ -155,14 +179,14 @@ spec:
         # Optional: pin agent pods to a specific node pool / GKE
         # Workload Identity SA via CUMORA_AGENT_SERVICE_ACCOUNT
         # (defaults to namespace `default` SA when unset).
-        # `/` now serves the SPA's index.html, so we point probes at the
-        # DB-touching /api/health instead.
+        # `/` now serves the SPA's index.html. Readiness may check the DB,
+        # but liveness must remain a pure process check.
         readinessProbe:
           httpGet: { path: /api/health, port: http }
           periodSeconds: 5
           timeoutSeconds: 2
         livenessProbe:
-          httpGet: { path: /api/health, port: http }
+          httpGet: { path: /api/livez, port: http }
           periodSeconds: 30
           timeoutSeconds: 3
         resources:

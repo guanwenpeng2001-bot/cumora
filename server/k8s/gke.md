@@ -196,14 +196,11 @@ ceiling (default `40`) before creating agent pods. Keep that lower
 than the advertised FUSE count so bursts are bounded by Cumora's real
 CPU, memory, API-server, and provider concurrency budget.
 
-> **The cluster-wide FUSE ceiling is inert under the shipped RBAC.**
-> `getClusterFuseUtilization()` shells out to `kubectl get nodes`, and when
-> that call fails it fails *open* — the cap becomes `Infinity`. Neither
-> `cumora-server.gke.yaml` nor `cumora-server.orbstack.yaml` grants node reads:
-> they bind a namespaced `Role` over `pods`, `pods/log`, and
-> `persistentvolumeclaims` only. Until a `ClusterRole` +
-> `ClusterRoleBinding` for `nodes: [get, list]` is added, only
-> `AGENT_POD_ADMISSION_MAX` actually bounds admission.
+The cluster-wide FUSE ceiling is enforced fail-closed. The checked-in
+manifests bind the server ServiceAccount to a narrow `ClusterRole` with only
+`nodes: [get, list]`, in addition to the namespaced Pod/PVC Role. If the node
+or Pod capacity read still fails, admission is refused with a readable reason;
+`AGENT_POD_ADMISSION_MAX` is never bypassed.
 
 On **GKE Autopilot**: the plugin DaemonSet works but Autopilot may
 reject `securityContext.capabilities.add: [SYS_ADMIN]` depending on
@@ -228,23 +225,12 @@ kubectl rollout status deployment/cumora-server
 The application Pods only read `schema_migrations` and refuse to start outside
 their supported version range. They never execute DDL during startup.
 
-> **Patch the liveness probe after applying.** The checked-in manifest still
-> points `livenessProbe` at `/api/health`, which touches the database. The
-> Deploy workflow patches it to `/api/livez` on every rollout precisely
-> because a DB-backed liveness probe turned a connection-pool stall into a
-> restart loop (2026-05-27). A manual `kubectl apply` re-introduces the bad
-> config, so follow it with:
->
-> ```sh
-> kubectl patch deployment/cumora-server --type=json -p='[{
->   "op": "replace",
->   "path": "/spec/template/spec/containers/0/livenessProbe/httpGet/path",
->   "value": "/api/livez"
-> }]'
-> ```
->
-> Readiness should stay on `/api/health` — that one *should* pull a pod out of
-> rotation when its dependencies are gone.
+The checked-in manifest points `livenessProbe` directly at `/api/livez`,
+which is a pure process liveness endpoint and does not touch the database.
+`readinessProbe` remains DB-backed so traffic is removed while the database is
+unavailable without restarting healthy application processes.
+Readiness should stay on `/api/health` — that one *should* pull a pod out of
+rotation when its dependencies are gone.
 
 ## 7. Verify end-to-end
 

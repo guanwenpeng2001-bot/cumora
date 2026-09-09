@@ -59,10 +59,9 @@ services:
       DATABASE_URL: postgres://postgres:cumora@db:5432/cumora
       REDIS_URL: redis://redis:6379
       NODE_ENV: production
-    # The image CMD only starts the server — chain the migration runner in
-    # front so the schema is guaranteed current before boot (advisory-locked,
-    # idempotent).
-    command: ["sh", "-c", "npm run migrate && npm run server:start"]
+    # The schema is owned by the one-shot `migrate` service below. Keeping
+    # DDL out of this long-lived container avoids a migration failure turning
+    # into a server CrashLoopBackOff.
     volumes:
       # Container-reachable kubeconfig copy (see header). Read-only mount;
       # kubectl in the container runs as root and auto-detects this path.
@@ -74,12 +73,31 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://localhost:5181/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 10s
       timeout: 5s
       retries: 12
       start_period: 30s
+
+  # Run schema migrations exactly once before the API starts. Compose waits
+  # for this service to exit successfully through server.depends_on.
+  migrate:
+    build:
+      context: .
+      dockerfile: server/docker/cumora-server.Dockerfile
+    container_name: cumora-migrate
+    restart: "no"
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://postgres:cumora@db:5432/cumora
+      NODE_ENV: production
+    command: ["npm", "run", "migrate"]
+    depends_on:
+      db:
+        condition: service_healthy
 
   web:
     build:
@@ -98,6 +116,9 @@ services:
   # Built from our fork, which adds POST /api/v1/admin/users/:id/api-keys
   # (admin-side key minting; upstream only has the user-facing POST /keys).
   sub2api:
+    # Pin the locally built image name to the audited fork revision; never
+    # resolve or pull a floating `latest` tag.
+    image: cumora-sub2api:fork-00739f3b1af5
     build:
       # Local checkout of the fork (github.com/guanwenpeng2001-bot/sub2api) —
       # much faster than re-cloning the git URL on every build. Push to the

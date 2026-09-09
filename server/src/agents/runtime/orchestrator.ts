@@ -61,7 +61,11 @@ const NS = process.env.CUMORA_AGENT_NAMESPACE ?? 'default'
  *  host services via host.docker.internal. The sub2api case swaps the
  *  compose-internal URL for its public counterpart first, so no port is
  *  hardcoded here — SUB2API_PUBLIC_URL is the pod-reachable form. */
-function podUrl(raw: string): string {
+export function podUrl(raw: string): string {
+  // An omitted optional endpoint (for example OPENAI_BASE_URL) is valid;
+  // malformed non-empty values are not. Callers must not silently inject a
+  // URL that was never successfully parsed into a Pod manifest.
+  if (raw === '') return ''
   try {
     let target = raw
     const internal = env.SUB2API_INTERNAL_URL.replace(/\/+$/, '')
@@ -72,7 +76,10 @@ function podUrl(raw: string): string {
     if (['localhost', '127.0.0.1', '[::1]', 'db', 'redis'].includes(u.hostname)) u.hostname = 'host.docker.internal'
     const out = u.toString()
     return target.endsWith('/') || !out.endsWith('/') ? out : out.slice(0, -1)
-  } catch { return raw }
+  } catch (cause) {
+    const detail = cause instanceof Error ? cause.message : String(cause)
+    throw new Error('invalid pod URL ' + JSON.stringify(raw) + ': ' + detail)
+  }
 }
 /** Comma-separated list of imagePullSecrets to attach to the agent
  *  Pod. Needed when the image lives in a private registry (e.g.
@@ -107,6 +114,8 @@ interface KubectlOpts {
   timeoutMs?: number
   /** stdin to pipe to kubectl (used by `kubectl apply -f -`). */
   stdin?: string
+  /** Abort an obsolete ensurePod mutation after its watchdog fires. */
+  signal?: AbortSignal
 }
 
 /** Caps concurrent `kubectl` child processes per replica
@@ -133,11 +142,16 @@ function kubectlSpawn(args: string[], opts: KubectlOpts = {}): Promise<KubectlRe
     let err = ''
     let settled = false
     let killTimer: NodeJS.Timeout | null = null
+    let abortListener: (() => void) | null = null
     const finish = (r: KubectlResult): void => {
       if (settled) return
       settled = true
       if (killTimer) { clearTimeout(killTimer); killTimer = null }
       if (timer) { clearTimeout(timer); }
+      if (abortListener) {
+        opts.signal?.removeEventListener('abort', abortListener)
+        abortListener = null
+      }
       resolve(r)
     }
     const timer = setTimeout(() => {
@@ -158,6 +172,23 @@ function kubectlSpawn(args: string[], opts: KubectlOpts = {}): Promise<KubectlRe
       })
     }, timeoutMs)
     timer.unref?.()
+    abortListener = () => {
+      if (settled) return
+      // The watchdog has already returned to the caller. Stop this child so
+      // an obsolete ensurePodImpl cannot apply a stale Pod after cancellation.
+      try { child.kill('SIGTERM') } catch { /* already gone */ }
+      finish({
+        code: 125,
+        out,
+        err: err + '\\n[kubectl] aborted by ensurePod watchdog',
+        timedOut: false,
+      })
+    }
+    if (opts.signal?.aborted) {
+      abortListener()
+      return
+    }
+    opts.signal?.addEventListener('abort', abortListener, { once: true })
     child.stdout.on('data', (d: Buffer) => { out += d.toString() })
     child.stderr.on('data', (d: Buffer) => { err += d.toString() })
     child.on('error', (e) => finish({
@@ -384,7 +415,7 @@ spec:
     - name: CUMORA_AGENT_ID
       value: ${yamlQuote(args.agentId)}
     - name: CUMORA_AGENT_RUNTIME_URL
-      value: ${yamlQuote(args.serverUrl)}
+      value: ${yamlQuote(podUrl(args.serverUrl))}
     - name: CUMORA_AGENT_IDLE_MS
       value: ${yamlQuote(String(args.idleMs))}
     - name: CUMORA_AGENT_NO_WORK_MS
@@ -495,7 +526,7 @@ spec:
 }
 
 /** Exported for tests — production callers go through ensurePod. */
-export const _testing = { podManifest, yamlQuote, dnsLabelValue, chromeProfilePvcManifest, chromeProfilePvcName }
+export const _testing = { podManifest, podUrl, yamlQuote, dnsLabelValue, chromeProfilePvcManifest, chromeProfilePvcName }
 
 // ─── cluster-wide FUSE admission control ─────────────────────────────
 //
@@ -523,6 +554,10 @@ export interface ClusterFuseUtilization {
   ratio: number
   /** True when result came from the in-memory cache. */
   cached: boolean
+  /** False means cluster capacity could not be established safely. */
+  capacityKnown: boolean
+  /** Human-readable read failure, present when capacityKnown is false. */
+  capacityError?: string
 }
 
 /** Pure parser — extracted so the unit test can pin both branches
@@ -551,7 +586,7 @@ export function parseClusterFuse(nodesJson: string, podsJson: string): { used: n
   return { used, cap }
 }
 
-interface FuseUtilCache { ts: number; used: number; cap: number }
+interface FuseUtilCache { ts: number; used: number; cap: number; capacityKnown: boolean }
 let fuseUtilCache: FuseUtilCache | null = null
 
 /** TTL on the cluster-wide fuse sample. Short enough that bursts get
@@ -566,13 +601,13 @@ const FUSE_CACHE_TTL_MS = 10_000
 const FUSE_ADMISSION_THRESHOLD = 0.90
 
 /** Sample (or read from cache) the cluster's cumora-agent fuse usage.
- *  Fails open: on kubectl error returns `cap=Infinity` so callers
- *  never block on transient cluster-state read failures. */
+ *  Fails closed: a missing/invalid capacity sample is not evidence that
+ *  capacity is available, so callers must refuse new Pod admission. */
 export async function getClusterFuseUtilization(): Promise<ClusterFuseUtilization> {
   const now = Date.now()
   if (fuseUtilCache && now - fuseUtilCache.ts < FUSE_CACHE_TTL_MS) {
-    const { used, cap } = fuseUtilCache
-    return { used, cap, ratio: cap > 0 ? used / cap : 0, cached: true }
+    const { used, cap, capacityKnown } = fuseUtilCache
+    return { used, cap, ratio: cap > 0 ? used / cap : 1, cached: true, capacityKnown }
   }
   const [nodes, pods] = await Promise.all([
     kubectlWithRetry(['get', 'nodes', '-o', 'json'], { timeoutMs: 10_000 }),
@@ -582,15 +617,39 @@ export async function getClusterFuseUtilization(): Promise<ClusterFuseUtilizatio
     ),
   ])
   if (nodes.code !== 0 || pods.code !== 0) {
-    // Fail open — we'd rather over-spawn during a kubectl flake than
-    // wedge every wake. Don't cache this so the next call retries.
-    return { used: 0, cap: Number.POSITIVE_INFINITY, ratio: 0, cached: false }
+    // Do not turn an RBAC/API-server failure into Infinity: that would
+    // bypass both the cluster ceiling and AGENT_POD_ADMISSION_MAX.
+    const detail = [nodes, pods]
+      .filter((r) => r.code !== 0)
+      .map((r) => (r.err || r.out).trim().slice(0, 240))
+      .filter(Boolean)
+      .join('; ')
+    return {
+      used: 0,
+      cap: 0,
+      ratio: 1,
+      cached: false,
+      capacityKnown: false,
+      capacityError: detail || 'kubectl could not read cluster capacity',
+    }
   }
   const parsed = parseClusterFuse(nodes.out, pods.out)
+  if (parsed.cap <= 0) {
+    // A successful response with no advertised fuse capacity is still
+    // unusable for admission; treat missing device-plugin data as unknown.
+    return {
+      used: parsed.used,
+      cap: 0,
+      ratio: 1,
+      cached: false,
+      capacityKnown: false,
+      capacityError: 'no devic.es/fuse capacity was advertised by any node',
+    }
+  }
   const appCap = env.AGENT_POD_ADMISSION_MAX
   const cap = appCap > 0 ? Math.min(parsed.cap, appCap) : parsed.cap
-  fuseUtilCache = { ts: now, used: parsed.used, cap }
-  return { used: parsed.used, cap, ratio: cap > 0 ? parsed.used / cap : 0, cached: false }
+  fuseUtilCache = { ts: now, used: parsed.used, cap, capacityKnown: true }
+  return { used: parsed.used, cap, ratio: parsed.used / cap, cached: false, capacityKnown: true }
 }
 
 /** Test-only — clear the in-memory cache so tests don't poison each other. */
@@ -601,6 +660,26 @@ export function _resetFuseUtilCacheForTests(): void { fuseUtilCache = null }
  *  waiting for the next refresh. No-op if the cache is empty. */
 function bumpFuseUtilUsedOnSpawn(): void {
   if (fuseUtilCache) fuseUtilCache.used++
+}
+
+// PostgreSQL advisory locks are process-independent, unlike inFlight and the
+// fuse cache. Hold this lease across the fresh capacity read and the Pod apply
+// so two cumora-server replicas cannot both pass check-before-spawn at once.
+const POD_ADMISSION_LOCK_KEY = 7_643_178_926_307n
+
+async function withPodAdmissionLease<T>(fn: () => Promise<T>): Promise<T> {
+  const client = await pool.connect()
+  let locked = false
+  try {
+    await client.query('SELECT pg_advisory_lock($1::bigint)', [POD_ADMISSION_LOCK_KEY.toString()])
+    locked = true
+    return await fn()
+  } finally {
+    if (locked) {
+      await client.query('SELECT pg_advisory_unlock($1::bigint)', [POD_ADMISSION_LOCK_KEY.toString()]).catch(() => { /* connection release unlocks it */ })
+    }
+    client.release()
+  }
 }
 
 export type PodPhase = '' | 'Pending' | 'Running' | 'Succeeded' | 'Failed' | 'Unknown'
@@ -778,31 +857,39 @@ export async function ensurePod(agentId: string): Promise<EnsurePodResult> {
   if (existing) return existing
   const p = (async (): Promise<EnsurePodResult> => {
     let watchdogFired = false
-    const watchdog = new Promise<EnsurePodResult>((resolve) =>
-      setTimeout(() => {
+    const controller = new AbortController()
+    let watchdogTimer: NodeJS.Timeout | null = null
+    const watchdog = new Promise<EnsurePodResult>((resolve) => {
+      watchdogTimer = setTimeout(() => {
         watchdogFired = true
+        // Cancel kubectl mutations and mark the generation obsolete. The
+        // losing ensurePodImpl may still finish a DB read, but it must not
+        // apply a stale PVC/Pod after this watchdog wins the race.
+        controller.abort()
         resolve({
           created: false,
           ok: false,
           code: 'watchdog_timeout',
-          reason: `ensurePod watchdog: implementation did not return within ${ENSURE_POD_WATCHDOG_MS}ms`,
+          reason: 'ensurePod watchdog: implementation did not return within ' + ENSURE_POD_WATCHDOG_MS + 'ms',
         })
-      }, ENSURE_POD_WATCHDOG_MS).unref?.(),
-    )
+      }, ENSURE_POD_WATCHDOG_MS)
+      watchdogTimer.unref?.()
+    })
     try {
-      const result = await Promise.race([ensurePodImpl(agentId), watchdog])
+      const result = await Promise.race([ensurePodImpl(agentId, controller.signal), watchdog])
       if (watchdogFired) {
         // Alert because this means something hung BELOW the per-call
         // timeouts — a real bug we want to know about, not just a
         // slow cluster.
         void notifyAlert({
           label: 'orchestrator.ensurePod_watchdog',
-          error: new Error(`ensurePod(${agentId}) exceeded ${ENSURE_POD_WATCHDOG_MS}ms`),
+          error: new Error('ensurePod(' + agentId + ') exceeded ' + ENSURE_POD_WATCHDOG_MS + 'ms'),
           extras: { agentId },
         })
       }
       return result
     } finally {
+      if (watchdogTimer) clearTimeout(watchdogTimer)
       inFlight.delete(agentId)
     }
   })()
@@ -810,7 +897,7 @@ export async function ensurePod(agentId: string): Promise<EnsurePodResult> {
   return p
 }
 
-async function ensurePodImpl(agentId: string): Promise<EnsurePodResult> {
+async function ensurePodImpl(agentId: string, signal: AbortSignal): Promise<EnsurePodResult> {
   const startedAt = Date.now()
   // This is the final authorization boundary for managed execution. Scheduler
   // lookups are advisory only: assignment/tier can change between a wake and
@@ -874,7 +961,7 @@ async function ensurePodImpl(agentId: string): Promise<EnsurePodResult> {
     if (denied) return denied
     const reap = await kubectlWithRetry(
       ['delete', 'pod', podName(agentId), '--ignore-not-found=true', '--wait=true', '--timeout=30s'],
-      { timeoutMs: 40_000 },
+      { timeoutMs: 40_000, signal },
     )
     if (reap.code !== 0) {
       // The reap failed — apply will almost certainly fail too (it
@@ -909,24 +996,8 @@ async function ensurePodImpl(agentId: string): Promise<EnsurePodResult> {
     if (denied) return denied
     await kubectlWithRetry(
       ['delete', 'pod', podName(agentId), '--ignore-not-found=true', '--wait=true', '--timeout=30s'],
-      { timeoutMs: 40_000 },
+      { timeoutMs: 40_000, signal },
     )
-  }
-
-  // Cluster-wide FUSE admission: refuse the spawn if the cluster is
-  // near its /dev/fuse capacity. The scheduler puts durable
-  // message.new/manual wakes into a Redis retry queue when this
-  // returns !ok; idle/scanner wakes are best-effort and retry on the
-  // next tick.
-  // Throwing this admission AT the kubectl-apply edge stops over-spawn
-  // at its narrowest possible chokepoint and keeps cluster cap from
-  // being exceeded regardless of upstream caller behavior.
-  const fuse = await getClusterFuseUtilization()
-  if (fuse.cap > 0 && fuse.ratio >= FUSE_ADMISSION_THRESHOLD) {
-    return {
-      created: false, ok: false, code: 'capacity_denied',
-      reason: `cluster fuse saturated: ${fuse.used}/${fuse.cap} (${Math.round(fuse.ratio * 100)}% ≥ ${Math.round(FUSE_ADMISSION_THRESHOLD * 100)}% threshold)`,
-    }
   }
 
   const persona = await inprocClient.loadPersona(agentId).catch(() => null)
@@ -994,6 +1065,13 @@ async function ensurePodImpl(agentId: string): Promise<EnsurePodResult> {
   const finalPlacementDenied = await recheckPlacement()
   if (finalPlacementDenied) return finalPlacementDenied
 
+  if (signal.aborted) {
+    return {
+      created: false, ok: false, code: 'watchdog_timeout',
+      reason: 'ensurePod watchdog cancelled this generation before Kubernetes mutation',
+    }
+  }
+
   // Apply the per-agent chrome-profile PVC BEFORE the pod. kubectl
   // apply is idempotent — if the PVC already exists this is a no-op.
   // The PVC outlives the pod, so an idle-exit / restart / re-spawn
@@ -1007,7 +1085,7 @@ async function ensurePodImpl(agentId: string): Promise<EnsurePodResult> {
   // pod manifest swaps the volume source to emptyDir to match.
   if (CHROME_PROFILE_ON_PVC) {
     const pvcManifest = chromeProfilePvcManifest({ agentId })
-    const pvcApply = await kubectlWithRetry(['apply', '-f', '-'], { stdin: pvcManifest, timeoutMs: 20_000 })
+    const pvcApply = await kubectlWithRetry(['apply', '-f', '-'], { stdin: pvcManifest, timeoutMs: 20_000, signal })
     if (pvcApply.code !== 0) {
       console.warn(`[orchestrator] chrome PVC apply failed for ${agentId}: ${(pvcApply.err || pvcApply.out).trim()}`)
     }
@@ -1026,8 +1104,42 @@ async function ensurePodImpl(agentId: string): Promise<EnsurePodResult> {
 
   // `kubectl apply` is the write path. Retry on transient errors;
   // 45s timeout because validation + admission webhooks can be slow
-  // when an image-pull-credential webhook runs.
-  const podApply = await kubectlWithRetry(['apply', '-f', '-'], { stdin: manifest, timeoutMs: 45_000 })
+  // when an image-pull-credential webhook runs. The fresh capacity read
+  // and this mutation share a PostgreSQL lease across server replicas.
+  const admission = await withPodAdmissionLease(async () => {
+    // Do not use this replica's pre-lease cache: another replica may have
+    // created a Pod while this one was waiting for the global lease.
+    fuseUtilCache = null
+    const fuse = await getClusterFuseUtilization()
+    if (!fuse.capacityKnown) {
+      return {
+        podApply: null,
+        denied: {
+          created: false as const,
+          ok: false as const,
+          code: 'capacity_denied' as const,
+          reason: 'cluster fuse capacity unavailable; refusing Pod admission: ' + (fuse.capacityError ?? 'unknown read failure'),
+        },
+      }
+    }
+    if (fuse.cap <= 0 || fuse.ratio >= FUSE_ADMISSION_THRESHOLD) {
+      return {
+        podApply: null,
+        denied: {
+          created: false as const,
+          ok: false as const,
+          code: 'capacity_denied' as const,
+          reason: 'cluster fuse saturated: ' + fuse.used + '/' + fuse.cap + ' (' + Math.round(fuse.ratio * 100) + '% ≥ ' + Math.round(FUSE_ADMISSION_THRESHOLD * 100) + '% threshold)',
+        },
+      }
+    }
+    return {
+      podApply: await kubectlWithRetry(['apply', '-f', '-'], { stdin: manifest, timeoutMs: 45_000, signal }),
+      denied: null,
+    }
+  })
+  if (admission.denied) return admission.denied
+  const podApply = admission.podApply
   if (podApply.code !== 0) {
     const errText = (podApply.err || podApply.out).trim()
     // Alert on apply failures — when this fires, agents stay in
