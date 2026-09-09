@@ -31,6 +31,7 @@ test('validateConnector accepts stdio and http shapes', () => {
 
 test('validateConnector rejects bad names / missing fields', () => {
   assert.match(validateConnector({ name: 'Bad Name', type: 'stdio', command: 'x' }) ?? '', /name/)
+  assert.match(validateConnector({ name: 'a__b', type: 'stdio', command: 'x' }) ?? '', /__/)
   assert.match(validateConnector({ name: 'ok', type: 'stdio' }) ?? '', /command/)
   assert.match(validateConnector({ name: 'ok', type: 'http', url: 'ftp://x' }) ?? '', /url/)
   assert.match(validateConnector({ name: 'ok', type: 'grpc' }) ?? '', /type/)

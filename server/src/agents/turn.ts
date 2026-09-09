@@ -860,6 +860,9 @@ const lastCompletedInbox = new Map<string, string>()
  *  truncating it. */
 const MAX_HOPS = 200
 
+const MCP_CONNECT_FAILURE_CACHE_MS = 30_000
+const mcpConnectorFailureCache = new Map<string, number>()
+
 /** Per-hop tool output bound before it is fed back to the model. This is not
  * the semantic compaction path; it is a last-mile safety valve so a single
  * enormous CLI result cannot explode the next Responses input. Keep the output
@@ -2459,25 +2462,42 @@ Mechanics:
   // we no longer feed it back as previous_response_id.
 
   // ─── MCP connectors (phase 6) ──────────────────────────────────────
-  // Connect every enabled connector and merge its tools into the tool
-  // surface as mcp__<connector>__<tool>. A connector that fails to
-  // connect is skipped for this turn (warn event) — never fatal. All
-  // clients are closed in the turn's finally block.
-  for (const spec of persona.mcpConnectors ?? []) {
-    try {
-      const client = await connectMcpConnector(spec, { cwd: process.env.CUMORA_PERSONA_DIR ?? '/workspace' })
-      mcpClients.push(client)
-      mcpToolDefs.push(...client.tools.map((t) => mcpToolToFunctionTool(spec.name, t)))
-    } catch (err) {
-      await runtime.recordEvent({
-        runId, agentId, companyId: runCompanyId,
-        kind: 'mcp.connector_failed',
-        level: 'warn',
-        title: `MCP connector ${spec.name} unavailable; continuing without it`,
-        data: { connector: spec.name, error: errorText(err) },
-        stage: 'mcp_connector_failed',
-      }).catch(() => { /* observability best-effort */ })
+  // Connect enabled connectors in parallel so one slow endpoint cannot
+  // linearly delay every connector after it. Failed names are briefly
+  // cached to avoid paying the connect timeout again on the next turn.
+  const seenMcpConnectorNames = new Set<string>()
+  const mcpCacheNow = Date.now()
+  const mcpSpecs = (persona.mcpConnectors ?? []).filter((spec) => {
+    if (seenMcpConnectorNames.has(spec.name)) return false
+    seenMcpConnectorNames.add(spec.name)
+    const cacheKey = runCompanyId + ':' + spec.name
+    const failedUntil = mcpConnectorFailureCache.get(cacheKey)
+    if (failedUntil === undefined) return true
+    if (failedUntil > mcpCacheNow) return false
+    mcpConnectorFailureCache.delete(cacheKey)
+    return true
+  })
+  const mcpConnectionResults = await Promise.allSettled(mcpSpecs.map((spec) =>
+    connectMcpConnector(spec, { cwd: process.env.CUMORA_PERSONA_DIR ?? '/workspace' }),
+  ))
+  for (let i = 0; i < mcpConnectionResults.length; i++) {
+    const spec = mcpSpecs[i]
+    const result = mcpConnectionResults[i]
+    if (result.status === 'fulfilled') {
+      mcpConnectorFailureCache.delete(runCompanyId + ':' + spec.name)
+      mcpClients.push(result.value)
+      mcpToolDefs.push(...result.value.tools.map((t) => mcpToolToFunctionTool(spec.name, t)))
+      continue
     }
+    mcpConnectorFailureCache.set(runCompanyId + ':' + spec.name, Date.now() + MCP_CONNECT_FAILURE_CACHE_MS)
+    await runtime.recordEvent({
+      runId, agentId, companyId: runCompanyId,
+      kind: 'mcp.connector_failed',
+      level: 'warn',
+      title: `MCP connector ${spec.name} unavailable; continuing without it`,
+      data: { connector: spec.name, error: errorText(result.reason) },
+      stage: 'mcp_connector_failed',
+    }).catch(() => { /* observability best-effort */ })
   }
 
   for (let hop = 0; hop < MAX_HOPS; hop++) {
@@ -3005,7 +3025,7 @@ Mechanics:
         if (mcpSplit) {
           const client = mcpClients.find((c) => c.connector === mcpSplit.connector)
           if (!client) throw new Error(`MCP connector ${mcpSplit.connector} is not connected this turn`)
-          const mcpRes = await client.callTool(mcpSplit.tool, parsedArgs as Record<string, unknown>)
+          const mcpRes = await client.callTool(tc.name, parsedArgs as Record<string, unknown>, batchAbortController.signal)
           return {
             tc,
             result: {

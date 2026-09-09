@@ -64,6 +64,7 @@ export function validateConnector(input: {
 }): string | null {
   const name = typeof input.name === 'string' ? input.name.trim() : ''
   if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(name)) return 'name must be 1-64 chars of a-z 0-9 _ - (start alnum)'
+  if (name.includes('__')) return 'name must not contain __'
   if (input.type !== 'stdio' && input.type !== 'http') return 'type must be stdio | http'
   if (input.type === 'stdio') {
     if (typeof input.command !== 'string' || !input.command.trim()) return 'stdio connectors need a command'

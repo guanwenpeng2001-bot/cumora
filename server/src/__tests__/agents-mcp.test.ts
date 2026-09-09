@@ -58,7 +58,7 @@ test('mcpToolToFunctionTool defaults schema/description when absent', () => {
 test('mcpResultToText joins text content and surfaces isError', () => {
   assert.deepEqual(
     mcpResultToText({ content: [{ type: 'text', text: 'a' }, { type: 'image' }, { type: 'text', text: 'b' }] }),
-    { text: 'a\nb', isError: false },
+    { text: 'a\nb', isError: true },
   )
   assert.deepEqual(
     mcpResultToText({ content: [{ type: 'text', text: 'boom' }], isError: true }),

@@ -10,6 +10,7 @@
  * dial only the registry URL.
  */
 import { spawn, type ChildProcess } from 'node:child_process'
+import { StringDecoder } from 'node:string_decoder'
 
 /** DB-free connector spec (structurally matches mcp_connectors rows). */
 export interface McpConnectorSpec {
@@ -48,7 +49,8 @@ export function prefixedToolName(connector: string, tool: string): string {
   return `mcp__${connector}__${clean}`.slice(0, 64)
 }
 
-/** Inverse of prefixedToolName. Returns null for non-MCP names. */
+/** Parse the wire prefix. The tool portion is still the sanitized wire name;
+ *  the connected client reverses it through its per-connection name map. */
 export function splitPrefixedToolName(name: string): { connector: string; tool: string } | null {
   if (!name.startsWith('mcp__')) return null
   const rest = name.slice(5)
@@ -81,11 +83,20 @@ export function mcpToolToFunctionTool(connector: string, tool: McpToolDef): {
 export function mcpResultToText(result: unknown): McpToolResult {
   const r = (result ?? {}) as { content?: Array<{ type?: string; text?: string }>; isError?: boolean }
   const parts = Array.isArray(r.content) ? r.content : []
-  const text = parts
+  const textParts = parts
     .filter((p) => p && p.type === 'text' && typeof p.text === 'string')
     .map((p) => p.text)
-    .join('\n')
-  return { text, isError: r.isError === true }
+  const text = textParts.join('\n')
+  const unsupportedTypes = [...new Set(parts
+    .filter((p) => !p || p.type !== 'text' || typeof p.text !== 'string')
+    .map((p) => p?.type ?? 'unknown'))]
+  const unsupportedText = unsupportedTypes.length > 0
+    ? `MCP returned unsupported content type(s): ${unsupportedTypes.join(', ')}`
+    : ''
+  return {
+    text: text || unsupportedText,
+    isError: r.isError === true || unsupportedTypes.length > 0,
+  }
 }
 
 /* ── JSON-RPC plumbing ────────────────────────────────────────────────── */
@@ -99,59 +110,99 @@ interface JsonRpcResponse {
 
 class McpError extends Error {}
 
+interface PendingRpc {
+  resolve: (v: unknown) => void
+  reject: (e: Error) => void
+  timer: ReturnType<typeof setTimeout>
+  controller: AbortController
+  abortCleanup?: () => void
+}
+
 /** Shared request/response matcher. Transport pushes decoded JSON-RPC
  *  messages to `onMessage`; `call` resolves by id with a timeout. */
 class RpcPump {
   private nextId = 1
-  private pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>()
+  private pending = new Map<number, PendingRpc>()
+  private settle(id: number, err?: Error, value?: unknown): void {
+    const entry = this.pending.get(id)
+    if (!entry) return
+    this.pending.delete(id)
+    clearTimeout(entry.timer)
+    entry.abortCleanup?.()
+    if (err) {
+      entry.controller.abort()
+      entry.reject(err)
+    } else {
+      entry.resolve(value)
+    }
+  }
   onMessage(msg: unknown): void {
     const m = (msg ?? {}) as JsonRpcResponse
     if (m.id === undefined || m.id === null) return // notification
     const id = typeof m.id === 'string' ? Number(m.id) : m.id
     const entry = this.pending.get(id)
     if (!entry) return
-    this.pending.delete(id)
-    clearTimeout(entry.timer)
-    if (m.error) entry.reject(new McpError(`MCP error ${m.error.code}: ${m.error.message}`))
-    else entry.resolve(m.result)
+    if (m.error) this.settle(id, new McpError(`MCP error ${m.error.code}: ${m.error.message}`))
+    else this.settle(id, undefined, m.result)
   }
-  call(method: string, params: unknown, timeoutMs: number, send: (payload: string) => void): Promise<unknown> {
+  call(
+    method: string,
+    params: unknown,
+    timeoutMs: number,
+    send: (payload: string, id: number, signal: AbortSignal) => void,
+    signal?: AbortSignal,
+  ): Promise<unknown> {
     const id = this.nextId++
     return new Promise((resolve, reject) => {
+      const controller = new AbortController()
       const timer = setTimeout(() => {
-        this.pending.delete(id)
-        reject(new McpError(`MCP ${method} timed out after ${timeoutMs}ms`))
+        this.settle(id, new McpError(`MCP ${method} timed out after ${timeoutMs}ms`))
       }, timeoutMs)
-      this.pending.set(id, { resolve, reject, timer })
-      send(JSON.stringify({ jsonrpc: '2.0', id, method, params }))
+      const entry: PendingRpc = { resolve, reject, timer, controller }
+      if (signal) {
+        const onAbort = () => this.settle(id, new McpError(`MCP ${method} aborted`))
+        entry.abortCleanup = () => signal.removeEventListener('abort', onAbort)
+        signal.addEventListener('abort', onAbort, { once: true })
+      }
+      this.pending.set(id, entry)
+      if (signal?.aborted) {
+        this.settle(id, new McpError(`MCP ${method} aborted`))
+        return
+      }
+      try {
+        send(JSON.stringify({ jsonrpc: '2.0', id, method, params }), id, controller.signal)
+      } catch (e) {
+        this.settle(id, e instanceof Error ? e : new Error(String(e)))
+      }
     })
   }
+  fail(id: number, err: Error): void {
+    this.settle(id, err)
+  }
   failAll(err: Error): void {
-    for (const [, entry] of this.pending) {
-      clearTimeout(entry.timer)
-      entry.reject(err)
-    }
-    this.pending.clear()
+    for (const id of this.pending.keys()) this.settle(id, err)
   }
 }
 
 const CLIENT_INFO = { name: 'cumora-mcp', version: '0.1.0' }
 const PROTOCOL_VERSION = '2024-11-05'
 
-async function handshake(pump: RpcPump, send: (p: string) => void): Promise<void> {
+async function handshake(pump: RpcPump, send: (p: string, id: number, signal: AbortSignal) => void): Promise<void> {
   await pump.call('initialize', {
     protocolVersion: PROTOCOL_VERSION,
     capabilities: {},
     clientInfo: CLIENT_INFO,
   }, CONNECT_TIMEOUT_MS, send)
-  send(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }))
+  send(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }), 0, AbortSignal.timeout(CALL_TIMEOUT_MS))
 }
 
 export interface McpClientHandle {
   /** Connector name (registry). */
   connector: string
   tools: McpToolDef[]
-  callTool(name: string, args: Record<string, unknown>): Promise<McpToolResult>
+  /** Wire tool name → original server tool name. */
+  toolNameMap: ReadonlyMap<string, string>
+  callTool(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<McpToolResult>
   close(): Promise<void>
 }
 
@@ -165,9 +216,10 @@ function connectStdio(spec: McpConnectorSpec, cwd: string): { pump: RpcPump; chi
   })
   const pump = new RpcPump()
   child.stdin?.on('error', (e) => pump.failAll(e))
+  const decoder = new StringDecoder('utf8')
   let buf = ''
-  child.stdout?.on('data', (chunk: Buffer) => {
-    buf += chunk.toString('utf8')
+  const consume = (text: string) => {
+    buf += text
     let nl = buf.indexOf('\n')
     while (nl >= 0) {
       const line = buf.slice(0, nl).trim()
@@ -176,7 +228,9 @@ function connectStdio(spec: McpConnectorSpec, cwd: string): { pump: RpcPump; chi
       if (!line) continue
       try { pump.onMessage(JSON.parse(line)) } catch { /* non-JSON log line */ }
     }
-  })
+  }
+  child.stdout?.on('data', (chunk: Buffer) => consume(decoder.write(chunk)))
+  child.stdout?.on('end', () => consume(decoder.end()))
   child.on('error', (e) => pump.failAll(e))
   child.on('exit', (code) => pump.failAll(new McpError(`MCP server exited (code ${code})`)))
   return { pump, child }
@@ -196,16 +250,26 @@ function connectHttp(spec: McpConnectorSpec): { pump: RpcPump; url: string; head
   }
 }
 
-async function httpSend(url: string, headers: Record<string, string>, payload: string, pump: RpcPump, timeoutMs: number): Promise<void> {
+async function httpSend(
+  url: string,
+  headers: Record<string, string>,
+  payload: string,
+  pump: RpcPump,
+  id: number,
+  signal: AbortSignal,
+): Promise<void> {
   // Streamable-HTTP: the JSON-RPC response arrives WITH the POST (inline
   // JSON or an SSE body). Either way it routes straight back into the pump.
   const res = await fetch(url, {
     method: 'POST',
     headers,
     body: payload,
-    signal: AbortSignal.timeout(timeoutMs),
+    signal,
   })
-  if (!res.ok) throw new McpError(`MCP http ${res.status}`)
+  if (!res.ok) {
+    pump.fail(id, new McpError(`MCP http ${res.status}`))
+    return
+  }
   const ct = (res.headers.get('content-type') ?? '').toLowerCase()
   const text = await res.text()
   if (ct.includes('text/event-stream')) {
@@ -231,7 +295,7 @@ export async function connectMcpConnector(
 ): Promise<McpClientHandle> {
   let pump: RpcPump
   let child: ChildProcess | null = null
-  let send: (payload: string) => void
+  let send: (payload: string, id: number, signal: AbortSignal) => void
 
   if (spec.type === 'stdio') {
     const s = connectStdio(spec, opts.cwd)
@@ -252,23 +316,42 @@ export async function connectMcpConnector(
   } else {
     const h = connectHttp(spec)
     pump = h.pump
-    send = (p) => { void httpSend(h.url, h.headers, p, pump, CALL_TIMEOUT_MS).catch((e) => pump.failAll(e instanceof Error ? e : new Error(String(e)))) }
+    send = (p, id, signal) => {
+      void httpSend(h.url, h.headers, p, pump, id, signal).catch((e) => {
+        pump.fail(id, e instanceof Error ? e : new Error(String(e)))
+      })
+    }
   }
 
   await handshake(pump, send)
   const listed = (await pump.call('tools/list', {}, LIST_TIMEOUT_MS, send)) as { tools?: McpToolDef[] }
   const tools = Array.isArray(listed?.tools) ? listed.tools : []
+  const toolNameMap = new Map<string, string>()
+  for (const tool of tools) {
+    const wireName = prefixedToolName(spec.name, tool.name)
+    const previous = toolNameMap.get(wireName)
+    if (previous !== undefined) {
+      if (child && child.exitCode === null) child.kill('SIGTERM')
+      throw new McpError(`MCP connector ${spec.name} has tool name collision: ${previous} and ${tool.name} → ${wireName}`)
+    }
+    toolNameMap.set(wireName, tool.name)
+  }
 
   return {
     connector: spec.name,
     tools,
-    async callTool(name, args) {
-      const result = await pump.call('tools/call', { name, arguments: args }, CALL_TIMEOUT_MS, send)
+    toolNameMap,
+    async callTool(name, args, signal) {
+      const wireName = toolNameMap.has(name) ? name : prefixedToolName(spec.name, name)
+      const originalName = toolNameMap.get(wireName)
+      if (originalName === undefined) throw new McpError(`MCP tool ${name} is not available on connector ${spec.name}`)
+      const result = await pump.call('tools/call', { name: originalName, arguments: args }, CALL_TIMEOUT_MS, send, signal)
       return mcpResultToText(result)
     },
     async close() {
       pump.failAll(new McpError('client closed'))
       if (child) {
+        if (child.exitCode !== null) return
         child.kill('SIGTERM')
         await new Promise<void>((resolve) => {
           const t = setTimeout(() => { child.kill('SIGKILL'); resolve() }, 2000)
