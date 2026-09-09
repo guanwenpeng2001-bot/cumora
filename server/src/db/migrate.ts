@@ -41,6 +41,10 @@ import {
   SERVER_SETTINGS_SQL,
   serverSettingsChecksum,
 } from './migrations/0007-server-settings.js'
+import {
+  MODEL_PRICING_SQL,
+  modelPricingChecksum,
+} from './migrations/0008-model-pricing.js'
 
 /** Frozen data backfill embedded in migration 0001. Exported so its behavior
  * can be exercised against PostgreSQL without replaying the whole migration. */
@@ -2552,6 +2556,10 @@ async function applyServerSettings(client: import('pg').PoolClient): Promise<voi
   await client.query(SERVER_SETTINGS_SQL)
 }
 
+async function applyModelPricing(client: import('pg').PoolClient): Promise<void> {
+  await client.query(MODEL_PRICING_SQL)
+}
+
 const VERSIONED_MIGRATIONS: readonly VersionedMigration[] = [
   {
     ...SCHEMA_MIGRATIONS[0],
@@ -2596,6 +2604,12 @@ const VERSIONED_MIGRATIONS: readonly VersionedMigration[] = [
     sourceChecksum: serverSettingsChecksum(),
     transactional: true,
     up: applyServerSettings,
+  },
+  {
+    ...SCHEMA_MIGRATIONS[7],
+    sourceChecksum: modelPricingChecksum(),
+    transactional: true,
+    up: applyModelPricing,
   },
 ]
 

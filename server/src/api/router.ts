@@ -20,6 +20,8 @@ import { fetchImageBytes } from '../agents/image-fetcher.js'
 import { transcribeAudio } from '../llm.js'
 import { SETTING_DEFS, getServerSetting, writeServerSettings, KNOWN_SETTING_KEYS } from '../settings.js'
 import { availableModels, invalidateModelCatalog } from '../models-catalog.js'
+import { parseUsageRange, usageSummary, usageTrend, usageByAgent, usageByModel, usageByProvider, usageLogs } from '../usage.js'
+import { modelPricingTable, upsertModelPricing } from '../model-pricing.js'
 import { getTriageEconomics, getWakeEconomics } from '../agents/observability.js'
 import { resolveKanbanAssigneeChange, wakeKanbanAgents } from '../agents/kanban-wake.js'
 import { AgentCreationError, createAgentRecord } from '../agents/create.js'
@@ -723,6 +725,74 @@ api.put('/settings/models', safe(async (req, res) => {
 api.get('/models/available', safe(async (req, res) => {
   const userId = requireAuth(req)
   res.json(await availableModels(userId, req.query?.refresh === '1'))
+}))
+
+/** Usage dashboard — pure reads over the llm_calls ledger, tenant-scoped. */
+api.get('/usage/summary', safe(async (req, res) => {
+  const { companyId } = await requireCompany(req)
+  const source = typeof req.query?.source === 'string' && req.query.source ? req.query.source : undefined
+  res.json(await usageSummary(companyId, parseUsageRange(req.query ?? {}), source))
+}))
+
+api.get('/usage/trend', safe(async (req, res) => {
+  const { companyId } = await requireCompany(req)
+  const granularity = req.query?.granularity === 'day' ? 'day' : 'hour'
+  res.json({ granularity, points: await usageTrend(companyId, parseUsageRange(req.query ?? {}), granularity) })
+}))
+
+api.get('/usage/by-agent', safe(async (req, res) => {
+  const { companyId } = await requireCompany(req)
+  res.json({ items: await usageByAgent(companyId, parseUsageRange(req.query ?? {})) })
+}))
+
+api.get('/usage/by-model', safe(async (req, res) => {
+  const { companyId } = await requireCompany(req)
+  res.json({ items: await usageByModel(companyId, parseUsageRange(req.query ?? {})) })
+}))
+
+api.get('/usage/by-provider', safe(async (req, res) => {
+  const { companyId } = await requireCompany(req)
+  res.json({ items: await usageByProvider(companyId, parseUsageRange(req.query ?? {})) })
+}))
+
+api.get('/usage/logs', safe(async (req, res) => {
+  const { companyId } = await requireCompany(req)
+  const q = req.query ?? {}
+  const source = typeof q.source === 'string' && q.source ? q.source : undefined
+  res.json(await usageLogs(companyId, parseUsageRange(q), {
+    page: Number(q.page ?? 1) || 1,
+    pageSize: Number(q.pageSize ?? 50) || 50,
+    source,
+  }))
+}))
+
+/** Price menu behind the usage dashboard. Read: any member; edit: admin. */
+api.get('/usage/pricing', safe(async (req, res) => {
+  await requireCompany(req)
+  res.json({ items: await modelPricingTable() })
+}))
+
+api.put('/usage/pricing', safe(async (req, res) => {
+  await requireSiteAdmin(req)
+  const b = (req.body ?? {}) as Record<string, unknown>
+  const model = typeof b.model === 'string' ? b.model.trim() : ''
+  if (!model) throw new HttpError(400, 'model required')
+  const num = (v: unknown): number => {
+    const n = Number(v)
+    if (!Number.isFinite(n) || n < 0) throw new HttpError(400, 'rates must be non-negative numbers')
+    return n
+  }
+  await upsertModelPricing({
+    model,
+    inPer1M: num(b.inPer1M ?? 0),
+    cachedInPer1M: num(b.cachedInPer1M ?? 0),
+    cacheWritePer1M: num(b.cacheWritePer1M ?? 0),
+    outPer1M: num(b.outPer1M ?? 0),
+    note: typeof b.note === 'string' ? b.note : null,
+    sourceUrl: typeof b.sourceUrl === 'string' ? b.sourceUrl : null,
+    pricedAt: typeof b.pricedAt === 'string' ? b.pricedAt : null,
+  })
+  res.json({ ok: true })
 }))
 
 // Liveness: "is this process alive?" — MUST NOT touch the DB. A slow or

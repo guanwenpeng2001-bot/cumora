@@ -13,6 +13,7 @@ import { attachWebSocket, resetHumanPresenceOnBoot } from './ws.js'
 import { bootDocumentBus } from './documents/rooms.js'
 import { pool } from './db/pool.js'
 import { getBrainModel, initServerSettings, startServerSettingsRefresher } from './settings.js'
+import { seedModelPricing, refreshModelPricing } from './model-pricing.js'
 import { redis } from './redis.js'
 import { startScanner } from './agents/scanner.js'
 import { startScheduler } from './agents/scheduler.js'
@@ -236,6 +237,13 @@ async function main() {
   void initServerSettings()
     .then(() => startServerSettingsRefresher())
     .catch((e) => console.warn('[settings] init failed; env fallbacks in effect', e instanceof Error ? e.message : e))
+
+  // Price menu: seed the built-in list on first boot, then serve from the
+  // 30s snapshot (cost.ts reads it between env overrides and hardcoded seeds).
+  void seedModelPricing()
+    .then(() => refreshModelPricing(true))
+    .then(() => setInterval(() => void refreshModelPricing(true), 30_000).unref())
+    .catch((e) => console.warn('[pricing] init failed; hardcoded seeds in effect', e instanceof Error ? e.message : e))
 
   server.listen(env.PORT, () => {
     console.log(`[boot] cumora server :${env.PORT} · instance ${env.INSTANCE_ID} · model ${getBrainModel()}`)

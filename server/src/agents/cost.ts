@@ -20,6 +20,8 @@
  *  (uncached) counts as the provider reports them: `inputTokens` excludes the
  *  cached portion; `cachedInputTokens` is the cache-READ portion (cheap);
  *  `cacheCreationTokens` is the cache-WRITE portion (a premium over input). */
+import { dbPriceFor } from '../model-pricing.js'
+
 export interface TokenUsage {
   inputTokens: number
   cachedInputTokens: number
@@ -90,7 +92,8 @@ function overrides(): Record<string, ModelPrice> {
   return envOverrides
 }
 
-/** Resolve the price for a model id: env override (exact) → seeded exact → seeded
+/** Resolve the price for a model id: env override (exact) → model_pricing
+ *  table (operator-editable, 30s snapshot) → seeded exact → seeded
  *  family substring → fallback. */
 export function priceFor(model: string | null | undefined): ModelPrice {
   const id = (model ?? '').toLowerCase().trim()
@@ -103,6 +106,8 @@ export function priceFor(model: string | null | undefined): ModelPrice {
   const ov = overrides()
   if (ov[id]) return ov[id]
   for (const [key, price] of Object.entries(ov)) if (matches(key)) return price
+  const db = dbPriceFor(id)
+  if (db) return db
   if (SEED_PRICES[id]) return SEED_PRICES[id]
   for (const [key, price] of Object.entries(SEED_PRICES)) if (matches(key)) return price
   return FALLBACK_PRICE

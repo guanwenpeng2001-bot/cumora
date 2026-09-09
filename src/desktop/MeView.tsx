@@ -12,6 +12,7 @@ import { LanguagePicker } from '@/components/LanguagePicker'
 import { useT, type MessageKey } from '@/lib/i18n'
 import { ModelsTab } from './ModelsTab'
 import { cn } from '@/lib/utils'
+import { UsageDashboard } from './UsageDashboard'
 import { api, getPairingServerOrigin, getServerOrigin, type ApiProject, type ApiQuotaSnapshot, type ApiQuotaWindow } from '@/api/client'
 import { ENGINE_BIN, ENGINE_LABEL, RUNNABLE_ENGINES, RUNNABLE_ENGINE_IDS, engineLabel, type RunnableEngineId } from '@/lib/engines'
 import type { Computer, EngineId } from '@/types'
@@ -333,6 +334,8 @@ function UsageTab() {
             ))}
           </div>
         </Section>
+
+      <UsageDashboard />
       </div>
     )
   }
@@ -352,6 +355,8 @@ function UsageTab() {
             </button>
           </div>
         </Section>
+
+      <UsageDashboard />
       </div>
     )
   }
@@ -370,6 +375,8 @@ function UsageTab() {
             </div>
           </div>
         </Section>
+
+      <UsageDashboard />
       </div>
     )
   }
@@ -393,6 +400,8 @@ function UsageTab() {
             </button>
           </div>
         </Section>
+
+      <UsageDashboard />
       </div>
     )
   }
@@ -424,6 +433,8 @@ function UsageTab() {
           {error && <span className="text-[11.5px] text-coral-deep font-display italic">{t('me.refreshFailed', { msg: error })}</span>}
         </div>
       </Section>
+
+      <UsageDashboard />
     </div>
   )
 }

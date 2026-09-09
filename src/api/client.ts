@@ -201,6 +201,75 @@ export interface ApiModelCatalog {
   gateway: boolean
 }
 
+/** Usage dashboard rows (GET /api/usage/*). */
+export interface ApiUsageSummary {
+  requests: number
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  reasoningTokens: number
+  costUsd: number
+  costEstimated: boolean
+  cacheHitRate: number
+  successRate: number
+}
+export interface ApiUsageTrendPoint {
+  bucket: string
+  costUsd: number
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+}
+export interface ApiUsageAgentRow {
+  agentId: string
+  name: string
+  avatarUrl: string | null
+  source: 'managed' | 'byoa'
+  requests: number
+  inputTokens: number
+  outputTokens: number
+  costUsd: number
+  successRate: number
+}
+export interface ApiUsageModelRow {
+  model: string
+  provider: string
+  requests: number
+  inputTokens: number
+  outputTokens: number
+  costUsd: number
+  costEstimated: boolean
+}
+export interface ApiUsageProviderRow {
+  provider: string
+  requests: number
+  inputTokens: number
+  outputTokens: number
+  costUsd: number
+}
+export interface ApiUsageLogRow {
+  id: string
+  createdAt: string
+  agentId: string | null
+  agentName: string | null
+  model: string
+  provider: string
+  purpose: string
+  source: string
+  inputTokens: number
+  outputTokens: number
+  costUsd: number
+  latencyMs: number | null
+  status: string
+}
+export interface ApiUsageLogPage {
+  items: ApiUsageLogRow[]
+  total: number
+  page: number
+  pageSize: number
+}
+
 export interface ApiQuotaWindow {
   usedUsd: number
   limitUsd: number | null
@@ -1333,6 +1402,19 @@ export const api = {
     }),
   getAvailableModels: (refresh = false) =>
     http<ApiModelCatalog>(`/models/available${refresh ? '?refresh=1' : ''}`),
+  /** Usage dashboard. `range` = ISO from/to; `source` filters ledger source. */
+  getUsageSummary: (from: string, to: string, source?: string) =>
+    http<ApiUsageSummary>(`/usage/summary?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}${source ? `&source=${encodeURIComponent(source)}` : ''}`),
+  getUsageTrend: (from: string, to: string, granularity: 'hour' | 'day') =>
+    http<{ granularity: string; points: ApiUsageTrendPoint[] }>(`/usage/trend?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&granularity=${granularity}`),
+  getUsageByAgent: (from: string, to: string) =>
+    http<{ items: ApiUsageAgentRow[] }>(`/usage/by-agent?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`),
+  getUsageByModel: (from: string, to: string) =>
+    http<{ items: ApiUsageModelRow[] }>(`/usage/by-model?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`),
+  getUsageByProvider: (from: string, to: string) =>
+    http<{ items: ApiUsageProviderRow[] }>(`/usage/by-provider?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`),
+  getUsageLogs: (from: string, to: string, page: number, pageSize: number, source?: string) =>
+    http<ApiUsageLogPage>(`/usage/logs?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&page=${page}&pageSize=${pageSize}${source ? `&source=${encodeURIComponent(source)}` : ''}`),
   markRead: (conversationId: string) =>
     http<{ ok: boolean }>(`/conversations/${encodeURIComponent(conversationId)}/read`, {
       method: 'POST',
