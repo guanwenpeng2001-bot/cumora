@@ -2,6 +2,8 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import ts from 'typescript'
+import { pathToFileURL } from 'node:url'
+import { RUNTIME_CALL_ID_INDEX_SQL } from '../db/migrations/0014-runtime-call-id-index.js'
 import { USAGE_ROLLUP_V2_SQL } from '../db/migrations/0013-usage-rollup-v2.js'
 
 function compile(path: string, pool: unknown) {
@@ -99,5 +101,64 @@ test('PostgreSQL: exact windows, versioned rollup convergence, routes, quality a
     assert.equal((await usage.usageLogs('tenant', historical, { page: 1, pageSize: 50 })).total, 0)
   } finally {
     await client.end()
+  }
+})
+
+// Optional standalone PostgreSQL WASM engine, installed outside the repository.
+// No service connection, database files or changes to the project dependencies.
+const pgliteModule = process.env.FIX_C_PGLITE_MODULE
+
+test('PostgreSQL in memory: callId migration replays on empty and existing histories and supports the runtime lookup', { skip: !pgliteModule }, async () => {
+  const { PGlite } = await import(pathToFileURL(pgliteModule!).href)
+  for (const populated of [false, true]) {
+    const db = new PGlite()
+    try {
+      const baseline = readFileSync(new URL('../db/migrate.ts', import.meta.url), 'utf8')
+      const start = baseline.indexOf('CREATE TABLE IF NOT EXISTS llm_calls (')
+      const end = baseline.indexOf('\n);', start) + 3
+      assert.ok(start > 0 && end > start)
+      await db.exec(baseline.slice(start, end))
+      await db.exec('CREATE TABLE participants(id text PRIMARY KEY, name text)')
+      const insert = (id: string, extras: unknown, company = 'tenant', agent = 'agent', source = 'byoa-codex', status = 'failed') => db.query(
+        `INSERT INTO llm_calls(id, company_id, agent_id, source, purpose, model, extras, status)
+         VALUES ($1, $2, $3, $4, 'inbox-triage', 'requested', $5, $6)`,
+        [id, company, agent, source, JSON.stringify(extras), status],
+      )
+      if (populated) {
+        await insert('old-1', { callId: 'same' })
+        await insert('old-duplicate', { callId: 'same' })
+        await insert('old-no-id', {})
+        await insert('old-null-id', { callId: null })
+      }
+      await db.exec(RUNTIME_CALL_ID_INDEX_SQL)
+      await db.exec(RUNTIME_CALL_ID_INDEX_SQL)
+      assert.equal((await db.query('SELECT COUNT(*)::int AS n FROM llm_calls')).rows[0].n, populated ? 4 : 0)
+      await insert('identified', { callId: 'probe', requestedModel: 'requested', actualModel: null, httpStatus: 401 })
+      await insert('other-tenant', { callId: 'probe' }, 'other')
+      await insert('other-agent', { callId: 'probe' }, 'tenant', 'other')
+      await insert('other-source', { callId: 'probe' }, 'tenant', 'agent', 'byoa-claude')
+      await insert('known', { callId: 'known', actualModel: 'provider-reported', requestedModel: 'requested' }, 'tenant', 'agent', 'byoa-codex', 'ok')
+      await insert('blank', { actualModel: '', requestedModel: 'requested' })
+      await insert('legacy', null, 'tenant', 'agent', 'byoa-codex', 'ok')
+      await insert('no-call-id-1', {})
+      await insert('no-call-id-2', {})
+      const server = readFileSync(new URL('../agents/runtime/server.ts', import.meta.url), 'utf8')
+      const lookup = server.match(/`(SELECT extras->>'callId' AS call_id FROM llm_calls[^`]+)`/)![1]
+      const params = ['tenant', 'agent', 'byoa-codex', ['probe']]
+      assert.deepEqual((await db.query(lookup, params)).rows, [{ call_id: 'probe' }])
+      await db.exec('SET enable_seqscan = off; SET plan_cache_mode = force_generic_plan')
+      await db.exec(`PREPARE runtime_lookup(text, text, text, text[]) AS ${lookup}`)
+      const plan = await db.query("EXPLAIN (FORMAT JSON) EXECUTE runtime_lookup('tenant', 'agent', 'byoa-codex', ARRAY['probe'])")
+      assert.match(JSON.stringify(plan.rows), /idx_llm_calls_runtime_call_id/)
+      const usage = compile('../usage.ts', { query: (sql: string, values: unknown[]) => db.query(sql, values) })
+      const logs = await usage.usageLogs('tenant', { from: new Date(0), to: new Date(Date.now() + 60000) }, { page: 1, pageSize: 50 })
+      for (const id of ['identified', 'legacy', 'blank', 'no-call-id-1']) {
+        const row = logs.items.find((r: any) => r.id === id)
+        assert.equal(row.actualModel, null, id)
+        assert.equal(row.requestedModel, 'requested', id)
+      }
+      assert.equal(logs.items.find((r: any) => r.id === 'known').actualModel, 'provider-reported')
+      assert.equal(logs.items.find((r: any) => r.id === 'identified').httpStatus, 401)
+    } finally { await db.close() }
   }
 })

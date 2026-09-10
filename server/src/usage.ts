@@ -424,7 +424,7 @@ export interface UsageLogRow {
   route?: string | null
   platform?: string | null
   requestedModel?: string
-  actualModel?: string
+  actualModel: string | null
   failureReason?: string | null
   failureStage?: string | null
   httpStatus?: number | null
@@ -467,7 +467,7 @@ export async function usageLogs(
             (COALESCE(l.extras->>'unpriced', '') NOT IN ('', 'false')) AS unpriced,
             l.extras->>'route' AS route, l.extras->>'platform' AS platform,
             COALESCE(NULLIF(l.extras->>'requestedModel', ''), l.model) AS requested_model,
-            COALESCE(NULLIF(l.extras->>'actualModel', ''), NULLIF(l.extras->>'requestedModel', ''), l.model) AS actual_model,
+            NULLIF(l.extras->>'actualModel', '') AS actual_model,
             l.extras->>'failureReason' AS failure_reason, l.extras->>'failureStage' AS failure_stage,
             l.extras->>'httpStatus' AS http_status,
             COALESCE(NULLIF(l.extras->>'logicalCallId', ''), NULLIF(l.extras->>'callId', '')) AS call_id,
@@ -496,7 +496,7 @@ export async function usageLogs(
       status: r.status, measured: r.measured, costEstimated: r.cost_estimated,
       unpriced: r.unpriced, route: r.route, platform: r.platform,
       requestedModel: r.requested_model || r.model,
-      actualModel: r.actual_model || r.requested_model || r.model,
+      actualModel: r.actual_model || null,
       failureReason: usageLogFailureReason(r.status, r.failure_reason, r.http_status),
       failureStage: r.status !== 'ok' && ['generation', 'poll', 'download', 'storage'].includes(r.failure_stage ?? '') ? r.failure_stage : null,
       httpStatus: r.http_status && /^[1-5]\d{2}$/.test(r.http_status) ? Number(r.http_status) : null,

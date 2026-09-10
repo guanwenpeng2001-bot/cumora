@@ -60,6 +60,7 @@ import {
 } from './migrations/0011-usage-logs-company-created-index.js'
 import { SUB2API_SYNC_SQL, sub2apiSyncChecksum } from './migrations/0012-sub2api-sync.js'
 import { USAGE_ROLLUP_V2_SQL, usageRollupV2Checksum } from './migrations/0013-usage-rollup-v2.js'
+import { RUNTIME_CALL_ID_INDEX_SQL, runtimeCallIdIndexChecksum } from './migrations/0014-runtime-call-id-index.js'
 
 /** Frozen data backfill embedded in migration 0001. Exported so its behavior
  * can be exercised against PostgreSQL without replaying the whole migration. */
@@ -2668,6 +2669,12 @@ const VERSIONED_MIGRATIONS: readonly VersionedMigration[] = [
     sourceChecksum: usageRollupV2Checksum(),
     transactional: true,
     up: async (client) => { await client.query(USAGE_ROLLUP_V2_SQL) },
+  },
+  {
+    ...SCHEMA_MIGRATIONS[13],
+    sourceChecksum: runtimeCallIdIndexChecksum(),
+    transactional: true,
+    up: async (client) => { await client.query(RUNTIME_CALL_ID_INDEX_SQL) },
   },
 ]
 

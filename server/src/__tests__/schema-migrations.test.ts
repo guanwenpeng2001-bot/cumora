@@ -103,3 +103,13 @@ test('a missing schema_migrations table becomes an actionable startup error', as
     (err) => err instanceof MigrationHistoryError && err.code === 'schema_uninitialized',
   )
 })
+
+test('runtime callId index is registered after the immutable version 13 prefix', async () => {
+  const { runtimeCallIdIndexChecksum } = await import('../db/migrations/0014-runtime-call-id-index.js')
+  assert.equal(SCHEMA_MIGRATIONS[13].checksum, runtimeCallIdIndexChecksum())
+  assert.equal(SCHEMA_MIGRATIONS[13].name, '0014_runtime_call_id_index')
+  const prior = current().slice(0, 13)
+  assert.deepEqual(validateMigrationHistory(prior, { allowPending: true }).pending, [SCHEMA_MIGRATIONS[13]])
+  // The added index changes performance only; schema 13 remains readable.
+  assert.equal(validateMigrationHistory(prior).currentVersion, 13)
+})

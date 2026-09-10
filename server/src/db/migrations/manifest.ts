@@ -82,12 +82,17 @@ export const SCHEMA_MIGRATIONS = [
     name: '0013_usage_rollup_v2',
     checksum: '0ea5015a4efcd5cf268d848244f3c20a8cb8f97793b7fe0f67e767a3e1141088',
   },
+  {
+    version: 14,
+    name: '0014_runtime_call_id_index',
+    checksum: 'c2084830edd6a3e0f27f4235cbe60af0269eafd428e0babe6918037137a4e233',
+  },
 ] as const satisfies readonly MigrationMetadata[]
 
 /** This build intentionally supports one exact schema range. Expand/contract
  * releases may widen the range, but both bounds must remain explicit. */
 export const MIN_SUPPORTED_SCHEMA_VERSION = 13
-export const MAX_SUPPORTED_SCHEMA_VERSION = 13
+export const MAX_SUPPORTED_SCHEMA_VERSION = 14
 
 function assertManifestShape(): void {
   for (let i = 0; i < SCHEMA_MIGRATIONS.length; i++) {

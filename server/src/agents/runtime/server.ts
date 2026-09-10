@@ -651,6 +651,7 @@ async function recordRuntimeLlmCalls(c: AuthorizedAgentRuntimeClaims, req: Reque
         const existing = await client.query<{ call_id: string }>(
           `SELECT extras->>'callId' AS call_id FROM llm_calls
             WHERE company_id = $1 AND agent_id = $2 AND source = $3
+              AND extras->>'callId' IS NOT NULL
               AND extras->>'callId' = ANY($4::text[])`,
           [c.companyId, c.sub, source, callIds],
         )

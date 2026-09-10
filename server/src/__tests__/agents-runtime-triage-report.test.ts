@@ -131,6 +131,7 @@ function serverFixture() {
         }
         if (sql.includes('SELECT extras')) {
           assert.ok(unlock, 'dedup lookup must hold transaction lock')
+          assert.match(sql, /extras->>'callId' IS NOT NULL/, 'lookup explicitly implies the partial index predicate')
           return { rows: rows.filter(r => r.companyId === params[0] && r.agentId === params[1] && r.source === params[2] && params[3].includes(r.extras.callId)).map(r => ({ call_id: r.extras.callId })) }
         }
         assert.match(sql, /^INSERT INTO llm_calls/)
@@ -147,10 +148,10 @@ function serverFixture() {
     },
   })
   return { rows, economics, ledger, fail: (value: boolean) => { failInsert = value }, authorize: (value: boolean) => { authorized = value },
-    async call(path: string, body: any, companyId = 'company') {
+    async call(path: string, body: any, companyId = 'company', agentId = 'agent') {
       let status = 200, response: any
       const res = { status(n: number) { status = n; return res }, json(value: any) { response = value } }
-      await handlers.get(path)({ sub: 'agent', companyId }, { body: structuredClone(body) }, res)
+      await handlers.get(path)({ sub: agentId, companyId }, { body: structuredClone(body) }, res)
       return { status, body: response }
     },
   }
@@ -216,4 +217,17 @@ test('local brain remains BYOA while server agenda retains cloud ledger source',
   assert.equal(cloud[5], 'agenda')
   assert.equal(cloud[6], 'cloud')
   assert.equal(cloud[20], null)
+})
+
+test('callId identity includes source and agent, and no-callId reports remain repeatable', async () => {
+  const f = serverFixture()
+  await f.call('/triage', report)
+  await f.call('/triage', { ...report, source: 'byoa-claude' })
+  assert.equal(f.rows.length, 2, 'different normalized sources have independent identities')
+  await f.call('/triage', report, 'company', 'other-agent')
+  assert.equal(f.rows.length, 3, 'different agents have independent identities')
+  const legacy = { source: report.source, hops: [{ model: 'legacy', purpose: 'agent-turn' }] }
+  assert.equal((await f.call('/llm-calls', legacy)).body.inserted, 1)
+  assert.equal((await f.call('/llm-calls', legacy)).body.inserted, 1)
+  assert.equal(f.rows.length, 5)
 })

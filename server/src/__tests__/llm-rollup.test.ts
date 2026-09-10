@@ -29,7 +29,7 @@ function fixture(failV2 = false, locked = true, gap: number | null = null, setti
 }
 
 test('migration 13 checksum matches and preserves legacy table and indexed v2 dimensions', () => {
-  assert.equal(SCHEMA_MIGRATIONS.at(-1)?.checksum, usageRollupV2Checksum())
+  assert.equal(SCHEMA_MIGRATIONS.find(m => m.version === 13)?.checksum, usageRollupV2Checksum())
   assert.match(USAGE_ROLLUP_V2_SQL, /NULLS NOT DISTINCT/)
   assert.match(USAGE_ROLLUP_V2_SQL, /company_id, bucket_hour/)
   assert.doesNotMatch(USAGE_ROLLUP_V2_SQL, /DROP|ALTER TABLE llm_calls_rollup\s/)
