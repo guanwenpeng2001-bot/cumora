@@ -26,7 +26,7 @@ import { spawn } from 'node:child_process'
 import { env } from '../../env.js'
 import { pool } from '../../db/pool.js'
 import type { ManagedPodSettings } from '../../managed-pod-settings.js'
-import { createManagedPodBootstrap, getBrainModel, getSupportModel, getCompactionModel } from '../../settings.js'
+import { createManagedPodBootstrap, getBrainModel, getSupportModel, getCompactionModel, getServerSettingsSnapshot, automationNumber, startAutomationTimer } from '../../settings.js'
 import { agentReasoningEffort, agentMaxOutputTokens, supportReasoningEffort, supportReasoningHeadroom } from '../reasoning.js'
 import { inprocClient } from './inproc-client.js'
 import { signAgentToken } from './jwt.js'
@@ -597,18 +597,14 @@ let fuseUtilCache: FuseUtilCache | null = null
  *  cached value tracks intra-window growth without a refresh. */
 const FUSE_CACHE_TTL_MS = 10_000
 
-/** Threshold above which `ensurePod` refuses new spawns. 0.90 leaves
- *  a 10% buffer for in-flight scheduling latency and inFlight-dedup
- *  raciness. Below 0.90 we let everything through. */
-const FUSE_ADMISSION_THRESHOLD = 0.90
-
 /** Sample (or read from cache) the cluster's cumora-agent fuse usage.
  *  Fails closed: a missing/invalid capacity sample is not evidence that
  *  capacity is available, so callers must refuse new Pod admission. */
-export async function getClusterFuseUtilization(): Promise<ClusterFuseUtilization> {
+export async function getClusterFuseUtilization(appCap = automationNumber('pod_admission_max')): Promise<ClusterFuseUtilization> {
   const now = Date.now()
   if (fuseUtilCache && now - fuseUtilCache.ts < FUSE_CACHE_TTL_MS) {
-    const { used, cap, capacityKnown } = fuseUtilCache
+    const { used, cap: clusterCap, capacityKnown } = fuseUtilCache
+    const cap = appCap > 0 ? Math.min(clusterCap, appCap) : clusterCap
     return { used, cap, ratio: cap > 0 ? used / cap : 1, cached: true, capacityKnown }
   }
   const [nodes, pods] = await Promise.all([
@@ -635,6 +631,13 @@ export async function getClusterFuseUtilization(): Promise<ClusterFuseUtilizatio
       capacityError: detail || 'kubectl could not read cluster capacity',
     }
   }
+  try {
+    for (const raw of [nodes.out, pods.out]) {
+      if (!Array.isArray(JSON.parse(raw)?.items)) throw new Error('missing items')
+    }
+  } catch {
+    return { used: 0, cap: 0, ratio: 1, cached: false, capacityKnown: false, capacityError: 'invalid cluster capacity response' }
+  }
   const parsed = parseClusterFuse(nodes.out, pods.out)
   if (parsed.cap <= 0) {
     // A successful response with no advertised fuse capacity is still
@@ -648,9 +651,8 @@ export async function getClusterFuseUtilization(): Promise<ClusterFuseUtilizatio
       capacityError: 'no devic.es/fuse capacity was advertised by any node',
     }
   }
-  const appCap = env.AGENT_POD_ADMISSION_MAX
   const cap = appCap > 0 ? Math.min(parsed.cap, appCap) : parsed.cap
-  fuseUtilCache = { ts: now, used: parsed.used, cap, capacityKnown: true }
+  fuseUtilCache = { ts: now, used: parsed.used, cap: parsed.cap, capacityKnown: true }
   return { used: parsed.used, cap, ratio: parsed.used / cap, cached: false, capacityKnown: true }
 }
 
@@ -1066,8 +1068,8 @@ async function ensurePodImpl(agentId: string, signal: AbortSignal): Promise<Ensu
     bootstrap,
     openaiKey: bootstrap.direct.text.apiKey,
     openaiBaseUrl: bootstrap.direct.text.baseURL,
-    idleMs: env.AGENT_IDLE_MS,
-    noWorkMs: env.AGENT_NO_WORK_MS,
+    idleMs: automationNumber('pod_idle_ms'),
+    noWorkMs: automationNumber('pod_no_work_ms'),
   })
 
   // `kubectl apply` is the write path. Retry on transient errors;
@@ -1078,7 +1080,9 @@ async function ensurePodImpl(agentId: string, signal: AbortSignal): Promise<Ensu
     // Do not use this replica's pre-lease cache: another replica may have
     // created a Pod while this one was waiting for the global lease.
     fuseUtilCache = null
-    const fuse = await getClusterFuseUtilization()
+    const { settings } = getServerSettingsSnapshot()
+    const threshold = Number(settings.pod_fuse_threshold)
+    const fuse = await getClusterFuseUtilization(Number(settings.pod_admission_max))
     if (!fuse.capacityKnown) {
       return {
         podApply: null,
@@ -1090,14 +1094,14 @@ async function ensurePodImpl(agentId: string, signal: AbortSignal): Promise<Ensu
         },
       }
     }
-    if (fuse.cap <= 0 || fuse.ratio >= FUSE_ADMISSION_THRESHOLD) {
+    if (fuse.cap <= 0 || fuse.ratio >= threshold) {
       return {
         podApply: null,
         denied: {
           created: false as const,
           ok: false as const,
           code: 'capacity_denied' as const,
-          reason: 'cluster fuse saturated: ' + fuse.used + '/' + fuse.cap + ' (' + Math.round(fuse.ratio * 100) + '% ≥ ' + Math.round(FUSE_ADMISSION_THRESHOLD * 100) + '% threshold)',
+          reason: 'cluster fuse saturated: ' + fuse.used + '/' + fuse.cap + ' (' + Math.round(fuse.ratio * 100) + '% ≥ ' + Math.round(threshold * 100) + '% threshold)',
         },
       }
     }
@@ -1202,7 +1206,7 @@ export function planIdlePvcGc(args: {
       drop.push({ pvcName: pvc.name, agentId: pvc.agentId, lastWakeAt: a.lastWakeAt, departedAt: a.departedAt, reason: 'departed' })
       continue
     }
-    if (a.lastWakeAt && a.lastWakeAt.getTime() < cutoff) {
+    if (args.idleThresholdMs > 0 && a.lastWakeAt && a.lastWakeAt.getTime() < cutoff) {
       drop.push({ pvcName: pvc.name, agentId: pvc.agentId, lastWakeAt: a.lastWakeAt, departedAt: null, reason: 'idle' })
       continue
     }
@@ -1221,6 +1225,7 @@ export function planIdlePvcGc(args: {
 }
 
 let chromePvcGcTimer: NodeJS.Timeout | null = null
+let chromePvcGcRunning = false
 
 async function listChromeProfilePvcs(): Promise<Array<{ name: string; agentId: string }>> {
   const out = await kubectlWithRetry(
@@ -1301,24 +1306,31 @@ export async function sweepIdleChromeProfilePvcs(opts: {
 export function startChromeProfilePvcGc(opts: {
   intervalMs: number
   idleThresholdMs: number
+  runtimeSettings?: boolean
 }): { stop(): void } | null {
   if (chromePvcGcTimer) return { stop: stopChromeProfilePvcGc }
-  if (opts.intervalMs <= 0) {
+  if (!opts.runtimeSettings && opts.intervalMs <= 0) {
     console.log('[chrome-pvc-gc] disabled (interval <= 0)')
     return null
   }
-  console.log(`[chrome-pvc-gc] running every ${opts.intervalMs}ms · idle threshold ${opts.idleThresholdMs}ms`)
+  console.log(opts.runtimeSettings ? '[chrome-pvc-gc] follows runtime settings' : `[chrome-pvc-gc] running every ${opts.intervalMs}ms · idle threshold ${opts.idleThresholdMs}ms`)
   const tick = async () => {
+    if (chromePvcGcRunning) return
+    chromePvcGcRunning = true
     try {
-      const deleted = await sweepIdleChromeProfilePvcs({ idleThresholdMs: opts.idleThresholdMs })
+      const deleted = await sweepIdleChromeProfilePvcs({ idleThresholdMs: opts.runtimeSettings ? automationNumber('chrome_pvc_gc_idle_days') * 24 * 60 * 60_000 : opts.idleThresholdMs })
       if (deleted.length > 0) {
         console.log(`[chrome-pvc-gc] swept ${deleted.length} PVC${deleted.length === 1 ? '' : 's'}`)
       }
     } catch (e) {
       console.error('[chrome-pvc-gc] tick crashed:', e instanceof Error ? e.message : String(e))
+    } finally {
+      chromePvcGcRunning = false
     }
   }
-  chromePvcGcTimer = setInterval(() => { void tick() }, opts.intervalMs)
+  chromePvcGcTimer = opts.runtimeSettings
+    ? startAutomationTimer('chrome_pvc_gc_enabled', 'chrome_pvc_gc_interval_ms', tick, { unref: true })
+    : setInterval(() => { void tick() }, opts.intervalMs)
   chromePvcGcTimer.unref()
   return { stop: stopChromeProfilePvcGc }
 }
@@ -1454,10 +1466,11 @@ export function evaluateFusePressureSample(
 /** One-shot sampler: take a fresh cluster reading, run the decision,
  *  fire the alert if needed. Exported for tests. */
 export async function pollClusterFusePressureOnce(): Promise<void> {
+  const { settings } = getServerSettingsSnapshot()
   // Reuse the admission-control cache where possible — but force a
   // fresh sample if the cache is stale (>10s).
   fuseUtilCache = null
-  const fuse = await getClusterFuseUtilization()
+  const fuse = await getClusterFuseUtilization(Number(settings.pod_admission_max))
   const pendingProbe = await kubectlWithRetry(
     [
       'get', 'pods', '-l', 'app=cumora-agent',
@@ -1472,10 +1485,10 @@ export async function pollClusterFusePressureOnce(): Promise<void> {
   const decision = evaluateFusePressureSample(
     fusePressureState, pending, fuse.ratio, Date.now(),
     {
-      pendingMin: 20,
-      ratioMin: 0.95,
-      sustainedMs: 5 * 60_000,        // 5 min of sustained pressure
-      alertCooldownMs: 30 * 60_000,   // re-alert at most every 30 min
+      pendingMin: Number(settings.cluster_monitor_pending_min),
+      ratioMin: Number(settings.cluster_monitor_ratio_min),
+      sustainedMs: Number(settings.cluster_monitor_sustained_ms),
+      alertCooldownMs: Number(settings.cluster_monitor_alert_cooldown_ms),
     },
   )
   if (decision.fire) {
@@ -1494,7 +1507,10 @@ export async function pollClusterFusePressureOnce(): Promise<void> {
 }
 
 /** Start the cluster fuse-pressure monitor. */
-export function startClusterFuseMonitor(intervalMs: number = 60_000): NodeJS.Timeout {
+export function startClusterFuseMonitor(intervalMs?: number): NodeJS.Timeout {
+  if (intervalMs === undefined) return startAutomationTimer(
+    'cluster_monitor_enabled', 'cluster_monitor_interval_ms', pollClusterFusePressureOnce, { immediate: true, unref: true },
+  )
   const tick = (): void => {
     void pollClusterFusePressureOnce().catch((e) =>
       console.warn('[orchestrator] pollClusterFusePressureOnce threw:', e instanceof Error ? e.message : String(e)),
@@ -1508,7 +1524,11 @@ export function startClusterFuseMonitor(intervalMs: number = 60_000): NodeJS.Tim
 
 /** Start the GC loop. Returns the timer so the caller can clearInterval
  *  on shutdown. */
-export function startCompletedPodGc(intervalMs: number = 60_000): NodeJS.Timeout {
+export function startCompletedPodGc(intervalMs?: number): NodeJS.Timeout {
+  if (intervalMs === undefined) return startAutomationTimer('pod_gc_enabled', 'pod_gc_interval_ms', async () => {
+    const result = await gcCompletedAgentPods()
+    if (result.deleted > 0) console.log(`[orchestrator] gc swept ${result.deleted} finished agent pods`)
+  }, { immediate: true, unref: true })
   const tick = (): void => {
     void gcCompletedAgentPods().then((r) => {
       if (r.deleted > 0) {

@@ -28,9 +28,10 @@ export interface SettingDef {
   required?: boolean
   pod?: boolean
   scope?: 'managed' | 'server' | 'byoa'
-  effect?: 'next-turn' | 'next-gate' | 'next-tick' | 'pending-T41'
+  effect?: 'next-turn' | 'next-gate' | 'next-tick' | 'next-admission' | 'next-create' | 'restart' | 'restart-next-create' | 'fixed' | 'pending-T41'
   unit?: 'ratio' | 'bytes' | 'pairs' | 'characters' | 'hops' | 'milliseconds'
   readOnly?: boolean
+  envOnly?: boolean
   defaultValue?: string
   allowedValues?: readonly string[]
   min?: number
@@ -94,6 +95,48 @@ export const SETTING_DEFS: readonly SettingDef[] = [
   { key: 'support_synthetic_gate_output_tokens', type: 'integer', defaultValue: '300', min: 1, max: 1000000, pod: true, scope: 'managed', effect: 'next-gate', description: 'Base output tokens; support reasoning headroom is added once.', envValue: () => '300' },
   { key: 'low_priority_wake_budget_per_minute', type: 'integer', defaultValue: '20', min: 1, max: 1000000, scope: 'server', effect: 'next-gate', envValue: () => '20' },
   { key: 'agent_turn_rate_per_minute', type: 'integer', defaultValue: '30', min: 1, max: 1000000, scope: 'server', effect: 'next-gate', envValue: () => '30' },
+  { key: 'pod_admission_enabled', type: 'boolean', defaultValue: 'true', scope: 'server', readOnly: true, allowedValues: ['true'], effect: 'fixed', envValue: () => 'true' },
+  { key: 'pod_capacity_unknown_mode', type: 'string', defaultValue: 'closed', scope: 'server', readOnly: true, allowedValues: ['closed'], effect: 'fixed', envValue: () => 'closed' },
+  { key: 'pod_assignment_policy', type: 'string', defaultValue: 'deny', scope: 'server', readOnly: true, allowedValues: ['deny'], effect: 'fixed', description: 'Invalid placement is always denied; tenant and assignment verification cannot be disabled.', envValue: () => 'deny' },
+  { key: 'pod_admission_max', type: 'integer', defaultValue: '40', scope: 'server', min: 0, max: 1000000, effect: 'next-admission', description: '0 retains the cluster capacity ceiling only. Changes never cancel admitted work.', envValue: () => String(env.AGENT_POD_ADMISSION_MAX ?? 40) },
+  { key: 'pod_fuse_threshold', type: 'number', defaultValue: '0.90', scope: 'server', effect: 'next-admission', unit: 'ratio', description: 'Admission stops at this ratio of the effective cap; existing Pods are not cancelled.', envValue: () => '0.90' },
+  { key: 'pod_gc_enabled', type: 'boolean', defaultValue: 'true', scope: 'server', effect: 'next-tick', envValue: () => process.env.ENABLE_AGENT_POD_GC === 'false' ? 'false' : 'true' },
+  { key: 'chrome_pvc_gc_enabled', type: 'boolean', defaultValue: 'true', scope: 'server', effect: 'next-tick', envValue: () => process.env.ENABLE_CHROME_PVC_GC === 'false' ? 'false' : 'true' },
+  { key: 'cluster_monitor_enabled', type: 'boolean', defaultValue: 'true', scope: 'server', effect: 'next-tick', envValue: () => process.env.ENABLE_CLUSTER_MONITOR === 'false' ? 'false' : 'true' },
+  { key: 'agent_run_sweeper_enabled', type: 'boolean', defaultValue: 'true', scope: 'server', effect: 'next-tick', envValue: () => process.env.ENABLE_AGENT_RUN_SWEEPER === 'false' ? 'false' : 'true' },
+  { key: 'cluster_monitor_pending_min', type: 'integer', defaultValue: '20', scope: 'server', effect: 'next-tick', min: 1, max: 2147483647, envValue: () => '20' },
+  { key: 'cluster_monitor_ratio_min', type: 'number', defaultValue: '0.95', scope: 'server', effect: 'next-tick', unit: 'ratio', envValue: () => '0.95' },
+  { key: 'cluster_monitor_sustained_ms', type: 'integer', defaultValue: '300000', scope: 'server', effect: 'next-tick', min: 1, max: 2147483647, unit: 'milliseconds', envValue: () => '300000' },
+  { key: 'cluster_monitor_alert_cooldown_ms', type: 'integer', defaultValue: '1800000', scope: 'server', effect: 'next-tick', min: 1, max: 2147483647, unit: 'milliseconds', envValue: () => '1800000' },
+  { key: 'pod_gc_interval_ms', type: 'integer', defaultValue: '60000', scope: 'server', min: 0, max: 2147483647, unit: 'milliseconds', effect: 'next-tick', description: '0 pauses future ticks; in-flight work completes without re-entry.', envValue: () => '60000' },
+  { key: 'cluster_monitor_interval_ms', type: 'integer', defaultValue: '60000', scope: 'server', min: 0, max: 2147483647, unit: 'milliseconds', effect: 'next-tick', description: '0 pauses future ticks; in-flight work completes without re-entry.', envValue: () => '60000' },
+  { key: 'agent_run_sweeper_interval_ms', type: 'integer', defaultValue: '60000', scope: 'server', min: 0, max: 2147483647, unit: 'milliseconds', effect: 'next-tick', description: '0 pauses future ticks; in-flight work completes without re-entry.', envValue: () => '60000' },
+  { key: 'email_retry_interval_ms', type: 'integer', defaultValue: '60000', scope: 'server', min: 0, max: 2147483647, unit: 'milliseconds', effect: 'next-tick', envValue: () => process.env.EMAIL_RETRY_INTERVAL_MS ?? '60000' },
+  { key: 'email_gc_interval_ms', type: 'integer', defaultValue: '86400000', scope: 'server', min: 0, max: 2147483647, unit: 'milliseconds', effect: 'next-tick', envValue: () => process.env.EMAIL_GC_INTERVAL_MS ?? '86400000' },
+  { key: 'db_gc_interval_ms', type: 'integer', defaultValue: '300000', scope: 'server', min: 0, max: 2147483647, unit: 'milliseconds', effect: 'next-tick', envValue: () => process.env.DB_GC_INTERVAL_MS ?? '300000' },
+  { key: 'workspace_cleanup_interval_ms', type: 'integer', defaultValue: '60000', scope: 'server', min: 0, max: 2147483647, unit: 'milliseconds', effect: 'next-tick', envValue: () => process.env.WORKSPACE_CLEANUP_INTERVAL_MS ?? '60000' },
+  { key: 'poll_sweep_interval_ms', type: 'integer', defaultValue: '60000', scope: 'server', min: 0, max: 2147483647, unit: 'milliseconds', effect: 'next-tick', envValue: () => process.env.POLL_SWEEP_INTERVAL_MS ?? '60000' },
+  { key: 'llm_rollup_interval_ms', type: 'integer', defaultValue: '120000', scope: 'server', min: 0, max: 2147483647, unit: 'milliseconds', effect: 'next-tick', envValue: () => process.env.LLM_ROLLUP_INTERVAL_MS ?? '120000' },
+  { key: 'db_gc_batch', type: 'integer', defaultValue: '10000', scope: 'server', min: 1, max: 1000000, effect: 'next-tick', envValue: () => process.env.DB_GC_BATCH ?? '10000' },
+  { key: 'db_gc_ws_tickets_days', type: 'integer', defaultValue: '1', scope: 'server', min: 0, max: 365000, effect: 'next-tick', envValue: () => process.env.DB_GC_WS_TICKETS_DAYS ?? '1' },
+  { key: 'db_gc_agent_log_days', type: 'integer', defaultValue: '30', scope: 'server', min: 0, max: 365000, effect: 'next-tick', envValue: () => process.env.DB_GC_AGENT_LOG_DAYS ?? '30' },
+  { key: 'db_gc_agent_events_days', type: 'integer', defaultValue: '30', scope: 'server', min: 0, max: 365000, effect: 'next-tick', envValue: () => process.env.DB_GC_AGENT_EVENTS_DAYS ?? '30' },
+  { key: 'db_gc_agent_runs_days', type: 'integer', defaultValue: '30', scope: 'server', min: 0, max: 365000, effect: 'next-tick', envValue: () => process.env.DB_GC_AGENT_RUNS_DAYS ?? '30' },
+  { key: 'db_gc_llm_calls_days', type: 'integer', defaultValue: '90', scope: 'server', min: 0, max: 365000, effect: 'next-tick', envValue: () => process.env.DB_GC_LLM_CALLS_DAYS ?? '90' },
+  { key: 'workspace_cleanup_batch', type: 'integer', defaultValue: '8', scope: 'server', min: 1, max: 32, effect: 'next-tick', envValue: () => process.env.WORKSPACE_CLEANUP_BATCH ?? '8' },
+  { key: 'workspace_cleanup_retention_days', type: 'integer', defaultValue: '7', scope: 'server', min: 0, max: 365000, effect: 'next-tick', envValue: () => process.env.WORKSPACE_CLEANUP_RETENTION_DAYS ?? '7' },
+  { key: 'llm_rollup_retention_hours', type: 'integer', defaultValue: '2280', scope: 'server', min: 0, max: 8760000, effect: 'next-tick', envValue: () => process.env.LLM_ROLLUP_RETENTION_HOURS ?? '2280' },
+  { key: 'agent_run_stale_age_ms', type: 'integer', defaultValue: '600000', scope: 'server', min: 0, max: 2147483647, unit: 'milliseconds', effect: 'next-tick', envValue: () => process.env.AGENT_RUN_STALE_AGE_MS ?? '600000' },
+  { key: 'workspace_runtime_cleanup_enabled', type: 'boolean', defaultValue: 'false', scope: 'server', effect: 'next-tick', envValue: () => process.env.WORKSPACE_RUNTIME_CLEANUP_ENABLED ?? 'false' },
+  { key: 'chrome_pvc_gc_interval_ms', type: 'integer', defaultValue: '3600000', scope: 'server', min: 0, max: 2147483647, unit: 'milliseconds', effect: 'next-tick', description: '0 pauses future ticks; in-flight work completes without re-entry.', envValue: () => String(env.CHROME_PVC_GC_INTERVAL_MS ?? 3600000) },
+  { key: 'chrome_pvc_gc_idle_days', type: 'integer', defaultValue: '30', scope: 'server', min: 0, max: 365000, effect: 'next-tick', envValue: () => String(env.CHROME_PVC_GC_IDLE_DAYS ?? 30) },
+  { key: 'pod_idle_ms', type: 'integer', defaultValue: '180000', scope: 'server', min: 0, max: 2147483647, unit: 'milliseconds', effect: 'next-create', envValue: () => String(env.AGENT_IDLE_MS ?? 180000) },
+  { key: 'pod_no_work_ms', type: 'integer', defaultValue: '90000', scope: 'server', min: 0, max: 2147483647, unit: 'milliseconds', effect: 'next-create', envValue: () => String(env.AGENT_NO_WORK_MS ?? 90000) },
+  { key: 'wake_fanout_concurrency', type: 'integer', defaultValue: '6', scope: 'server', readOnly: true, envOnly: true, effect: 'restart', description: 'Env-managed process semaphore; change the deployment env and restart. DB writes are unsupported.', envValue: () => String(env.WAKE_FANOUT_CONCURRENCY ?? 6) },
+  { key: 'kubectl_max_concurrency', type: 'integer', defaultValue: '8', scope: 'server', readOnly: true, envOnly: true, effect: 'restart', description: 'Env-managed process semaphore; change the deployment env and restart. DB writes are unsupported.', envValue: () => String(env.KUBECTL_MAX_CONCURRENCY ?? 8) },
+  { key: 'chrome_profile_pvc_enabled', type: 'boolean', defaultValue: 'true', scope: 'server', readOnly: true, envOnly: true, effect: 'restart-next-create', description: 'Deployment env; restart before next Pod/PVC creation. Existing storage requires a separate migration, not a hot settings update.', envValue: () => process.env.CUMORA_CHROME_PROFILE_PVC === 'false' ? 'false' : 'true' },
+  { key: 'chrome_pvc_size', type: 'string', defaultValue: '500Mi', scope: 'server', readOnly: true, envOnly: true, effect: 'restart-next-create', description: 'Deployment env; restart before next Pod/PVC creation. Existing storage requires a separate migration, not a hot settings update.', envValue: () => process.env.CUMORA_CHROME_PVC_SIZE ?? '500Mi' },
+  { key: 'chrome_pvc_storage_class', type: 'string', defaultValue: '', scope: 'server', readOnly: true, envOnly: true, effect: 'restart-next-create', description: 'Deployment env; restart before next Pod/PVC creation. Existing storage requires a separate migration, not a hot settings update.', envValue: () => process.env.CUMORA_CHROME_PVC_STORAGECLASS ?? '' },
   // Not a model — the skills tab's local hub directory.
   { key: 'local_skillhub_path', type: 'string', envValue: () => process.env.LOCAL_SKILLHUB_PATH ?? '' },
 ]
@@ -145,8 +188,9 @@ function makeSnapshot(rows: { key: string; value: string }[], defaults?: Readonl
   const sources: Record<string, 'db' | 'env'> = {}
   for (const def of SETTING_DEFS) {
     const fallback = defaults ? defaults[def.key] ?? def.defaultValue ?? '' : settingEnvValue(def, diagnostics)
-    settings[def.key] = values.get(def.key) ?? fallback
-    sources[def.key] = values.has(def.key) ? 'db' : 'env'
+    settings[def.key] = def.envOnly ? fallback : values.get(def.key) ?? fallback
+    sources[def.key] = !def.envOnly && values.has(def.key) ? 'db' : 'env'
+    if (def.envOnly && values.has(def.key) && values.get(def.key) !== fallback) diagnostics.push(`ignored-db-setting:${def.key}`)
     try { validateServerSettings({ [def.key]: settings[def.key] }, true) } catch {
       diagnostics.push(`invalid-setting:${def.key}`)
       console.warn('[settings] invalid value; using env/default', def.key)
@@ -344,7 +388,7 @@ export async function seedServerSettingsFromEnv(): Promise<void> {
        SELECT e.key, e.value FROM jsonb_each_text($1::jsonb) e
        WHERE NOT EXISTS (SELECT 1 FROM server_settings s WHERE s.key = $2 || e.key)
        ON CONFLICT (key) DO NOTHING`,
-      [JSON.stringify(Object.fromEntries(SETTING_DEFS.map((d) => [d.key, settingEnvValue(d)]))), INHERIT_PREFIX],
+      [JSON.stringify(Object.fromEntries(SETTING_DEFS.filter(d => !d.envOnly).map((d) => [d.key, settingEnvValue(d)]))), INHERIT_PREFIX],
     )
   })
 }
@@ -421,11 +465,12 @@ export function automationEnabled(key: string): boolean {
 /** The monitor survives disable/enable; an in-flight tick always owns its slot. */
 export function startAutomationTimer(
   enabledKey: string, intervalKey: string, tick: () => Promise<void>,
+  options: { immediate?: boolean; unref?: boolean } = {},
 ): NodeJS.Timeout {
   let interval = automationEnabled(enabledKey) ? automationNumber(intervalKey) : 0
-  let dueAt = Date.now() + interval
+  let dueAt = Date.now() + (options.immediate ? 0 : interval)
   let running = false
-  return setInterval(() => {
+  const timer = setInterval(() => {
     const next = automationEnabled(enabledKey) ? automationNumber(intervalKey) : 0
     const now = Date.now()
     if (next !== interval) {
@@ -439,6 +484,56 @@ export function startAutomationTimer(
       running = false
     })
   }, 100)
+  if (options.unref) timer.unref()
+  return timer
+}
+
+/** A stopped worker retains ownership of its in-flight tick across restarts. */
+export function createOperationsWorker(
+  intervalKey: string, tick: () => Promise<unknown>,
+  options: { immediate?: boolean; unref?: boolean; enabledKey?: string } = {},
+): { start(intervalMs?: number): NodeJS.Timeout; stop(): void; nudge(): void } {
+  let timer: NodeJS.Timeout | null = null
+  let running = false
+  let override: number | undefined
+  let interval = 0
+  let dueAt = 0
+  const readInterval = () => options.enabledKey && !automationEnabled(options.enabledKey)
+    ? 0 : override ?? automationNumber(intervalKey)
+  const run = () => {
+    if (!timer || running || readInterval() <= 0) return
+    running = true
+    void withServerSettingsSnapshot(tick).catch(error => {
+      console.error(`[${intervalKey}]`, error)
+    }).finally(() => { running = false })
+  }
+  return {
+    start(intervalMs) {
+      if (timer) return timer
+      override = intervalMs
+      interval = readInterval()
+      dueAt = Date.now() + interval
+      timer = setInterval(() => {
+        const next = readInterval()
+        const now = Date.now()
+        if (next !== interval) {
+          interval = next
+          dueAt = now + interval
+        }
+        if (interval <= 0 || running || now < dueAt) return
+        dueAt = now + interval
+        run()
+      }, 100)
+      if (options.unref) timer.unref()
+      if (options.immediate) run()
+      return timer
+    },
+    stop() {
+      if (timer) clearInterval(timer)
+      timer = null
+    },
+    nudge: run,
+  }
 }
 
 export class InvalidServerSettingError extends Error {}

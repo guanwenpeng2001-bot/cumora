@@ -12,7 +12,7 @@ import { storage, UPLOAD_DIR } from './storage.js'
 import { attachWebSocket, resetHumanPresenceOnBoot } from './ws.js'
 import { bootDocumentBus } from './documents/rooms.js'
 import { pool } from './db/pool.js'
-import { getBrainModel, initServerSettings, startServerSettingsRefresher } from './settings.js'
+import { getBrainModel, initServerSettings, startServerSettingsRefresher, automationNumber } from './settings.js'
 import { seedModelPricing, refreshModelPricing } from './model-pricing.js'
 import { redis } from './redis.js'
 import { startScanner } from './agents/scanner.js'
@@ -308,7 +308,7 @@ async function main() {
   // close goes through a per-poll transaction with FOR UPDATE, so a
   // racing replica seeing the same row finds closedAt already set and
   // bails idempotently.
-  startPollExpirationSweeper(env.POLL_SWEEP_INTERVAL_MS)
+  startPollExpirationSweeper()
 
   // Observability pre-aggregation refresher — keeps llm_calls_rollup current
   // so the admin Observability page reads ~30k hourly buckets (~230ms) instead
@@ -332,10 +332,8 @@ async function main() {
   // finished, so without this leftover idle-exit pods accumulate
   // indefinitely. ENABLE_AGENT_POD_GC=false disables (e.g. local dev
   // without kubectl).
-  if (process.env.ENABLE_AGENT_POD_GC !== 'false') {
-    startCompletedPodGc()
-    console.log('[boot] agent-pod GC running every 60s')
-  }
+  startCompletedPodGc()
+  console.log('[boot] agent-pod GC follows runtime settings')
 
   // Chrome-profile PVC garbage collection — reclaims volumes for
   // off-boarded agents and for agents idle > CHROME_PVC_GC_IDLE_DAYS.
@@ -343,31 +341,26 @@ async function main() {
   // the agent population grows; without it, abandoned profiles
   // accumulate forever. ENABLE_CHROME_PVC_GC=false disables (e.g.
   // emptyDir-mode clusters that never create PVCs in the first place).
-  if (process.env.ENABLE_CHROME_PVC_GC !== 'false') {
-    startChromeProfilePvcGc({
-      intervalMs: env.CHROME_PVC_GC_INTERVAL_MS,
-      idleThresholdMs: env.CHROME_PVC_GC_IDLE_DAYS * 24 * 60 * 60_000,
-    })
-  }
+  startChromeProfilePvcGc({
+    intervalMs: automationNumber('chrome_pvc_gc_interval_ms'),
+    idleThresholdMs: automationNumber('chrome_pvc_gc_idle_days') * 24 * 60 * 60_000,
+    runtimeSettings: true,
+  })
 
   // Cluster fuse-pressure monitor — periodic check that fires
   // notifyAlert when pending agent pods stay above 20 (or fuse
   // utilization ≥ 95%) for 5min sustained. ENABLE_CLUSTER_MONITOR=false
   // disables. Pairs with the FUSE admission control in ensurePod.
-  if (process.env.ENABLE_CLUSTER_MONITOR !== 'false') {
-    startClusterFuseMonitor()
-    console.log('[boot] cluster fuse-pressure monitor running every 60s')
-  }
+  startClusterFuseMonitor()
+  console.log('[boot] cluster fuse-pressure monitor follows runtime settings')
 
   // Agent run orphan sweeper — if a pod finishes during server
   // rolling restart / NEG cutover, its final /runtime/runs/:id/finish
   // call can be lost after all semantic work is done. Active turns
   // update agent_runs.updated_at through status heartbeats/events, so
   // a 10min stale running row is an orphan, not real work.
-  if (process.env.ENABLE_AGENT_RUN_SWEEPER !== 'false') {
-    startStaleAgentRunSweeper()
-    console.log('[boot] stale agent-run sweeper running every 60s')
-  }
+  startStaleAgentRunSweeper()
+  console.log('[boot] stale agent-run sweeper follows runtime settings')
 
   // BYOA computer offline sweeper — flip paired computers to 'offline' once
   // their daemon heartbeat goes stale, broadcasting the transition so the
