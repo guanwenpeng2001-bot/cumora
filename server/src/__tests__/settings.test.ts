@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
 import { runInNewContext } from 'node:vm'
@@ -16,7 +17,7 @@ function deferred<T>() {
   return { promise, resolve }
 }
 
-function fixture() {
+function fixture(clock?: { now: number; ticks: Array<() => void> }) {
   let data = new Map<string, string>([['brain_model', 'old'], [REVISION, '0']])
   const statements: string[] = []
   let failKey = ''
@@ -77,13 +78,17 @@ function fixture() {
   runInNewContext(ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText, {
     exports,
     require(name: string) {
+      if (name === 'node:async_hooks') return { AsyncLocalStorage }
       if (name === './db/pool.js') return { pool }
       if (name === './env.js') return { env }
       if (name === './sub2api.js') return {}
       if (name === './managed-pod-settings.js') return { getManagedPodSettings: () => null }
       throw new Error('unexpected dependency: ' + name)
     },
-    process: { env: {} }, console: { warn() {} },
+    process: { env: {} }, console: { warn() {}, error() {} },
+    Date: clock ? class extends Date { static now() { return clock.now } } : Date,
+    setInterval: (tick: () => void) => { assert.ok(clock); clock.ticks.push(tick); return { unref() {}, tick } },
+    clearInterval: (timer: { tick: () => void }) => { assert.ok(clock); const index = clock.ticks.indexOf(timer.tick); if (index >= 0) clock.ticks[index] = () => {} },
   })
   return {
     settings: exports, statements, env,
@@ -394,4 +399,278 @@ test('turn definitions publish all nine defaults alongside automation and cerebe
   }
   assert.equal(inherited.settings.idle_enabled, 'false')
   assert.equal(inherited.settings.support_inbox_triage_output_tokens, '2500')
+})
+
+test('Pod domain preserves defaults, fixed safety floors, and actual application boundaries', async () => {
+  const f = fixture()
+  await f.settings.loadServerSettings()
+  const expected = {
+    pod_admission_enabled: 'true', pod_admission_max: '40', pod_fuse_threshold: '0.90',
+    pod_capacity_unknown_mode: 'closed', pod_assignment_policy: 'deny', pod_gc_enabled: 'true',
+    chrome_pvc_gc_enabled: 'true', cluster_monitor_enabled: 'true', agent_run_sweeper_enabled: 'true',
+    cluster_monitor_pending_min: '20', cluster_monitor_ratio_min: '0.95',
+    cluster_monitor_sustained_ms: '300000', cluster_monitor_alert_cooldown_ms: '1800000',
+  }
+  const snapshot = f.settings.getServerSettingsSnapshot()
+  for (const [key, value] of Object.entries(expected)) {
+    assert.equal(snapshot.settings[key], value, key)
+    assert.equal(snapshot.definitions!.filter(def => def.key === key).length, 1, key)
+  }
+  for (const [key, value] of Object.entries({ pod_admission_enabled: 'false', pod_capacity_unknown_mode: 'open', pod_assignment_policy: 'allow' })) {
+    await assert.rejects(f.settings.writeServerSettings({ [key]: value }), /read-only/)
+    await assert.rejects(f.settings.writeServerSettings({ [key]: null }), /read-only/)
+    f.data.set(key, value)
+  }
+  await f.settings.loadServerSettings()
+  for (const key of ['pod_admission_enabled', 'pod_capacity_unknown_mode', 'pod_assignment_policy']) {
+    assert.equal(f.settings.getServerSetting(key), expected[key as keyof typeof expected])
+    assert.ok(f.settings.getServerSettingsSnapshot().diagnostics!.includes(`invalid-setting:${key}`))
+  }
+  for (const [key, effect] of [
+    ['pod_admission_max', 'next-admission'], ['pod_idle_ms', 'next-create'],
+    ['pod_no_work_ms', 'next-create'], ['wake_fanout_concurrency', 'restart'],
+    ['kubectl_max_concurrency', 'restart'], ['chrome_pvc_size', 'restart-next-create'],
+    ['chrome_pvc_storage_class', 'restart-next-create'],
+  ]) assert.equal(snapshot.definitions!.find(def => def.key === key)!.effect, effect)
+  await assert.rejects(f.settings.writeServerSettings({ wake_fanout_concurrency: '10' }), /read-only/)
+  f.data.set('wake_fanout_concurrency', '999')
+  await f.settings.loadServerSettings()
+  assert.equal(f.settings.getServerSetting('wake_fanout_concurrency'), '6')
+  assert.equal(f.settings.getServerSettingsSnapshot().sources.wake_fanout_concurrency, 'env')
+  assert.ok(f.settings.getServerSettingsSnapshot().diagnostics!.includes('ignored-db-setting:wake_fanout_concurrency'))
+})
+
+test('Pod tunables validate new input, retain valid writes and support inheritance', async () => {
+  const f = fixture()
+  await f.settings.loadServerSettings()
+  for (const [key, value] of [
+    ['pod_admission_max', '-1'], ['pod_admission_max', '1.5'], ['pod_fuse_threshold', '0'],
+    ['pod_fuse_threshold', '1'], ['pod_fuse_threshold', 'NaN'], ['cluster_monitor_ratio_min', 'Infinity'],
+    ['cluster_monitor_pending_min', '0'], ['cluster_monitor_sustained_ms', '-1'],
+    ['pod_gc_interval_ms', '2147483648'], ['agent_run_sweeper_enabled', '0'],
+  ]) await assert.rejects(f.settings.writeServerSettings({ [key]: value }))
+  assert.equal(f.connections, 0)
+  await f.settings.writeServerSettings({ pod_admission_max: '10', pod_fuse_threshold: '0.8', cluster_monitor_pending_min: '5', pod_gc_interval_ms: '0' })
+  assert.equal(f.settings.getServerSetting('pod_admission_max'), '10')
+  assert.equal(f.settings.getServerSetting('pod_fuse_threshold'), '0.8')
+  assert.equal(f.settings.getServerSetting('pod_gc_interval_ms'), '0')
+  await f.settings.writeServerSettings({ pod_admission_max: null, pod_gc_interval_ms: null })
+  assert.equal(f.settings.getServerSetting('pod_admission_max'), '40')
+  assert.equal(f.settings.getServerSetting('pod_gc_interval_ms'), '60000')
+})
+
+test('Pod worker timer disables, re-enables and reschedules without cancelling or overlapping an in-flight tick', async () => {
+  const clock = { now: 1000, ticks: [] as Array<() => void> }
+  const f = fixture(clock)
+  await f.settings.loadServerSettings()
+  const held = deferred<void>()
+  let runs = 0
+  let finished = 0
+  const flush = () => new Promise<void>(resolve => setImmediate(resolve))
+  f.settings.startAutomationTimer('pod_gc_enabled', 'pod_gc_interval_ms', async () => {
+    runs++
+    if (runs === 1) await held.promise
+    finished++
+  }, { immediate: true, unref: true })
+  clock.ticks[0]()
+  await flush()
+  assert.equal(runs, 1)
+  await f.settings.writeServerSettings({ pod_gc_enabled: 'false' })
+  clock.now += 1000
+  clock.ticks[0]()
+  assert.equal(finished, 0)
+  await f.settings.writeServerSettings({ pod_gc_enabled: 'true', pod_gc_interval_ms: '500' })
+  clock.ticks[0]()
+  clock.now += 1000
+  clock.ticks[0]()
+  await flush()
+  assert.equal(runs, 1)
+  held.resolve()
+  await flush()
+  assert.equal(finished, 1)
+  clock.ticks[0]()
+  await flush()
+  assert.equal(runs, 2)
+  await f.settings.writeServerSettings({ pod_gc_interval_ms: '0' })
+  clock.ticks[0]()
+  clock.now += 1000
+  clock.ticks[0]()
+  await flush()
+  assert.equal(runs, 2)
+  await f.settings.writeServerSettings({ pod_gc_interval_ms: '1000' })
+  clock.ticks[0]()
+  clock.now += 999
+  clock.ticks[0]()
+  await flush()
+  assert.equal(runs, 2)
+  clock.now++
+  clock.ticks[0]()
+  await flush()
+  assert.equal(runs, 3)
+})
+
+
+test('operations settings preserve defaults, validate bounds and allow inheritance', async () => {
+  const f = fixture()
+  await f.settings.loadServerSettings()
+  const defaults: Record<string, string> = {
+    email_retry_interval_ms: '60000', email_gc_interval_ms: '86400000', db_gc_interval_ms: '300000',
+    workspace_cleanup_interval_ms: '60000', workspace_runtime_cleanup_enabled: 'false',
+    poll_sweep_interval_ms: '60000', llm_rollup_interval_ms: '120000',
+    chrome_pvc_gc_interval_ms: '3600000', chrome_pvc_gc_idle_days: '30',
+    db_gc_batch: '10000', db_gc_ws_tickets_days: '1', db_gc_agent_log_days: '30',
+    db_gc_agent_events_days: '30', db_gc_agent_runs_days: '30', db_gc_llm_calls_days: '90',
+    workspace_cleanup_batch: '8', workspace_cleanup_retention_days: '7', llm_rollup_retention_hours: '2280',
+    agent_run_stale_age_ms: '600000',
+  }
+  for (const [key, value] of Object.entries(defaults)) {
+    assert.equal(f.settings.getServerSetting(key), value, key)
+    assert.equal(f.settings.getServerSettingsSnapshot().definitions!.filter(def => def.key === key).length, 1)
+  }
+  for (const [key, value] of Object.entries({ email_retry_interval_ms: '-1', db_gc_batch: '0',
+    workspace_cleanup_batch: '33', db_gc_llm_calls_days: '1.5', llm_rollup_interval_ms: '2147483648',
+    workspace_runtime_cleanup_enabled: 'maybe', llm_rollup_retention_hours: '-1' })) {
+    await assert.rejects(f.settings.writeServerSettings({ [key]: value }))
+  }
+  await f.settings.writeServerSettings({ db_gc_llm_calls_days: '0', llm_rollup_interval_ms: '0', workspace_runtime_cleanup_enabled: 'true' })
+  assert.equal(f.settings.automationNumber('db_gc_llm_calls_days'), 0)
+  assert.equal(f.settings.automationNumber('llm_rollup_interval_ms'), 0)
+  assert.equal(f.settings.automationEnabled('workspace_runtime_cleanup_enabled'), true)
+  await f.settings.writeServerSettings(Object.fromEntries(Object.keys(defaults).map(key => [key, null])))
+  for (const [key, value] of Object.entries(defaults)) assert.equal(f.settings.getServerSetting(key), value)
+})
+
+test('DB worker pause, resume, interval change and stop/start cannot overlap a held transaction', async () => {
+  const clock = { now: 0, ticks: [] as Array<() => void> }
+  const f = fixture(clock)
+  await f.settings.loadServerSettings()
+  await f.settings.writeServerSettings({ db_gc_interval_ms: '1000', db_gc_agent_log_days: '0',
+    db_gc_agent_events_days: '0', db_gc_agent_runs_days: '0', db_gc_llm_calls_days: '0' })
+  const held = deferred<void>()
+  let connections = 0, active = 0, peak = 0
+  const days: number[] = []
+  const api: Record<string, any> = {}
+  const js = ts.transpileModule(readFileSync(new URL('../db-gc.ts', import.meta.url), 'utf8'),
+    { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText
+  runInNewContext(js, { exports: api, console: { log() {}, error() {} }, require(name: string) {
+    if (name === './settings.js') return f.settings
+    if (name === './metrics.js') return { inc() {} }
+    assert.equal(name, './db/pool.js')
+    return { pool: { async connect() {
+      connections++; active++; peak = Math.max(peak, active)
+      const first = connections === 1
+      return { release() { active-- }, async query(sql: string, params: number[] = []) {
+        if (first && sql === 'BEGIN') await held.promise
+        if (sql.startsWith('SELECT')) days.push(params[0])
+        return { rows: [], rowCount: 0 }
+      } }
+    } } }
+  } })
+  const flush = () => new Promise<void>(resolve => setImmediate(resolve))
+  const tick = async (advance = 0) => { clock.now += advance; for (const work of [...clock.ticks]) work(); await flush() }
+  api.startDbGcWorker(); api.startDbGcWorker()
+  assert.equal(clock.ticks.length, 1, 'start is idempotent')
+  await tick(1000)
+  assert.equal(connections, 1)
+  await f.settings.writeServerSettings({ db_gc_interval_ms: '0', db_gc_ws_tickets_days: '5' })
+  await tick(5000)
+  await f.settings.writeServerSettings({ db_gc_interval_ms: '200' })
+  await tick(); await tick(500)
+  api.stopDbGcWorker(); api.startDbGcWorker()
+  await tick(500)
+  assert.equal(connections, 1)
+  held.resolve(); await flush()
+  assert.deepEqual(days, [1], 'in-flight tick retains its settings snapshot')
+  await tick()
+  assert.equal(connections, 2)
+  assert.deepEqual(days, [1, 5], 'next tick applies retention changes')
+  assert.equal(peak, 1)
+  await f.settings.writeServerSettings({ db_gc_interval_ms: '1000' })
+  await tick(); await tick(999)
+  assert.equal(connections, 2)
+  await tick(1)
+  assert.equal(connections, 3)
+  api.stopDbGcWorker(); await tick(5000)
+  assert.equal(connections, 3)
+})
+
+test('operations worker starts disabled, gates nudges, and recovers after failure', async () => {
+  const clock = { now: 0, ticks: [] as Array<() => void> }
+  const f = fixture(clock)
+  await f.settings.loadServerSettings()
+  await f.settings.writeServerSettings({ workspace_cleanup_interval_ms: '0' })
+  let runs = 0
+  const worker = f.settings.createOperationsWorker('workspace_cleanup_interval_ms', async () => {
+    runs++
+    if (runs === 1) throw new Error('injected failure')
+  }, { immediate: true, unref: true })
+  const flush = () => new Promise<void>(resolve => setImmediate(resolve))
+  worker.start(); worker.nudge(); await flush()
+  assert.equal(runs, 0)
+  await f.settings.writeServerSettings({ workspace_cleanup_interval_ms: '500' })
+  clock.ticks[0](); clock.now = 499; clock.ticks[0](); await flush()
+  assert.equal(runs, 0)
+  clock.now = 500; clock.ticks[0](); await flush()
+  assert.equal(runs, 1)
+  worker.nudge(); await flush()
+  assert.equal(runs, 2)
+  worker.stop(); worker.nudge(); clock.now = 5000; clock.ticks[0](); await flush()
+  assert.equal(runs, 2)
+})
+
+
+test('workspace cleanup uses configured batch and retention while default runtime cleanup makes no external call', async () => {
+  const f = fixture()
+  await f.settings.loadServerSettings()
+  const calls: { sql: string; params: unknown[] }[] = []
+  const api: Record<string, any> = {}
+  const js = ts.transpileModule(readFileSync(new URL('../workspace-cleanup.ts', import.meta.url), 'utf8'),
+    { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText
+  const dependencies: Record<string, unknown> = {
+    './settings.js': f.settings,
+    'node:crypto': { randomUUID: () => 'test-worker' },
+    './storage.js': { storage: {}, normalizeStorageKey: (key: string) => key },
+    './db/pool.js': { pool: { async query(sql: string, params: unknown[] = []) {
+      calls.push({ sql, params })
+      if (sql.includes('UPDATE workspace_cleanup_jobs j')) return { rows: [{ id: 'job', agent_ids: ['agent'], storage_keys: [] }] }
+      return { rows: [] }
+    } } },
+  }
+  runInNewContext(js, { exports: api, process: { pid: 1 }, require(name: string) {
+    if (name.includes('documents/')) return {}
+    assert.ok(name in dependencies, `unexpected dependency ${name}`)
+    return dependencies[name]
+  } })
+  await f.settings.writeServerSettings({ workspace_cleanup_retention_days: '0', workspace_cleanup_batch: '3' })
+  assert.equal((await api.drainWorkspaceCleanupJobs()).completed, 1)
+  assert.ok(!calls.some(c => c.sql.startsWith('DELETE')))
+  const claim = calls.find(c => c.sql.includes('SKIP LOCKED'))!
+  assert.ok(claim)
+  assert.ok(claim.params.includes(3))
+  calls.length = 0
+  await f.settings.writeServerSettings({ workspace_cleanup_retention_days: '14' })
+  await api.drainWorkspaceCleanupJobs()
+  assert.deepEqual(Array.from(calls.find(c => c.sql.startsWith('DELETE'))!.params), [14])
+})
+
+test('stale-run expiry is disabled by zero and retains running-only scope and default age', async () => {
+  const f = fixture()
+  await f.settings.loadServerSettings()
+  const calls: { sql: string; params: unknown[] }[] = []
+  const api: Record<string, any> = {}
+  const js = ts.transpileModule(readFileSync(new URL('../agents/observability.ts', import.meta.url), 'utf8'),
+    { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText
+  runInNewContext(js, { exports: api, require(name: string) {
+    if (name === '../settings.js') return f.settings
+    if (name === '../db/pool.js') return { pool: { async query(sql: string, params: unknown[]) { calls.push({ sql, params }); return { rows: [] } } } }
+    if (name === './cost.js' || name === 'node:crypto') return {}
+    throw new Error('unexpected dependency: ' + name)
+  } })
+  await f.settings.writeServerSettings({ agent_run_stale_age_ms: '0' })
+  await api.markStaleAgentRuns()
+  assert.equal(calls.length, 0)
+  await f.settings.writeServerSettings({ agent_run_stale_age_ms: null })
+  await api.markStaleAgentRuns()
+  assert.deepEqual(Array.from(calls[0].params), [600_000])
+  assert.ok(calls[0].sql.includes("WHERE status = 'running'"))
 })
