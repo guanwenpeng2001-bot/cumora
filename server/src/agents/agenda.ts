@@ -431,9 +431,8 @@ export function parseAgendaVerdict(raw: string): {
 }
 
 /** Cerebellum classifier: given the agenda + persona, decide if a
- *  wake is justified. Strict JSON. Falls back to "actionable=false"
- *  on any error so a classifier outage doesn't burn brain calls on
- *  every heartbeat. */
+ * wake is justified. On error only a single recent peer-last stall has a
+ * deterministic follow-up floor; other work keeps the error sentinel. */
 export function classifyAgendaActionable(args: Parameters<typeof classifyAgendaCaptured>[0]): Promise<AgendaVerdict> {
   return withServerSettingsSnapshot(() => classifyAgendaCaptured(args))
 }
@@ -521,6 +520,14 @@ Reply as strict JSON.`
   } catch (e) {
     console.warn('[agenda] classifier failed', e instanceof Error ? e.message : e)
     console.warn('[agenda] failure policy:', getServerSetting('agenda_error_mode'))
+    const stall = agenda.stalls.length === 1 ? agenda.stalls[0] : null
+    if (agenda.cards.length === 0 && agenda.events.length === 0 && stall &&
+        !stall.lastAuthorIsSelf && Number.isFinite(stall.minutesSilent) &&
+        stall.minutesSilent >= 0 && stall.minutesSilent <= 30) {
+      return { actionable: true,
+        focus: `Check the recent unanswered conversation ${stall.conversationId}; respond if a reply is owed.`,
+        reason: 'classifier error: recent peer-last stall fallback' }
+    }
     return { actionable: false, focus: '', reason: AGENDA_CLASSIFIER_ERROR }
   }
 }

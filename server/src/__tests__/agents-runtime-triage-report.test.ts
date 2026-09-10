@@ -22,7 +22,7 @@ function declarations(path: string, names: string[]) {
     ts.isVariableStatement(n) && n.declarationList.declarations.some(d => names.includes(d.name.getText(ast))),
   ).map(n => n.getText(ast)).join('\n')
 }
-function daemonFixture(result: any, options: { payload?: any; abort?: boolean; mkdirFails?: boolean; deliveryFails?: number } = {}) {
+function daemonFixture(result: any, options: { payload?: any; backoffUntil?: number; abort?: boolean; mkdirFails?: boolean; deliveryFails?: number } = {}) {
   const source = read('../agents/computer/daemon.ts')
   const ast = ts.createSourceFile('daemon.ts', source, ts.ScriptTarget.Latest, true)
   const cls = ast.statements.find(n => ts.isClassDeclaration(n) && n.name?.text === 'AgentRunner') as ts.ClassDeclaration
@@ -45,7 +45,7 @@ function daemonFixture(result: any, options: { payload?: any; abort?: boolean; m
     console: { warn: (message: string) => warnings.push(message) },
   })
   const runner = new Runner()
-  Object.assign(runner, { cfg: { serverUrl: 'fake' }, agent: { id: 'a' }, triageModel: () => 'requested-model',
+  Object.assign(runner, { triageBackoffUntil: options.backoffUntil ?? 0, cfg: { serverUrl: 'fake' }, agent: { id: 'a' }, triageModel: () => 'requested-model',
     triageModelPin: () => 'requested-model', engineEnv: () => ({}),
     adapter: { id: 'codex', classify: async () => { calls++; if (result instanceof Error) throw result; return result } },
   })
@@ -230,4 +230,25 @@ test('callId identity includes source and agent, and no-callId reports remain re
   assert.equal((await f.call('/llm-calls', legacy)).body.inserted, 1)
   assert.equal((await f.call('/llm-calls', legacy)).body.inserted, 1)
   assert.equal(f.rows.length, 5)
+})
+
+test('BYOA cooldown reads human verdict without calling the local classifier', async () => {
+  const f = daemonFixture(valid, { backoffUntil: Date.now() + 600_000,
+    payload: { messageIds: ['m1'], verdict: { actionable: true, reason: 'human waiting', promptNote: 'Reply to the human', source: 'human-dm' } } })
+  assert.equal((await f.run()).outcome, 'execute')
+  assert.equal(f.calls(), 0)
+  assert.equal(f.reports.length, 0)
+})
+
+test('BYOA cooldown defers model-only payload without extending its deadline or acknowledging', async () => {
+  const deadline = Date.now() + 600_000
+  const f = daemonFixture(valid, { backoffUntil: deadline })
+  for (let i = 0; i < 3; i++) {
+    const verdict = await f.run()
+    assert.equal(verdict.outcome, 'defer')
+    assert.equal(verdict.ackAllowed, false)
+    assert.equal(verdict.retryAt, deadline)
+  }
+  assert.equal(f.calls(), 0)
+  assert.equal(f.reports.length, 0)
 })

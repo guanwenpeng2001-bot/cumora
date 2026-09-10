@@ -20,6 +20,7 @@
  * server doesn't track Pod lifetimes — the next wake re-creates the
  * Pod via the orchestrator.
  */
+import { randomUUID } from 'node:crypto'
 import { pool } from '../db/pool.js'
 import { env } from '../env.js'
 import { inboxTriageBoundary } from './runtime/wake-options.js'
@@ -67,10 +68,11 @@ type WakeOptions = Pick<AgentTurnOptions, 'idleReason' | 'backgroundBrief' | 'po
   triageTarget?: { conversationId: string; messageId: string }
   /** Message fan-out must resolve placement before delivering to a live runtime. */
   placementTriage?: boolean
+  recoveryProbe?: boolean
   triageDeferred?: TriageDisposition
   triageBoundary?: string
 }
-type WakeFailureClass = 'ensure_pod' | 'host_resolution' | 'triage'
+type WakeFailureClass = 'ensure_pod' | 'host_resolution' | 'triage' | 'delivery'
 
 interface WakeRetryJob {
   id: string
@@ -80,6 +82,7 @@ interface WakeRetryJob {
   steerPayload: SteerWakePayload | null
   options: WakeOptions
   attempt: number
+  failureClass: WakeFailureClass
   lastFailure: string
 }
 
@@ -100,11 +103,13 @@ export function triageRetryDelayMs(attempt: number): number {
   return Math.min(max, Math.max(base, base / 6 * 2 ** Math.max(0, Math.min(30, attempt))))
 }
 
-const TRANSIENT_ENSURE_POD_FAILURE = /\b(?:capacity_denied|pod_apply_failed|watchdog_timeout)\b/i
+// Only this code proves ensurePod did not apply a Pod. Ambiguous timeouts
+// remain durable via cold-start inbox drain; replay could create a second turn.
+const SAFE_MESSAGE_ENSURE_FAILURE = /^capacity_denied(?:\s*:|$)/i
 const MESSAGE_WAKE_RETRY_MAX_ATTEMPTS = 5
 
 export function _shouldRetryEnsurePodFailure(reason: WakeReason, ensureReason: string): boolean {
-  if (reason === 'message.new') return TRANSIENT_ENSURE_POD_FAILURE.test(ensureReason)
+  if (reason === 'message.new') return SAFE_MESSAGE_ENSURE_FAILURE.test(ensureReason)
   if (reason !== 'manual') return false
   if (/no such agent/i.test(ensureReason)) return false
   return true
@@ -118,7 +123,7 @@ export function _shouldRetryWakeFailure(
   failureReason: string,
   failureClass: WakeFailureClass,
 ): boolean {
-  if (failureClass === 'host_resolution' || failureClass === 'triage') return true
+  if (failureClass === 'host_resolution' || failureClass === 'triage' || failureClass === 'delivery') return true
   return _shouldRetryEnsurePodFailure(reason, failureReason)
 }
 
@@ -164,12 +169,11 @@ async function scheduleWakeRetry(
   failureClass: WakeFailureClass = 'ensure_pod',
 ): Promise<void> {
   if (!_shouldRetryWakeFailure(reason, failureReason, failureClass)) return
-  const id = wakeRetryId(agentId, reason, options.triageBoundary ? null : conversationId) + (options.triageBoundary ? `:${options.triageBoundary}` : '')
+  const id = wakeRetryId(agentId, reason, conversationId)
   const maxAttempts = reason === 'message.new'
     ? MESSAGE_WAKE_RETRY_MAX_ATTEMPTS
     : WAKE_RETRY_MAX_ATTEMPTS
   if (attempt > maxAttempts) {
-    await redis.hdel(WAKE_RETRY_JOB_KEY, id).catch(() => { /* ignore */ })
     if (reason === 'message.new') {
       await postWakeRetryExhaustedNotice(agentId, conversationId, attempt, failureReason)
     }
@@ -178,20 +182,30 @@ async function scheduleWakeRetry(
       error: new Error('wake retry exhausted for ' + agentId + ': ' + failureReason),
       extras: { agentId, reason, conversationId, attempt, failureReason },
     })
-    return
+    if (reason !== 'message.new') return
+    // No live Pod exists to probe a resting agent's inbox. Keep a low-frequency
+    // durable probe after the fast retry budget, without bypassing triage.
+    options = { ...options, recoveryProbe: true }
+    attempt = 0
   }
-  const delay = failureClass === 'triage' ? triageRetryDelayMs(attempt) : _wakeRetryDelayMs(attempt)
+  const delay = options.recoveryProbe ? 5 * 60_000 : failureClass === 'triage' ? triageRetryDelayMs(attempt) : _wakeRetryDelayMs(attempt)
   const dueAt = Math.max(Date.now() + delay, options.triageDeferred?.retryAt ?? 0) + Math.floor(Math.random() * 1_000)
   const job: WakeRetryJob = {
     id, agentId, reason, conversationId, steerPayload,
     options: { ...options, triageNote: undefined, triageDeferred: undefined },
-    attempt,
+    attempt, failureClass,
     lastFailure: failureReason,
   }
   const queued = await redis.eval(`
-    if redis.call('HEXISTS', KEYS[1], ARGV[1]) == 1 then return 0 end
-    redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
-    redis.call('ZADD', KEYS[2], ARGV[3], ARGV[1])
+    local existing = redis.call('HGET', KEYS[1], ARGV[1])
+    local incoming = cjson.decode(ARGV[2])
+    if existing then
+      local previous = cjson.decode(existing)
+      incoming.attempt = math.max(previous.attempt, incoming.attempt)
+    end
+    redis.call('HSET', KEYS[1], ARGV[1], cjson.encode(incoming))
+    local due = redis.call('ZSCORE', KEYS[2], ARGV[1])
+    redis.call('ZADD', KEYS[2], math.min(tonumber(due) or tonumber(ARGV[3]), tonumber(ARGV[3])), ARGV[1])
     return 1
   `, 2, WAKE_RETRY_JOB_KEY, WAKE_RETRY_DUE_KEY, id, JSON.stringify(job), dueAt)
   if (queued !== 1) return
@@ -199,46 +213,49 @@ async function scheduleWakeRetry(
 }
 
 async function pollWakeRetriesOnce(): Promise<void> {
-  const ids = await redis.zrangebyscore(WAKE_RETRY_DUE_KEY, 0, Date.now(), 'LIMIT', 0, WAKE_RETRY_BATCH_SIZE)
-  for (const id of ids) {
-    const claimed = await redis.zrem(WAKE_RETRY_DUE_KEY, id)
-    if (claimed !== 1) continue
-    const raw = await redis.hget(WAKE_RETRY_JOB_KEY, id)
-    if (!raw) continue
-    await redis.hdel(WAKE_RETRY_JOB_KEY, id).catch(() => { /* ignore */ })
+  // Claim and remove the payload in one operation. A concurrent enqueue after
+  // this script creates a new job that this worker can no longer HDEL by mistake.
+  const claimed = await redis.eval(`
+    local ids = redis.call('ZRANGEBYSCORE', KEYS[2], 0, ARGV[1], 'LIMIT', 0, ARGV[2])
+    local jobs = {}
+    for _, id in ipairs(ids) do
+      local raw = redis.call('HGET', KEYS[1], id)
+      redis.call('ZREM', KEYS[2], id)
+      redis.call('HDEL', KEYS[1], id)
+      if raw then table.insert(jobs, raw) end
+    end
+    return jobs
+  `, 2, WAKE_RETRY_JOB_KEY, WAKE_RETRY_DUE_KEY, Date.now(), WAKE_RETRY_BATCH_SIZE) as string[]
+  const results = await Promise.allSettled(claimed.map(async raw => {
     let job: WakeRetryJob
+    try { job = JSON.parse(raw) as WakeRetryJob } catch { return }
     try {
-      job = JSON.parse(raw) as WakeRetryJob
-    } catch {
-      continue
-    }
-    wakeOne(
-      job.agentId,
-      job.reason,
-      job.conversationId,
-      job.steerPayload,
-      job.options,
-      job.attempt,
-    ).catch((err) => {
+      if (job.options.recoveryProbe) {
+        const inbox = await inprocClient.loadInbox(job.agentId)
+        if (inbox.length === 0) return
+      }
+      await wakeOne(job.agentId, job.reason, job.conversationId, job.steerPayload,
+        { ...job.options, recoveryProbe: false }, job.attempt)
+    } catch (err) {
       console.error(`[scheduler] wake retry ${job.id} failed:`, err instanceof Error ? err.message : err)
-      scheduleWakeRetry(
-        job.agentId,
-        job.reason,
-        job.conversationId,
-        job.steerPayload,
-        job.options,
-        job.attempt + 1,
+      await scheduleWakeRetry(job.agentId, job.reason, job.conversationId,
+        job.steerPayload, job.options, job.attempt + 1,
         err instanceof Error ? err.message : String(err),
-      ).catch(() => { /* ignore */ })
-    })
-  }
+        job.options.recoveryProbe ? 'host_resolution' : job.failureClass ?? 'host_resolution')
+    }
+  }))
+  const failures = results.filter(result => result.status === 'rejected')
+  if (failures.length > 0) throw new AggregateError(failures.map(result => result.reason), 'wake retry batch failed')
 }
 
 function startWakeRetryWorker(intervalMs: number = 5_000): NodeJS.Timeout {
+  let polling = false
   const tick = (): void => {
+    if (polling) return
+    polling = true
     pollWakeRetriesOnce().catch((err) =>
       console.error('[scheduler] wake retry worker failed:', err instanceof Error ? err.message : err),
-    )
+    ).finally(() => { polling = false })
   }
   setImmediate(tick)
   const t = setInterval(tick, intervalMs)
@@ -391,7 +408,14 @@ async function wakeOneCaptured(
   // placement becomes mandatory for managed-message triage and whenever zero
   // subscribers would send us toward ensurePod.
   const resolveHostForWake = async (): Promise<ResolvedAgentHost | null> => {
-    const hostResult = await resolveAgentHost(agentId)
+    let hostResult: Awaited<ReturnType<typeof resolveAgentHost>>
+    try {
+      hostResult = await resolveAgentHost(agentId)
+    } catch (err) {
+      await scheduleWakeRetry(agentId, reason, conversationId, steerPayload, options,
+        retryAttempt + 1, err instanceof Error ? err.message : String(err), 'host_resolution')
+      return null
+    }
     if (hostResult.status === 'missing') {
       console.warn(`[scheduler] ${agentId} wake ignored: no active agent row`)
       return null
@@ -452,7 +476,14 @@ async function wakeOneCaptured(
     ...(options.pollBrief ? { pollBrief: options.pollBrief } : {}),
     ...(options.triageNote ? { triageNote: options.triageNote, triageBoundary: options.triageBoundary } : {}),
   }
-  const delivered = await deliverWake(agentId, wakePayload)
+  let delivered: number
+  try {
+    delivered = await deliverWake(agentId, wakePayload)
+  } catch (err) {
+    await scheduleWakeRetry(agentId, reason, conversationId, steerPayload, options,
+      retryAttempt + 1, err instanceof Error ? err.message : String(err), 'delivery')
+    return false
+  }
 
   // Steering: if the agent's pod is currently mid-turn (busy lease in
   // Redis), ALSO publish the message body as a steer event so the
@@ -545,7 +576,10 @@ async function wakeOneCaptured(
   // event explicitly afterwards because the inbox IS the source of
   // truth.
   const r = await ensurePod(agentId, reason === 'message.new' && options.triageNote
-    ? { triageNote: options.triageNote, triageBoundary: options.triageBoundary } : undefined)
+    ? { triageNote: options.triageNote, triageBoundary: options.triageBoundary } : undefined).catch(err => ({
+      ok: false as const, created: false, code: 'pod_apply_failed',
+      reason: err instanceof Error ? err.message : String(err),
+    }))
   if (r.created) {
     console.log('[scheduler] ' + agentId + ' resting → spinning up pod (' + reason + ')')
     // Synthetic/message wakes are durable in the inbox. Only the explicit
@@ -596,12 +630,22 @@ async function wakeOneCaptured(
  *  parallel kubectl-applies fight at the K8s API server.
  *
  *  Fix: SETNX a key per message id; only the first replica that
- *  claims it proceeds. TTL=60s reaps the key automatically. */
+ *  claims it proceeds. Renew while queued recipients are still being drained. */
 async function claimAndWake(payload: MessageNewEvent): Promise<void> {
   const key = `cumora:wake-claim:${payload.message.id}`
-  const claimed = await redis.set(key, '1', 'EX', 60, 'NX').catch(() => null)
+  const owner = randomUUID()
+  const claimed = await redis.set(key, owner, 'EX', 300, 'NX').catch(() => null)
   if (claimed === null) return     // another replica owns this wake
-  await wake(payload)
+  const renew = setInterval(() => {
+    void redis.eval(`
+      if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+      return redis.call('EXPIRE', KEYS[1], 300)
+    `, 1, key, owner).catch(err => {
+      console.warn('[scheduler] wake claim renewal failed:', err instanceof Error ? err.message : err)
+    })
+  }, 30_000)
+  renew.unref?.()
+  try { await wake(payload) } finally { clearInterval(renew) }
 }
 
 // ─── author-name cache (Fix #10) ─────────────────────────────────────
@@ -988,7 +1032,7 @@ export async function fanOutWake(
   // 2026-05-27 connection-exhaustion outage). Excess recipients queue
   // and drain at a sustainable rate; a delayed wake still self-heals —
   // the message is durable in the inbox, the pod drains on attach, and
-  // the per-message wake-claim TTLs out in 60s.
+  // the per-message wake claim is renewed until fan-out finishes.
   await Promise.all(recipients.map((m) => wakeFanoutSem.run(async () => {
     // One recipient failing (triage throw, kubectl flake) must not stop
     // the others or escape into the Redis on-message handler.
@@ -1036,7 +1080,7 @@ export function startScheduler(): void {
       // fire-and-forget — pool.query inside wake() or ensurePod's kubectl
       // shell-out can transiently reject. We don't want an unhandled
       // rejection here; just log and let the next wake retry. The
-      // wake-claim Redis key TTLs out in 60s so a missed wake recovers
+      // next event has its own claim key, so a missed wake recovers
       // naturally on the next message in the same convo.
       claimAndWake(payload).catch((err) => {
         console.error(`[scheduler] claimAndWake failed for ${payload.message?.id}:`,

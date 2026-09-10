@@ -503,3 +503,73 @@ test('classifyAgendaActionable: identical content is re-evaluated on every heart
   assert.equal(v2.focus, 'ship-2')
   assert.equal(calls, 2, 'time-sensitive agenda decisions must not reuse an old verdict')
 })
+
+// Isolated outage regressions execute production functions with fake I/O.
+// Select with --test-name-pattern=isolated when DB access is prohibited.
+import { readFileSync } from 'node:fs'
+import ts from 'typescript'
+function isolatedAgendaDeclarations(path: string, names: string[], globals: Record<string, unknown>) {
+  const source = readFileSync(new URL(path, import.meta.url), 'utf8')
+  const ast = ts.createSourceFile(path, source, ts.ScriptTarget.Latest, true)
+  const body = ast.statements.filter(n => ts.isFunctionDeclaration(n) && names.includes(n.name?.text ?? ''))
+    .map(n => n.getText(ast)).join('\n')
+  const output = ts.transpileModule(body + '\nexport { ' + names.join(', ') + ' }', {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+  }).outputText
+  const api: Record<string, any> = {}
+  new Function('exports', ...Object.keys(globals), output)(api, ...Object.values(globals))
+  return api
+}
+const isolatedStall = { conversationId: 'direct-peer', kind: 'direct', title: null, lastMessageId: 'm',
+  lastAuthorId: 'peer', lastAuthorName: 'Peer', lastAuthorIsSelf: false,
+  lastBody: 'Please send the result', minutesSilent: 10, recentTail: 'Peer: Please send the result' }
+for (const [label, stalls, expected] of [
+  ['one recent peer-last stall', [isolatedStall], true],
+  ['30 minute boundary', [{ ...isolatedStall, minutesSilent: 30 }], true],
+  ['old stall', [{ ...isolatedStall, minutesSilent: 31 }], false],
+  ['self-last stall', [{ ...isolatedStall, lastAuthorIsSelf: true }], false],
+  ['multiple stalls', [isolatedStall, { ...isolatedStall, conversationId: 'other' }], false],
+  ['invalid age', [{ ...isolatedStall, minutesSilent: NaN }], false],
+] as const) {
+  test(`isolated agenda outage: ${label}`, async () => {
+    const api = isolatedAgendaDeclarations('../agents/agenda.ts', ['classifyAgendaCaptured'], {
+      automationEnabled: () => true, automationNumber: () => 8000,
+      renderAgendaForClassifier: () => 'agenda', AGENDA_CLASSIFIER_ERROR,
+      getServerSetting: () => 'defer', getTrackedLlmClient: async () => { throw new Error('classifier unavailable') },
+    })
+    const result = await api.classifyAgendaCaptured({ persona: STUB_PERSONA, companyId: 'c',
+      agenda: { cards: [], events: [], stalls } })
+    assert.equal(result.actionable, expected)
+    if (expected) assert.match(result.focus, /direct-peer/)
+    else assert.equal(result.reason, AGENDA_CLASSIFIER_ERROR)
+  })
+}
+
+test('isolated idle outage emits generic heartbeat; recovery emits focused agenda and explicit skip stays quiet', async () => {
+  let verdict = { actionable: false, focus: '', reason: AGENDA_CLASSIFIER_ERROR }
+  const wakes: any[] = [], records: any[] = []
+  const api = isolatedAgendaDeclarations('../agents/idle.ts', ['agendaHasItems', 'runIdleTickCaptured'], {
+    automationEnabled: () => true, automationNumber: () => 60_000,
+    pool: { query: async () => ({ rows: [{ id: 'company' }] }) },
+    pickAgent: async () => ({ id: 'agent', company_id: 'company', status: 'resting', last_spoke: null }),
+    gatherAgentAgenda: async () => SINGLE_CARD_AGENDA,
+    getPersona: async () => STUB_PERSONA,
+    classifyAgenda: async () => verdict,
+    recordIdleWake: async (_agent: unknown, ref: unknown) => { records.push(ref) },
+    wakeIdleAgent: async (...args: unknown[]) => { wakes.push(args) },
+    renderAgendaBrief, AGENDA_CLASSIFIER_ERROR,
+  })
+  await api.runIdleTickCaptured()
+  assert.equal(wakes.length, 1)
+  assert.equal(wakes[0][1], 'idle')
+  assert.equal(wakes[0][4].backgroundBrief, undefined)
+  assert.equal(records[0].agendaVerdict, 'classifier_error')
+  verdict = { actionable: true, focus: 'Resume work', reason: 'recovered' }
+  await api.runIdleTickCaptured()
+  assert.equal(wakes.length, 2)
+  assert.equal(wakes[1][1], 'background_scan')
+  assert.match(wakes[1][4].backgroundBrief.body, /Ship migration/)
+  verdict = { actionable: false, focus: '', reason: 'not needed' }
+  await api.runIdleTickCaptured()
+  assert.equal(wakes.length, 2)
+})

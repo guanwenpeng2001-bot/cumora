@@ -77,8 +77,8 @@ function mergeTurnOptions(next: AgentTurnOptions | null): void {
   pendingTurnOptions = mergeWakeTurnOptions(pendingTurnOptions, next)
 }
 
-/** All wake sources pass this gate while holding the drain lock. A new
- * message does not bypass the deadline while deferred messages remain unread.
+/** All wake sources pass this gate while holding the drain lock. Only the
+ * deferred batch stays gated; a new message must reach triage's human fast path.
  * If those messages were read/removed elsewhere, the stale boundary is cleared. */
 async function admitInboxDrain(agentId: string): Promise<boolean> {
   const deferred = state.inboxDeferred
@@ -86,7 +86,7 @@ async function admitInboxDrain(agentId: string): Promise<boolean> {
   if (Date.now() < deferred.retryAt) {
     const inbox = await runtime.loadInbox(agentId)
     const ids = new Set(deferred.messageIds)
-    if (inbox.some(row => ids.has(row.id))) return false
+    if (inbox.some(row => ids.has(row.id)) && inbox.every(row => ids.has(row.id))) return false
   }
   state.inboxDeferred = null
   if (inboxRetryTimer) clearTimeout(inboxRetryTimer)

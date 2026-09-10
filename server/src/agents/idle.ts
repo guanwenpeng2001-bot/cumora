@@ -174,6 +174,13 @@ async function runIdleTickCaptured(): Promise<void> {
           agendaEvents: agenda.events.length,
           agendaVerdict: classifierFailed ? 'classifier_error' : 'skip',
         })
+        if (classifierFailed) {
+          // Preserve the ordinary heartbeat floor during an agenda outage.
+          // This still passes the runtime's synthetic-wake gate.
+          await wakeIdleAgent(agent.id, 'idle', null, null, {
+            idleReason: 'idle heartbeat; agenda classifier unavailable',
+          })
+        }
         continue
       }
 
