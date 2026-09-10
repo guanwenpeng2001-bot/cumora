@@ -3,7 +3,9 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { randomUUID, createHash } from 'node:crypto'
 import ts from 'typescript'
-import { compactHistoryWithSummary, estimateTokens } from '../agents/turn-compaction.js'
+import { compactHistoryWithSummary } from '../agents/turn-compaction.js'
+import * as compaction from '../agents/turn-compaction.js'
+import * as streams from '../agents/turn-stream.js'
 
 // Load the actual private consumers and executor with isolated I/O dependencies.
 function compile(source: string, dependencies: Record<string, unknown>, globals: Record<string, unknown> = {}) {
@@ -44,13 +46,16 @@ function fixture(behavior: (request: any, signal?: AbortSignal) => AsyncIterable
   })
   const source = read('../agents/turn.ts')
   const names = ['executeAuxiliaryStream', 'verifyTerminalCompletion', 'summarizeHistoryItems', 'summarizeSteerBatch',
-    'formatItemsForSummary', 'extractJsonObject', 'parseCompletionVerification', 'verifierSideEffects', 'renderSteerBatchTruncated', 'renderSteerBatchVerbatim']
+    'utf8Head', 'executeAgentTurnHop', 'contextWindowFor', 'hardLimitFor', 'stripImageInputs', 'isImageFetchFailure',
+    'isModelProviderConnectionError', 'isModelProviderConnectionText', 'formatItemsForSummary', 'extractJsonObject', 'parseCompletionVerification', 'verifierSideEffects', 'renderSteerBatchTruncated', 'renderSteerBatchVerbatim']
   const ast = ts.createSourceFile('turn.ts', source, ts.ScriptTarget.Latest, true)
   const functions = ast.statements.filter(node => ts.isFunctionDeclaration(node) && names.includes(node.name?.text ?? '')).map(node => node.getText(ast)).join('\n')
   const turn = compile(functions + '\nexport { ' + names.join(', ') + ' }', {
     '../llm-resolver.js': resolver, '../llm-execution.js': execution, '../llm.js': llm, './cost.js': cost,
-  }, { estimateTokens })
-  return { turn, records, requests }
+    './turn-compaction.js': compaction, './fallback.js': fallback, '../novita.js': {},
+  }, { ...compaction, ...streams,
+    traceResponseOutputItem: () => ({}), errorText: (error: unknown) => String(error) })
+  return { turn, records, requests, resolver }
 }
 const failure = () => Object.assign(new Error('connection reset'), { code: 'ECONNRESET' })
 const batch = Array.from({ length: 8 }, () => ({ authorName: 'Alice', conversationId: 'c-one', body: 'Please deliver ' + 'x'.repeat(1000) }))
@@ -135,6 +140,10 @@ test('summary chain exhaustion still drops history and inserts its marker', asyn
   assert.ok(result.droppedPairCount > 0)
   assert.match(JSON.stringify(result.newHistory), /auto-compaction/)
   assert.match(JSON.stringify(result.newHistory), /original request/)
+  const calls = result.newHistory.filter((x: any) => x.type === 'function_call').map((x: any) => x.call_id)
+  const outputs = result.newHistory.filter((x: any) => x.type === 'function_call_output').map((x: any) => x.call_id)
+  assert.deepEqual(outputs, calls)
+  assert.deepEqual(calls, ['10', '11'])
 })
 
 for (const status of [401, 403, 429]) test(`stream creation HTTP ${status} is accounted before fallback`, async () => {
@@ -146,4 +155,118 @@ for (const status of [401, 403, 429]) test(`stream creation HTTP ${status} is ac
   assert.equal(requests.length, 2)
   assert.equal(records.length, 2)
   assert.equal(records[0].extras.failureReason, `upstream-http-${status}`)
+})
+
+
+async function budgetPlan(f: ReturnType<typeof fixture>, windows: number[]) {
+  const plan = await f.resolver.resolveRoleCall(null, 'server', 'brain', 'agent-turn')
+  return { ...plan, candidates: plan.candidates.slice(0, windows.length).map((candidate: any, i: number) => ({
+    ...candidate, parameters: { ...candidate.parameters, contextWindow: windows[i], maxOutputTokens: 100 },
+  })) }
+}
+const hopContext = { companyId: null, role: 'brain', purpose: 'agent-turn', extras: { hop: 1 } }
+
+test('turn budget: smaller fallback rejects irreducible input before sending or recording an attempt', async () => {
+  const f = fixture(/** biome-ignore lint/correctness/useYield: fake upstream rejection */ async function* () {
+    throw Object.assign(new Error('primary unavailable'), { status: 503 })
+  })
+  const plan = await budgetPlan(f, [10_000, 500])
+  await assert.rejects(f.turn.executeAgentTurnHop({ plan, context: hopContext,
+    input: [{ role: 'user', content: '中文'.repeat(500) }], instructions: '', tools: [],
+    compactionPolicy: { ...compaction.DEFAULT_COMPACTION_POLICY, autoEnabled: false },
+  }), /input exceeds context budget/)
+  assert.equal(f.requests.length, 1)
+  assert.equal(f.records.length, 1, 'no fictional attempt for a locally rejected candidate')
+})
+
+test('turn budget: Chinese tool history fits a smaller fallback with automatic summaries disabled', async () => {
+  const f = fixture(async function* (request) {
+    if (request.model === 'same') throw Object.assign(new Error('primary unavailable'), { status: 503 })
+    yield { type: 'response.completed', response: { model: 'brain-backup', output: [], usage: { input_tokens: 500, output_tokens: 10 } } }
+  })
+  const plan = await budgetPlan(f, [100_000, 1500])
+  const input: any[] = [{ role: 'user', content: '继续处理中文任务' }]
+  for (let i = 0; i < 30; i++) input.push(
+    { type: 'function_call', call_id: String(i), name: 'bash', arguments: '{}' },
+    { type: 'function_call_output', call_id: String(i), output: '中文😀'.repeat(100) },
+  )
+  const result = await f.turn.executeAgentTurnHop({ plan, context: hopContext, input, instructions: 'continue', tools: [],
+    compactionPolicy: { ...compaction.DEFAULT_COMPACTION_POLICY, autoEnabled: false, outputBytes: 300, keepRecentPairs: 3 },
+  })
+  assert.equal(f.requests.length, 2)
+  assert.equal(result.state.actualModel, 'brain-backup')
+  assert.ok(compaction.estimateHistoryTokens(result.input) <= Math.floor(1500 * 0.95))
+  assert.ok(result.input.length < input.length)
+  const calls = new Set(result.input.filter((x: any) => x.type === 'function_call').map((x: any) => x.call_id))
+  for (const item of result.input) if (item.type === 'function_call_output') {
+    assert.ok(calls.has(item.call_id))
+    assert.equal(Buffer.from(item.output).toString('utf8'), item.output)
+  }
+  for (const id of ['27', '28', '29']) assert.ok(calls.has(id))
+  assert.deepEqual(f.records.map(r => r.extras.attempt), [1, 2])
+  assert.ok(f.records.every(r => r.extras.hop === 1), 'fallback attempts stay within the same hop')
+})
+
+test('turn budget: configured hard ratio rejects input even when the physical window could fit it', async () => {
+  const f = fixture(async function* () { yield { type: 'response.completed', response: { output: [] } } })
+  const plan = await budgetPlan(f, [1000])
+  await assert.rejects(f.turn.executeAgentTurnHop({ plan, context: hopContext,
+    input: [{ role: 'user', content: '中'.repeat(600) }], instructions: '', tools: [],
+    compactionPolicy: { ...compaction.DEFAULT_COMPACTION_POLICY, softRatio: 0.4, hardRatio: 0.5 },
+  }), /input exceeds context budget/)
+  assert.equal(f.requests.length, 0)
+  assert.equal(f.records.length, 0)
+})
+
+
+test('managed turn deadline freezes policy once, propagates cancellation and clears its timer', async () => {
+  const source = read('../agents/turn.ts')
+  const ast = ts.createSourceFile('turn.ts', source, ts.ScriptTarget.Latest, true)
+  const wrapper = ast.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'runAgentTurn')!
+  let reads = 0, scheduled = 0, cleared = 0
+  let timeout: (() => void) | undefined
+  const policy = Object.freeze({ maxHops: 7, timeoutMs: 25 })
+  const timer = { unref() {} }
+  const turn = compile(wrapper.getText(ast), {}, {
+    getTurnBudgetPolicy: () => { reads++; return policy },
+    setTimeout(fn: () => void, ms: number) { scheduled++; assert.equal(ms, 25); timeout = fn; return timer },
+    clearTimeout(value: unknown) { assert.equal(value, timer); cleared++ },
+    runAgentTurnWithBudget: async (_id: string, options: any, captured: unknown) => {
+      assert.equal(captured, policy)
+      assert.equal(options.signal.aborted, false)
+      timeout!()
+      options.signal.throwIfAborted()
+    },
+  })
+  await assert.rejects(turn.runAgentTurn('a'), /Managed turn deadline exceeded/)
+  assert.equal(reads, 1)
+  assert.equal(scheduled, 1)
+  assert.equal(cleared, 1)
+})
+
+test('managed turn deadline zero schedules no timer and preserves caller cancellation', async () => {
+  const source = read('../agents/turn.ts')
+  const ast = ts.createSourceFile('turn.ts', source, ts.ScriptTarget.Latest, true)
+  const wrapper = ast.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'runAgentTurn')!
+  const caller = new AbortController()
+  const turn = compile(wrapper.getText(ast), {}, {
+    getTurnBudgetPolicy: () => ({ timeoutMs: 0, maxHops: 200 }),
+    setTimeout() { assert.fail('timeout=0 must not create a timer') },
+    clearTimeout() { assert.fail('no timer to clear') },
+    runAgentTurnWithBudget: async (_id: string, options: any) => {
+      caller.abort(new Error('caller cancelled'))
+      options.signal.throwIfAborted()
+    },
+  })
+  await assert.rejects(turn.runAgentTurn('a', { signal: caller.signal }), /caller cancelled/)
+})
+
+
+test('turn output byte head and summarizer input keep complete Unicode code points', () => {
+  const f = fixture(async function* () { yield { type: 'response.completed', response: { output: [] } } })
+  assert.equal(f.turn.utf8Head('a中😀尾', 7), 'a中')
+  assert.equal(f.turn.utf8Head('a中😀尾', 8), 'a中😀')
+  const text = f.turn.formatItemsForSummary([{ type: 'function_call_output', call_id: 'c', output: '中'.repeat(1199) + '😀尾' }])
+  assert.ok(text.endsWith('😀'))
+  assert.equal(Buffer.from(text).toString('utf8'), text)
 })

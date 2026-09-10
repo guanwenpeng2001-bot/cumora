@@ -1,7 +1,6 @@
 import type { ContextRow, InboxRow, PersonaRow, WorklogEntry } from './runtime/client.js'
 import { supportReasoningOptions, supportReasoningHeadroom } from './reasoning.js'
-import { getSupportModel } from '../settings.js'
-import { env } from '../env.js'
+import { getSupportModel, getServerSetting, automationEnabled, automationNumber, withServerSettingsSnapshot } from '../settings.js'
 import { getTrackedLlmClient } from './llm-ledger.js'
 import { inprocClient } from './runtime/inproc-client.js'
 import { buildTriageRequest, parseTriage, finalizeTriage, isRateLimited, deferTriage, type InboxTriageVerdict, type ClaimsByConvo } from './triage-core.js'
@@ -33,7 +32,11 @@ export async function gatherClaimsByConvo(inbox: InboxRow[]): Promise<ClaimsByCo
  *  from `/inbox-triage/payload` and run it on their LOCAL small model (Haiku /
  *  small Codex) so judgment never leaves the operator's machine and never spends
  *  cloud quota. The big brain is never spent on triage in either path. */
-export async function classifyInboxTriage(args: {
+export function classifyInboxTriage(args: Parameters<typeof classifyInboxTriageCaptured>[0]): ReturnType<typeof classifyInboxTriageCaptured> {
+  return withServerSettingsSnapshot(() => classifyInboxTriageCaptured(args))
+}
+
+async function classifyInboxTriageCaptured(args: {
   runId?: string | null
   agentId: string
   companyId: string | null
@@ -59,8 +62,9 @@ export async function classifyInboxTriage(args: {
   if (req.verdict) return req.verdict
   // Tracked client → every triage call lands in llm_calls with purpose='inbox-triage'
   // alongside its agent_triages row, so spend rollups by purpose see this too.
-  const deadline = Date.now() + 8_000
-  const signal = AbortSignal.timeout(8_000)
+  const timeout = automationNumber('cloud_inbox_triage_timeout_ms')
+  const deadline = Date.now() + timeout
+  const signal = AbortSignal.timeout(timeout)
   try {
     const client = await getTrackedLlmClient({
       role: 'support',
@@ -79,7 +83,7 @@ export async function classifyInboxTriage(args: {
       // Thinking models (e.g. deepseek vision-exp) spend part of this budget on
       // reasoning_content before emitting the JSON — 500 starves them into an
       // empty content. 2000 leaves room for brief reasoning + the verdict JSON.
-      max_output_tokens: 2000 + supportReasoningHeadroom(),
+      max_output_tokens: automationNumber('support_inbox_triage_output_tokens') + supportReasoningHeadroom(),
       ...supportReasoningOptions(),
     }, {
       // Disable SDK retries; all configured candidates share the gate deadline.
@@ -90,6 +94,7 @@ export async function classifyInboxTriage(args: {
     const parsed = parseTriage(r.output_text ?? '{}')
     if (parsed) {
       const verdict = finalizeTriage(parsed, 'support-model')
+      if (verdict.outcome === 'defer') verdict.retryAt = Date.now() + automationNumber('triage_backoff_base_ms')
       // Record the gate's cache-aware cost (fire-and-forget; never delay the gate).
       // A cloud triage is a cold one-shot — its input is billed uncached, which is
       // the whole reason this measurement exists.
@@ -115,11 +120,11 @@ export async function classifyInboxTriage(args: {
     // stays unread and is retried on the next wake/scan once the limit lifts.
     if (status === 429 || status === 503 || isRateLimited(msg)) {
       console.warn('[inbox-triage] classifier RATE-LIMITED — failing CLOSED (not waking the big brain):', msg)
-      return deferTriage('rate-limited', `triage rate-limited (${msg.slice(0, 120)}); backing off`, 'rate-limited')
+      return { ...deferTriage('rate-limited', `triage rate-limited (${msg.slice(0, 120)}); ${getServerSetting('triage_rate_limit_mode')}`, 'rate-limited'), retryAt: Date.now() + automationNumber('triage_backoff_base_ms') }
     }
     console.warn('[inbox-triage] classifier failed', msg)
-    return deferTriage('fail-open', 'classifier failed; deferred without acknowledging the inbox',
-      msg.startsWith('invalid triage JSON:') ? 'invalid-result' : signal.aborted ? 'timeout' : 'classifier-error')
+    return { ...deferTriage('fail-closed', `classifier failed; ${getServerSetting('inbox_triage_failure_mode')} without acknowledging the inbox`,
+      msg.startsWith('invalid triage JSON:') ? 'invalid-result' : signal.aborted ? 'timeout' : 'classifier-error'), retryAt: Date.now() + automationNumber('triage_backoff_base_ms') }
   }
 }
 
@@ -133,7 +138,11 @@ export async function classifyInboxTriage(args: {
  *  Fails CLOSED on ANY error (rate-limit, parse, network): unlike inbox triage
  *  there is no human to leave hanging, so skipping is always safe AND saves
  *  tokens — exactly the bias we want for unprompted wakes. */
-export async function gateSyntheticWake(args: {
+export function gateSyntheticWake(args: Parameters<typeof gateSyntheticWakeCaptured>[0]): ReturnType<typeof gateSyntheticWakeCaptured> {
+  return withServerSettingsSnapshot(() => gateSyntheticWakeCaptured(args))
+}
+
+async function gateSyntheticWakeCaptured(args: {
   companyId: string | null
   agentId?: string | null
   runId?: string | null
@@ -145,6 +154,7 @@ export async function gateSyntheticWake(args: {
    *  starved of context and doesn't reflexively kill genuine initiative. */
   signals: string
 }): Promise<{ act: boolean; reason: string; note: string }> {
+  if (!automationEnabled('synthetic_gate_enabled')) return { act: false, reason: 'synthetic gate disabled', note: '' }
   const kindLabel = args.kind === 'idle' ? 'an idle heartbeat'
     : args.kind === 'background_scan' ? 'an internal background scan'
     : 'a poll update it is watching'
@@ -165,8 +175,9 @@ export async function gateSyntheticWake(args: {
     '',
     'Reply ONLY as strict JSON: {"act": boolean, "reason": "one short factual reason", "note": "if act is true, one sentence telling the big brain what to do; else empty"}.',
   ].filter(Boolean).join('\n')
-  const deadline = Date.now() + 8_000
-  const signal = AbortSignal.timeout(8_000)
+  const timeout = automationNumber('synthetic_gate_timeout_ms')
+  const deadline = Date.now() + timeout
+  const signal = AbortSignal.timeout(timeout)
   try {
     const client = await getTrackedLlmClient({
       role: 'support',
@@ -181,7 +192,7 @@ export async function gateSyntheticWake(args: {
       instructions,
       input,
       text: { format: { type: 'json_object' } },
-      max_output_tokens: 300 + supportReasoningHeadroom(),
+      max_output_tokens: automationNumber('support_synthetic_gate_output_tokens') + supportReasoningHeadroom(),
       ...supportReasoningOptions(),
     }, { maxRetries: 0, signal, get timeout() { return Math.max(1, deadline - Date.now()) } })
     const parsed = JSON.parse(r.output_text ?? '{}') as { act?: unknown; reason?: unknown; note?: unknown }
@@ -193,6 +204,6 @@ export async function gateSyntheticWake(args: {
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     console.warn(`[synthetic-wake-gate] ${args.kind} gate failed — failing CLOSED (NOT waking the big brain):`, msg)
-    return { act: false, reason: `gate failed (${msg.slice(0, 120)}); not waking the big brain`, note: '' }
+    return { act: false, reason: `gate failed (${msg.slice(0, 120)}); ${getServerSetting('synthetic_gate_failure_mode')}`, note: '' }
   }
 }

@@ -43,7 +43,7 @@
  *  collide because each agentId gets its own bucket.
  */
 import type { ResponseInputItem } from 'openai/resources/responses/responses.mjs'
-import { env } from '../env.js'
+import { automationEnabled } from '../settings.js'
 
 /** One queued steer — wraps the raw message body with the metadata
  *  the summarizer / dedup paths need. Filled in by the SSE handler in
@@ -70,6 +70,7 @@ export interface SteerItem {
  *  the current batch may drain, and how many batches we've consumed
  *  this turn. Reset between turns via {@link resetSteerForAgent}. */
 interface AgentSteerState {
+  enabled: boolean
   queue: SteerItem[]
   /** Parallel set of messageIds currently in `queue`, kept in sync on
    *  push + drain. Replaces the previous O(n) `queue.some()` dedup
@@ -259,14 +260,12 @@ export const MAX_BYTES_PER_TURN = 64 * 1024
  *  don't extend it. Idempotent on messageId — duplicate pushes (e.g.
  *  retried Redis delivery) are silently coalesced. */
 export function pushSteer(agentId: string, item: SteerItem): void {
-  // Emergency disable: STEER_ENABLED=false in env makes pushSteer a
-  // no-op. The pod still receives steer SSE events but discards them;
-  // the message remains in the DB and surfaces normally on the next
-  // wake. Use this to disable steering without a redeploy if an
-  // incident emerges in prod.
-  if (!env.STEER_ENABLED) return
+  // Kill-switch is evaluated at push time: disabling steer stops NEW pushes
+  // immediately; items already queued stay drainable for the current turn.
   if (!agentId || !item.messageId) return
+  if (!automationEnabled('steer_enabled')) return
   const cur = state.get(agentId) ?? newAgentState()
+  state.set(agentId, cur)
   // Idempotency: if this exact messageId is already in the queue,
   // drop the duplicate. The wake-bus delivers via Redis pub/sub which
   // is at-most-once on disconnect, but if the server retries during a
@@ -395,14 +394,14 @@ export function drainSteer(agentId: string, now: number = Date.now()): SteerItem
   return out
 }
 
-/** Discard ALL state for an agent. Called at turn start (in case the
+/** Reset the queue and capture steering policy. Called at turn start (in case the
  *  previous turn ended with a stale partial batch) and turn end. Pod
  *  shutdown also calls this implicitly via process exit. Also clears
  *  any lingering active-tool registration so the next turn starts
  *  fresh — turn.ts should always pair register/clear, but a crash
  *  between them would leak a stale controller without this. */
 export function resetSteerForAgent(agentId: string): void {
-  state.delete(agentId)
+  state.set(agentId, newAgentState())
   activeToolBatches.delete(agentId)
 }
 
@@ -426,7 +425,7 @@ export function _peekSteerStateForTests(agentId: string): {
   bytesDrainedThisTurn: number
 } | null {
   const cur = state.get(agentId)
-  if (!cur) return null
+  if (!cur || (cur.queue.length === 0 && cur.batchesDrainedThisTurn === 0 && cur.bytesDrainedThisTurn === 0)) return null
   return {
     queueLength: cur.queue.length,
     batchReadyAt: cur.batchReadyAt,
@@ -444,7 +443,7 @@ export function _resetAllSteerForTests(): void {
 // ── helpers ────────────────────────────────────────────────────────────
 
 function newAgentState(): AgentSteerState {
-  return { queue: [], queuedIds: new Set(), batchReadyAt: 0, batchesDrainedThisTurn: 0, bytesDrainedThisTurn: 0 }
+  return { enabled: automationEnabled('steer_enabled'), queue: [], queuedIds: new Set(), batchReadyAt: 0, batchesDrainedThisTurn: 0, bytesDrainedThisTurn: 0 }
 }
 
 // `ResponseInputItem` is imported so callers can stay aligned with

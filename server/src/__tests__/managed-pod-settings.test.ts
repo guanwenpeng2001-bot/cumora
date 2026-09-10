@@ -301,3 +301,29 @@ test('new CLI children inherit the latest complete snapshot after a running Pod 
   assert.equal(child.settings.getBrainModel(), 'child-brain')
   assert.equal(child.settings.getServerSettingsSnapshot().revision, '19')
 })
+
+
+test('legacy Pod bootstrap inherits the optional turn policy and refreshes it without writes', async () => {
+  const { config } = await bootstrap()
+  const old = plain(config)
+  for (const def of fixture().settings.SETTING_DEFS.filter(d => d.scope === 'managed')) {
+    delete (old.policy.settings as Record<string, string>)[def.key]
+    delete (old.policy.sources as Record<string, string>)[def.key]
+    delete (old.defaults as Record<string, string>)[def.key]
+  }
+  const pod = fixture(old)
+  pod.fail()
+  await pod.settings.initializeManagedPodSettings(1)
+  const first = pod.settings.getTurnBudgetPolicy()
+  assert.equal(first.maxHops, 200)
+  assert.equal(first.softRatio, 0.75)
+  assert.equal(first.outputBytes, 600)
+  pod.fail(false)
+  pod.setRows([{ key: '__settings_revision', value: '18' },
+    { key: 'agent_max_hops', value: '9' }, { key: 'auto_compaction_enabled', value: 'false' }])
+  await pod.settings.refreshServerSettings(true)
+  assert.equal(pod.settings.getTurnBudgetPolicy().maxHops, 9)
+  assert.equal(pod.settings.getTurnBudgetPolicy().autoEnabled, false)
+  assert.equal(pod.settings.getTurnBudgetPolicy().hardRatio, 0.95)
+  assert.equal(first.maxHops, 200)
+})

@@ -31,7 +31,7 @@ import { pool } from '../db/pool.js'
 import { env } from '../env.js'
 import { getTrackedLlmClient } from './llm-ledger.js'
 import { supportReasoningOptions, supportReasoningHeadroom } from './reasoning.js'
-import { getSupportModel } from '../settings.js'
+import { getSupportModel, getServerSetting, automationEnabled, automationNumber, withServerSettingsSnapshot } from '../settings.js'
 import { redis } from '../redis.js'
 
 /** A Kanban card that the agent should plausibly act on. */
@@ -435,7 +435,11 @@ export function parseAgendaVerdict(raw: string): {
  *  wake is justified. Strict JSON. Falls back to "actionable=false"
  *  on any error so a classifier outage doesn't burn brain calls on
  *  every heartbeat. */
-export async function classifyAgendaActionable(args: {
+export function classifyAgendaActionable(args: Parameters<typeof classifyAgendaCaptured>[0]): Promise<AgendaVerdict> {
+  return withServerSettingsSnapshot(() => classifyAgendaCaptured(args))
+}
+
+async function classifyAgendaCaptured(args: {
   persona: { name: string; role: string; style: string; model: string | null }
   companyId: string
   agenda: AgentAgenda
@@ -445,6 +449,7 @@ export async function classifyAgendaActionable(args: {
    *  endpoint passes `c.sub`. Older callers can omit it. */
   agentId?: string
 }): Promise<AgendaVerdict> {
+  if (!automationEnabled('agenda_gate_enabled')) return { actionable: false, focus: '', reason: 'agenda gate disabled' }
   const { persona, companyId, agenda } = args
   if (agenda.cards.length === 0 && agenda.events.length === 0 && agenda.stalls.length === 0) {
     return { actionable: false, focus: '', reason: 'empty agenda' }
@@ -472,6 +477,9 @@ Current agenda for this agent:
 ${rendered}
 
 Reply as strict JSON.`
+  const timeout = automationNumber('cloud_inbox_triage_timeout_ms')
+  const deadline = Date.now() + timeout
+  const signal = AbortSignal.timeout(timeout)
   try {
     const client = await getTrackedLlmClient({
       role: 'support',
@@ -494,7 +502,7 @@ Reply as strict JSON.`
       // enough room for reasoning plus the small structured verdict.
       max_output_tokens: 2000 + supportReasoningHeadroom(),
       ...supportReasoningOptions(),
-    })
+    }, { maxRetries: 0, signal, get timeout() { return Math.max(1, deadline - Date.now()) } })
     const parsed = parseAgendaVerdict(r.output_text ?? '')
     if (!parsed) throw new Error('agenda classifier returned no recoverable verdict')
     // Coerce to a real boolean *strictly*. `Boolean("no")` is `true`
@@ -513,44 +521,7 @@ Reply as strict JSON.`
     }
   } catch (e) {
     console.warn('[agenda] classifier failed', e instanceof Error ? e.message : e)
-    // ─── deterministic fallback ─────────────────────────────────────
-    // When the cerebellum classifier is unavailable (sub2api 503 / model
-    // outage / network), default fail-closed BUT carve out a narrow,
-    // conservative case so the stall safety net isn't 100% broken during
-    // an outage: a SINGLE recent stall where SOMEONE ELSE spoke last and
-    // this agent owes a reply. The rationale:
-    //   - we don't try to judge "concluded vs in-motion" without the LLM
-    //     (that's exactly what the cerebellum is for); we just surface
-    //     the simplest "you have an unread, nobody else has it" case.
-    //   - bounded: ONE stall only (multi-stall ambiguity → fail-closed),
-    //     SOMEONE-ELSE-spoke-last only (not "I spoke, nudge them" — that
-    //     direction needs more judgment), minutesSilent ≤ STALL_FALLBACK_MAX
-    //     (don't resurrect ancient threads), no card/event noise (those
-    //     genuinely need LLM judgment on priority).
-    //   - cost bounded: the per-conversation NX nudge claim (claimStallNudge)
-    //     still applies downstream — at most ONE agent ever wakes the
-    //     big brain for a given stall, even if all members' fallbacks
-    //     fire simultaneously.
-    //   - aligned with [[keep-hard-safety-backstops]]: a deterministic
-    //     floor under the AI layer for the narrow case where the AI
-    //     judgment is OBVIOUSLY consistent (unread message I owe a reply
-    //     to, recent, alone on the agenda).
-    const STALL_FALLBACK_MAX_MIN = 30
-    const recentAwaitingMe = agenda.stalls.filter(
-      (s) => !s.lastAuthorIsSelf && s.minutesSilent <= STALL_FALLBACK_MAX_MIN,
-    )
-    if (
-      agenda.cards.length === 0 &&
-      agenda.events.length === 0 &&
-      recentAwaitingMe.length === 1
-    ) {
-      const s = recentAwaitingMe[0]
-      return {
-        actionable: true,
-        focus: `Reply to ${s.lastAuthorName} in ${s.title ?? s.conversationId} — they spoke last (${s.minutesSilent}m ago) and you haven't responded.`,
-        reason: `${AGENDA_CLASSIFIER_ERROR} (deterministic fallback: single recent awaiting-you stall)`,
-      }
-    }
+    console.warn('[agenda] failure policy:', getServerSetting('agenda_error_mode'))
     return { actionable: false, focus: '', reason: AGENDA_CLASSIFIER_ERROR }
   }
 }

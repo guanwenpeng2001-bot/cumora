@@ -18,14 +18,24 @@
 import type { PoolClient, QueryConfig } from 'pg'
 import { pool } from './db/pool.js'
 import { env, resolveDirectLlmEnv } from './env.js'
+import type { CompactionPolicy } from './agents/turn-compaction.js'
 import { parseApiKeyMap, sub2apiOpenAIBaseURL } from './sub2api.js'
 import { DIRECT_LLM_SLOTS, getManagedPodSettings, installManagedPodSettings, type ManagedPodSettings } from './managed-pod-settings.js'
 
 export interface SettingDef {
   key: string
-  type: 'model' | 'list' | 'string' | 'integer' | 'reasoning' | 'json'
+  type: 'model' | 'list' | 'string' | 'integer' | 'reasoning' | 'json' | 'boolean' | 'number'
   required?: boolean
   pod?: boolean
+  scope?: 'managed' | 'server' | 'byoa'
+  effect?: 'next-turn' | 'next-gate' | 'next-tick' | 'pending-T41'
+  unit?: 'ratio' | 'bytes' | 'pairs' | 'characters' | 'hops' | 'milliseconds'
+  readOnly?: boolean
+  defaultValue?: string
+  allowedValues?: readonly string[]
+  min?: number
+  max?: number
+  description?: string
   /** Env fallback when the DB has no row. */
   envValue: () => string
 }
@@ -50,6 +60,40 @@ export const SETTING_DEFS: readonly SettingDef[] = [
   { key: 'agent_max_output_tokens', pod: true, type: 'integer', envValue: () => process.env.CUMORA_AGENT_MAX_OUTPUT_TOKENS ?? '4000' },
   { key: 'support_reasoning_effort', pod: true, type: 'reasoning', envValue: () => process.env.CUMORA_SUPPORT_REASONING_EFFORT ?? 'low' },
   { key: 'support_reasoning_headroom', pod: true, type: 'integer', envValue: () => process.env.CUMORA_SUPPORT_REASONING_HEADROOM ?? '0' },
+  { key: 'auto_compaction_enabled', pod: true, defaultValue: 'true', type: 'boolean', scope: 'managed', effect: 'next-turn', envValue: () => 'true' },
+  { key: 'compaction_soft_ratio', pod: true, defaultValue: '0.75', type: 'number', scope: 'managed', effect: 'next-turn', unit: 'ratio', envValue: () => '0.75' },
+  { key: 'compaction_hard_ratio', pod: true, defaultValue: '0.95', type: 'number', scope: 'managed', effect: 'next-turn', unit: 'ratio', envValue: () => '0.95' },
+  { key: 'compaction_output_bytes', pod: true, defaultValue: '600', type: 'integer', min: 1, scope: 'managed', effect: 'next-turn', unit: 'bytes', envValue: () => '600', description: 'UTF-8 output prefix bytes; truncation marker is additional.' },
+  { key: 'compaction_keep_recent_pairs', pod: true, defaultValue: '2', type: 'integer', min: 0, scope: 'managed', effect: 'next-turn', unit: 'pairs', envValue: () => '2' },
+  { key: 'compaction_strategy', pod: true, defaultValue: 'summary', type: 'string', allowedValues: ['summary', 'drop-and-marker'], scope: 'managed', effect: 'next-turn', envValue: () => 'summary' },
+  { key: 'compaction_summary_max_chars', pod: true, defaultValue: '4000', type: 'integer', min: 1, scope: 'managed', effect: 'next-turn', unit: 'characters', envValue: () => '4000' },
+  { key: 'agent_max_hops', pod: true, defaultValue: '200', type: 'integer', min: 1, scope: 'managed', effect: 'next-turn', unit: 'hops', envValue: () => '200', description: 'Main turn hops; fallback attempts do not consume additional hops.' },
+  { key: 'agent_turn_timeout_ms', pod: true, defaultValue: '0', type: 'integer', min: 0, max: 2147483647, scope: 'managed', effect: 'next-turn', unit: 'milliseconds', envValue: () => '0', description: 'Managed turn only; 0 disables the turn deadline. BYOA retains its local CUMORA_TURN_TIMEOUT_MS and engine behavior.' },
+  { key: 'idle_enabled', type: 'boolean', defaultValue: 'true', scope: 'server', effect: 'next-tick', envValue: () => process.env.ENABLE_IDLE ?? 'true' },
+  { key: 'idle_interval_ms', type: 'integer', defaultValue: '900000', min: 0, max: 2147483647, unit: 'milliseconds', scope: 'server', effect: 'next-tick', envValue: () => process.env.IDLE_INTERVAL_MS ?? '900000' },
+  { key: 'idle_min_quiet_min', type: 'integer', defaultValue: '25', min: 0, max: 525600, scope: 'server', effect: 'next-tick', envValue: () => process.env.IDLE_MIN_QUIET_MIN ?? '25' },
+  { key: 'agenda_gate_enabled', type: 'boolean', defaultValue: 'true', scope: 'server', effect: 'next-gate', description: 'Disabled stops automatic agenda decisions; human messages, calendar delivery and manual briefs remain enabled.', envValue: () => 'true' },
+  { key: 'agenda_error_mode', type: 'string', defaultValue: 'defer', allowedValues: ['defer'], scope: 'server', effect: 'next-gate', description: 'Classifier errors defer without a brain wake or acknowledgement.', envValue: () => 'defer' },
+  { key: 'scanner_enabled', type: 'boolean', defaultValue: 'true', scope: 'server', effect: 'next-tick', envValue: () => process.env.ENABLE_SCANNER ?? 'true' },
+  { key: 'scanner_interval_ms', type: 'integer', defaultValue: '90000', min: 0, max: 2147483647, unit: 'milliseconds', scope: 'server', effect: 'next-tick', envValue: () => process.env.SCANNER_INTERVAL_MS ?? '90000' },
+  { key: 'scanner_min_messages', type: 'integer', defaultValue: '8', min: 1, max: 80, scope: 'server', effect: 'next-tick', envValue: () => '8' },
+  { key: 'scanner_window_hours', type: 'integer', defaultValue: '24', min: 1, max: 8760, scope: 'server', effect: 'next-tick', envValue: () => '24' },
+  { key: 'steer_enabled', type: 'boolean', defaultValue: 'true', pod: true, scope: 'managed', effect: 'next-turn', description: 'Disables mid-turn injection only; durable messages remain available to the next turn.', envValue: () => (env.STEER_ENABLED ? 'true' : 'false') },
+  { key: 'byoa_group_steer_enabled', type: 'boolean', defaultValue: 'true', scope: 'byoa', effect: 'pending-T41', description: 'Saved policy; delivery and daemon consumption pending T41.', envValue: () => process.env.CUMORA_BYOA_STEER_GROUP ?? 'true' },
+  { key: 'byoa_group_steer_interval_ms', type: 'integer', defaultValue: '8000', min: 0, max: 2147483647, unit: 'milliseconds', scope: 'byoa', effect: 'pending-T41', description: 'Saved policy; delivery and daemon consumption pending T41.', envValue: () => process.env.CUMORA_BYOA_STEER_GROUP_INTERVAL_MS ?? '8000' },
+  { key: 'synthetic_gate_enabled', type: 'boolean', defaultValue: 'true', pod: true, scope: 'managed', effect: 'next-gate', description: 'Disabled suppresses synthetic wakes; never bypasses the gate.', envValue: () => 'true' },
+  { key: 'synthetic_gate_failure_mode', type: 'string', defaultValue: 'closed', pod: true, readOnly: true, allowedValues: ['closed'], scope: 'managed', effect: 'next-gate', description: 'Safety floor: no brain wake and no inbox acknowledgement on failure.', envValue: () => 'closed' },
+  { key: 'triage_rate_limit_mode', type: 'string', defaultValue: 'closed', pod: true, readOnly: true, allowedValues: ['closed'], scope: 'managed', effect: 'next-gate', description: 'Safety floor: no brain wake and no inbox acknowledgement on failure.', envValue: () => 'closed' },
+  { key: 'inbox_triage_failure_mode', type: 'string', defaultValue: 'defer', pod: true, allowedValues: ['defer'], scope: 'managed', effect: 'next-gate', envValue: () => 'defer' },
+  { key: 'cloud_inbox_triage_timeout_ms', type: 'integer', defaultValue: '8000', min: 1, max: 2147483647, unit: 'milliseconds', pod: true, scope: 'managed', effect: 'next-gate', envValue: () => '8000' },
+  { key: 'synthetic_gate_timeout_ms', type: 'integer', defaultValue: '8000', min: 1, max: 2147483647, unit: 'milliseconds', pod: true, scope: 'managed', effect: 'next-gate', envValue: () => '8000' },
+  { key: 'byoa_triage_timeout_ms', type: 'integer', defaultValue: '30000', min: 1, max: 2147483647, unit: 'milliseconds', scope: 'byoa', effect: 'pending-T41', description: 'Saved policy; delivery and daemon consumption pending T41.', envValue: () => '30000' },
+  { key: 'triage_backoff_base_ms', type: 'integer', defaultValue: '30000', min: 1, max: 2147483647, unit: 'milliseconds', pod: true, scope: 'managed', effect: 'next-gate', envValue: () => '30000' },
+  { key: 'triage_backoff_max_ms', type: 'integer', defaultValue: '60000', min: 1, max: 2147483647, unit: 'milliseconds', pod: true, scope: 'managed', effect: 'next-gate', envValue: () => '60000' },
+  { key: 'support_inbox_triage_output_tokens', type: 'integer', defaultValue: '2000', min: 1, max: 1000000, pod: true, scope: 'managed', effect: 'next-gate', description: 'Base output tokens; support reasoning headroom is added once.', envValue: () => '2000' },
+  { key: 'support_synthetic_gate_output_tokens', type: 'integer', defaultValue: '300', min: 1, max: 1000000, pod: true, scope: 'managed', effect: 'next-gate', description: 'Base output tokens; support reasoning headroom is added once.', envValue: () => '300' },
+  { key: 'low_priority_wake_budget_per_minute', type: 'integer', defaultValue: '20', min: 1, max: 1000000, scope: 'server', effect: 'next-gate', envValue: () => '20' },
+  { key: 'agent_turn_rate_per_minute', type: 'integer', defaultValue: '30', min: 1, max: 1000000, scope: 'server', effect: 'next-gate', envValue: () => '30' },
   // Not a model — the skills tab's local hub directory.
   { key: 'local_skillhub_path', type: 'string', envValue: () => process.env.LOCAL_SKILLHUB_PATH ?? '' },
 ]
@@ -71,8 +115,18 @@ export interface ServerSettingsSnapshot {
   revision: string
   settings: Readonly<Record<string, string>>
   sources: Readonly<Record<string, 'db' | 'env'>>
+  definitions?: readonly Readonly<Omit<SettingDef, 'envValue'>>[]
   diagnostics?: readonly string[]
   source?: 'db' | 'env' | 'bootstrap'
+}
+
+let settingsContext: import('node:async_hooks').AsyncLocalStorage<ServerSettingsSnapshot> | undefined
+
+export async function withServerSettingsSnapshot<T>(work: () => T | Promise<T>): Promise<T> {
+  const captured = getServerSettingsSnapshot()
+  const { AsyncLocalStorage } = await import('node:async_hooks')
+  settingsContext ??= new AsyncLocalStorage<ServerSettingsSnapshot>()
+  return settingsContext.run(captured, work)
 }
 
 let snapshot: ServerSettingsSnapshot | null = null
@@ -90,18 +144,33 @@ function makeSnapshot(rows: { key: string; value: string }[], defaults?: Readonl
   const settings: Record<string, string> = {}
   const sources: Record<string, 'db' | 'env'> = {}
   for (const def of SETTING_DEFS) {
-    const fallback = defaults ? defaults[def.key] ?? '' : def.envValue()
+    const fallback = defaults ? defaults[def.key] ?? def.defaultValue ?? '' : settingEnvValue(def, diagnostics)
     settings[def.key] = values.get(def.key) ?? fallback
     sources[def.key] = values.has(def.key) ? 'db' : 'env'
-    try { validateServerSettings({ [def.key]: settings[def.key] }) } catch {
+    try { validateServerSettings({ [def.key]: settings[def.key] }, true) } catch {
       diagnostics.push(`invalid-setting:${def.key}`)
       console.warn('[settings] invalid value; using env/default', def.key)
       settings[def.key] = fallback
       sources[def.key] = 'env'
-      try { validateServerSettings({ [def.key]: settings[def.key] }) } catch { settings[def.key] = '' }
+      try { validateServerSettings({ [def.key]: settings[def.key] }, true) } catch { settings[def.key] = def.defaultValue ?? '' }
     }
   }
-  return Object.freeze({ revision, source: 'db', settings: Object.freeze(settings), sources: Object.freeze(sources), diagnostics: Object.freeze(diagnostics) })
+  if (!(Number(settings.compaction_soft_ratio) < Number(settings.compaction_hard_ratio))) {
+    diagnostics.push('invalid-setting:compaction-ratios')
+    console.warn('[settings] invalid compaction ratios; using defaults')
+    settings.compaction_soft_ratio = '0.75'
+    settings.compaction_hard_ratio = '0.95'
+    sources.compaction_soft_ratio = sources.compaction_hard_ratio = 'env'
+  }
+  if (Number(settings.triage_backoff_base_ms) > Number(settings.triage_backoff_max_ms)) {
+    diagnostics.push('invalid-setting:triage-backoff')
+    console.warn('[settings] invalid triage backoff; using defaults')
+    settings.triage_backoff_base_ms = '30000'
+    settings.triage_backoff_max_ms = '60000'
+    sources.triage_backoff_base_ms = sources.triage_backoff_max_ms = 'env'
+  }
+  const definitions = Object.freeze(SETTING_DEFS.map(({ envValue: _envValue, ...def }) => Object.freeze(def)))
+  return Object.freeze({ revision, definitions, source: 'db', settings: Object.freeze(settings), sources: Object.freeze(sources), diagnostics: Object.freeze(diagnostics) })
 }
 
 function installSnapshot(next: ServerSettingsSnapshot): void {
@@ -117,6 +186,7 @@ function podPolicy(policy: ServerSettingsSnapshot): ServerSettingsSnapshot {
     revision: policy.revision, source: policy.source,
     settings: Object.freeze(Object.fromEntries(allowed.map(def => [def.key, policy.settings[def.key]]))),
     sources: Object.freeze(Object.fromEntries(allowed.map(def => [def.key, policy.sources[def.key]]))),
+    definitions: policy.definitions?.filter(def => def.pod),
     diagnostics: policy.diagnostics,
   })
 }
@@ -152,7 +222,7 @@ async function readManagedPodSettings(base: ManagedPodSettings): Promise<Managed
 export async function createManagedPodBootstrap(agentId: string, companyId: string, mapURL: (url: string) => string): Promise<ManagedPodSettings> {
   const base: ManagedPodSettings = {
     version: 1, agentId, source: 'bootstrap', policy: podPolicy(getServerSettingsSnapshot()),
-    defaults: Object.fromEntries(SETTING_DEFS.filter(def => def.pod).map(def => [def.key, def.envValue()])),
+    defaults: Object.fromEntries(SETTING_DEFS.filter(def => def.pod).map(def => [def.key, settingEnvValue(def)])),
     gateway: { companyId, ownerId: '', authorizationVersion: '', generation: 0, keys: {}, baseURL: mapURL(sub2apiOpenAIBaseURL()) },
     direct: Object.fromEntries(DIRECT_LLM_SLOTS.map(slot => {
       const direct = resolveDirectLlmEnv(slot)
@@ -165,13 +235,35 @@ export async function createManagedPodBootstrap(agentId: string, companyId: stri
 }
 
 function installPodBootstrap(): ManagedPodSettings | null {
-  const managed = getManagedPodSettings()
+  let managed = getManagedPodSettings()
   if (managed && !snapshot) {
-    for (const def of SETTING_DEFS.filter(def => def.pod)) {
+    // Older bootstraps predate the optional managed turn settings.
+    const defaults = { ...managed.defaults }
+    const settings = { ...managed.policy.settings }
+    const sources = { ...managed.policy.sources }
+    for (const def of SETTING_DEFS.filter(def => def.scope === 'managed')) {
+      defaults[def.key] ??= settingEnvValue(def)
+      if (settings[def.key] === undefined) {
+        settings[def.key] = defaults[def.key]
+        sources[def.key] = 'env'
+      }
+    }
+    managed = { ...managed, defaults, policy: { ...managed.policy, settings, sources } }
+    for (const def of SETTING_DEFS.filter(def => def.pod && def.defaultValue === undefined)) {
       if (typeof managed.policy.settings[def.key] !== 'string' || typeof managed.defaults[def.key] !== 'string'
         || !['db', 'env'].includes(managed.policy.sources[def.key])) throw new Error('Incomplete managed Pod policy')
     }
-    installSnapshot(Object.freeze({ ...managed.policy, source: managed.source }))
+    installManagedPodSettings(managed)
+    const normalized = podPolicy(makeSnapshot([
+      ...Object.entries(managed.policy.settings).map(([key, value]) => ({ key, value })),
+      { key: REVISION_KEY, value: managed.policy.revision },
+    ], managed.defaults))
+    const originalPolicy = managed.policy
+    installSnapshot(Object.freeze({ ...normalized, source: managed.source,
+      sources: Object.freeze(Object.fromEntries(Object.entries(normalized.sources).map(([key, source]) => [
+        key, normalized.settings[key] === originalPolicy.settings[key] ? originalPolicy.sources[key] ?? source : source,
+      ]))),
+    }))
   }
   return managed
 }
@@ -225,6 +317,8 @@ export async function refreshServerSettings(force = false): Promise<void> {
 }
 
 export function getServerSettingsSnapshot(): ServerSettingsSnapshot {
+  const captured = settingsContext?.getStore()
+  if (captured) return captured
   installPodBootstrap()
   if (!snapshot || Date.now() - snapshotAt >= REFRESH_MS) void refreshServerSettings()
   return snapshot ?? Object.freeze({ ...makeSnapshot([]), source: 'env' })
@@ -250,7 +344,7 @@ export async function seedServerSettingsFromEnv(): Promise<void> {
        SELECT e.key, e.value FROM jsonb_each_text($1::jsonb) e
        WHERE NOT EXISTS (SELECT 1 FROM server_settings s WHERE s.key = $2 || e.key)
        ON CONFLICT (key) DO NOTHING`,
-      [JSON.stringify(Object.fromEntries(SETTING_DEFS.map((d) => [d.key, d.envValue()]))), INHERIT_PREFIX],
+      [JSON.stringify(Object.fromEntries(SETTING_DEFS.map((d) => [d.key, settingEnvValue(d)]))), INHERIT_PREFIX],
     )
   })
 }
@@ -281,18 +375,93 @@ export function getImageModel(): string { return getServerSetting('image_model')
 export function getAudioModel(): string { return getServerSetting('audio_model') }
 export function getEmbedModel(): string { return getServerSetting('embed_model') }
 
+export interface TurnBudgetPolicy extends CompactionPolicy {
+  readonly maxHops: number
+  readonly timeoutMs: number
+  readonly revision: string
+}
+
+export function getTurnBudgetPolicy(): Readonly<TurnBudgetPolicy> {
+  const { settings, revision } = getServerSettingsSnapshot()
+  return Object.freeze({
+    autoEnabled: settings.auto_compaction_enabled === 'true',
+    softRatio: Number(settings.compaction_soft_ratio), hardRatio: Number(settings.compaction_hard_ratio),
+    outputBytes: Number(settings.compaction_output_bytes), keepRecentPairs: Number(settings.compaction_keep_recent_pairs),
+    strategy: settings.compaction_strategy as CompactionPolicy['strategy'],
+    summaryMaxChars: Number(settings.compaction_summary_max_chars),
+    maxHops: Number(settings.agent_max_hops), timeoutMs: Number(settings.agent_turn_timeout_ms), revision,
+  })
+}
+
+function settingEnvValue(def: SettingDef, diagnostics?: string[]): string {
+  const raw = def.envValue()
+  if (def.defaultValue === undefined) return raw
+  let value = raw
+  if (['idle_enabled', 'scanner_enabled'].includes(def.key)) value = raw === 'false' ? 'false' : 'true'
+  else if (def.key === 'byoa_group_steer_enabled') value = raw === '0' ? 'false' : 'true'
+  else if (def.type === 'boolean') {
+    if (/^(true|1|yes|on)$/i.test(raw)) value = 'true'
+    else if (/^(false|0|no|off)$/i.test(raw)) value = 'false'
+  }
+  try { validateServerSettings({ [def.key]: value }, true); return value } catch {
+    diagnostics?.push(`invalid-env-setting:${def.key}`)
+    console.warn('[settings] invalid env value; using default', def.key)
+    return def.defaultValue
+  }
+}
+
+export function automationNumber(key: string): number {
+  return Number(getServerSetting(key))
+}
+
+export function automationEnabled(key: string): boolean {
+  return getServerSetting(key) === 'true'
+}
+
+/** The monitor survives disable/enable; an in-flight tick always owns its slot. */
+export function startAutomationTimer(
+  enabledKey: string, intervalKey: string, tick: () => Promise<void>,
+): NodeJS.Timeout {
+  let interval = automationEnabled(enabledKey) ? automationNumber(intervalKey) : 0
+  let dueAt = Date.now() + interval
+  let running = false
+  return setInterval(() => {
+    const next = automationEnabled(enabledKey) ? automationNumber(intervalKey) : 0
+    const now = Date.now()
+    if (next !== interval) {
+      interval = next
+      dueAt = now + interval
+    }
+    if (interval <= 0 || running || now < dueAt) return
+    running = true
+    dueAt = now + interval
+    void withServerSettingsSnapshot(tick).catch(e => console.error(`[${enabledKey}]`, e)).finally(() => {
+      running = false
+    })
+  }, 100)
+}
+
 export class InvalidServerSettingError extends Error {}
 
-export function validateServerSettings(entries: Record<string, unknown>): asserts entries is Record<string, string | null> {
+export function validateServerSettings(entries: Record<string, unknown>, reading = false): asserts entries is Record<string, string | null> {
   for (const [key, value] of Object.entries(entries)) {
     const def = SETTING_DEFS.find((d) => d.key === key)
     if (!def) throw new InvalidServerSettingError('unknown setting key: ' + key)
+    if (def.readOnly && !reading) throw new InvalidServerSettingError('read-only setting: ' + key)
     if (value === null) {
       if (def.required && !def.envValue().trim()) throw new InvalidServerSettingError('setting ' + key + ' has no inherited value')
       continue
     }
     if (typeof value !== 'string') throw new InvalidServerSettingError('setting ' + key + ' must be a string or null to inherit')
     if (def.required && !value.trim()) throw new InvalidServerSettingError('setting ' + key + ' must not be empty; use null to inherit')
+    if (def.allowedValues && !def.allowedValues.includes(value)) throw new InvalidServerSettingError('invalid setting: ' + key)
+    if (def.type === 'boolean' && !['true', 'false'].includes(value)) throw new InvalidServerSettingError('invalid boolean setting: ' + key)
+    if (def.type === 'number' && (!/^(?:0(?:\.\d+)?|1(?:\.0+)?)$/.test(value) || !(Number(value) > 0 && Number(value) < 1))) {
+      throw new InvalidServerSettingError('invalid ratio setting: ' + key)
+    }
+    if ((def.min !== undefined && Number(value) < def.min) || (def.max !== undefined && Number(value) > def.max)) {
+      throw new InvalidServerSettingError('setting out of range: ' + key)
+    }
     if (def.type === 'json') {
       if (key === 'llm_config') parseLlmConfig(value, true)
       else parseGroupConfig(value, true)
@@ -346,6 +515,22 @@ export async function writeServerSettings(entries: Record<string, string | null>
   }
   const rows = Object.entries(entries)
   return commitSettings(async (client) => {
+    if (rows.some(([key]) => key === 'triage_backoff_base_ms' || key === 'triage_backoff_max_ms')) {
+      const current = await client.query<{ key: string; value: string }>('SELECT key, value FROM server_settings')
+      const after = { ...makeSnapshot(current.rows).settings }
+      for (const [key, value] of rows) after[key] = value ?? settingEnvValue(SETTING_DEFS.find(d => d.key === key)!)
+      if (Number(after.triage_backoff_base_ms) > Number(after.triage_backoff_max_ms)) {
+        throw new InvalidServerSettingError('triage backoff must satisfy base <= max')
+      }
+    }
+    if (rows.some(([key]) => key === 'compaction_soft_ratio' || key === 'compaction_hard_ratio')) {
+      const current = await client.query<{ key: string; value: string }>('SELECT key, value FROM server_settings')
+      const after = { ...makeSnapshot(current.rows).settings }
+      for (const [key, value] of rows) after[key] = value ?? SETTING_DEFS.find(d => d.key === key)!.envValue()
+      if (!(Number(after.compaction_soft_ratio) < Number(after.compaction_hard_ratio))) {
+        throw new InvalidServerSettingError('compaction ratios must satisfy 0 < soft < hard < 1')
+      }
+    }
     if (rows.some(([key]) => ['embed_model', 'llm_config', 'sub2api_group_config'].includes(key))) {
       const current = await client.query<{ key: string; value: string }>('SELECT key, value FROM server_settings')
       const before = makeSnapshot(current.rows).settings

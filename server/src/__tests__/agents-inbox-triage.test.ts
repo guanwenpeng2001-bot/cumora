@@ -205,13 +205,17 @@ test('a rate-limited model FAILS CLOSED — never wakes the big brain (the quota
   assert.equal(v.source, 'rate-limited')
 })
 
-test('a NON-rate-limit error still fails OPEN (safe to let the brain decide)', async () => {
+test('a NON-rate-limit error now DEFERS with retry (no brain wake, no ack)', async () => {
   stubLlmThrows(new Error('ECONNRESET socket hang up'))
   const v = await classifyInboxTriage({
     agentId: PERSONA.id, companyId: PERSONA.companyId, persona: PERSONA,
     inbox: [inboxRow({ author_kind: 'agent', author_id: 'atlas-1', body: 'team, weigh in on the roadmap' })],
     context: [contextRow({ author_kind: 'agent', author_id: 'atlas-1', body: 'team, weigh in on the roadmap' })],
   })
-  assert.equal(v.actionable, true)
-  assert.equal(v.source, 'fail-open')
+  // T22 contract: transport/classifier failures defer + retry — never wake
+  // the brain on a broken gate, never ack the inbox away.
+  assert.equal(v.actionable, false)
+  assert.equal(v.source, 'fail-closed')
+  assert.equal((v as { outcome?: string }).outcome, 'defer')
+  assert.ok((v as { retryAt?: number }).retryAt, 'deferred triage carries a retry time')
 })

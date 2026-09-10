@@ -294,3 +294,104 @@ test('failed PUT returns no success, does not invalidate catalog, and leaves GET
   assert.equal(after.body, before.body)
   assert.equal(api.invalidations, 0)
 })
+
+
+test('turn budget defaults retain existing limits and expose managed next-turn scope', async () => {
+  const f = fixture()
+  await f.settings.loadServerSettings()
+  const policy = f.settings.getTurnBudgetPolicy()
+  assert.deepEqual(JSON.parse(JSON.stringify(policy)), {
+    autoEnabled: true, softRatio: 0.75, hardRatio: 0.95, outputBytes: 600,
+    keepRecentPairs: 2, strategy: 'summary', summaryMaxChars: 4000, maxHops: 200, timeoutMs: 0, revision: '0',
+  })
+  assert.ok(Object.isFrozen(policy))
+  const def = f.settings.SETTING_DEFS.find(d => d.key === 'agent_turn_timeout_ms')!
+  assert.equal(def.scope, 'managed')
+  assert.equal(def.effect, 'next-turn')
+  assert.match(def.description!, /BYOA.*local CUMORA_TURN_TIMEOUT_MS/)
+  await f.settings.writeServerSettings({ auto_compaction_enabled: 'false', compaction_output_bytes: '321',
+    compaction_keep_recent_pairs: '0', compaction_strategy: 'drop-and-marker', compaction_summary_max_chars: '250',
+    agent_max_hops: '9', agent_turn_timeout_ms: '1000', compaction_soft_ratio: '0.6', compaction_hard_ratio: '0.8' })
+  assert.equal(policy.maxHops, 200, 'already captured turn policy cannot change')
+  const next = f.settings.getTurnBudgetPolicy()
+  assert.deepEqual(JSON.parse(JSON.stringify(next)), {
+    autoEnabled: false, softRatio: 0.6, hardRatio: 0.8, outputBytes: 321,
+    keepRecentPairs: 0, strategy: 'drop-and-marker', summaryMaxChars: 250, maxHops: 9, timeoutMs: 1000, revision: '1',
+  })
+  await f.settings.writeServerSettings({ agent_max_hops: null, agent_turn_timeout_ms: null })
+  assert.equal(f.settings.getTurnBudgetPolicy().maxHops, 200)
+  assert.equal(f.settings.getTurnBudgetPolicy().timeoutMs, 0)
+})
+
+test('turn budget rejects invalid values and validates partial ratio updates in the locked transaction', async () => {
+  const f = fixture()
+  await f.settings.loadServerSettings()
+  for (const [key, value] of [
+    ['auto_compaction_enabled', '0'], ['compaction_strategy', 'anything'], ['compaction_soft_ratio', '0'],
+    ['compaction_hard_ratio', '1'], ['compaction_soft_ratio', 'NaN'], ['compaction_output_bytes', '0'],
+    ['compaction_summary_max_chars', '-1'], ['compaction_keep_recent_pairs', '1.5'],
+    ['agent_max_hops', '0'], ['agent_turn_timeout_ms', '2147483648'],
+  ]) await assert.rejects(f.settings.writeServerSettings({ [key]: value }))
+  assert.equal(f.connections, 0)
+  await f.settings.writeServerSettings({ compaction_soft_ratio: '0.85', compaction_hard_ratio: '0.9' })
+  const before = f.settings.getServerSettingsSnapshot()
+  await assert.rejects(f.settings.writeServerSettings({ compaction_hard_ratio: '0.8', agent_max_hops: '3' }), /soft < hard/)
+  assert.equal(f.settings.getServerSettingsSnapshot(), before)
+  assert.equal(f.data.has('agent_max_hops'), false)
+  await f.settings.writeServerSettings({ compaction_hard_ratio: '0.99', compaction_soft_ratio: '0.97' })
+  await assert.rejects(f.settings.writeServerSettings({ compaction_hard_ratio: null }), /soft < hard/)
+})
+
+test('invalid stored ratio ordering produces a diagnostic and a valid fallback pair', async () => {
+  const f = fixture()
+  f.data.set('compaction_soft_ratio', '0.98')
+  f.data.set('compaction_hard_ratio', '0.8')
+  await f.settings.loadServerSettings()
+  assert.equal(f.settings.getTurnBudgetPolicy().softRatio, 0.75)
+  assert.equal(f.settings.getTurnBudgetPolicy().hardRatio, 0.95)
+  assert.ok(f.settings.getServerSettingsSnapshot().diagnostics?.includes('invalid-setting:compaction-ratios'))
+})
+
+
+test('turn definitions publish all nine defaults alongside automation and cerebellum settings', async () => {
+  const f = fixture()
+  await f.settings.loadServerSettings()
+  const defaults: Record<string, string> = {
+    auto_compaction_enabled: 'true', compaction_soft_ratio: '0.75', compaction_hard_ratio: '0.95',
+    compaction_output_bytes: '600', compaction_keep_recent_pairs: '2', compaction_strategy: 'summary',
+    compaction_summary_max_chars: '4000', agent_max_hops: '200', agent_turn_timeout_ms: '0',
+  }
+  const snapshot = f.settings.getServerSettingsSnapshot()
+  for (const [key, value] of Object.entries(defaults)) {
+    const defs = snapshot.definitions!.filter(def => def.key === key)
+    assert.equal(defs.length, 1, key)
+    assert.equal(defs[0].defaultValue, value, key)
+    assert.equal(defs[0].scope, 'managed', key)
+    assert.equal(defs[0].effect, 'next-turn', key)
+    assert.equal(defs[0].pod, true, key)
+    assert.equal(snapshot.settings[key], value, key)
+    assert.equal(snapshot.sources[key], 'env', key)
+  }
+  const otherKeys = [
+    'idle_enabled', 'idle_interval_ms', 'idle_min_quiet_min', 'agenda_gate_enabled', 'agenda_error_mode',
+    'scanner_enabled', 'scanner_interval_ms', 'scanner_min_messages', 'scanner_window_hours',
+    'steer_enabled', 'byoa_group_steer_enabled', 'byoa_group_steer_interval_ms',
+    'synthetic_gate_enabled', 'synthetic_gate_failure_mode', 'inbox_triage_failure_mode', 'triage_rate_limit_mode',
+    'cloud_inbox_triage_timeout_ms', 'synthetic_gate_timeout_ms', 'byoa_triage_timeout_ms',
+    'triage_backoff_base_ms', 'triage_backoff_max_ms', 'support_inbox_triage_output_tokens',
+    'support_synthetic_gate_output_tokens', 'low_priority_wake_budget_per_minute', 'agent_turn_rate_per_minute',
+  ]
+  for (const key of otherKeys) assert.equal(snapshot.definitions!.filter(def => def.key === key).length, 1, key)
+  await f.settings.writeServerSettings({ agent_max_hops: '12', idle_enabled: 'false', support_inbox_triage_output_tokens: '2500' })
+  assert.equal(f.settings.getTurnBudgetPolicy().maxHops, 12)
+  assert.equal(f.settings.getServerSetting('idle_enabled'), 'false')
+  assert.equal(f.settings.getServerSetting('support_inbox_triage_output_tokens'), '2500')
+  await f.settings.writeServerSettings(Object.fromEntries(Object.keys(defaults).map(key => [key, null])))
+  const inherited = f.settings.getServerSettingsSnapshot()
+  for (const [key, value] of Object.entries(defaults)) {
+    assert.equal(inherited.settings[key], value, key)
+    assert.equal(inherited.sources[key], 'env', key)
+  }
+  assert.equal(inherited.settings.idle_enabled, 'false')
+  assert.equal(inherited.settings.support_inbox_triage_output_tokens, '2500')
+})

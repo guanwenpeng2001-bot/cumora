@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { pool } from '../db/pool.js'
 import { redis } from '../redis.js'
+import { automationEnabled, automationNumber, startAutomationTimer, withServerSettingsSnapshot } from '../settings.js'
 import { wakeAgent } from './scheduler.js'
 import type { AgentTurnOptions } from './turn.js'
 
@@ -37,8 +38,6 @@ interface BackgroundScanAgent {
  */
 const SCANNER_LOCK_KEY = 7_643_178_926_318n
 
-const SCANNER_MIN_MESSAGES = 8
-const SCANNER_WINDOW_HOURS = 24
 
 /**
  * Cross-replica dedup claim TTL. Matched to SCANNER_WINDOW_HOURS: a
@@ -46,7 +45,6 @@ const SCANNER_WINDOW_HOURS = 24
  * of the window they can never be re-proposed, so the claim has nothing left
  * to protect.
  */
-const SCAN_CLAIM_TTL_SECONDS = SCANNER_WINDOW_HOURS * 3600
 
 /**
  * Local accelerator only — Redis holds the truth.
@@ -108,7 +106,7 @@ async function scanAlreadyClaimed(digest: string): Promise<boolean> {
  *  the audit row are spent — a dropped wake must stay retryable. */
 async function claimScan(digest: string): Promise<void> {
   try {
-    await redis.set(`cumora:scan:${digest}`, '1', 'EX', SCAN_CLAIM_TTL_SECONDS)
+    await redis.set(`cumora:scan:${digest}`, '1', 'EX', automationNumber('scanner_window_hours') * 3600)
   } catch (e) {
     console.warn('[scanner] claim write failed — other replicas may repeat this scan',
       e instanceof Error ? e.message : e)
@@ -210,7 +208,7 @@ async function loadRecentActivity(companyId: string): Promise<ScanRecentMessage[
         AND m.created_at > NOW() - ($2 || ' hours')::interval
       ORDER BY m.created_at DESC
       LIMIT 80`,
-    [companyId, String(SCANNER_WINDOW_HOURS)],
+    [companyId, String(automationNumber('scanner_window_hours'))],
   )
   return rows
 }
@@ -266,7 +264,7 @@ For brand / voice / cross-project collision scans, require specific evidence:
 Available agents: ${agentIds}
 Available humans: ${humanIds}
 
-Recent group activity from the last ${SCANNER_WINDOW_HOURS} hours:
+Recent group activity from the last ${automationNumber('scanner_window_hours')} hours:
 
 ${renderActivitySummary(args.recent)}`
 }
@@ -293,7 +291,12 @@ async function recordScanWake(agent: BackgroundScanAgent, fingerprint: string): 
  * One scanning pass. Assumes the caller holds the leader lock — call
  * `runBackgroundScans()` unless you are a test driving the pass directly.
  */
-export async function scanOnce(): Promise<void> {
+export function scanOnce(): Promise<void> {
+  return withServerSettingsSnapshot(scanOnceCaptured)
+}
+
+async function scanOnceCaptured(): Promise<void> {
+  if (!automationEnabled('scanner_enabled') || automationNumber('scanner_interval_ms') <= 0) return
   const agents = await loadBackgroundScanAgents()
   const inFlight = new Set<string>()
   for (const agent of agents) {
@@ -301,7 +304,7 @@ export async function scanOnce(): Promise<void> {
       if (await agentHasUnreadInbox(agent.id)) continue
 
       const recent = await loadRecentActivity(agent.company_id)
-      if (recent.length < SCANNER_MIN_MESSAGES) continue
+      if (recent.length < automationNumber('scanner_min_messages')) continue
 
       const fingerprint = `${agent.company_id}|${agent.id}|${recent.map((r) => r.message_id).sort().join('|')}`
       const digest = scanDigest(fingerprint)
@@ -349,6 +352,7 @@ export async function scanOnce(): Promise<void> {
  * repeat queries the holder is already running.
  */
 export async function runBackgroundScans(): Promise<void> {
+  if (!automationEnabled('scanner_enabled') || automationNumber('scanner_interval_ms') <= 0) return
   const client = await pool.connect()
   try {
     const lock = await client.query<{ ok: boolean }>(
@@ -367,17 +371,10 @@ export async function runBackgroundScans(): Promise<void> {
 }
 
 /** Periodic kick — call from server boot. */
-export function startScanner(intervalMs: number): NodeJS.Timeout {
-  return setInterval(() => {
-    if (scannerRunning) {
-      console.warn('[scanner] previous background scan pass still running — skipping tick')
-      return
-    }
+export function startScanner(): NodeJS.Timeout {
+  return startAutomationTimer('scanner_enabled', 'scanner_interval_ms', async () => {
+    if (scannerRunning) return
     scannerRunning = true
-    runBackgroundScans()
-      .catch((e) => console.error('[scanner]', e))
-      .finally(() => {
-        scannerRunning = false
-      })
-  }, intervalMs)
+    try { await runBackgroundScans() } finally { scannerRunning = false }
+  })
 }

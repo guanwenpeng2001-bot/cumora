@@ -277,22 +277,9 @@ async function main() {
   // instance runs the pass, and wakes are claimed in Redis with a 24h TTL so
   // the lock moving elsewhere doesn't re-wake agents for activity already
   // scanned. See agents/scanner.ts.
-  if (process.env.ENABLE_SCANNER !== 'false') {
-    const handle = startScanner(env.SCANNER_INTERVAL_MS)
-    console.log(`[boot] background scanner running every ${env.SCANNER_INTERVAL_MS}ms`)
-    handle.unref()
-  }
-
-  // Idle scheduler — gives agents a chance to spontaneously initiate when
-  // nothing is incoming. Defaults to 15min cadence; set IDLE_INTERVAL_MS=0
-  // to disable. See agents/idle.ts for what an idle tick actually does.
-  if (process.env.ENABLE_IDLE !== 'false' && env.IDLE_INTERVAL_MS > 0) {
-    const handle = startIdleScheduler(env.IDLE_INTERVAL_MS)
-    if (handle) {
-      console.log(`[boot] idle scheduler running every ${env.IDLE_INTERVAL_MS}ms (min quiet ${env.IDLE_MIN_QUIET_MIN}min)`)
-      handle.unref()
-    }
-  }
+  startScanner().unref()
+  startIdleScheduler().unref()
+  console.log('[boot] scanner and idle scheduler follow runtime settings')
 
   // Outbound email retry loop — reclaims transport_status='failed' rows.
   // SKIP LOCKED keeps multi-replica deploys safe; setting

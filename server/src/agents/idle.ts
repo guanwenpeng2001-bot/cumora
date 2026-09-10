@@ -15,7 +15,7 @@
  */
 import { randomUUID } from 'node:crypto'
 import { pool } from '../db/pool.js'
-import { env } from '../env.js'
+import { automationEnabled, automationNumber, startAutomationTimer, withServerSettingsSnapshot } from '../settings.js'
 import { wakeAgent } from './scheduler.js'
 import { getPersona } from './personas.js'
 import {
@@ -55,7 +55,7 @@ interface IdleCandidate {
 }
 
 async function pickAgent(companyId: string): Promise<IdleCandidate | null> {
-  const minQuietMin = env.IDLE_MIN_QUIET_MIN
+  const minQuietMin = automationNumber('idle_min_quiet_min')
   // Pick the 5 random candidates FIRST, then compute last_spoke only for those
   // 5 — not for every avail/resting agent. The old shape ran the correlated
   // `MAX(created_at) WHERE author_id = p.id` subquery for ALL matching agents
@@ -119,7 +119,12 @@ function agendaHasItems(agenda: AgentAgenda): boolean {
   return agenda.cards.length > 0 || agenda.events.length > 0
 }
 
-export async function runIdleTick(): Promise<void> {
+export function runIdleTick(): Promise<void> {
+  return withServerSettingsSnapshot(runIdleTickCaptured)
+}
+
+async function runIdleTickCaptured(): Promise<void> {
+  if (!automationEnabled('idle_enabled') || automationNumber('idle_interval_ms') <= 0) return
   const { rows: tenants } = await pool.query<{ id: string }>(
     `SELECT id FROM companies`,
   )
@@ -144,7 +149,7 @@ export async function runIdleTick(): Promise<void> {
           agendaVerdict: 'empty',
         })
         await wakeIdleAgent(agent.id, 'idle', null, null, {
-          idleReason: `idle heartbeat after at least ${env.IDLE_MIN_QUIET_MIN} quiet minute(s)`,
+          idleReason: `idle heartbeat after at least ${automationNumber('idle_min_quiet_min')} quiet minute(s)`,
         })
         continue
       }
@@ -169,17 +174,6 @@ export async function runIdleTick(): Promise<void> {
           agendaEvents: agenda.events.length,
           agendaVerdict: classifierFailed ? 'classifier_error' : 'skip',
         })
-        // Healthy classifier said "skip" — that's the cost-saving path:
-        // we spent only the cerebellum call this tick, the brain stays
-        // resting. But on classifier ERROR (network blip / quota) we
-        // must NOT silence the agent — fall back to the generic idle
-        // wake so a sustained outage doesn't quietly turn every agent
-        // with assigned cards into a no-op.
-        if (classifierFailed) {
-          await wakeIdleAgent(agent.id, 'idle', null, null, {
-            idleReason: `idle heartbeat after at least ${env.IDLE_MIN_QUIET_MIN} quiet minute(s) (agenda triage unavailable)`,
-          })
-        }
         continue
       }
 
@@ -209,9 +203,6 @@ export async function runIdleTick(): Promise<void> {
   }
 }
 
-export function startIdleScheduler(intervalMs: number): NodeJS.Timeout | null {
-  if (intervalMs <= 0) return null
-  return setInterval(() => {
-    runIdleTick().catch((e) => console.error('[idle]', e))
-  }, intervalMs)
+export function startIdleScheduler(): NodeJS.Timeout {
+  return startAutomationTimer('idle_enabled', 'idle_interval_ms', runIdleTick)
 }

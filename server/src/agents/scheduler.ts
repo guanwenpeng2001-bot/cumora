@@ -32,6 +32,7 @@ import {
 } from './computer/registry.js'
 import { deliver as deliverWake, deliverSteer, type PollWakeBrief } from './runtime/wake-bus.js'
 import { inprocClient, isAgentBusy } from './runtime/inproc-client.js'
+import { automationNumber, withServerSettingsSnapshot } from '../settings.js'
 import { classifyInboxTriage, type InboxTriageVerdict } from './inbox-triage.js'
 import { triageDisposition, deferTriage, type TriageDisposition } from './triage-core.js'
 import type { AgentTurnOptions } from './turn.js'
@@ -89,6 +90,13 @@ const WAKE_RETRY_BATCH_SIZE = 25
 export function _wakeRetryDelayMs(attempt: number): number {
   const n = Math.max(0, Math.min(4, attempt))
   return Math.min(60_000, 5_000 * 2 ** n)
+}
+
+export function triageRetryDelayMs(attempt: number): number {
+  const base = automationNumber('triage_backoff_base_ms')
+  const max = automationNumber('triage_backoff_max_ms')
+  // Preserve the existing 30s defer floor and 5s exponential retry ladder.
+  return Math.min(max, Math.max(base, base / 6 * 2 ** Math.max(0, Math.min(30, attempt))))
 }
 
 const TRANSIENT_ENSURE_POD_FAILURE = /\b(?:capacity_denied|pod_apply_failed|watchdog_timeout)\b/i
@@ -171,7 +179,8 @@ async function scheduleWakeRetry(
     })
     return
   }
-  const dueAt = Math.max(Date.now() + _wakeRetryDelayMs(attempt), options.triageDeferred?.retryAt ?? 0) + Math.floor(Math.random() * 1_000)
+  const delay = failureClass === 'triage' ? triageRetryDelayMs(attempt) : _wakeRetryDelayMs(attempt)
+  const dueAt = Math.max(Date.now() + delay, options.triageDeferred?.retryAt ?? 0) + Math.floor(Math.random() * 1_000)
   const job: WakeRetryJob = {
     id, agentId, reason, conversationId, steerPayload,
     options: { ...options, triageNote: undefined, triageDeferred: undefined },
@@ -265,7 +274,6 @@ export async function wakeAgent(
 // scheduler scope (idle.ts, scanner.ts) IS per-process; multiple
 // replicas multiply the budget naturally (a 2-replica deploy gets
 // 2 × LOW_PRIORITY_WAKE_BUDGET_PER_MIN cluster-wide).
-const LOW_PRIORITY_WAKE_BUDGET_PER_MIN = 20
 let lowPriWindowStart = Date.now()
 let lowPriUsed = 0
 let lowPriDroppedInWindow = 0
@@ -278,18 +286,18 @@ let lowPriDroppedInWindow = 0
 // can't burn unbounded cost. It never looks at message content, and
 // human-driven wakes are never throttled. Generous enough that normal use never
 // trips it; low enough to cap a ping-pong.
-const AGENT_TURN_RATE_PER_MINUTE = 30
 
 /** Consume one agent-turn token (rolling 60s window). Returns false when the
  *  agent is over its content-blind activation budget. Fail-open on Redis errors.
  *  Shared by the cloud fan-out and the BYOA triage endpoint so one agent has one
  *  budget across both paths. */
 export async function consumeAgentTurnToken(agentId: string): Promise<boolean> {
+  const limit = automationNumber('agent_turn_rate_per_minute')
   try {
     const key = `cumora:turn-rate:${agentId}`
     const count = await redis.incr(key)
     if (count === 1) await redis.expire(key, 60).catch(() => { /* best-effort */ })
-    return count <= AGENT_TURN_RATE_PER_MINUTE
+    return count <= limit
   } catch {
     return true // fail-open
   }
@@ -306,7 +314,7 @@ export function _consumeLowPriorityWakeBudget(now: number = Date.now()): boolean
     lowPriUsed = 0
     lowPriDroppedInWindow = 0
   }
-  if (lowPriUsed >= LOW_PRIORITY_WAKE_BUDGET_PER_MIN) {
+  if (lowPriUsed >= automationNumber('low_priority_wake_budget_per_minute')) {
     lowPriDroppedInWindow++
     return false
   }
@@ -358,7 +366,11 @@ export async function resolveDurableDeliveryAgent(args: {
   return rows[0]?.delivery_recipient_id ?? null
 }
 
-async function wakeOne(
+function wakeOne(...args: Parameters<typeof wakeOneCaptured>): Promise<boolean> {
+  return withServerSettingsSnapshot(() => wakeOneCaptured(...args))
+}
+
+async function wakeOneCaptured(
   agentId: string,
   reason: WakeReason,
   conversationId: string | null,
@@ -369,7 +381,7 @@ async function wakeOne(
   // Synthetic wakes can be dropped under load — the next idle tick
   // or next scanner pass will re-evaluate. Real wakes never are.
   if ((reason === 'idle' || reason === 'background_scan') && !_consumeLowPriorityWakeBudget()) {
-    console.warn(`[scheduler] ${agentId} ${reason} wake dropped: budget ${LOW_PRIORITY_WAKE_BUDGET_PER_MIN}/min exceeded`)
+    console.warn(`[scheduler] ${agentId} ${reason} wake dropped: budget ${automationNumber('low_priority_wake_budget_per_minute')}/min exceeded`)
     return false
   }
 
@@ -449,11 +461,9 @@ async function wakeOne(
   // steer payload is harmless (queue gets discarded by the new turn's
   // resetSteerForAgent at start).
   //
-  // STEER_ENABLED kill-switch: if env says false, never publish a
-  // steer. Wake still fires; the message is in the DB; the agent's
-  // next turn picks it up via loadInbox normally. Use this knob to
-  // disable steering during an incident without a redeploy.
-  if (env.STEER_ENABLED && steerPayload && delivered > 0) {
+  // The runtime queue owns the turn's fixed steer_enabled policy.
+  // Durable wake delivery remains active when injection is disabled.
+  if (steerPayload && delivered > 0) {
     const busy = await isAgentBusy(agentId).catch(() => false)
     if (busy) {
       // Per-agent rate limit: at most STEER_RATE_PER_MINUTE steers
@@ -783,7 +793,7 @@ async function wake(payload: MessageNewEvent): Promise<void> {
     recipients = allowed.filter((m): m is string => m !== null)
     const dropped = agentRecipients.length - recipients.length
     if (dropped > 0) {
-      console.warn(`[scheduler] turn-rate floor: dropped ${dropped} agent-driven wake(s) in ${conversationId} (over ${AGENT_TURN_RATE_PER_MINUTE}/min)`)
+      console.warn(`[scheduler] turn-rate floor: dropped ${dropped} agent-driven wake(s) in ${conversationId} (over ${automationNumber('agent_turn_rate_per_minute')}/min)`)
     }
   }
 
@@ -958,7 +968,7 @@ export async function triageWakeRecipient(
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err)
     console.warn(`[scheduler] ${agentId} inbox triage unavailable; deferred: ${reason}`)
-    return { triageDeferred: deferTriage('fail-open', reason, 'payload-unavailable') }
+    return { triageDeferred: { ...deferTriage('fail-closed', reason, 'payload-unavailable'), retryAt: Date.now() + automationNumber('triage_backoff_base_ms') } }
   }
 }
 
