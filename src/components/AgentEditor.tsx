@@ -1,3 +1,4 @@
+import { agentCliCommand } from '@/lib/agentCliRelease'
 import { useEffect, useRef, useState } from 'react'
 import { api, http, getPairingServerOrigin, resolveAssetUrl, type AgentInput } from '@/api/client'
 import { FallbackChainEditor, CatalogStatus, EFFORT_OPTIONS, modelInteger } from '@/components/ModelFields'
@@ -254,7 +255,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
 
   const origin = getPairingServerOrigin()
   const repairCommand = repairCode
-    ? `npx cumora@latest agent computer --pair ${repairCode}${origin ? ` --server ${origin}` : ''}`
+    ? agentCliCommand(` --pair ${repairCode}${origin ? ` --server ${origin}` : ''}`)
     : ''
 
   useEffect(() => { void useComputers.getState().refresh() }, [])

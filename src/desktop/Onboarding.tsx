@@ -1,3 +1,4 @@
+import { agentCliCommand } from '@/lib/agentCliRelease'
 import { useEffect, useState } from 'react'
 import { api, getPairingServerOrigin } from '@/api/client'
 import { useComputers } from '@/stores/computers'
@@ -24,7 +25,7 @@ export function Onboarding() {
   // than erroring on a Claude it doesn't have.
   const [engine, setEngine] = useState<RunnableEngineId>('claude')
   // Default to installing the always-on service: it auto-starts at sign-in,
-  // auto-restarts on crash, and auto-updates — so the user isn't tied to a
+  // auto-restarts on crash — so the user isn't tied to a
   // terminal that must stay open. Appends `--install-service` to the command.
   const [asService, setAsService] = useState(true)
 
@@ -41,7 +42,7 @@ export function Onboarding() {
   // picking Grok on a machine that also has Claude silently paired it to Claude.
   const engineFlag = engine === 'claude' ? '' : ` --engine ${engine}`
   const serviceFlag = asService ? ' --install-service' : ''
-  const cmd = code ? `npx cumora@latest agent computer --pair ${code}${origin ? ` --server ${origin}` : ''}${engineFlag}${serviceFlag}` : ''
+  const cmd = code ? agentCliCommand(` --pair ${code}${origin ? ` --server ${origin}` : ''}${engineFlag}${serviceFlag}`) : ''
 
   async function getCode() {
     setErr(null); setBusy(true)

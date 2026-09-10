@@ -1,3 +1,4 @@
+import { agentCliCommand, AGENT_CLI_RELEASE_TAG } from '@/lib/agentCliRelease'
 import { useCallback, useEffect, useState } from 'react'
 import { useParticipants } from '@/stores/participants'
 import { useComputers } from '@/stores/computers'
@@ -892,7 +893,7 @@ function ComputersTab() {
   const origin = getPairingServerOrigin()
   const serverFlag = origin ? ` --server ${origin}` : ''
   const engineFlag = engine === 'claude' ? '' : ` --engine ${engine}`
-  const pairCommand = code ? `npx cumora@latest agent computer --pair ${code}${serverFlag}${engineFlag}${asService ? ' --install-service' : ''}` : ''
+  const pairCommand = code ? agentCliCommand(` --pair ${code}${serverFlag}${engineFlag}${asService ? ' --install-service' : ''}`) : ''
   const list = Object.values(byId).sort((a, b) =>
     (a.kind === 'cloud' ? 0 : 1) - (b.kind === 'cloud' ? 0 : 1) || a.name.localeCompare(b.name))
 
@@ -965,7 +966,7 @@ function ComputersTab() {
             const repairable = c.kind !== 'cloud'
             const expanded = repairFor === c.id
             const enginesShown = enginesOpen.has(c.id)
-            const repairCmd = repairCode ? `npx cumora@latest agent computer --pair ${repairCode}${serverFlag}` : ''
+            const repairCmd = repairCode ? agentCliCommand(` --pair ${repairCode}${serverFlag}`) : ''
             const rows = repairable ? pairedRows(c) : []
             const detecting = busyId === c.id
             // Extracted so the header can be wrapped in either a plain
@@ -1276,7 +1277,7 @@ function DaemonUpgradeBanner({ onJump }: { onJump: () => void }) {
   const outdated = Object.values(byId).filter((c) => c.daemonOutdated)
   if (outdated.length === 0) return null
 
-  const latest = outdated.map((c) => c.latestDaemonVersion).find(Boolean) ?? null
+  const latest = AGENT_CLI_RELEASE_TAG.replace('agent-cli-v', '')
   const one = outdated.length === 1 ? outdated[0] : null
   // Run-mode-aware instructions. A supervised daemon (--install-service) is
   // restarted through its launchd/systemd wrapper; a manually-run foreground
@@ -1285,7 +1286,7 @@ function DaemonUpgradeBanner({ onJump }: { onJump: () => void }) {
   // which itself prints install-service guidance when no service exists.
   const manual = outdated.filter((c) => c.daemonSupervised === false)
   const allManual = manual.length === outdated.length
-  const cmd = allManual ? 'npx cumora@latest agent computer' : 'npx cumora@latest agent computer --restart'
+  const cmd = agentCliCommand(allManual ? '' : ' --restart')
   const copy = () => { void navigator.clipboard?.writeText(cmd); setCopied(true); window.setTimeout(() => setCopied(false), 1600) }
 
   return (
@@ -1319,13 +1320,13 @@ function DaemonUpgradeBanner({ onJump }: { onJump: () => void }) {
               <>
                 {' '}{one ? t('me.daemonAutoHelp') : t('me.daemonAutoHelpPlural')}
                 {manual.length > 0 && (
-                  <>{' '}({manual.map((c) => c.name).join(', ')} {manual.length === 1 ? t('me.daemonManualInfix') : t('me.daemonManualInfixPlural')} {t('me.daemonManualRun')} — Ctrl-C and re-run there instead.)</>
+                  <>{' '}({manual.map((c) => c.name).join(', ')}: {manual.length === 1 ? t('me.daemonManualHelp') : t('me.daemonManualHelpPlural')})</>
                 )}
               </>
             )}
           </div>
           <div className="mt-2.5 flex items-stretch gap-2 max-w-[580px]">
-            <code className="flex-1 bg-ink-900 text-cloud rounded-[10px] px-3 py-2 text-[12px] font-mono overflow-x-auto whitespace-nowrap select-all flex items-center">{cmd}</code>
+            <code className="flex-1 bg-ink-900 text-cloud rounded-[10px] px-3 py-2 text-[12px] font-mono overflow-x-auto whitespace-pre-wrap break-all select-all flex items-center">{cmd}</code>
             <button type="button" onClick={copy}
               className="shrink-0 inline-flex items-center justify-center min-w-[82px] text-[12px] font-semibold px-3 rounded-[10px] text-white transition-colors duration-200"
               style={{ background: copied ? 'var(--avail)' : 'var(--gold-deep)' }}>
