@@ -8,18 +8,121 @@ import { pool } from './db/pool.js'
 
 export interface UsageRange { from: Date; to: Date }
 
-/** Parse ?from=&to= ISO params; clamp to sane bounds (max 92 days back). */
+const HOUR_MS = 3_600_000
+const DAY_MS = 86_400_000
+
+export class UsageInputError extends Error {}
+
+/** ISO instants use an explicit offset; date-only inputs mean UTC midnight. */
 export function parseUsageRange(q: { from?: unknown; to?: unknown }): UsageRange {
   const now = Date.now()
-  const parse = (v: unknown): number | null => {
-    if (typeof v !== 'string' || !v) return null
-    const t = Date.parse(v)
-    return Number.isFinite(t) ? t : null
+  const parse = (value: unknown, fallback: number): number => {
+    if (value === undefined) return fallback
+    if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?(?:Z|[+-]\d{2}:\d{2}))?$/.test(value)) {
+      throw new UsageInputError('from/to must be ISO dates or timestamps with a timezone')
+    }
+    const time = Date.parse(value)
+    if (!Number.isFinite(time) || new Date(value.slice(0, 10)).toISOString().slice(0, 10) !== value.slice(0, 10)) {
+      throw new UsageInputError('invalid from/to date')
+    }
+    return time
   }
-  const to = parse(q.to) ?? now
-  const from = parse(q.from) ?? new Date(now).setHours(0, 0, 0, 0)
-  const minFrom = now - 92 * 86_400_000
-  return { from: new Date(Math.max(from, minFrom)), to: new Date(Math.min(to, now + 86_400_000)) }
+  const to = Math.min(parse(q.to, now), now + DAY_MS)
+  const from = Math.max(parse(q.from, Math.floor(now / DAY_MS) * DAY_MS), now - 92 * DAY_MS, to - 92 * DAY_MS)
+  if (from >= to) throw new UsageInputError('from must be before to')
+  return { from: new Date(from), to: new Date(to) }
+}
+
+export function parseUsagePagination(q: { page?: unknown; pageSize?: unknown }): { page: number; pageSize: number } {
+  const integer = (value: unknown, fallback: number): number => {
+    if (value === undefined) return fallback
+    if ((typeof value !== 'number' && typeof value !== 'string') || (typeof value === 'string' && !/^\d+$/.test(value))) {
+      throw new UsageInputError('page and pageSize must be positive integers')
+    }
+    const n = Number(value)
+    if (!Number.isSafeInteger(n) || n < 1) throw new UsageInputError('page and pageSize must be positive integers')
+    return n
+  }
+  const page = integer(q.page, 1)
+  const pageSize = integer(q.pageSize, 50)
+  if (pageSize > 200 || !Number.isSafeInteger((page - 1) * pageSize)) throw new UsageInputError('pagination exceeds supported bounds')
+  return { page, pageSize }
+}
+
+// Whole hours have one owner. Partial hours retain the exact [from,to) filter
+// and use idx_llm_calls_company_created, including a window inside one hour.
+const WINDOW_SQL = `WITH bounds AS (
+  SELECT date_trunc('hour', $2::timestamptz, 'UTC') +
+           CASE WHEN $2::timestamptz = date_trunc('hour', $2::timestamptz, 'UTC') THEN INTERVAL '0 hours' ELSE INTERVAL '1 hour' END AS lo,
+         date_trunc('hour', $3::timestamptz, 'UTC') AS hi
+), usage_window AS (
+  SELECT r.*, 0::bigint AS quality_unknown_calls FROM llm_calls_rollup_v2 r CROSS JOIN bounds b
+    JOIN llm_rollup_state st ON st.id
+   WHERE r.company_id = $1 AND r.bucket_hour >= b.lo AND r.bucket_hour < b.hi
+     AND r.bucket_hour >= st.coverage_from AND r.bucket_hour < st.completed_through
+  UNION ALL
+  SELECT r.*, NULL::text AS route, NULL::text AS platform,
+         0::bigint AS unknown_calls, 0::bigint AS unpriced_calls, r.calls AS quality_unknown_calls
+    FROM llm_calls_rollup r CROSS JOIN bounds b JOIN llm_rollup_state st ON st.id
+   WHERE r.company_id = $1 AND r.bucket_hour >= b.lo AND r.bucket_hour < b.hi
+     AND (st.coverage_from IS NULL OR r.bucket_hour < st.coverage_from OR r.bucket_hour >= st.completed_through)
+  UNION ALL
+  SELECT date_trunc('hour', l.created_at, 'UTC'), l.company_id, l.agent_id, l.purpose, l.model, l.source, l.daemon_version,
+         1::bigint, (l.status = 'ok')::int, (l.status <> 'ok')::int, (l.status = 'rate_limited')::int,
+         COALESCE(l.input_tokens, 0), COALESCE(l.cached_input_tokens, 0), COALESCE(l.cache_creation_tokens, 0),
+         COALESCE(l.output_tokens, 0), COALESCE(l.reasoning_tokens, 0), l.cost_usd, l.cost_estimated,
+         l.extras->>'route', l.extras->>'platform', (l.measured IS NOT TRUE)::int,
+         (COALESCE(l.extras->>'unpriced', '') NOT IN ('', 'false'))::int, 0::bigint
+    FROM bounds b CROSS JOIN LATERAL (
+      SELECT * FROM llm_calls
+       WHERE company_id = $1 AND created_at >= $2::timestamptz
+         AND created_at < LEAST(b.lo, $3::timestamptz)
+      UNION ALL
+      SELECT * FROM llm_calls
+       WHERE company_id = $1 AND created_at >= GREATEST(b.lo, b.hi, $2::timestamptz)
+         AND created_at < $3::timestamptz
+    ) l
+) `
+
+export interface UsageMetadata {
+  timezone: 'UTC'
+  aggregatedAt: string | null
+  completedThrough: string | null
+  aggregationStatus: 'pending' | 'ready' | 'failed' | 'paused' | 'stale'
+  rawRetentionFrom: string | null
+  earliestRawAt: string | null
+  logsComplete: boolean
+  boundaryComplete: boolean
+  aggregationVersion: 2
+  legacyBefore: string | null
+}
+
+export async function usageMetadata(tenant: string, range: UsageRange): Promise<UsageMetadata> {
+  const { rows } = await pool.query<{
+    coverage_from: Date | null; aggregated_at: Date | null; completed_through: Date | null; status: UsageMetadata['aggregationStatus']
+    raw_retention_from: Date | null; earliest_raw_at: Date | null; stale: boolean
+  }>(`SELECT st.coverage_from, st.aggregated_at, st.completed_through, st.status,
+             CASE WHEN $3::double precision > 0 THEN NOW() - ($3 * INTERVAL '1 day') END AS raw_retention_from,
+             (SELECT created_at FROM llm_calls WHERE company_id = $1 ORDER BY created_at LIMIT 1) AS earliest_raw_at,
+             st.aggregated_at < NOW() - ($2::double precision * INTERVAL '1 millisecond') AS stale
+        FROM llm_rollup_state st WHERE st.id`,
+  [tenant, Math.max(300_000, Number(process.env.LLM_ROLLUP_INTERVAL_MS ?? 120_000) * 3 || 300_000),
+    Number(process.env.DB_GC_LLM_CALLS_DAYS ?? 90) || 0])
+  const r = rows[0]!
+  const retained = r.raw_retention_from ? new Date(r.raw_retention_from).getTime() : -Infinity
+  const from = range.from.getTime(), to = range.to.getTime()
+  return {
+    timezone: 'UTC', aggregatedAt: r.aggregated_at ? new Date(r.aggregated_at).toISOString() : null,
+    completedThrough: r.completed_through ? new Date(r.completed_through).toISOString() : null,
+    aggregationStatus: Number(process.env.LLM_ROLLUP_INTERVAL_MS ?? 120_000) <= 0 ? 'paused'
+      : r.status === 'ready' && r.stale ? 'stale' : r.status,
+    rawRetentionFrom: Number.isFinite(retained) ? new Date(retained).toISOString() : null,
+    earliestRawAt: r.earliest_raw_at ? new Date(r.earliest_raw_at).toISOString() : null,
+    logsComplete: from >= retained,
+    boundaryComplete: (from % HOUR_MS === 0 || from >= retained) && (to % HOUR_MS === 0 || Math.max(from, Math.floor(to / HOUR_MS) * HOUR_MS) >= retained),
+    aggregationVersion: 2,
+    legacyBefore: r.coverage_from ? new Date(r.coverage_from).toISOString() : null,
+  }
 }
 
 /** Known model IDs and explicit relay namespaces only; labels do not infer accounts. */
@@ -53,6 +156,10 @@ export interface UsageSummary {
   /** true when any contributing row was priced from a non-operator rate. */
   costEstimated: boolean
   /** cache-read / (fresh input + cache-read); 0 when no input at all. */
+  unknownRequests?: number
+  unpricedRequests?: number
+  qualityUnknownRequests?: number
+  sources?: string[]
   cacheHitRate: number
   successRate: number
 }
@@ -61,11 +168,12 @@ interface SummaryRow {
   requests: string; input_tokens: string; output_tokens: string
   cache_read: string; cache_write: string; reasoning: string
   cost_usd: string; cost_estimated: boolean; ok: string
+  unknown_calls: string; unpriced_calls: string; quality_unknown_calls: string; sources: string[]
 }
 
 export async function usageSummary(tenant: string, range: UsageRange, source?: string): Promise<UsageSummary> {
   const { rows } = await pool.query<SummaryRow>(
-    `SELECT COALESCE(SUM(calls), 0)::text AS requests,
+    `${WINDOW_SQL}SELECT COALESCE(SUM(calls), 0)::text AS requests,
             COALESCE(SUM(input_tokens), 0)::text           AS input_tokens,
             COALESCE(SUM(output_tokens), 0)::text          AS output_tokens,
             COALESCE(SUM(cached_input_tokens), 0)::text    AS cache_read,
@@ -73,9 +181,13 @@ export async function usageSummary(tenant: string, range: UsageRange, source?: s
             COALESCE(SUM(reasoning_tokens), 0)::text       AS reasoning,
             COALESCE(SUM(cost_usd), 0)::text               AS cost_usd,
             COALESCE(BOOL_OR(cost_estimated), false)      AS cost_estimated,
-            COALESCE(SUM(ok_calls), 0)::text            AS ok
-       FROM llm_calls_rollup
-      WHERE company_id = $1 AND bucket_hour >= $2 AND bucket_hour < $3
+            COALESCE(SUM(ok_calls), 0)::text AS ok,
+            COALESCE(SUM(unknown_calls), 0)::text AS unknown_calls,
+            COALESCE(SUM(unpriced_calls), 0)::text AS unpriced_calls,
+            COALESCE(SUM(quality_unknown_calls), 0)::text AS quality_unknown_calls,
+            ARRAY_AGG(DISTINCT source) FILTER (WHERE source IS NOT NULL) AS sources
+       FROM usage_window
+      WHERE company_id = $1
         AND ($4::text IS NULL OR source = $4)`,
     [tenant, range.from.toISOString(), range.to.toISOString(), source ?? null],
   )
@@ -93,6 +205,10 @@ export async function usageSummary(tenant: string, range: UsageRange, source?: s
     reasoningTokens: Number(r.reasoning),
     costUsd: Number(r.cost_usd),
     costEstimated: r.cost_estimated,
+    unknownRequests: Number(r.unknown_calls ?? 0),
+    unpricedRequests: Number(r.unpriced_calls ?? 0),
+    qualityUnknownRequests: Number(r.quality_unknown_calls ?? 0),
+    sources: r.sources ?? [],
     cacheHitRate: inputTokens + cacheReadTokens > 0 ? cacheReadTokens / (inputTokens + cacheReadTokens) : 0,
     successRate: requests > 0 ? Number(r.ok) / requests : 0,
   }
@@ -108,13 +224,13 @@ export interface TrendPoint {
 
 export async function usageTrend(tenant: string, range: UsageRange, granularity: 'hour' | 'day'): Promise<TrendPoint[]> {
   const { rows } = await pool.query<{ bucket: Date; cost_usd: string; input_tokens: string; output_tokens: string; cache_read: string }>(
-    `SELECT date_trunc($4, bucket_hour) AS bucket,
+    `${WINDOW_SQL}SELECT date_trunc($4, bucket_hour, 'UTC') AS bucket,
             COALESCE(SUM(cost_usd), 0)::text            AS cost_usd,
             COALESCE(SUM(input_tokens), 0)::text        AS input_tokens,
             COALESCE(SUM(output_tokens), 0)::text       AS output_tokens,
             COALESCE(SUM(cached_input_tokens), 0)::text AS cache_read
-       FROM llm_calls_rollup
-      WHERE company_id = $1 AND bucket_hour >= $2 AND bucket_hour < $3
+       FROM usage_window
+      WHERE company_id = $1
       GROUP BY 1 ORDER BY 1`,
     [tenant, range.from.toISOString(), range.to.toISOString(), granularity],
   )
@@ -122,7 +238,7 @@ export async function usageTrend(tenant: string, range: UsageRange, granularity:
   // Gap-fill so the chart axis is continuous.
   const stepMs = granularity === 'hour' ? 3_600_000 : 86_400_000
   const out: TrendPoint[] = []
-  for (let t = range.from.getTime(); t < range.to.getTime(); t += stepMs) {
+  for (let t = Math.floor(range.from.getTime() / stepMs) * stepMs; t < range.to.getTime(); t += stepMs) {
     const key = new Date(t).toISOString()
     const r = byBucket.get(key)
     out.push({
@@ -141,6 +257,7 @@ export interface AgentUsageRow {
   name: string
   avatarUrl: string | null
   source: 'managed' | 'byoa'
+  actualSource?: string
   requests: number
   inputTokens: number
   outputTokens: number
@@ -150,22 +267,21 @@ export interface AgentUsageRow {
 
 export async function usageByAgent(tenant: string, range: UsageRange): Promise<AgentUsageRow[]> {
   const { rows } = await pool.query<{
-    agent_id: string; name: string | null; avatar_url: string | null; kind: string | null
+    agent_id: string; name: string | null; avatar_url: string | null; source: string
     requests: string; input_tokens: string; output_tokens: string; cost_usd: string; ok: string
   }>(
-    `SELECT l.agent_id,
-            p.name, p.avatar_url, c.kind
+    `${WINDOW_SQL}SELECT l.agent_id,
+            p.name, p.avatar_url, l.source
             ,
             COALESCE(SUM(l.calls), 0)::text          AS requests,
             COALESCE(SUM(l.input_tokens + l.cached_input_tokens), 0)::text  AS input_tokens,
             COALESCE(SUM(l.output_tokens), 0)::text  AS output_tokens,
             COALESCE(SUM(l.cost_usd), 0)::text       AS cost_usd,
             COALESCE(SUM(l.ok_calls), 0)::text       AS ok
-       FROM llm_calls_rollup l
+       FROM usage_window l
        LEFT JOIN participants p ON p.id = l.agent_id
-       LEFT JOIN computers c ON c.id = p.computer_id
-      WHERE l.company_id = $1 AND l.bucket_hour >= $2 AND l.bucket_hour < $3
-      GROUP BY l.agent_id, p.name, p.avatar_url, c.kind
+      WHERE l.company_id = $1
+      GROUP BY l.agent_id, p.name, p.avatar_url, l.source
       ORDER BY SUM(l.cost_usd) DESC NULLS LAST`,
     [tenant, range.from.toISOString(), range.to.toISOString()],
   )
@@ -173,7 +289,8 @@ export async function usageByAgent(tenant: string, range: UsageRange): Promise<A
     agentId: r.agent_id,
     name: r.name ?? r.agent_id ?? '—',
     avatarUrl: r.avatar_url,
-    source: r.kind === 'cloud' ? 'managed' : 'byoa',
+    source: r.source.startsWith('byoa') ? 'byoa' : 'managed',
+    actualSource: r.source,
     requests: Number(r.requests),
     inputTokens: Number(r.input_tokens),
     outputTokens: Number(r.output_tokens),
@@ -190,10 +307,22 @@ export interface ModelUsageRow {
   outputTokens: number
   costUsd: number
   costEstimated: boolean
+  route?: string | null
+  platform?: string | null
+  source?: string
+  unknownRequests?: number
+  unpricedRequests?: number
+  qualityUnknownRequests?: number
 }
 
 interface ModelRollupRow {
   model: string
+  route: string | null
+  platform: string | null
+  source: string
+  unknown_calls: string
+  unpriced_calls: string
+  quality_unknown_calls: string
   requests: string
   input_tokens: string
   output_tokens: string
@@ -203,15 +332,18 @@ interface ModelRollupRow {
 
 async function queryUsageByModelRows(tenant: string, range: UsageRange): Promise<ModelRollupRow[]> {
   const { rows } = await pool.query<ModelRollupRow>(
-    `SELECT model,
+    `${WINDOW_SQL}SELECT model, route, platform, source,
             COALESCE(SUM(calls), 0)::text AS requests,
             COALESCE(SUM(input_tokens + cached_input_tokens), 0)::text AS input_tokens,
             COALESCE(SUM(output_tokens), 0)::text AS output_tokens,
             COALESCE(SUM(cost_usd), 0)::text AS cost_usd,
-            COALESCE(BOOL_OR(cost_estimated), false) AS cost_estimated
-       FROM llm_calls_rollup
-      WHERE company_id = $1 AND bucket_hour >= $2 AND bucket_hour < $3
-      GROUP BY model
+            COALESCE(BOOL_OR(cost_estimated), false) AS cost_estimated,
+            COALESCE(SUM(unknown_calls), 0)::text AS unknown_calls,
+            COALESCE(SUM(unpriced_calls), 0)::text AS unpriced_calls,
+            COALESCE(SUM(quality_unknown_calls), 0)::text AS quality_unknown_calls
+       FROM usage_window
+      WHERE company_id = $1
+      GROUP BY model, route, platform, source
       ORDER BY SUM(cost_usd) DESC NULLS LAST`,
     [tenant, range.from.toISOString(), range.to.toISOString()],
   )
@@ -222,7 +354,10 @@ export async function usageByModel(tenant: string, range: UsageRange): Promise<M
   const rows = await queryUsageByModelRows(tenant, range)
   return rows.map((r) => ({
     model: r.model,
-    provider: providerForModel(r.model),
+    provider: r.platform ?? providerForModel(r.model),
+    route: r.route, platform: r.platform, source: r.source,
+    unknownRequests: Number(r.unknown_calls ?? 0), unpricedRequests: Number(r.unpriced_calls ?? 0),
+    qualityUnknownRequests: Number(r.quality_unknown_calls ?? 0),
     requests: Number(r.requests),
     inputTokens: Number(r.input_tokens),
     outputTokens: Number(r.output_tokens),
@@ -243,7 +378,7 @@ export async function usageByProvider(tenant: string, range: UsageRange): Promis
   const models = await queryUsageByModelRows(tenant, range)
   const acc = new Map<string, ProviderUsageRow>()
   for (const model of models) {
-    const provider = providerForModel(model.model)
+    const provider = model.platform ?? providerForModel(model.model)
     const row = acc.get(provider) ?? { provider, requests: 0, inputTokens: 0, outputTokens: 0, costUsd: 0 }
     row.requests += Number(model.requests)
     row.inputTokens += Number(model.input_tokens)
@@ -268,6 +403,11 @@ export interface UsageLogRow {
   costUsd: number
   latencyMs: number | null
   status: string
+  measured?: boolean
+  costEstimated?: boolean
+  unpriced?: boolean
+  route?: string | null
+  platform?: string | null
 }
 
 export interface UsageLogPage {
@@ -282,8 +422,7 @@ export async function usageLogs(
   range: UsageRange,
   args: { page: number; pageSize: number; source?: string },
 ): Promise<UsageLogPage> {
-  const page = Math.max(1, args.page)
-  const pageSize = Math.min(200, Math.max(1, args.pageSize))
+  const { page, pageSize } = parseUsagePagination(args)
   const params: unknown[] = [tenant, range.from.toISOString(), range.to.toISOString(), args.source ?? null]
   const where = `l.company_id = $1 AND l.created_at >= $2 AND l.created_at < $3 AND ($4::text IS NULL OR l.source = $4)`
   const { rows: countRows } = await pool.query<{ total: string }>(
@@ -294,15 +433,18 @@ export async function usageLogs(
     model: string; purpose: string; source: string
     input_tokens: number | null; output_tokens: number | null; cost_usd: string | null
     latency_ms: number | null; status: string
+    measured: boolean; cost_estimated: boolean; unpriced: boolean; route: string | null; platform: string | null
   }>(
     `SELECT l.id, l.created_at, l.agent_id, p.name AS agent_name,
             l.model, l.purpose, l.source,
             l.input_tokens + COALESCE(l.cached_input_tokens, 0) AS input_tokens,
-            l.output_tokens, l.cost_usd::text, l.latency_ms, l.status
+            l.output_tokens, l.cost_usd::text, l.latency_ms, l.status, l.measured, l.cost_estimated,
+            (COALESCE(l.extras->>'unpriced', '') NOT IN ('', 'false')) AS unpriced,
+            l.extras->>'route' AS route, l.extras->>'platform' AS platform
        FROM llm_calls l
        LEFT JOIN participants p ON p.id = l.agent_id
       WHERE ${where}
-      ORDER BY l.created_at DESC
+      ORDER BY l.created_at DESC, l.id DESC
       LIMIT $5 OFFSET $6`,
     [...params, pageSize, (page - 1) * pageSize],
   )
@@ -313,14 +455,15 @@ export async function usageLogs(
       agentId: r.agent_id,
       agentName: r.agent_name,
       model: r.model,
-      provider: providerForModel(r.model),
+      provider: r.platform ?? providerForModel(r.model),
       purpose: r.purpose,
       source: r.source,
       inputTokens: Number(r.input_tokens ?? 0),
       outputTokens: Number(r.output_tokens ?? 0),
       costUsd: Number(r.cost_usd ?? 0),
       latencyMs: r.latency_ms,
-      status: r.status,
+      status: r.status, measured: r.measured, costEstimated: r.cost_estimated,
+      unpriced: r.unpriced, route: r.route, platform: r.platform,
     })),
     total: Number(countRows[0]?.total ?? 0),
     page,

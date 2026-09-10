@@ -21,7 +21,7 @@ import { transcribeAudio, AudioInputError } from '../llm.js'
 import { LLM_ROLES, type LlmRole, getServerSettingsSnapshot, writeServerSettings, validateServerSettings, InvalidServerSettingError } from '../settings.js'
 import { availableModels, invalidateModelCatalog } from '../models-catalog.js'
 import { TenantLlmAccessError, resolveTenantLlmContext } from '../tenant-llm-context.js'
-import { parseUsageRange, usageSummary, usageTrend, usageByAgent, usageByModel, usageByProvider, usageLogs } from '../usage.js'
+import { UsageInputError, parseUsagePagination, usageMetadata, parseUsageRange, usageSummary, usageTrend, usageByAgent, usageByModel, usageByProvider, usageLogs } from '../usage.js'
 import { modelPricingTable, upsertModelPricing, validateModelPricing } from '../model-pricing.js'
 import {
   ResourceError, listSkills, createSkillFromPaste, deleteSkill, installFromHub, searchHub,
@@ -762,43 +762,56 @@ api.get('/models/available', safe(async (req, res) => {
   }
 }))
 
+function safeUsage(handler: (req: Request & AuthedRequest, res: Response) => Promise<void>) {
+  return safe(async (req, res) => {
+    try { await handler(req, res) }
+    catch (error) {
+      if (error instanceof UsageInputError) throw new HttpError(400, error.message)
+      throw error
+    }
+  })
+}
+
 /** Usage dashboard — pure reads over the llm_calls ledger, tenant-scoped. */
-api.get('/usage/summary', safe(async (req, res) => {
+api.get('/usage/summary', safeUsage(async (req, res) => {
   const { companyId } = await requireCompany(req)
   const source = typeof req.query?.source === 'string' && req.query.source ? req.query.source : undefined
-  res.json(await usageSummary(companyId, parseUsageRange(req.query ?? {}), source))
+  const range = parseUsageRange(req.query ?? {})
+  res.json({ ...await usageSummary(companyId, range, source), metadata: await usageMetadata(companyId, range) })
 }))
 
-api.get('/usage/trend', safe(async (req, res) => {
+api.get('/usage/trend', safeUsage(async (req, res) => {
   const { companyId } = await requireCompany(req)
   const granularity = req.query?.granularity === 'day' ? 'day' : 'hour'
-  res.json({ granularity, points: await usageTrend(companyId, parseUsageRange(req.query ?? {}), granularity) })
+  const range = parseUsageRange(req.query ?? {})
+  res.json({ granularity, points: await usageTrend(companyId, range, granularity), metadata: await usageMetadata(companyId, range) })
 }))
 
-api.get('/usage/by-agent', safe(async (req, res) => {
+api.get('/usage/by-agent', safeUsage(async (req, res) => {
   const { companyId } = await requireCompany(req)
-  res.json({ items: await usageByAgent(companyId, parseUsageRange(req.query ?? {})) })
+  const range = parseUsageRange(req.query ?? {})
+  res.json({ items: await usageByAgent(companyId, range), metadata: await usageMetadata(companyId, range) })
 }))
 
-api.get('/usage/by-model', safe(async (req, res) => {
+api.get('/usage/by-model', safeUsage(async (req, res) => {
   const { companyId } = await requireCompany(req)
-  res.json({ items: await usageByModel(companyId, parseUsageRange(req.query ?? {})) })
+  const range = parseUsageRange(req.query ?? {})
+  res.json({ items: await usageByModel(companyId, range), metadata: await usageMetadata(companyId, range) })
 }))
 
-api.get('/usage/by-provider', safe(async (req, res) => {
+api.get('/usage/by-provider', safeUsage(async (req, res) => {
   const { companyId } = await requireCompany(req)
-  res.json({ items: await usageByProvider(companyId, parseUsageRange(req.query ?? {})) })
+  const range = parseUsageRange(req.query ?? {})
+  res.json({ items: await usageByProvider(companyId, range), metadata: await usageMetadata(companyId, range) })
 }))
 
-api.get('/usage/logs', safe(async (req, res) => {
+api.get('/usage/logs', safeUsage(async (req, res) => {
   const { companyId } = await requireCompany(req)
   const q = req.query ?? {}
   const source = typeof q.source === 'string' && q.source ? q.source : undefined
-  res.json(await usageLogs(companyId, parseUsageRange(q), {
-    page: Number(q.page ?? 1) || 1,
-    pageSize: Number(q.pageSize ?? 50) || 50,
-    source,
-  }))
+  const range = parseUsageRange(q)
+  const pagination = parseUsagePagination(q)
+  res.json({ ...await usageLogs(companyId, range, { ...pagination, source }), metadata: await usageMetadata(companyId, range) })
 }))
 
 /** Price menu behind the usage dashboard. Read: any member; edit: admin. */
