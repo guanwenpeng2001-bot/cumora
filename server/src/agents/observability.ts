@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import type { PoolClient } from 'pg'
 import { pool } from '../db/pool.js'
+import { automationNumber, createOperationsWorker } from '../settings.js'
 import { EMPTY_USAGE, effectiveCostUsd, modelPriceTable, priceFor, type TokenUsage } from './cost.js'
 
 export type AgentRunStatus = 'running' | 'completed' | 'failed' | 'skipped'
@@ -337,7 +338,8 @@ export async function touchAgentRunForOwner(args: {
   return rows[0] ?? { owned: false, touched: false }
 }
 
-export async function markStaleAgentRuns(maxAgeMs: number = 10 * 60_000): Promise<Array<{ id: string; agent_id: string }>> {
+export async function markStaleAgentRuns(maxAgeMs: number = automationNumber('agent_run_stale_age_ms')): Promise<Array<{ id: string; agent_id: string }>> {
+  if (maxAgeMs <= 0) return []
   const { rows } = await pool.query<{ id: string; agent_id: string }>(
     `UPDATE agent_runs
         SET status = 'failed',
@@ -354,23 +356,21 @@ export async function markStaleAgentRuns(maxAgeMs: number = 10 * 60_000): Promis
   return rows
 }
 
-export function startStaleAgentRunSweeper(
-  intervalMs: number = 60_000,
-  maxAgeMs: number = 10 * 60_000,
-): NodeJS.Timeout {
-  const tick = (): void => {
-    void markStaleAgentRuns(maxAgeMs).then((rows) => {
-      if (rows.length > 0) {
-        console.warn(`[observability] closed ${rows.length} stale running agent run(s): ${rows.map((r) => r.id).join(', ')}`)
-      }
-    }).catch((err) => {
-      console.warn('[observability] stale agent run sweeper failed:', err instanceof Error ? err.message : err)
-    })
+let staleRunMaxAgeMs: number | undefined
+const staleRunWorker = createOperationsWorker('agent_run_sweeper_interval_ms', async () => {
+  const rows = await markStaleAgentRuns(staleRunMaxAgeMs)
+  if (rows.length > 0) {
+    console.warn(`[observability] closed ${rows.length} stale running agent run(s): ${rows.map((r) => r.id).join(', ')}`)
   }
-  setImmediate(tick)
-  const t = setInterval(tick, intervalMs)
-  t.unref?.()
-  return t
+}, { immediate: true, unref: true, enabledKey: 'agent_run_sweeper_enabled' })
+
+export function startStaleAgentRunSweeper(intervalMs?: number, maxAgeMs?: number): NodeJS.Timeout {
+  staleRunMaxAgeMs = maxAgeMs
+  return staleRunWorker.start(intervalMs)
+}
+
+export function stopStaleAgentRunSweeper(): void {
+  staleRunWorker.stop()
 }
 
 // ─── triage economics ─────────────────────────────────────────────────────

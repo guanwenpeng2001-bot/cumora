@@ -17,6 +17,7 @@
  */
 import { randomUUID } from 'node:crypto'
 import { pool } from './db/pool.js'
+import { createOperationsWorker } from './settings.js'
 import { CH_MESSAGE_NEW, CH_POLLS, type PollUpdatedEvent } from './redis.js'
 import {
   enqueueBroadcast,
@@ -386,32 +387,18 @@ async function buildPollUpdatedEvent(
   }
 }
 
-let sweepTimer: NodeJS.Timeout | null = null
+const sweepWorker = createOperationsWorker('poll_sweep_interval_ms', async () => {
+  const closed = await sweepExpiredPolls()
+  if (closed > 0) console.log(`[polls] sweeper closed ${closed} expired poll${closed === 1 ? '' : 's'}`)
+}, { unref: true })
 
-/** Start the periodic sweep loop. Idempotent — re-calling is a no-op.
- *  Interval comes from env.POLL_SWEEP_INTERVAL_MS; 0 disables. */
-export function startPollExpirationSweeper(intervalMs: number): { stop(): void } | null {
-  if (sweepTimer) return { stop: stopPollExpirationSweeper }
-  if (intervalMs <= 0) {
-    console.log('[polls] expiration sweeper disabled (POLL_SWEEP_INTERVAL_MS=0)')
-    return null
-  }
-  console.log(`[polls] expiration sweeper running every ${intervalMs}ms`)
-  const tick = async () => {
-    try {
-      const closed = await sweepExpiredPolls()
-      if (closed > 0) console.log(`[polls] sweeper closed ${closed} expired poll${closed === 1 ? '' : 's'}`)
-    } catch (e) {
-      console.error('[polls] sweeper tick failed:', e instanceof Error ? e.message : String(e))
-    }
-  }
-  sweepTimer = setInterval(() => { void tick() }, intervalMs)
-  sweepTimer.unref()
+export function startPollExpirationSweeper(intervalMs?: number): { stop(): void } {
+  sweepWorker.start(intervalMs)
   return { stop: stopPollExpirationSweeper }
 }
 
 export function stopPollExpirationSweeper(): void {
-  if (sweepTimer) { clearInterval(sweepTimer); sweepTimer = null }
+  sweepWorker.stop()
 }
 
 /** Cron sweeper — close any open poll whose expiresAt has elapsed.

@@ -7,7 +7,7 @@ import type { SweepTarget } from '../db-gc.js'
 function harness(days = 1) {
   const queries: { sql: string; params: unknown[] }[] = []
   const dependencies: Record<string, unknown> = {
-    './env.js': { env: new Proxy({}, { get: (_target, key) => String(key).endsWith('_DAYS') ? days : 0 }) },
+    './settings.js': { automationNumber: (key: string) => key.endsWith('_days') ? days : 0, createOperationsWorker: () => ({ start() {}, stop() {} }) },
     './metrics.js': { inc: () => {} },
     './db/pool.js': { pool: { connect: async () => ({
       query: async (sql: string, params: unknown[] = []) => {

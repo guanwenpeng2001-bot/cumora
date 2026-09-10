@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import type { PoolClient } from 'pg'
 import { pool } from './db/pool.js'
-import { env } from './env.js'
+import { automationEnabled, automationNumber, createOperationsWorker } from './settings.js'
 import {
   messageAttachmentStorageKey,
   normalizeStorageKey,
@@ -29,11 +29,7 @@ export interface WorkspaceCleanupDependencies {
 }
 
 const CLAIM_LEASE_MS = 60_000
-const BATCH_SIZE = 8
-const COMPLETED_RETENTION_DAYS = 7
 const workerId = `workspace-cleanup-${process.pid}-${randomUUID().slice(0, 8)}`
-let workerTimer: NodeJS.Timeout | null = null
-let workerRunning = false
 
 export async function enqueueWorkspaceCleanup(
   client: PoolClient,
@@ -149,7 +145,7 @@ export async function findReferencedStorageKeys(keys: string[], client?: PoolCli
 }
 
 async function defaultDeleteAgentRuntime(agentId: string): Promise<void> {
-  if (!env.WORKSPACE_RUNTIME_CLEANUP_ENABLED) return
+  if (!automationEnabled('workspace_runtime_cleanup_enabled')) return
   const { deletePod, deleteChromeProfilePvc } = await import('./agents/runtime/orchestrator.js')
   await Promise.all([deletePod(agentId), deleteChromeProfilePvc(agentId)])
 }
@@ -190,10 +186,12 @@ async function markFailed(job: CleanupJob, error: unknown): Promise<void> {
 }
 
 async function cleanupCompletedRows(): Promise<void> {
+  const retentionDays = automationNumber('workspace_cleanup_retention_days')
+  if (retentionDays <= 0) return
   await pool.query(
     `DELETE FROM workspace_cleanup_jobs
       WHERE completed_at <= NOW() - ($1 * INTERVAL '1 day')`,
-    [COMPLETED_RETENTION_DAYS],
+    [retentionDays],
   )
 }
 
@@ -208,7 +206,7 @@ export async function drainWorkspaceCleanupJobs(options: {
     deleteAgentRuntime: options.dependencies?.deleteAgentRuntime ?? defaultDeleteAgentRuntime,
   }
   await cleanupCompletedRows()
-  const rows = await claimBatch(Math.max(1, Math.min(options.batchSize ?? BATCH_SIZE, 32)))
+  const rows = await claimBatch(Math.max(1, Math.min(options.batchSize ?? automationNumber('workspace_cleanup_batch'), 32)))
   let completed = 0
   let failed = 0
   await Promise.all(rows.map(async (row) => {
@@ -224,31 +222,19 @@ export async function drainWorkspaceCleanupJobs(options: {
   return { claimed: rows.length, completed, failed }
 }
 
-function runWorkerTick(): void {
-  if (workerRunning) return
-  workerRunning = true
-  void drainWorkspaceCleanupJobs()
-    .then((result) => {
-      if (result.failed > 0) console.warn(`[workspace-cleanup] ${result.failed} job(s) delayed; cleanup will retry`)
-    })
-    .catch((error) => console.warn('[workspace-cleanup] drain failed', error instanceof Error ? error.message : error))
-    .finally(() => { workerRunning = false })
-}
+const worker = createOperationsWorker('workspace_cleanup_interval_ms', async () => {
+  const result = await drainWorkspaceCleanupJobs()
+  if (result.failed > 0) console.warn(`[workspace-cleanup] ${result.failed} job(s) delayed; cleanup will retry`)
+}, { immediate: true, unref: true })
 
 export function nudgeWorkspaceCleanupWorker(): void {
-  if (workerTimer) setImmediate(runWorkerTick)
+  worker.nudge()
 }
 
-export function startWorkspaceCleanupWorker(): NodeJS.Timeout | null {
-  if (workerTimer || env.WORKSPACE_CLEANUP_INTERVAL_MS <= 0) return workerTimer
-  runWorkerTick()
-  workerTimer = setInterval(runWorkerTick, env.WORKSPACE_CLEANUP_INTERVAL_MS)
-  workerTimer.unref()
-  console.log(`[boot] workspace cleanup running every ${env.WORKSPACE_CLEANUP_INTERVAL_MS}ms`)
-  return workerTimer
+export function startWorkspaceCleanupWorker(): NodeJS.Timeout {
+  return worker.start()
 }
 
 export function stopWorkspaceCleanupWorker(): void {
-  if (workerTimer) clearInterval(workerTimer)
-  workerTimer = null
+  worker.stop()
 }

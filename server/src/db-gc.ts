@@ -46,7 +46,7 @@
  * DB_GC_INTERVAL_MS=0 (whole worker) or a table's retention env to 0.
  */
 import { pool } from './db/pool.js'
-import { env } from './env.js'
+import { automationNumber, createOperationsWorker } from './settings.js'
 import { inc } from './metrics.js'
 
 export interface SweepTarget {
@@ -63,11 +63,11 @@ export function targets(): SweepTarget[] {
   return [
     // ws_tickets keys off expires_at: a ticket is garbage once expired,
     // the extra day is just diagnostic slack.
-    { table: 'ws_tickets',   pkCol: 'token_hash', timeCol: 'expires_at', days: env.DB_GC_WS_TICKETS_DAYS },
-    { table: 'agent_log',    pkCol: 'id',         timeCol: 'created_at', days: env.DB_GC_AGENT_LOG_DAYS },
-    { table: 'agent_events', pkCol: 'id',         timeCol: 'created_at', days: env.DB_GC_AGENT_EVENTS_DAYS },
-    { table: 'agent_runs',   pkCol: 'id',         timeCol: 'started_at', days: env.DB_GC_AGENT_RUNS_DAYS },
-    { table: 'llm_calls',    pkCol: 'id',         timeCol: 'created_at', days: env.DB_GC_LLM_CALLS_DAYS },
+    { table: 'ws_tickets',   pkCol: 'token_hash', timeCol: 'expires_at', days: automationNumber('db_gc_ws_tickets_days') },
+    { table: 'agent_log',    pkCol: 'id',         timeCol: 'created_at', days: automationNumber('db_gc_agent_log_days') },
+    { table: 'agent_events', pkCol: 'id',         timeCol: 'created_at', days: automationNumber('db_gc_agent_events_days') },
+    { table: 'agent_runs',   pkCol: 'id',         timeCol: 'started_at', days: automationNumber('db_gc_agent_runs_days') },
+    { table: 'llm_calls',    pkCol: 'id',         timeCol: 'created_at', days: automationNumber('db_gc_llm_calls_days') },
   ]
 }
 
@@ -114,7 +114,7 @@ async function deleteBatch(t: SweepTarget, batchSize: number): Promise<{ picked:
 /** Run one sweep across all tables. Bounded by maxBatchesPerTable so a
  *  huge backlog burns down across many ticks instead of one marathon. */
 export async function runDbGcTick(opts?: { batchSize?: number; maxBatchesPerTable?: number }): Promise<Record<string, number>> {
-  const batchSize = opts?.batchSize ?? env.DB_GC_BATCH
+  const batchSize = opts?.batchSize ?? automationNumber('db_gc_batch')
   const maxBatches = opts?.maxBatchesPerTable ?? 10
   const deleted: Record<string, number> = {}
   for (const t of targets()) {
@@ -145,26 +145,13 @@ export async function runDbGcTick(opts?: { batchSize?: number; maxBatchesPerTabl
   return deleted
 }
 
-let timer: NodeJS.Timeout | null = null
+const worker = createOperationsWorker('db_gc_interval_ms', runDbGcTick)
 
-/** Start the periodic GC loop. Idempotent — re-calling is a no-op. */
-export function startDbGcWorker(): { stop(): void } | null {
-  if (timer) return { stop: stopDbGcWorker }
-  const intervalMs = env.DB_GC_INTERVAL_MS
-  if (intervalMs <= 0) {
-    console.log('[db-gc] disabled (DB_GC_INTERVAL_MS=0)')
-    return null
-  }
-  const windows = targets().map((t) => `${t.table}=${t.days}d`).join(' ')
-  console.log(`[db-gc] starting · interval=${intervalMs}ms · batch=${env.DB_GC_BATCH} · ${windows}`)
-  const tick = async () => {
-    try { await runDbGcTick() }
-    catch (e) { console.error('[db-gc] tick failed:', e instanceof Error ? e.message : String(e)) }
-  }
-  timer = setInterval(() => { void tick() }, intervalMs)
+export function startDbGcWorker(): { stop(): void } {
+  worker.start()
   return { stop: stopDbGcWorker }
 }
 
 export function stopDbGcWorker(): void {
-  if (timer) { clearInterval(timer); timer = null }
+  worker.stop()
 }

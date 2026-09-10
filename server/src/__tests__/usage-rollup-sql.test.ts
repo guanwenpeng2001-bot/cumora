@@ -9,6 +9,8 @@ function compile(path: string, pool: unknown) {
     { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText
   const exports: Record<string, any> = {}
   new Function('exports', 'require', js)(exports, (name: string) => {
+    if (name === './agents/llm-rollup.js') return { isLlmRollupPaused: () => false }
+    if (name.endsWith('/settings.js')) return { automationNumber: (key: string) => ({ llm_rollup_interval_ms: 120_000, db_gc_llm_calls_days: 90, llm_rollup_retention_hours: 2280 }[key]), createOperationsWorker: () => ({ start() {}, stop() {} }) }
     assert.ok(['./db/pool.js', '../db/pool.js'].includes(name))
     return { pool }
   })

@@ -9,11 +9,13 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import ts from 'typescript'
 
-function loadUsage(query: (sql: string, params: unknown[]) => Promise<unknown> = async () => { throw new Error('unexpected DB call') }) {
+function loadUsage(query: (sql: string, params: unknown[]) => Promise<unknown> = async () => { throw new Error('unexpected DB call') }, settings: Record<string, number> = {}) {
   const source = readFileSync(new URL('../usage.ts', import.meta.url), 'utf8')
   const js = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText
   const exports: Record<string, any> = {}
   new Function('exports', 'require', js)(exports, (name: string) => {
+    if (name === './agents/llm-rollup.js') return { isLlmRollupPaused: () => settings.llm_rollup_interval_ms === 0 }
+    if (name.endsWith('/settings.js')) return { automationNumber: (key: string) => settings[key] ?? ({ llm_rollup_interval_ms: 120_000, db_gc_llm_calls_days: 90, llm_rollup_retention_hours: 2280 }[key]), createOperationsWorker: () => ({ start() {}, stop() {} }) }
     assert.equal(name, './db/pool.js')
     return { pool: { query } }
   })
@@ -166,4 +168,24 @@ test('summary separates unknown measurement, unpriced calls and unavailable lega
   assert.equal(result.costEstimated, true)
   assert.deepEqual(result.sources, ['cloud', 'byoa-codex'])
   assert.equal(result.cacheHitRate, 0)
+})
+
+
+test('metadata uses settings for pause, stale interval and raw-retention boundary', async () => {
+  const settings = { llm_rollup_interval_ms: 0, db_gc_llm_calls_days: 0 }
+  const parameters: unknown[][] = []
+  const usage = loadUsage(async (_sql, params) => {
+    parameters.push(params)
+    return { rows: [{ status: 'ready', stale: false, raw_retention_from: null }] }
+  }, settings)
+  const range = { from: new Date('2026-09-01T00:00:00Z'), to: new Date('2026-09-02T00:00:00Z') }
+  const paused = await usage.usageMetadata('tenant', range)
+  assert.equal(paused.aggregationStatus, 'paused', 'settings override persisted ready status')
+  assert.equal(paused.rawRetentionFrom, null)
+  assert.equal(paused.logsComplete, true)
+  assert.deepEqual(parameters[0], ['tenant', 300_000, 0])
+  Object.assign(settings, { llm_rollup_interval_ms: 600_000, db_gc_llm_calls_days: 120 })
+  assert.equal((await usage.usageMetadata('tenant', range)).aggregationStatus, 'ready')
+  assert.deepEqual(parameters[1], ['tenant', 1_800_000, 120])
+  assert.ok(!readFileSync(new URL('../usage.ts', import.meta.url), 'utf8').includes('process.env'))
 })

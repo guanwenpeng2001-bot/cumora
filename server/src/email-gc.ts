@@ -26,7 +26,7 @@
  * Disabling: set EMAIL_GC_INTERVAL_MS=0.
  */
 import { pool } from './db/pool.js'
-import { env } from './env.js'
+import { createOperationsWorker } from './settings.js'
 import { storage, type StorageObject } from './storage.js'
 import { inc } from './metrics.js'
 
@@ -111,25 +111,13 @@ export async function runGcTick(): Promise<{ inspected: number; deleted: number;
   return { inspected: inStorage.length, deleted, failed }
 }
 
-let timer: NodeJS.Timeout | null = null
+const worker = createOperationsWorker('email_gc_interval_ms', runGcTick)
 
-/** Start the periodic GC loop. Idempotent — re-calling is a no-op. */
-export function startEmailGcWorker(): { stop(): void } | null {
-  if (timer) return { stop: stopEmailGcWorker }
-  const intervalMs = env.EMAIL_GC_INTERVAL_MS
-  if (intervalMs <= 0) {
-    console.log('[email-gc] disabled (EMAIL_GC_INTERVAL_MS=0)')
-    return null
-  }
-  console.log(`[email-gc] starting · interval=${intervalMs}ms · safety=${SAFETY_AGE_MS}ms`)
-  const tick = async () => {
-    try { await runGcTick() }
-    catch (e) { console.error('[email-gc] tick failed:', e instanceof Error ? e.message : String(e)) }
-  }
-  timer = setInterval(() => { void tick() }, intervalMs)
+export function startEmailGcWorker(): { stop(): void } {
+  worker.start()
   return { stop: stopEmailGcWorker }
 }
 
 export function stopEmailGcWorker(): void {
-  if (timer) { clearInterval(timer); timer = null }
+  worker.stop()
 }

@@ -5,6 +5,8 @@
  * paginated request log). Never writes.
  */
 import { pool } from './db/pool.js'
+import { automationNumber } from './settings.js'
+import { isLlmRollupPaused } from './agents/llm-rollup.js'
 
 export interface UsageRange { from: Date; to: Date }
 
@@ -98,6 +100,9 @@ export interface UsageMetadata {
 }
 
 export async function usageMetadata(tenant: string, range: UsageRange): Promise<UsageMetadata> {
+  const intervalMs = automationNumber('llm_rollup_interval_ms')
+  const retentionDays = automationNumber('db_gc_llm_calls_days')
+  const paused = isLlmRollupPaused()
   const { rows } = await pool.query<{
     coverage_from: Date | null; aggregated_at: Date | null; completed_through: Date | null; status: UsageMetadata['aggregationStatus']
     raw_retention_from: Date | null; earliest_raw_at: Date | null; stale: boolean
@@ -106,15 +111,15 @@ export async function usageMetadata(tenant: string, range: UsageRange): Promise<
              (SELECT created_at FROM llm_calls WHERE company_id = $1 ORDER BY created_at LIMIT 1) AS earliest_raw_at,
              st.aggregated_at < NOW() - ($2::double precision * INTERVAL '1 millisecond') AS stale
         FROM llm_rollup_state st WHERE st.id`,
-  [tenant, Math.max(300_000, Number(process.env.LLM_ROLLUP_INTERVAL_MS ?? 120_000) * 3 || 300_000),
-    Number(process.env.DB_GC_LLM_CALLS_DAYS ?? 90) || 0])
+  [tenant, Math.max(300_000, intervalMs * 3),
+    retentionDays])
   const r = rows[0]!
   const retained = r.raw_retention_from ? new Date(r.raw_retention_from).getTime() : -Infinity
   const from = range.from.getTime(), to = range.to.getTime()
   return {
     timezone: 'UTC', aggregatedAt: r.aggregated_at ? new Date(r.aggregated_at).toISOString() : null,
     completedThrough: r.completed_through ? new Date(r.completed_through).toISOString() : null,
-    aggregationStatus: Number(process.env.LLM_ROLLUP_INTERVAL_MS ?? 120_000) <= 0 ? 'paused'
+    aggregationStatus: paused ? 'paused'
       : r.status === 'ready' && r.stale ? 'stale' : r.status,
     rawRetentionFrom: Number.isFinite(retained) ? new Date(retained).toISOString() : null,
     earliestRawAt: r.earliest_raw_at ? new Date(r.earliest_raw_at).toISOString() : null,

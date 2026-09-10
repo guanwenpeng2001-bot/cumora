@@ -25,10 +25,7 @@
  */
 import { pool } from '../db/pool.js'
 import type { PoolClient } from 'pg'
-
-/** Interval between rollup refresh ticks. Default 120s; set 0 to disable. Read
- *  straight from process.env (not env.ts) to keep this self-contained. */
-const INTERVAL_MS = Number(process.env.LLM_ROLLUP_INTERVAL_MS ?? 120_000)
+import { automationNumber, createOperationsWorker } from '../settings.js'
 
 // Distinct from migrate's SCHEMA_LOCK_KEY (7_643_178_926_104n).
 const ROLLUP_LOCK_KEY = 7_643_178_926_211n
@@ -40,8 +37,6 @@ const STEADY_WINDOW_HOURS = 3
 // a touch more keeps the boundary clean. Capped so a brand-new table can't try
 // to scan unbounded history in one statement.
 const MAX_BACKFILL_HOURS = 95 * 24
-// Drop buckets older than this so the rollup stays bounded as history grows.
-const RETENTION_HOURS = 95 * 24
 
 /**
  * Upsert every hourly bucket whose source rows are newer than `sinceHours`.
@@ -58,7 +53,7 @@ export async function refreshLlmRollup(sinceHours: number, connection?: PoolClie
               NOW() AS until,
               date_trunc('hour', NOW() - ($2::double precision * INTERVAL '1 day'), 'UTC') + INTERVAL '1 hour' AS retained_from`,
       [Math.min(MAX_BACKFILL_HOURS, Math.max(1, Math.ceil(sinceHours))),
-        Number(process.env.DB_GC_LLM_CALLS_DAYS ?? 90) > 0 ? Math.min(95, Number(process.env.DB_GC_LLM_CALLS_DAYS ?? 90)) : 95],
+        automationNumber('db_gc_llm_calls_days') > 0 ? Math.min(95, automationNumber('db_gc_llm_calls_days')) : 95],
     )
     const { since, until, retained_from: retainedFrom } = rows[0]!
     const params = [since, until]
@@ -172,14 +167,17 @@ export async function runLlmRollupTick(): Promise<{ skipped?: boolean; buckets?:
         ? MAX_BACKFILL_HOURS
         : Math.min(MAX_BACKFILL_HOURS, Math.max(STEADY_WINDOW_HOURS, gap + 1))
       const buckets = await refreshLlmRollup(sinceHours, client)
-      await client.query(
-        `DELETE FROM llm_calls_rollup WHERE bucket_hour < NOW() - ($1::int * INTERVAL '1 hour')`,
-        [RETENTION_HOURS],
-      )
-      await client.query(
-        `DELETE FROM llm_calls_rollup_v2 WHERE bucket_hour < NOW() - ($1::int * INTERVAL '1 hour')`,
-        [RETENTION_HOURS],
-      )
+      const retentionHours = automationNumber('llm_rollup_retention_hours')
+      if (retentionHours > 0) {
+        await client.query(
+          `DELETE FROM llm_calls_rollup WHERE bucket_hour < NOW() - ($1::int * INTERVAL '1 hour')`,
+          [retentionHours],
+        )
+        await client.query(
+          `DELETE FROM llm_calls_rollup_v2 WHERE bucket_hour < NOW() - ($1::int * INTERVAL '1 hour')`,
+          [retentionHours],
+        )
+      }
       return { buckets, sinceHours }
     } catch (error) {
       await client.query("UPDATE llm_rollup_state SET status = 'failed', attempted_at = NOW() WHERE id").catch(() => {})
@@ -192,38 +190,24 @@ export async function runLlmRollupTick(): Promise<{ skipped?: boolean; buckets?:
   }
 }
 
-let timer: NodeJS.Timeout | null = null
+let stopped = false
+const worker = createOperationsWorker('llm_rollup_interval_ms', async () => {
+  const startedAt = Date.now()
+  const result = await runLlmRollupTick()
+  if (!result.skipped) console.log(`[llm-rollup] refreshed ${result.buckets} buckets (window=${result.sinceHours}h) in ${Date.now() - startedAt}ms`)
+}, { immediate: true })
 
-/** Start the periodic rollup refresher. Idempotent. Fires the first tick
- *  immediately (so a fresh deploy backfills right away rather than waiting a
- *  full interval), then on the interval. LLM_ROLLUP_INTERVAL_MS=0 disables. */
-export function startLlmRollupRefresher(): { stop(): void } | null {
-  if (timer) return { stop: stopLlmRollupRefresher }
-  const intervalMs = INTERVAL_MS
-  if (intervalMs <= 0) {
-    void pool.query("UPDATE llm_rollup_state SET status = 'paused' WHERE id").catch(() => {})
-    console.log('[llm-rollup] disabled (LLM_ROLLUP_INTERVAL_MS=0)')
-    return null
-  }
-  console.log(`[llm-rollup] starting · interval=${intervalMs}ms`)
-  const tick = async () => {
-    const t = Date.now()
-    try {
-      const r = await runLlmRollupTick()
-      if (!r.skipped) console.log(`[llm-rollup] refreshed ${r.buckets} buckets (window=${r.sinceHours}h) in ${Date.now() - t}ms`)
-    } catch (e) {
-      console.error('[llm-rollup] tick failed:', e instanceof Error ? e.message : String(e))
-    }
-  }
-  // Kick the first pass now so the dashboard has data ASAP after boot.
-  void tick()
-  timer = setInterval(() => { void tick() }, intervalMs)
+export function isLlmRollupPaused(): boolean {
+  return stopped || automationNumber('llm_rollup_interval_ms') <= 0
+}
+
+export function startLlmRollupRefresher(): { stop(): void } {
+  stopped = false
+  worker.start()
   return { stop: stopLlmRollupRefresher }
 }
 
 export function stopLlmRollupRefresher(): void {
-  if (timer) {
-    clearInterval(timer); timer = null
-    void pool.query("UPDATE llm_rollup_state SET status = 'paused' WHERE id").catch(() => {})
-  }
+  stopped = true
+  worker.stop()
 }

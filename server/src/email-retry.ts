@@ -22,7 +22,7 @@
  * never picked up again (terminal failure).
  */
 import { pool } from './db/pool.js'
-import { env } from './env.js'
+import { createOperationsWorker } from './settings.js'
 import {
   sendViaProvider, normalizeMessageId, formatAddress, parseAddress,
 } from './email.js'
@@ -218,27 +218,13 @@ export async function runRetryTick(maxBatch = 16): Promise<{ attempted: number }
   return { attempted: due.length }
 }
 
-let timer: NodeJS.Timeout | null = null
+const worker = createOperationsWorker('email_retry_interval_ms', runRetryTick)
 
-/** Start the periodic retry loop. Idempotent — re-calling is a no-op. */
-export function startEmailRetryWorker(): { stop(): void } | null {
-  if (timer) return { stop: stopEmailRetryWorker }
-  const intervalMs = env.EMAIL_RETRY_INTERVAL_MS
-  if (intervalMs <= 0) {
-    console.log('[email-retry] disabled (EMAIL_RETRY_INTERVAL_MS=0)')
-    return null
-  }
-  console.log(`[email-retry] starting · interval=${intervalMs}ms · max-attempts=${BACKOFF_STEPS_MS.length}`)
-  const tick = async () => {
-    try { await runRetryTick() }
-    catch (e) { console.error('[email-retry] tick failed:', e instanceof Error ? e.message : String(e)) }
-  }
-  // First tick after one full interval (let migrations + server boot
-  // complete first). subsequent ticks fire on the interval.
-  timer = setInterval(() => { void tick() }, intervalMs)
+export function startEmailRetryWorker(): { stop(): void } {
+  worker.start()
   return { stop: stopEmailRetryWorker }
 }
 
 export function stopEmailRetryWorker(): void {
-  if (timer) { clearInterval(timer); timer = null }
+  worker.stop()
 }

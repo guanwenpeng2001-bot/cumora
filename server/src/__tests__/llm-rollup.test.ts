@@ -5,7 +5,7 @@ import ts from 'typescript'
 import { USAGE_ROLLUP_V2_SQL, usageRollupV2Checksum } from '../db/migrations/0013-usage-rollup-v2.js'
 import { SCHEMA_MIGRATIONS } from '../db/migrations/manifest.js'
 
-function fixture(failV2 = false, locked = true, gap: number | null = null) {
+function fixture(failV2 = false, locked = true, gap: number | null = null, settings: Record<string, number> = {}) {
   const calls: { sql: string; params: unknown[] }[] = []
   let released = 0
   const since = new Date('2026-09-01T00:00:00Z'), until = new Date('2026-09-02T12:43:00Z')
@@ -21,6 +21,7 @@ function fixture(failV2 = false, locked = true, gap: number | null = null) {
     { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText
   const exports: Record<string, any> = {}
   new Function('exports', 'require', output)(exports, (name: string) => {
+    if (name.endsWith('/settings.js')) return { automationNumber: (key: string) => settings[key] ?? ({ llm_rollup_interval_ms: 120_000, db_gc_llm_calls_days: 90, llm_rollup_retention_hours: 2280 }[key]), createOperationsWorker: () => ({ start() {}, stop() {} }) }
     assert.equal(name, '../db/pool.js')
     return { pool: { connect: async () => client, query: async () => { throw new Error('must use locked connection') } } }
   })
@@ -70,4 +71,34 @@ test('lock contention skips all writes; outage catch-up uses persisted watermark
   const resumed = fixture(false, true, 24)
   assert.equal((await resumed.exports.runLlmRollupTick()).sinceHours, 25)
   assert.match(resumed.calls[1].sql, /completed_through/)
+})
+
+
+test('rollup retention zero disables pruning; configured raw retention bounds catch-up', async () => {
+  const settings = { db_gc_llm_calls_days: 0, llm_rollup_retention_hours: 0 }
+  const f = fixture(false, true, 24, settings)
+  await f.exports.runLlmRollupTick()
+  assert.ok(!f.calls.some(c => c.sql.startsWith('DELETE FROM llm_calls_rollup')))
+  assert.equal(f.calls.find(c => c.sql.includes('AS retained_from'))!.params[1], 95)
+  f.calls.length = 0
+  Object.assign(settings, { db_gc_llm_calls_days: 30, llm_rollup_retention_hours: 3000 })
+  await f.exports.runLlmRollupTick()
+  assert.equal(f.calls.find(c => c.sql.includes('AS retained_from'))!.params[1], 30)
+  const deletes = f.calls.filter(c => c.sql.startsWith('DELETE FROM llm_calls_rollup'))
+  assert.equal(deletes.length, 2)
+  for (const call of deletes) assert.deepEqual(call.params, [3000])
+})
+
+
+test('explicit rollup stop is visible even after an in-flight writer could have published ready', () => {
+  const settings = { llm_rollup_interval_ms: 120_000 }
+  const f = fixture(false, true, null, settings)
+  assert.equal(f.exports.isLlmRollupPaused(), false)
+  f.exports.stopLlmRollupRefresher()
+  assert.equal(f.exports.isLlmRollupPaused(), true)
+  f.exports.startLlmRollupRefresher()
+  assert.equal(f.exports.isLlmRollupPaused(), false)
+  settings.llm_rollup_interval_ms = 0
+  assert.equal(f.exports.isLlmRollupPaused(), true)
+  assert.deepEqual(f.calls, [], 'pause visibility never overwrites a peer replica watermark')
 })
