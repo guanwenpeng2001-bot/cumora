@@ -75,7 +75,7 @@ export async function executeTool(args: {
   let result: ToolResult
   try {
     switch (args.name) {
-      case 'palette':            result = await tPalette(parsed, args.companyId ?? null, args.agentId); break
+      case 'palette':            result = await tPalette(parsed, args.companyId ?? null, args.agentId, args.runId); break
       case 'dm_with':            result = await tDmWith(parsed, args.agentId); break
       case 'pull_group':         result = await tPullGroup(parsed, args.agentId); break
       case 'set_turn_status':    result = tSetTurnStatus(parsed); break
@@ -303,11 +303,11 @@ async function tReact(args: Record<string, unknown>, agentId: string): Promise<T
   }
 }
 
-async function tPalette(args: Record<string, unknown>, companyId: string | null, agentId: string): Promise<ToolResult> {
+async function tPalette(args: Record<string, unknown>, companyId: string | null, agentId: string, runId?: string | null): Promise<ToolResult> {
   const t0 = Date.now()
   const brief = String(args.brief ?? '').trim()
   const openai = await getTrackedLlmClient({
-    purpose: 'palette', companyId, agentId,
+    role: 'support', purpose: 'palette', companyId, agentId, runId,
     extras: { brief: brief.slice(0, 120) },
   })
   const r = await openai.responses.create({

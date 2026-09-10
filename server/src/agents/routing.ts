@@ -111,7 +111,7 @@ export async function routeMessage(args: {
   try {
     const { getTrackedLlmClient } = await import('./llm-ledger.js')
     const { supportModel } = await import('./model-policy.js')
-    const client = await getTrackedLlmClient({ purpose: 'message-routing', companyId: args.companyId })
+    const client = await getTrackedLlmClient({ role: 'support', purpose: 'message-routing', companyId: args.companyId })
     const r = await client.responses.create({
       model: supportModel(),
       instructions: req.instructions,

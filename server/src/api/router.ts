@@ -3111,6 +3111,7 @@ type Gender = 'feminine' | 'masculine' | 'androgynous'
  * intentionally rare in this project.
  */
 async function inferAgentGender(args: {
+  agentId?: string
   name: string; role: string; systemPrompt: string
   /** Tenant for sub2api routing — falls back to legacy global key
    *  when null. */
@@ -3121,7 +3122,7 @@ async function inferAgentGender(args: {
   try {
     const { getTrackedLlmClient } = await import('../agents/llm-ledger.js')
     const client = await getTrackedLlmClient({
-      purpose: 'gender', companyId: args.tenant,
+      role: 'support', purpose: 'gender', companyId: args.tenant, agentId: args.agentId,
       extras: { agentName: name, role: role.slice(0, 60) },
     })
     const r = await client.responses.create({
@@ -3482,7 +3483,7 @@ export async function generateAndPersistAvatar(args: {
   // Gender inference is async — call before the visual signature so we pick
   // from the right bucket. Falls back to androgynous if the classifier fails.
   const gender = await inferAgentGender({
-    name: a.name, role: a.role ?? '', systemPrompt: styleHint, tenant,
+    name: a.name, role: a.role ?? '', systemPrompt: styleHint, tenant, agentId: id,
   })
   const visual = visualSignatureFor(id, gender)
   const genderClause = gender === 'feminine'

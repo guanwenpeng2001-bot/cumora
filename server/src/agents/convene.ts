@@ -281,7 +281,9 @@ You're in a LIVE CONVENE — a real-time work session. Other team members will s
 Topic of this convene: ${args.topic}`
 
   const client = await getTrackedLlmClient({
+    role: 'brain',
     purpose: 'convene-speech',
+    agent: { id: args.agentId, model: persona.model, modelConfig: persona.modelConfig },
     companyId: args.companyId,
     agentId: args.agentId,
     conversationId: args.session.conversation_id,
@@ -423,6 +425,7 @@ async function classifyDecision(args: { sessionId: string; topic: string }): Pro
   try {
     const tenant = (await companyIdForConveneSession(args.sessionId)) ?? null
     const client = await getTrackedLlmClient({
+      role: 'support',
       purpose: 'convene-decision',
       companyId: tenant,
       extras: { sessionId: args.sessionId, topic: args.topic.slice(0, 120) },

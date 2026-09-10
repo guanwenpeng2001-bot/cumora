@@ -34,6 +34,7 @@ export async function gatherClaimsByConvo(inbox: InboxRow[]): Promise<ClaimsByCo
  *  small Codex) so judgment never leaves the operator's machine and never spends
  *  cloud quota. The big brain is never spent on triage in either path. */
 export async function classifyInboxTriage(args: {
+  runId?: string | null
   agentId: string
   companyId: string | null
   persona: PersonaRow
@@ -58,8 +59,12 @@ export async function classifyInboxTriage(args: {
   if (req.verdict) return req.verdict
   // Tracked client → every triage call lands in llm_calls with purpose='inbox-triage'
   // alongside its agent_triages row, so spend rollups by purpose see this too.
+  const deadline = Date.now() + 8_000
+  const signal = AbortSignal.timeout(8_000)
   const client = await getTrackedLlmClient({
+    role: 'support',
     purpose: 'inbox-triage',
+    runId: args.runId,
     companyId: args.companyId,
     agentId: args.agentId,
     extras: { inboxCount: args.inbox.length },
@@ -77,11 +82,10 @@ export async function classifyInboxTriage(args: {
       max_output_tokens: 2000 + supportReasoningHeadroom(),
       ...supportReasoningOptions(),
     }, {
-      // Triage is a fast GATE. Do NOT retry — a rate-limited model retried (or
-      // escalated to the big brain on fail-open) is exactly what burned users'
-      // quota. ONE attempt, an 8s ceiling; on a rate-limit we fail CLOSED below.
+      // Disable SDK retries; all configured candidates share the gate deadline.
       maxRetries: 0,
-      timeout: 8_000,
+      signal,
+      get timeout() { return Math.max(1, deadline - Date.now()) },
     })
     const parsed = parseTriage(r.output_text ?? '{}')
     if (parsed) {
@@ -137,6 +141,8 @@ export async function classifyInboxTriage(args: {
  *  tokens — exactly the bias we want for unprompted wakes. */
 export async function gateSyntheticWake(args: {
   companyId: string | null
+  agentId?: string | null
+  runId?: string | null
   personaName: string
   kind: 'idle' | 'background_scan' | 'poll.updated'
   brief: string
@@ -165,9 +171,14 @@ export async function gateSyntheticWake(args: {
     '',
     'Reply ONLY as strict JSON: {"act": boolean, "reason": "one short factual reason", "note": "if act is true, one sentence telling the big brain what to do; else empty"}.',
   ].filter(Boolean).join('\n')
+  const deadline = Date.now() + 8_000
+  const signal = AbortSignal.timeout(8_000)
   try {
     const client = await getTrackedLlmClient({
+      role: 'support',
       purpose: 'synthetic-wake-gate',
+      agentId: args.agentId,
+      runId: args.runId,
       companyId: args.companyId,
       extras: { kind: args.kind, persona: args.personaName },
     })
@@ -178,7 +189,7 @@ export async function gateSyntheticWake(args: {
       text: { format: { type: 'json_object' } },
       max_output_tokens: 300 + supportReasoningHeadroom(),
       ...supportReasoningOptions(),
-    }, { maxRetries: 0, timeout: 8_000 })
+    }, { maxRetries: 0, signal, get timeout() { return Math.max(1, deadline - Date.now()) } })
     const parsed = JSON.parse(r.output_text ?? '{}') as { act?: unknown; reason?: unknown; note?: unknown }
     return {
       act: parsed.act === true,

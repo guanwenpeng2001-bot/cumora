@@ -474,6 +474,7 @@ ${rendered}
 Reply as strict JSON.`
   try {
     const client = await getTrackedLlmClient({
+      role: 'support',
       purpose: 'agenda',
       companyId,
       agentId: args.agentId ?? null,
