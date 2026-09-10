@@ -456,6 +456,10 @@ export interface EngineMcpConnector {
 export function buildEngineMcpServers(connectors: EngineMcpConnector[]): Record<string, unknown> {
   const out: Record<string, unknown> = {}
   for (const c of connectors) {
+    if (Object.hasOwn(out, c.name)) {
+      console.warn(`[engine] MCP connector ${c.name} failed: duplicate server name`)
+      continue
+    }
     if (c.type === 'http') {
       out[c.name] = { type: 'http', url: c.url, ...(c.headers && Object.keys(c.headers).length ? { headers: c.headers } : {}) }
     } else {
@@ -485,26 +489,35 @@ export function mergeEngineSecureMcpConfig(existingJson: string, connectors: Eng
 }
 
 function mcpTomlEscape(v: string): string {
-  return `"${v.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
+  return JSON.stringify(v).replace(/\u007f/g, String.raw`\u007f`)
 }
 
-/** Codex secure-mode args: one `-c mcp_servers.<name>={…}` per connector
- *  (its user config is ignored via --ignore-user-config). http connectors
- *  use {url=…}; headers have no codex-argv equivalent and are dropped. */
+/** Codex 0.153.4 accepts http_headers in its streamable-HTTP config.
+ *  Bound operator tools use the same approval mode as the cumora bridge;
+ *  the server itself stays optional so connection failure cannot block a turn. */
 export function buildEngineCodexMcpArgs(connectors: EngineMcpConnector[]): string[] {
   const out: string[] = []
+  const names = new Set(['cumora'])
   for (const c of connectors) {
     const key = c.name.replace(/-/g, '_')
+    if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(c.name) || c.name.includes('__') || names.has(key)) {
+      console.warn(`[codex] MCP connector ${c.name} failed: invalid or conflicting server name`)
+      continue
+    }
+    names.add(key)
     if (c.type === 'stdio') {
       const parts = [`command=${mcpTomlEscape(c.command ?? '')}`]
       if (c.args?.length) parts.push(`args=[${c.args.map(mcpTomlEscape).join(',')}]`)
       const envEntries = Object.entries(c.env ?? {})
       if (envEntries.length) {
-        parts.push(`env={${envEntries.map(([k, v]) => `${k}=${mcpTomlEscape(v)}`).join(',')}}`)
+        parts.push(`env={${envEntries.map(([k, v]) => `${/^[A-Za-z0-9_-]+$/.test(k) ? k : mcpTomlEscape(k)}=${mcpTomlEscape(v)}`).join(',')}}`)
       }
-      out.push('-c', `mcp_servers.${key}={${parts.join(',')}}`)
+      out.push('-c', `mcp_servers.${key}={${parts.join(',')},default_tools_approval_mode="approve"}`)
     } else {
-      out.push('-c', `mcp_servers.${key}={url=${mcpTomlEscape(c.url ?? '')}}`)
+      const parts = [`url=${mcpTomlEscape(c.url ?? '')}`]
+      const headers = Object.entries(c.headers ?? {})
+      if (headers.length) parts.push(`http_headers={${headers.map(([k, v]) => `${mcpTomlEscape(k)}=${mcpTomlEscape(v)}`).join(',')}}`)
+      out.push('-c', `mcp_servers.${key}={${parts.join(',')},default_tools_approval_mode="approve"}`)
     }
   }
   return out

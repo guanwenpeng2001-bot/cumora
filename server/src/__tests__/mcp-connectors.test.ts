@@ -68,10 +68,36 @@ test('mergeClaudeSecureMcpConfig: bridge wins name clashes; malformed input pass
 test('buildCodexMcpArgs: one -c pair per connector, dashes normalized, escaping', () => {
   const args = buildCodexMcpArgs([stdio, http])
   assert.deepEqual(args, [
-    '-c', 'mcp_servers.fs_local={command="npx",args=["-y","@mcp/fs","/data"],env={API_KEY="x"}}',
-    '-c', 'mcp_servers.remote_api={url="https://mcp.example.com/sse"}',
+    '-c', 'mcp_servers.fs_local={command="npx",args=["-y","@mcp/fs","/data"],env={API_KEY="x"},default_tools_approval_mode="approve"}',
+    '-c', 'mcp_servers.remote_api={url="https://mcp.example.com/sse",http_headers={"Authorization"="Bearer t"},default_tools_approval_mode="approve"}',
   ])
   // backslash/quote escaping
   const esc = buildCodexMcpArgs([{ ...stdio, command: 'C:\\tools\\"x".exe', args: [] }])
   assert.match(esc[1] ?? '', /command="C:\\\\tools\\\\\\"x\\"\.exe"/)
+})
+
+test('Codex rejects normalized name collisions and preserves the built-in cumora bridge', (t) => {
+  const warnings: string[] = []
+  t.mock.method(console, 'warn', (line: string) => warnings.push(line))
+  const args = buildCodexMcpArgs([stdio, { ...http, name: 'fs_local' }, { ...http, name: 'cumora' }, http])
+  assert.equal(args.filter(arg => arg.startsWith('mcp_servers.fs_local=')).length, 1)
+  assert.equal(args.some(arg => arg.startsWith('mcp_servers.cumora=')), false)
+  assert.equal(args.some(arg => arg.startsWith('mcp_servers.remote_api=')), true)
+  assert.equal(warnings.length, 2)
+  assert.ok(warnings.every(line => line.includes('failed')))
+  assert.ok(warnings.every(line => !line.includes('Bearer t')))
+})
+
+test('Codex headers preserve quoted names and control-character escaping in TOML', () => {
+  const args = buildCodexMcpArgs([{ ...http, headers: { Authorization: 'Bearer t', 'X-Api-Key': 'a"b', 'X-Extra': '中文' } },
+    { ...stdio, args: ['line1\nline2\tend'], env: { 'key.with.dot': 'value' } }])
+  assert.ok(args[1].includes('http_headers={"Authorization"="Bearer t","X-Api-Key"="a\\"b","X-Extra"="中文"}'))
+  assert.ok(args[3].includes(String.raw`args=["line1\nline2\tend"]`))
+  assert.ok(args[3].includes('env={"key.with.dot"="value"}'))
+})
+
+test('Codex TOML escapes DEL rather than emitting a forbidden literal character', () => {
+  const args = buildCodexMcpArgs([{ ...stdio, args: [String.fromCharCode(127)] }])
+  assert.ok(args[1].includes(String.raw`args=["\u007f"]`))
+  assert.equal(args[1].includes(String.fromCharCode(127)), false)
 })

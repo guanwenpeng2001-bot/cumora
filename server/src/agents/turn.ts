@@ -2531,7 +2531,10 @@ Mechanics:
   const seenMcpConnectorNames = new Set<string>()
   const mcpCacheNow = Date.now()
   const mcpSpecs = (persona.mcpConnectors ?? []).filter((spec) => {
-    if (seenMcpConnectorNames.has(spec.name)) return false
+    if (seenMcpConnectorNames.has(spec.name)) {
+      console.warn('[turn] MCP connector ' + spec.name + ' failed: duplicate connector name')
+      return false
+    }
     seenMcpConnectorNames.add(spec.name)
     const cacheKey = runCompanyId + ':' + spec.name
     const failedUntil = mcpConnectorFailureCache.get(cacheKey)
@@ -2541,7 +2544,7 @@ Mechanics:
     return true
   })
   const mcpConnectionResults = await Promise.allSettled(mcpSpecs.map((spec) =>
-    connectMcpConnector(spec, { cwd: process.env.CUMORA_PERSONA_DIR ?? '/workspace' }),
+    connectMcpConnector(spec, { cwd: process.env.CUMORA_PERSONA_DIR ?? '/workspace', signal: options.signal }),
   ))
   for (let i = 0; i < mcpConnectionResults.length; i++) {
     const spec = mcpSpecs[i]

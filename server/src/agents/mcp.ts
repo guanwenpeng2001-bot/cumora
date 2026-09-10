@@ -9,7 +9,7 @@
  * the agent's pod with cwd pinned to the agent workspace; http connectors
  * dial only the registry URL.
  */
-import { spawn, type ChildProcess } from 'node:child_process'
+import { spawn, execFile, type ChildProcess } from 'node:child_process'
 import { StringDecoder } from 'node:string_decoder'
 
 /** DB-free connector spec (structurally matches mcp_connectors rows). */
@@ -43,10 +43,12 @@ const CALL_TIMEOUT_MS = 60_000
 
 /** `mcp__<connector>__<tool>` — sanitized so the wire name matches
  *  OpenAI's tool-name charset. Connector names are registry-validated
- *  ([a-z0-9_-]); tool names from third-party servers get sanitized here. */
+ *  ([a-z0-9_-]); underscores are escaped to keep the separator reversible.
+ *  Tool names from third-party servers get sanitized here. */
 export function prefixedToolName(connector: string, tool: string): string {
   const clean = tool.replace(/[^a-zA-Z0-9_-]/g, '_')
-  return `mcp__${connector}__${clean}`.slice(0, 64)
+  const encodedConnector = connector.replace(/_/g, '_u')
+  return `mcp__${encodedConnector}__${clean}`.slice(0, 64)
 }
 
 /** Parse the wire prefix. The tool portion is still the sanitized wire name;
@@ -56,7 +58,7 @@ export function splitPrefixedToolName(name: string): { connector: string; tool: 
   const rest = name.slice(5)
   const sep = rest.indexOf('__')
   if (sep <= 0 || sep === rest.length - 2) return null
-  return { connector: rest.slice(0, sep), tool: rest.slice(sep + 2) }
+  return { connector: rest.slice(0, sep).replace(/_u/g, '_'), tool: rest.slice(sep + 2) }
 }
 
 /** MCP tool schema → OpenAI Responses function-tool def, name prefixed. */
@@ -121,6 +123,7 @@ interface PendingRpc {
 /** Shared request/response matcher. Transport pushes decoded JSON-RPC
  *  messages to `onMessage`; `call` resolves by id with a timeout. */
 class RpcPump {
+  private terminalError: Error | undefined
   private nextId = 1
   private pending = new Map<number, PendingRpc>()
   private settle(id: number, err?: Error, value?: unknown): void {
@@ -152,6 +155,7 @@ class RpcPump {
     send: (payload: string, id: number, signal: AbortSignal) => void,
     signal?: AbortSignal,
   ): Promise<unknown> {
+    if (this.terminalError) return Promise.reject(this.terminalError)
     const id = this.nextId++
     return new Promise((resolve, reject) => {
       const controller = new AbortController()
@@ -180,21 +184,13 @@ class RpcPump {
     this.settle(id, err)
   }
   failAll(err: Error): void {
+    this.terminalError = err
     for (const id of this.pending.keys()) this.settle(id, err)
   }
 }
 
 const CLIENT_INFO = { name: 'cumora-mcp', version: '0.1.0' }
 const PROTOCOL_VERSION = '2024-11-05'
-
-async function handshake(pump: RpcPump, send: (p: string, id: number, signal: AbortSignal) => void): Promise<void> {
-  await pump.call('initialize', {
-    protocolVersion: PROTOCOL_VERSION,
-    capabilities: {},
-    clientInfo: CLIENT_INFO,
-  }, CONNECT_TIMEOUT_MS, send)
-  send(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }), 0, AbortSignal.timeout(CALL_TIMEOUT_MS))
-}
 
 export interface McpClientHandle {
   /** Connector name (registry). */
@@ -208,14 +204,43 @@ export interface McpClientHandle {
 
 /** stdio transport: spawn the command with cwd pinned to the agent
  *  workspace; newline-delimited JSON-RPC on stdout. */
-function connectStdio(spec: McpConnectorSpec, cwd: string): { pump: RpcPump; child: ChildProcess } {
+function connectStdio(spec: McpConnectorSpec, cwd: string): { pump: RpcPump; child: ChildProcess; close: () => Promise<void> } {
+  const pump = new RpcPump()
   const child = spawn(spec.command ?? '', spec.args ?? [], {
     cwd,
     env: { ...process.env, ...(spec.env ?? {}) },
     stdio: ['pipe', 'pipe', 'pipe'],
+    windowsHide: true,
+    detached: process.platform !== 'win32',
   })
-  const pump = new RpcPump()
+  // Install ownership before any protocol work, including spawn errors.
+  let exited = false
+  const closed = new Promise<void>((resolve) => child.once('close', () => { exited = true; resolve() }))
+  let closing: Promise<void> | undefined
+  const close = () => closing ??= (async () => {
+    pump.failAll(new McpError('client closed'))
+    if (exited) return
+    if (process.platform === 'win32' && child.pid && child.exitCode === null && child.signalCode === null) {
+      await new Promise<void>(resolve => execFile('taskkill.exe', ['/pid', String(child.pid), '/t', '/f'],
+        { windowsHide: true, timeout: 2000 }, () => resolve()))
+    }
+    const signalTree = (signal: NodeJS.Signals) => {
+      if (process.platform !== 'win32' && child.pid) {
+        try { process.kill(-child.pid, signal); return } catch { /* group already gone */ }
+      }
+      if (!exited) child.kill(signal)
+    }
+    const timer = setTimeout(() => signalTree('SIGKILL'), 2000)
+    try {
+      signalTree('SIGTERM')
+      await closed
+    } finally {
+      clearTimeout(timer)
+      if (process.platform !== 'win32') signalTree('SIGKILL')
+    }
+  })()
   child.stdin?.on('error', (e) => pump.failAll(e))
+  child.stderr?.resume()
   const decoder = new StringDecoder('utf8')
   let buf = ''
   const consume = (text: string) => {
@@ -230,10 +255,10 @@ function connectStdio(spec: McpConnectorSpec, cwd: string): { pump: RpcPump; chi
     }
   }
   child.stdout?.on('data', (chunk: Buffer) => consume(decoder.write(chunk)))
-  child.stdout?.on('end', () => consume(decoder.end()))
+  child.stdout?.on('end', () => { consume(decoder.end()); pump.failAll(new McpError('MCP server stdout closed')) })
   child.on('error', (e) => pump.failAll(e))
   child.on('exit', (code) => pump.failAll(new McpError(`MCP server exited (code ${code})`)))
-  return { pump, child }
+  return { pump, child, close }
 }
 
 /** streamable-HTTP transport: POST JSON-RPC; accept JSON or SSE bodies. */
@@ -267,23 +292,39 @@ async function httpSend(
     signal,
   })
   if (!res.ok) {
-    pump.fail(id, new McpError(`MCP http ${res.status}`))
-    return
+    await res.body?.cancel()
+    throw new McpError(`MCP http ${res.status}`)
   }
+  const sessionId = res.headers.get('mcp-session-id')
+  if (sessionId) headers['mcp-session-id'] = sessionId
+  if (id === 0 || res.status === 202) { await res.body?.cancel(); return }
   const ct = (res.headers.get('content-type') ?? '').toLowerCase()
-  const text = await res.text()
-  if (ct.includes('text/event-stream')) {
-    for (const line of text.split('\n')) {
-      const t = line.trim()
-      if (!t.startsWith('data:')) continue
-      const data = t.slice(5).trim()
-      if (!data) continue
-      try { pump.onMessage(JSON.parse(data)) } catch { /* skip */ }
-    }
-    return
+  if (ct.includes('text/event-stream') && res.body) {
+    const reader = res.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+    try {
+      while (true) {
+        const { value, done } = await reader.read()
+        buffer = (buffer + decoder.decode(value, { stream: !done })).replace(/\r\n/g, '\n')
+        let end: number
+        while ((end = buffer.indexOf('\n\n')) >= 0) {
+          const event = buffer.slice(0, end)
+          buffer = buffer.slice(end + 2)
+          const data = event.split('\n').filter(line => line.startsWith('data:')).map(line => line.slice(5).trimStart()).join('\n')
+          if (!data) continue
+          let message: JsonRpcResponse
+          try { message = JSON.parse(data) as JsonRpcResponse } catch { continue }
+          pump.onMessage(message)
+          if (String(message.id) === String(id)) return
+        }
+        if (done) throw new McpError('MCP HTTP stream ended without a response')
+      }
+    } finally { await reader.cancel().catch(() => {}); reader.releaseLock() }
   }
-  if (!text.trim()) return
-  try { pump.onMessage(JSON.parse(text)) } catch { /* skip */ }
+  const message = await res.json() as JsonRpcResponse
+  if (String(message.id) !== String(id)) throw new McpError('MCP HTTP response id mismatch')
+  pump.onMessage(message)
 }
 
 /** Connect one connector: initialize handshake + tools/list. Throws on
@@ -291,73 +332,102 @@ async function httpSend(
  *  turn" per the lifecycle contract. */
 export async function connectMcpConnector(
   spec: McpConnectorSpec,
-  opts: { cwd: string },
+  opts: { cwd: string; signal?: AbortSignal; connectTimeoutMs?: number; callTimeoutMs?: number },
 ): Promise<McpClientHandle> {
-  let pump: RpcPump
-  let child: ChildProcess | null = null
-  let send: (payload: string, id: number, signal: AbortSignal) => void
-
-  if (spec.type === 'stdio') {
-    const s = connectStdio(spec, opts.cwd)
-    pump = s.pump
-    child = s.child
-    send = (p) => {
-      const stdin = child?.stdin
-      if (!stdin || !stdin.writable) {
-        pump.failAll(new McpError('MCP server stdin is not writable'))
-        return
-      }
-      try {
-        stdin.write(p + '\n')
-      } catch (e) {
-        pump.failAll(e instanceof Error ? e : new Error(String(e)))
-      }
-    }
-  } else {
-    const h = connectHttp(spec)
-    pump = h.pump
-    send = (p, id, signal) => {
-      void httpSend(h.url, h.headers, p, pump, id, signal).catch((e) => {
-        pump.fail(id, e instanceof Error ? e : new Error(String(e)))
-      })
-    }
+  opts.signal?.throwIfAborted()
+  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(spec.name) || spec.name.includes('__')) {
+    throw new McpError('Invalid MCP connector name')
   }
-
-  await handshake(pump, send)
-  const listed = (await pump.call('tools/list', {}, LIST_TIMEOUT_MS, send)) as { tools?: McpToolDef[] }
-  const tools = Array.isArray(listed?.tools) ? listed.tools : []
-  const toolNameMap = new Map<string, string>()
-  for (const tool of tools) {
-    const wireName = prefixedToolName(spec.name, tool.name)
-    const previous = toolNameMap.get(wireName)
-    if (previous !== undefined) {
-      if (child && child.exitCode === null) child.kill('SIGTERM')
-      throw new McpError(`MCP connector ${spec.name} has tool name collision: ${previous} and ${tool.name} → ${wireName}`)
-    }
-    toolNameMap.set(wireName, tool.name)
+  if (prefixedToolName(spec.name, '').length >= 64) {
+    throw new McpError('MCP connector name leaves no room for a reversible tool name')
   }
-
-  return {
-    connector: spec.name,
-    tools,
-    toolNameMap,
-    async callTool(name, args, signal) {
-      const wireName = toolNameMap.has(name) ? name : prefixedToolName(spec.name, name)
-      const originalName = toolNameMap.get(wireName)
-      if (originalName === undefined) throw new McpError(`MCP tool ${name} is not available on connector ${spec.name}`)
-      const result = await pump.call('tools/call', { name: originalName, arguments: args }, CALL_TIMEOUT_MS, send, signal)
-      return mcpResultToText(result)
-    },
-    async close() {
-      pump.failAll(new McpError('client closed'))
-      if (child) {
-        if (child.exitCode !== null) return
-        child.kill('SIGTERM')
-        await new Promise<void>((resolve) => {
-          const t = setTimeout(() => { child.kill('SIGKILL'); resolve() }, 2000)
-          child.once('exit', () => { clearTimeout(t); resolve() })
-        })
+  const lifetime = new AbortController()
+  const connecting = AbortSignal.any([AbortSignal.timeout((opts.connectTimeoutMs ?? CONNECT_TIMEOUT_MS) + (opts.connectTimeoutMs ?? LIST_TIMEOUT_MS)), ...(opts.signal ? [opts.signal] : [])])
+  const sending = new Set<Promise<void>>()
+  let setProtocolVersion = (_version: string) => {}
+  let pump = new RpcPump()
+  let closeTransport: () => Promise<void> = async () => {}
+  let closing: Promise<void> | undefined
+  let closed = false
+  const close = () => closing ??= (async () => {
+    closed = true
+    lifetime.abort()
+    pump.failAll(new McpError('client closed'))
+    await closeTransport()
+    await Promise.allSettled(sending)
+  })()
+  let send: (payload: string, id: number, signal: AbortSignal) => Promise<void>
+  try {
+    if (spec.type === 'stdio') {
+      const transport = connectStdio(spec, opts.cwd)
+      pump = transport.pump
+      closeTransport = transport.close
+      send = async (payload) => {
+        const stdin = transport.child.stdin
+        if (!stdin?.writable) throw new McpError('MCP server stdin is not writable')
+        await new Promise<void>((resolve, reject) => stdin.write(payload + '\n', e => e ? reject(e) : resolve()))
       }
-    },
+    } else if (spec.type === 'http') {
+      const h = connectHttp(spec)
+      pump = h.pump
+      setProtocolVersion = version => { h.headers['mcp-protocol-version'] = version }
+      send = (payload, id, signal) => httpSend(h.url, h.headers, payload, pump, id, AbortSignal.any([signal, lifetime.signal]))
+      closeTransport = async () => {
+        await Promise.allSettled(sending)
+        if (!h.headers['mcp-session-id']) return
+        await fetch(h.url, { method: 'DELETE', headers: h.headers, signal: AbortSignal.timeout(2000) })
+          .then(async response => { await response.body?.cancel() }).catch(() => {})
+      }
+    } else { throw new McpError('Unsupported MCP transport') }
+    const dispatch = (payload: string, id: number, signal: AbortSignal) => {
+      const request = send(payload, id, signal).catch(e => pump.fail(id, e instanceof Error ? e : new Error(String(e))))
+      sending.add(request)
+      void request.finally(() => sending.delete(request))
+    }
+    const timeout = opts.connectTimeoutMs ?? CONNECT_TIMEOUT_MS
+    const initialized = await pump.call('initialize', {
+      protocolVersion: PROTOCOL_VERSION, capabilities: {}, clientInfo: CLIENT_INFO,
+    }, timeout, dispatch, connecting) as { protocolVersion?: string; capabilities?: unknown }
+    if (!initialized || typeof initialized.protocolVersion !== 'string' || !initialized.capabilities) {
+      throw new McpError('Invalid MCP initialize response')
+    }
+    setProtocolVersion(initialized.protocolVersion)
+    await send(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }), 0, connecting)
+    const tools: McpToolDef[] = []
+    const cursors = new Set<string>()
+    let cursor: string | undefined
+    do {
+      const listed = await pump.call('tools/list', cursor ? { cursor } : {}, opts.connectTimeoutMs ?? LIST_TIMEOUT_MS, dispatch, connecting) as { tools?: McpToolDef[]; nextCursor?: string }
+      if (!listed || !Array.isArray(listed.tools)) throw new McpError('Invalid MCP tools/list response')
+      tools.push(...listed.tools)
+      cursor = listed.nextCursor
+      if (cursor !== undefined && (typeof cursor !== 'string' || cursors.has(cursor) || cursors.size >= 100)) {
+        throw new McpError('Invalid MCP tools/list cursor')
+      }
+      if (cursor) cursors.add(cursor)
+    } while (cursor)
+    const toolNameMap = new Map<string, string>()
+    for (const tool of tools) {
+      if (!tool || typeof tool.name !== 'string' || !tool.name.trim()) throw new McpError('Invalid MCP tool name')
+      const wireName = prefixedToolName(spec.name, tool.name)
+      const previous = toolNameMap.get(wireName)
+      if (previous !== undefined) throw new McpError(`MCP connector ${spec.name} has tool name collision: ${previous} and ${tool.name} → ${wireName}`)
+      toolNameMap.set(wireName, tool.name)
+    }
+    return {
+      connector: spec.name, tools, toolNameMap,
+      async callTool(name, args, signal) {
+        if (closed) throw new McpError('client closed')
+        const wireName = toolNameMap.has(name) ? name : prefixedToolName(spec.name, name)
+        const originalName = toolNameMap.get(wireName)
+        if (originalName === undefined) throw new McpError(`MCP tool ${name} is not available on connector ${spec.name}`)
+        const result = await pump.call('tools/call', { name: originalName, arguments: args }, opts.callTimeoutMs ?? CALL_TIMEOUT_MS, dispatch, signal)
+        return mcpResultToText(result)
+      },
+      close,
+    }
+  } catch (error) {
+    await close()
+    throw error
   }
 }
