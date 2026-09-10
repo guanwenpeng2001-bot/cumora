@@ -1,0 +1,67 @@
+# Optional gateway layer. Always combine with docker-compose.yml, in that order.
+# Keep the existing project name, service identities, default network and data volume.
+services:
+  server:
+    environment:
+      # Server uses its internal route; PUBLIC_URL must also be reachable from K8s Pods.
+      SUB2API_INTERNAL_URL: ${SUB2API_INTERNAL_URL:-}
+      SUB2API_PUBLIC_URL: ${SUB2API_PUBLIC_URL:-}
+
+  # sub2api — LLM quota gateway. cumora-server mirrors each user into it
+  # (see server/src/sub2api.ts) and routes tenant LLM traffic through it.
+  # Built from our fork, which adds POST /api/v1/admin/users/:id/api-keys
+  # (admin-side key minting; upstream only has the user-facing POST /keys).
+  sub2api:
+    # Pin the locally built image name to the audited fork revision; never
+    # resolve or pull a floating `latest` tag.
+    image: cumora-sub2api:fork-00739f3b1af5
+    build:
+      # Local checkout of the fork (github.com/guanwenpeng2001-bot/sub2api) —
+      # much faster than re-cloning the git URL on every build. Push to the
+      # fork first if the image should reflect committed state.
+      context: ../sub2api
+    container_name: cumora-sub2api
+    restart: unless-stopped
+    environment:
+      AUTO_SETUP: "true"
+      SERVER_HOST: 0.0.0.0
+      SERVER_PORT: "8080"
+      SERVER_MODE: release
+      # Own database inside the shared pg16 instance (created once by hand:
+      # CREATE DATABASE sub2api). pg_trgm is available in the pgvector image.
+      DATABASE_HOST: db
+      DATABASE_PORT: "5432"
+      DATABASE_USER: postgres
+      DATABASE_PASSWORD: cumora
+      DATABASE_DBNAME: sub2api
+      DATABASE_SSLMODE: disable
+      # Shared redis, separate logical db (cumora uses db 0).
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_DB: "1"
+      ADMIN_EMAIL: admin@cumora.local
+      # Interpolated from the repo-root .env (compose's own substitution,
+      # NOT env_file) — all three must be set there.
+      ADMIN_PASSWORD: ${SUB2API_ADMIN_PASSWORD:?set SUB2API_ADMIN_PASSWORD in .env}
+      JWT_SECRET: ${SUB2API_JWT_SECRET:?set SUB2API_JWT_SECRET in .env}
+      TOTP_ENCRYPTION_KEY: ${SUB2API_TOTP_ENCRYPTION_KEY:?set SUB2API_TOTP_ENCRYPTION_KEY in .env}
+      # Empty image control model is intentionally not a deployment recommendation.
+      # Scheduler values are operator-supplied; DB settings take precedence.
+      SUB2API_IMAGES_MAIN_MODEL: ${SUB2API_IMAGES_MAIN_MODEL:-}
+      UPSTREAM_MODEL_SYNC_ENABLED: ${UPSTREAM_MODEL_SYNC_ENABLED:-}
+      UPSTREAM_MODEL_SYNC_INTERVAL_HOURS: ${UPSTREAM_MODEL_SYNC_INTERVAL_HOURS:-}
+      UPSTREAM_MODEL_SYNC_ACCOUNT_TIMEOUT_SECONDS: ${UPSTREAM_MODEL_SYNC_ACCOUNT_TIMEOUT_SECONDS:-}
+      TZ: Asia/Shanghai
+    volumes:
+      - sub2api-data:/app/data
+    ports:
+      # 8082 avoids clashing with Vite dev (5180), server (5181), web (8080).
+      - "8082:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  sub2api-data:
