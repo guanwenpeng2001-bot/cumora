@@ -22,24 +22,24 @@ export function parseUsageRange(q: { from?: unknown; to?: unknown }): UsageRange
   return { from: new Date(Math.max(from, minFrom)), to: new Date(Math.min(to, now + 86_400_000)) }
 }
 
-/** Provider label from a model id. Prefix routes win (they name the
- *  relay); otherwise family substring. Heuristic by design — the ledger
- *  doesn't record the upstream account. */
+/** Known model IDs and explicit relay namespaces only; labels do not infer accounts. */
 export function providerForModel(model: string | null | undefined): string {
-  const m = (model ?? '').toLowerCase()
+  const m = (model ?? '').toLowerCase().trim()
   if (!m) return 'unknown'
-  if (m.startsWith('novita/')) return 'Novita'
-  if (m.startsWith('orcarouter/')) return 'OrcaRouter'
-  if (/^k3|^kimi|moonshot/.test(m)) return 'Kimi'
-  if (m.includes('deepseek')) return 'DeepSeek'
-  if (/^qwen|^wan\d|^z-image|^fun-asr/.test(m)) return 'DashScope'
-  if (m.startsWith('gpt') || m.startsWith('o3') || m.startsWith('o4')) return 'OpenAI'
-  if (m.startsWith('claude')) return 'Anthropic'
-  if (m.startsWith('gemini')) return 'Google'
-  if (m.startsWith('grok')) return 'xAI'
-  if (m.startsWith('antigravity')) return 'Antigravity'
-  if (m.startsWith('chatgpt-web/')) return 'ChatGPT Web'
-  return 'other'
+  if (m.startsWith('novita/') && m.length > 7) return 'Novita'
+  if (m.startsWith('orcarouter/') && m.length > 11) return 'OrcaRouter'
+  if (m.startsWith('chatgpt-web/') && m.length > 12) return 'ChatGPT Web'
+  const models: Record<string, readonly string[]> = {
+    Kimi: ['k3', 'kimi-for-coding', 'kimi-k3', 'kimi-k2.7', 'kimi-k2.7-code', 'kimi-k2.6', 'kimi-k2.5', 'moonshot-v1-8k', 'moonshot-v1-32k', 'moonshot-v1-128k'],
+    DeepSeek: ['deepseek-v4-flash', 'deepseek-v4-pro', 'deepseek-chat', 'deepseek-reasoner'],
+    DashScope: ['qwen-max', 'qwen-plus', 'qwen-turbo', 'qwen-image-max', 'qwen3-asr-flash', 'fun-asr', 'z-image-turbo'],
+    OpenAI: ['gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.4-nano', 'gpt-4o', 'gpt-4o-mini', 'o3', 'o3-mini', 'o4-mini'],
+    Anthropic: ['haiku', 'sonnet', 'opus', 'claude-haiku', 'claude-sonnet', 'claude-opus', 'claude-haiku-4-5', 'claude-sonnet-4-5', 'claude-sonnet-4-6', 'claude-opus-4-1', 'claude-opus-4-5', 'claude-opus-4-6', 'claude-opus-4-7', 'claude-opus-4-8'],
+    Google: ['gemini-3.1-pro-high', 'gemini-3.1-pro', 'gemini-3-flash', 'gemini-2.5-pro', 'gemini-2.5-flash'],
+    xAI: ['grok-4', 'grok-4-fast', 'grok-3', 'grok-3-mini'],
+    Antigravity: ['antigravity'],
+  }
+  return Object.entries(models).find(([, ids]) => ids.includes(m))?.[0] ?? 'other'
 }
 
 export interface UsageSummary {

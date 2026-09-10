@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { resolveRoleCall, type RoleCallPlan, type RoleCallCandidate } from './llm-resolver.js'
 import { getLlmCandidateClient } from './llm.js'
 import { fallbackReason, isLlmCancellation } from './agents/fallback.js'
-import { measuredUsage, type TokenUsage } from './agents/cost.js'
+import { captureCallPricing, measuredUsage, type TokenUsage } from './agents/cost.js'
 import { recordLlmCall, classifyLlmCallError, type LlmCallContext, type LlmCallRecord } from './agents/llm-ledger.js'
 import { getServerSettingsSnapshot, parseLlmConfig } from './settings.js'
 
@@ -48,6 +48,8 @@ export async function executeLlmPlan<T>(options: LlmExecutionOptions<T>): Promis
     const state: LlmAttemptState = { usage: null, rawUsage: null, actualModel: null, committed: false }
     const send = await options.prepare(candidate, state)
     checkAbort()
+    const pricing = await captureCallPricing()
+    checkAbort()
     const start = Date.now()
     let value: T | undefined
     let error: unknown
@@ -82,6 +84,7 @@ export async function executeLlmPlan<T>(options: LlmExecutionOptions<T>): Promis
     }
     await (options.record ?? recordLlmCall)({
       ...context, model: state.actualModel ?? candidate.model, usage: state.usage,
+      pricing: pricing(state.actualModel ?? candidate.model, candidate.route.id),
       reasoningTokens: state.reasoningTokens, latencyMs: Date.now() - start, status,
       error: failed ? (error instanceof Error ? error.message : String(error)) : null, extras,
     })

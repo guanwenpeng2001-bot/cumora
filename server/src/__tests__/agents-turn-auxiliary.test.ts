@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import { randomUUID } from 'node:crypto'
+import { randomUUID, createHash } from 'node:crypto'
 import ts from 'typescript'
 import { compactHistoryWithSummary, estimateTokens } from '../agents/turn-compaction.js'
 
@@ -31,7 +31,7 @@ function fixture(behavior: (request: any, signal?: AbortSignal) => AsyncIterable
     './agents/model-config.js': { REASONING_EFFORTS: new Set(['none']), parseAgentModelConfig: () => null },
   })
   const fallback = compile(read('../agents/fallback.ts'), { '../settings.js': {} })
-  const cost = compile(read('../agents/cost.ts'), { '../model-pricing.js': {} })
+  const cost = compile(read('../agents/cost.ts'), { '../model-pricing.js': { captureDbPricing: () => () => null, refreshModelPricing: async () => {} }, 'node:crypto': { createHash } })
   const create = async (request: any, options: any) => {
     requests.push({ ...request, signal: options?.signal })
     return behavior(request, options?.signal)
@@ -81,7 +81,7 @@ for (const purpose of ['completion-verify', 'compaction', 'steer-summary']) {
 }
 
 test('steer exhaustion preserves truncated original with conversation and draft', async () => {
-  const { turn, records } = fixture(async function* () { throw failure() })
+  const { turn, records } = fixture(/** biome-ignore lint/correctness/useYield: stream that fails before its first event */ async function* () { throw failure() })
   const result = await invoke(turn, 'steer-summary')
   assert.equal(records.length, 2)
   assert.equal(result, turn.renderSteerBatchTruncated(batch, 'draft'))
@@ -121,7 +121,7 @@ test('cancellation in the consumer never advances', async () => {
 })
 
 test('summary chain exhaustion still drops history and inserts its marker', async () => {
-  const { turn, records } = fixture(async function* () { throw failure() })
+  const { turn, records } = fixture(/** biome-ignore lint/correctness/useYield: stream that fails before its first event */ async function* () { throw failure() })
   const history: any[] = [{ type: 'message', role: 'user', content: 'original request' }]
   for (let i = 0; i < 12; i++) history.push(
     { type: 'function_call', call_id: String(i), name: 'bash', arguments: '{}' },

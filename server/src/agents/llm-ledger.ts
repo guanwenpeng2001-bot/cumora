@@ -45,7 +45,7 @@ import { pool } from '../db/pool.js'
 import { getLlmClient, __isLlmTestOverrideActive } from '../llm.js'
 import { executeTrackedText } from '../llm-execution.js'
 import type { RoleCallPlan, RoleCallAgent } from '../llm-resolver.js'
-import { EMPTY_USAGE, effectiveCostUsd, priceFor, usageFromOpenAI, type TokenUsage, measuredUsage } from './cost.js'
+import { EMPTY_USAGE, effectiveCostUsd, priceFor, capturePricing, validModelPrice, type ModelPrice, type TokenUsage, measuredUsage } from './cost.js'
 
 /** The exhaustive set of business purposes that spend sub2api. Adding a new
  *  callsite REQUIRES adding its purpose here — that's the discipline knob that
@@ -100,6 +100,7 @@ export interface LlmCallContext {
  *  client and direct `recordLlmCall()` callers (e.g. the streaming turn). */
 export interface LlmCallRecord extends LlmCallContext {
   source?: LlmCallSource
+  pricing?: Readonly<ModelPrice>
   model: string
   /** null/undefined → call ran but provider gave no usage (recorded as zeros,
    *  measured=false). The cost will be 0 in that case — we never guess. */
@@ -126,23 +127,31 @@ const LLM_CALL_COLUMNS = `
 `
 
 function llmCallValues(rec: LlmCallRecord): unknown[] {
-  const unpriced = rec.extras?.unpriced
-  const measured = !!rec.usage && !unpriced
-  const usage = rec.usage ?? EMPTY_USAGE
-  // Cost is computed at insert time so the row is meaningful on its own.
-  // A later operator price change re-prices new rows only; if we later want
-  // back-fill, the breakdown is preserved so a recompute is one UPDATE away.
-  const cost = effectiveCostUsd(rec.model, usage)
+  const price = rec.pricing ?? priceFor(rec.model, typeof rec.extras?.route === 'string' ? rec.extras.route : undefined)
+  const validUsage = rec.usage
+    && [rec.usage.inputTokens, rec.usage.cachedInputTokens, rec.usage.cacheCreationTokens, rec.usage.outputTokens]
+      .every(n => typeof n === 'number' && Number.isSafeInteger(n) && n >= 0)
+  const unpriced = rec.extras?.unpriced || price.unpriced
+    || (rec.purpose === 'avatar-image' || rec.purpose === 'agent-image' ? 'image-pricing-unavailable' : null)
+    || (rec.purpose === 'audio-transcription' ? 'duration-pricing-unavailable' : null)
+    || (!validUsage ? 'usage-unavailable' : null)
+    || (!validModelPrice(price) ? 'invalid-price' : null)
+  const usage = validUsage ? rec.usage! : EMPTY_USAGE
+  const cost = effectiveCostUsd(rec.model, usage, price)
+  const reason = unpriced || (!Number.isFinite(cost.usd) ? 'invalid-cost' : null)
+  // `measured` tracks usage measurement only; pricing validity is expressed
+  // via cost_estimated/extras.unpriced, never by flipping measured.
+  const measured = Boolean(validUsage)
   return [
     `llm-${randomUUID()}`,
     rec.companyId, rec.agentId ?? null, rec.runId ?? null, rec.conversationId ?? null,
     rec.purpose, rec.source ?? 'cloud', rec.model,
     usage.inputTokens, usage.cachedInputTokens, usage.cacheCreationTokens,
     usage.outputTokens, rec.reasoningTokens ?? 0,
-    measured ? cost.usd : 0, unpriced ? true : cost.estimated, measured,
+    measured && !reason ? cost.usd : 0, reason ? true : cost.estimated, measured,
     rec.latencyMs, rec.status,
     rec.error ? rec.error.slice(0, 500) : null,
-    JSON.stringify({ ...rec.extras, usage: rec.usage ?? null, measurement: measured ? 'measured' : 'unknown' }),
+    JSON.stringify({ ...rec.extras, pricing: price, unpriced: reason || undefined, usage: validUsage ? rec.usage : null, measurement: measured ? 'measured' : 'unknown' }),
     rec.daemonVersion ?? null,
   ]
 }
@@ -270,18 +279,19 @@ export async function getTrackedLlmClient(ctx: LlmCallContext): Promise<OpenAI> 
     if (__isLlmTestOverrideActive()) {
       const t0 = Date.now()
       const model = String(args.model ?? '<unknown>')
+      const pricing = capturePricing()(model)
       try {
         const r = await boundCreate(args, opts)
         void recordLlmCall({
-          ...ctx, model,
-          usage: usageFromOpenAI(r.usage),
+          ...ctx, model, pricing,
+          usage: measuredUsage(r.usage, api),
           reasoningTokens: readReasoningTokens(r.usage),
           latencyMs: Date.now() - t0, status: 'ok',
         })
         return r
       } catch (err) {
         void recordLlmCall({
-          ...ctx, model, usage: null,
+          ...ctx, model, pricing, usage: null,
           latencyMs: Date.now() - t0,
           status: classifyLlmCallError(err),
           error: err instanceof Error ? err.message : String(err),
@@ -302,17 +312,18 @@ export async function getTrackedLlmClient(ctx: LlmCallContext): Promise<OpenAI> 
     async (args: AnyArgs, opts?: unknown): Promise<AnyResponse> => {
       const t0 = Date.now()
       const model = String(args.model ?? '<unknown>')
+      const pricing = capturePricing()(model)
       try {
         const r = await boundGenerate(args, opts)
         void recordLlmCall({
-          ...ctx, model, usage: null,
+          ...ctx, model, pricing, usage: null,
           latencyMs: Date.now() - t0, status: 'ok',
           extras: { ...(ctx.extras ?? {}), n: args.n ?? 1, size: args.size },
         })
         return r
       } catch (err) {
         void recordLlmCall({
-          ...ctx, model, usage: null,
+          ...ctx, model, pricing, usage: null,
           latencyMs: Date.now() - t0,
           status: classifyLlmCallError(err),
           error: err instanceof Error ? err.message : String(err),

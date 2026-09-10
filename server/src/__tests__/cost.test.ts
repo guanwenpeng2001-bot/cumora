@@ -1,9 +1,18 @@
-import { test } from 'node:test'
+import { test, before, after, mock } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   effectiveCostUsd, priceFor, cacheHitRate, usageFromOpenAI, usageFromClaude,
   addUsage, inputEquivalentTokens, type TokenUsage,
 } from '../agents/cost.js'
+
+import { pool } from '../db/pool.js'
+import { refreshModelPricing } from '../model-pricing.js'
+
+before(async () => {
+  mock.method(pool, 'query', async () => ({ rows: [] }))
+  await refreshModelPricing(true)
+})
+after(() => mock.restoreAll())
 
 test('cache-read is far cheaper than fresh input (the whole premise)', () => {
   const fresh: TokenUsage = { inputTokens: 1_000_000, cachedInputTokens: 0, cacheCreationTokens: 0, outputTokens: 0 }
@@ -36,7 +45,7 @@ test('Claude usage: input_tokens EXCLUDES cache read/write (kept separate)', () 
 
 test('bare tier ids resolve to their tier (not the fallback) — "haiku" ≠ sonnet rate', () => {
   // Regression: the triage model id is the bare "haiku"; it must match the
-  // "claude-haiku" seed (bidirectional substring), not fall through to fallback.
+  // "claude-haiku" seed through the explicit compatibility alias.
   // Prices = Anthropic list (Haiku 4.5 = $1/$5; current Opus 4.5+ = $5/$25;
   // legacy Opus 4.1 = $15/$75; Sonnet 4.x = $3/$15).
   assert.equal(priceFor('haiku').inPer1M, 1)

@@ -109,6 +109,8 @@ function serverFixture() {
   const ledger = compile(declarations('../agents/llm-ledger.ts', ['LLM_CALL_COLUMNS', 'llmCallValues', 'recordLlmCallsBatch']) + '\nexport { llmCallValues }', {
     randomUUID, EMPTY_USAGE: { inputTokens: 0, cachedInputTokens: 0, cacheCreationTokens: 0, outputTokens: 0 },
     effectiveCostUsd: () => ({ usd: 0.1, estimated: false }),
+    priceFor: () => ({}),
+    validModelPrice: () => false,
   })
   const serverSource = read('../agents/runtime/server.ts')
   const routes = serverSource.slice(serverSource.indexOf("runtimeRouter.post('/triage'"), serverSource.indexOf('// Heartbeat a long engine turn'))

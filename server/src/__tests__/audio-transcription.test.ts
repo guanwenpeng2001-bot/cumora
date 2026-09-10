@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import { randomUUID } from 'node:crypto'
+import { randomUUID, createHash } from 'node:crypto'
 import ts from 'typescript'
 
 const read = (path: string) => readFileSync(new URL(path, import.meta.url), 'utf8')
@@ -26,7 +26,7 @@ function fixture(statuses: (number | Error)[] = [], gateway = false, content: un
     './agents/model-config.js': { REASONING_EFFORTS: new Set(['none']) },
   })
   const fallback = compile(read('../agents/fallback.ts'), { '../settings.js': {} })
-  const cost = compile(read('../agents/cost.ts'), { '../model-pricing.js': {} })
+  const cost = compile(read('../agents/cost.ts'), { '../model-pricing.js': { captureDbPricing: () => () => null, refreshModelPricing: async () => {} }, 'node:crypto': { createHash } })
   const getLlmCandidateClient = async (plan: any, candidate: any) => ({ post: async (path: string, options: any) => {
     requests.push({ path, options, company: plan.companyId, route: candidate.route })
     const status = statuses[requests.length - 1]

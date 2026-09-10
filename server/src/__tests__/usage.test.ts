@@ -47,3 +47,9 @@ test('parseUsageRange: explicit ISO range passes through; garbage falls back', (
   const bad = parseUsageRange({ from: 'not-a-date', to: 'also-not' })
   assert.ok(Number.isFinite(bad.from.getTime()))
 })
+
+test('providerForModel: similar IDs never inherit a provider by substring', () => {
+  for (const model of ['not-deepseek-v4-pro', 'my-moonshot', 'gpt-5.5-impostor', 'k30', 'claudeish', 'qwenish', 'unknown/gpt-5.5']) {
+    assert.equal(providerForModel(model), 'other', model)
+  }
+})
