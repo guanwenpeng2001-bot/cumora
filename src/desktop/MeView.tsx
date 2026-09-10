@@ -9,7 +9,7 @@ import { Avatar } from '@/components/Avatar'
 import { Checkbox } from '@/components/Checkbox'
 import { AppearancePicker, ChatLayoutPicker } from '@/components/AppearancePicker'
 import { LanguagePicker } from '@/components/LanguagePicker'
-import { useT, type MessageKey } from '@/lib/i18n'
+import { useT, useLocale, type MessageKey } from '@/lib/i18n'
 import { ModelsTab } from './ModelsTab'
 import { cn } from '@/lib/utils'
 import { UsageDashboard } from './UsageDashboard'
@@ -262,13 +262,19 @@ function QuotaCard({ period, label, sub, window }: {
   window: ApiQuotaWindow | null
 }) {
   const t = useT()
-  const used = window?.usedUsd ?? 0
-  const limit = window?.limitUsd ?? null
-  const pct = limit != null && limit > 0 ? Math.min(100, (used / limit) * 100) : 0
+  const locale = useLocale()
+  const text = (zh: string, en: string) => locale === 'zh-CN' ? zh : en
+  const unknown = text('未知', 'Unknown')
+  const used = window?.usedUsd
+  const limit = window?.limitUsd
+  const knownUsed = typeof used === 'number' && Number.isFinite(used) && used >= 0
+  const knownLimit = typeof limit === 'number' && Number.isFinite(limit) && limit >= 0
+  const unlimited = limit === null
+  const pct = knownUsed && knownLimit ? (limit > 0 ? Math.min(100, (used / limit) * 100) : 100) : null
   // Tone shifts as the user gets close to the cap. Default is the brand
   // skype blue; coral takes over past the 75% mark so a glance at the
   // cards still tells the user "you're fine" vs "slow down".
-  const tone = limit == null ? 'neutral'
+  const tone = pct == null ? 'neutral'
              : pct >= 95 ? 'danger'
              : pct >= 75 ? 'warn'
              : 'ok'
@@ -282,24 +288,26 @@ function QuotaCard({ period, label, sub, window }: {
       style={{ border: '1px solid var(--ink-100)' }}>
       <div className="flex items-baseline justify-between gap-3">
         <div className="font-display font-semibold text-[14px] text-ink-900">{t(label)}</div>
-        {limit != null
+        {pct != null
           ? <div className="font-mono text-[11px] font-semibold text-ink-500">{pct.toFixed(0)}%</div>
-          : <div className="font-mono text-[10px] tracking-wider uppercase text-ink-300">{t('me.unlimited')}</div>}
+          : <div className="font-mono text-[10px] tracking-wider uppercase text-ink-300">{unlimited ? t('me.unlimited') : unknown}</div>}
       </div>
       <div className="font-display tabular-nums text-[22px] tracking-tight text-ink-900" style={{ letterSpacing: '-0.02em' }}>
-        {fmtUsd(used)}
-        <span className="text-ink-300 text-[15px] font-normal"> / {limit != null ? fmtUsd(limit) : '∞'}</span>
+        {knownUsed ? fmtUsd(used) : unknown}
+        <span className="text-ink-300 text-[15px] font-normal"> / {knownLimit ? fmtUsd(limit) : unlimited ? '∞' : unknown}</span>
       </div>
       <div className="h-2 rounded-full overflow-hidden" style={{ background: 'var(--sky2-100, #E1F3FD)' }}>
         <div
           className="h-full rounded-full transition-[width,background-color,opacity] duration-500"
           style={{
-            width: limit != null ? `${Math.max(2, pct)}%` : '100%',
+            width: pct != null ? `${pct}%` : '0%',
             background: barColor,
-            opacity: limit != null ? 1 : 0.35,
+            opacity: pct != null ? 1 : 0.35,
           }}
         />
       </div>
+      <div className="text-[11px] text-ink-500">{text('sub2api 实际扣费', 'sub2api actual charges')}: {knownUsed ? fmtUsd(used) : unknown}
+        {' · '}{text('剩余额度', 'Remaining quota')}: {knownUsed && knownLimit ? fmtUsd(Math.max(0, limit - used)) : unlimited && knownUsed ? t('me.unlimited') : unknown}</div>
       <div className="flex items-center justify-between text-[11px]">
         <span className="font-display italic text-ink-400">{t(sub)}</span>
         {resets && <span className="font-mono text-ink-500">{resets}</span>}
@@ -309,24 +317,36 @@ function QuotaCard({ period, label, sub, window }: {
 }
 
 function UsageTab() {
+  const epoch = useAuth((s) => s.contextEpoch)
+  return <UsageTabContent key={epoch} />
+}
+
+function UsageTabContent() {
   const t = useT()
+  const locale = useLocale()
+  const text = (zh: string, en: string) => locale === 'zh-CN' ? zh : en
+  const epoch = useAuth((s) => s.contextEpoch)
+  const [refresh, setRefresh] = useState(0)
   const [state, setState] = useState<
     | { kind: 'loading' }
     | { kind: 'ready'; configured: boolean; snapshot: ApiQuotaSnapshot | null; error?: string }
     | { kind: 'error'; message: string }
   >({ kind: 'loading' })
 
-  const load = () => {
+  const load = () => setRefresh((value) => value + 1)
+  useEffect(() => {
+    const controller = new AbortController()
+    const current = () => !controller.signal.aborted && useAuth.getState().contextEpoch === epoch
     setState({ kind: 'loading' })
-    api.getQuota()
-      .then((r) => setState({ kind: 'ready', configured: r.configured, snapshot: r.snapshot, error: r.error }))
-      .catch((e) => setState({ kind: 'error', message: e instanceof Error ? e.message : String(e) }))
-  }
-  useEffect(load, [])
+    api.getQuota(controller.signal)
+      .then((r) => { if (current()) setState({ kind: 'ready', configured: r.configured, snapshot: r.error ? null : r.snapshot, error: r.error }) })
+      .catch(() => { if (current()) setState({ kind: 'error', message: text('额度未知；无法读取网关，请重试。', 'Quota unknown; unable to read the gateway. Please retry.') }) })
+    return () => controller.abort()
+  }, [refresh, epoch])
 
   const quotaContent = state.kind === 'loading' ? (
     <Section title={t('me.sectionQuota')}>
-      <div className="grid grid-cols-3 gap-3">
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
         {PERIOD_META.map((p) => (
           <div key={p.key} className="bg-cloud rounded-[14px] p-5 h-[140px]"
             style={{ border: '1px solid var(--ink-100)' }}>
@@ -364,7 +384,7 @@ function UsageTab() {
       <div className="bg-cloud rounded-[14px] p-6"
         style={{ border: '1px dashed var(--ink-100)' }}>
         <div className="font-display text-[14px] text-ink-700">
-          {state.error ? t('me.quotaUnreachable') : t('me.noActiveSub')}
+          {state.error ? text('网关不可达，额度未知', 'Gateway unreachable; quota unknown') : text('无可用订阅快照，额度未知', 'No subscription snapshot; quota unknown')}
         </div>
         <div className="font-display italic text-[12px] text-ink-500 mt-1 max-w-xl">
           {state.error ? t('me.quotaGatewayUnreachHint') : t('me.subNotProvisioned')}
@@ -379,10 +399,11 @@ function UsageTab() {
   ) : (
     <Section title={t('me.sectionQuota')}>
       <div className="text-[13px] text-ink-500 leading-[1.55] mb-4 max-w-2xl font-display italic">
-        {t('me.quotaIntro')}
-        {state.snapshot.groupName ? <> {t('me.quotaIntroPlan', { plan: state.snapshot.groupName })}</> : null}
+        {text('当前登录用户的 sub2api 订阅组', 'sub2api subscription group for the signed-in user')}: {state.snapshot.groupName || text('未命名组', 'Unnamed group')} (ID: {state.snapshot.groupId})
+        <div>{text('仅限该订阅组；primary 订阅不代表四平台共享余额。其他组、钱包及 key 余额：未知（接口未提供）。', 'This subscription group only; a primary subscription is not a shared balance across four platforms. Other groups, wallets and key balances: unknown (not provided).')}</div>
+        <div>{text('订阅状态', 'Subscription status')}: {state.snapshot.status} · {text('到期时间', 'Expires at')}: {state.snapshot.expiresAt ? new Date(state.snapshot.expiresAt).toLocaleString() : text('未知', 'Unknown')}</div>
       </div>
-      <div className="grid grid-cols-3 gap-3">
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
         {PERIOD_META.map((p) => (
           <QuotaCard
             key={p.key}

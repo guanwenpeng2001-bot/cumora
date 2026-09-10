@@ -7,7 +7,38 @@ import { adminApi, type AdminUser, type AdminUserDetail, type AdminStats, type T
 import { resolveAssetUrl } from '@/api/client'
 import { Pager } from './Pager'
 import { useAuth } from '@/stores/auth'
-import { useT } from '@/lib/i18n'
+import { useT, useLocale } from '@/lib/i18n'
+
+type UserSync = {
+  sub2apiSync?: {
+    targetTier: Tier
+    version: string
+    status: 'pending' | 'processing' | 'failed' | 'succeeded'
+    attempts: number
+    nextAttemptAt: string | null
+    lastError: string | null
+  } | null
+}
+
+function TierSync({ user }: { user: AdminUser & UserSync }) {
+  const locale = useLocale()
+  const text = (zh: string, en: string) => locale === 'zh-CN' ? zh : en
+  const sync = user.sub2apiSync
+  const labels = {
+    pending: text('等待同步；尚未完成', 'Pending; not complete'),
+    processing: text('同步处理中；尚未完成', 'Processing; not complete'),
+    failed: text('同步失败；尚未完成', 'Failed; not complete'),
+    succeeded: text('同步已确认', 'Sync confirmed'),
+  }
+  return <div style={{ fontSize: 11, overflowWrap: 'anywhere' }} role="status">
+    <div>{text('有效套餐', 'Effective tier')}: {user.tier}</div>
+    <div>{text('目标套餐', 'Target tier')}: {sync?.targetTier ?? text('未知', 'Unknown')}</div>
+    <div>{sync ? labels[sync.status] ?? text('同步状态未知', 'Sync status unknown') : sync === null ? text('无同步记录', 'No sync record') : text('同步状态未知；展开或刷新读取', 'Sync unknown; expand or refresh to load')}</div>
+    {sync && <div>{text('同步版本 / 尝试次数', 'Sync version / attempts')}: {sync.version} / {sync.attempts}</div>}
+    {sync?.nextAttemptAt && <div>{text('下次重试', 'Next retry')}: {fmtDateTime(sync.nextAttemptAt)}</div>}
+    {sync?.status === 'failed' && <div className="admin-banner-err">{text('网关对账失败，有效套餐保持原值。服务端将按重试计划继续同步。', 'Gateway reconciliation failed; the effective tier is unchanged. The server will retry as scheduled.')}</div>}
+  </div>
+}
 
 const PAGE = 50
 
@@ -41,7 +72,6 @@ export function UsersPage({ stats }: { stats: AdminStats | null }) {
   }, [q, tier, load])
 
   const onTierChange = async (u: AdminUser, next: Tier) => {
-    if (u.tier === next) return
     try {
       const updated = await adminApi.patchUser(u.id, { tier: next })
       setItems((rows) => rows.map((r) => (r.id === u.id ? updated : r)))
@@ -154,29 +184,40 @@ function UserRow({ u, expanded, onToggleExpand, onTierChange, onAdminToggle, onS
   u: AdminUser
   expanded: boolean
   onToggleExpand: () => void
-  onTierChange: (t: Tier) => void
+  onTierChange: (t: Tier) => Promise<void>
   onAdminToggle: () => void
   onSuspendToggle: () => Promise<AdminUser | null>
   isMe: boolean
 }) {
-  const [detail, setDetail] = useState<AdminUserDetail | null>(null)
+  const [detailResult, setDetailResult] = useState<{ user: AdminUser; detail: AdminUserDetail & UserSync } | null>(null)
+  const detail = detailResult?.user === u ? detailResult.detail : null
+  const setDetail = (value: AdminUserDetail & UserSync) => setDetailResult({ user: u, detail: value })
+  const [refresh, setRefresh] = useState(0)
+  const [tierBusy, setTierBusy] = useState(false)
+  const [detailError, setDetailError] = useState(false)
+  const locale = useLocale()
+  const text = (zh: string, en: string) => locale === 'zh-CN' ? zh : en
+  const currentUser: AdminUser & UserSync = detailError ? { ...u, sub2apiSync: undefined } : detail ?? u
   const [loadingDetail, setLoadingDetail] = useState(false)
   const t = useT()
 
   useEffect(() => {
-    if (!expanded || detail) return
+    if (!expanded) return
+    let cancelled = false
     setLoadingDetail(true)
+    setDetailError(false)
     adminApi.getUser(u.id)
-      .then(setDetail)
-      .catch((e) => {
-        const msg = e instanceof Error ? e.message : String(e)
-        alert(t('users.loadFailed', { error: msg }))
-      })
-      .finally(() => setLoadingDetail(false))
-    // `t` is deliberately NOT a dependency: useT returns a fresh closure
-    // every render, and this effect must not re-fetch on unrelated
-    // re-renders.
-  }, [expanded, detail, u.id])
+      .then((value) => { if (!cancelled) setDetail(value) })
+      .catch(() => { if (!cancelled) { setDetailResult(null); setDetailError(true) } })
+      .finally(() => { if (!cancelled) setLoadingDetail(false) })
+    return () => { cancelled = true }
+  }, [expanded, u, refresh])
+
+  const changeTier = async (next: Tier) => {
+    if (tierBusy) return
+    setTierBusy(true)
+    try { await onTierChange(next) } finally { setTierBusy(false) }
+  }
 
   // Detail drawer's suspend action — keep the AdminUserDetail snapshot in
   // sync with the freshly-patched row from the parent, so the reason
@@ -203,12 +244,15 @@ function UserRow({ u, expanded, onToggleExpand, onTierChange, onAdminToggle, onS
           </div>
         </div>
         <div onClick={(e) => e.stopPropagation()} data-label={t('users.colTier')}>
-          <select className="admin-select admin-select-sm"
-            value={u.tier} onChange={(e) => onTierChange(e.target.value as Tier)}>
+          <TierSync user={currentUser} />
+          <label style={{ fontSize: 11 }}>{text('设置目标套餐', 'Set target tier')}
+          <select className="admin-select admin-select-sm" disabled={tierBusy || loadingDetail}
+            value={currentUser.sub2apiSync?.targetTier ?? currentUser.tier} onChange={(e) => void changeTier(e.target.value as Tier)}>
             <option value="free">{t('users.tierFree')}</option>
             <option value="pro">{t('users.tierPro')}</option>
             <option value="max">{t('users.tierMax')}</option>
           </select>
+          </label>
         </div>
         <div onClick={(e) => e.stopPropagation()} data-label={t('users.colAdmin')}>
           <button
@@ -227,6 +271,8 @@ function UserRow({ u, expanded, onToggleExpand, onTierChange, onAdminToggle, onS
       </div>
       {expanded && (
         <div className="admin-row-detail">
+          <button type="button" className="btn-ghost" disabled={loadingDetail || tierBusy} onClick={() => { setDetailResult(null); setRefresh((value) => value + 1) }}>{text('刷新套餐同步状态', 'Refresh tier sync status')}</button>
+          {detailError && <div className="admin-banner-err">{text('同步状态读取失败，当前状态未知。请刷新重试。', 'Could not load sync status; current status unknown. Refresh to retry.')}</div>}
           {loadingDetail && <div className="admin-empty">{t('users.loadingDetails')}</div>}
           {detail && (
             <div className="admin-detail-grid">
