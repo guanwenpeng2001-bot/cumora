@@ -18,7 +18,6 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { env } from '../env.js'
 import { getSupportModel } from '../settings.js'
 import { getTrackedLlmClient } from './llm-ledger.js'
 import { pool } from '../db/pool.js'

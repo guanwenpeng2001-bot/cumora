@@ -21,8 +21,8 @@ const tempDirs: string[] = []
 // the child down — otherwise it outlives the test and the runner never exits.
 const liveSessions: Array<{ stop(): void | Promise<void> }> = []
 
-function secureClaudeEnv(root: string, overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
-  const base: NodeJS.ProcessEnv = { ...process.env }
+function secureClaudeEnv(root: string, overrides: NodeJS.ProcessEnv = {}, inherited: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const base: NodeJS.ProcessEnv = { ...inherited }
   // withClaudeUserSettingsEnv only imports a key from settings.json when the
   // process environment does NOT already define it — an explicit value wins, by
   // design. Spreading process.env therefore let the developer's own shell
@@ -161,7 +161,7 @@ test('local engine failure returns stderr tail for observability', async () => {
   await writeFakeCli(
     binDir,
     'claude',
-    "process.stderr.write('Claude Code error: usage limit reached, no tokens left\\n')\nprocess.exit(1)\n",
+    "require('node:fs').writeSync(2, 'Claude Code error: usage limit reached, no tokens left' + String.fromCharCode(10)); process.exitCode = 1",
   )
   useFakeCliPath(binDir)
 
@@ -169,7 +169,7 @@ test('local engine failure returns stderr tail for observability', async () => {
   const result = await getAdapter('claude').run({
     home,
     prompt: 'wake',
-    env: secureClaudeEnv(root),
+    env: secureClaudeEnv(root, {}, { PATH: process.env.PATH, SystemRoot: process.env.SystemRoot }),
     model: null,
     fastModel: null,
     onLog: (line) => logs.push(line),
@@ -422,14 +422,14 @@ test('persistent Claude startup failure keeps stderr for first send', async () =
   await writeFakeCli(
     binDir,
     'claude',
-    "process.stderr.write('Claude Code error: subscription expired\\n')\nprocess.exit(1)\n",
+    "require('node:fs').writeSync(2, 'Claude Code error: subscription expired' + String.fromCharCode(10)); process.exitCode = 1",
   )
   useFakeCliPath(binDir)
 
   const logs: string[] = []
   const session = getAdapter('claude').startSession?.({
     home,
-    env: secureClaudeEnv(root),
+    env: secureClaudeEnv(root, {}, { PATH: process.env.PATH, SystemRoot: process.env.SystemRoot }),
     model: null,
     fastModel: null,
     onLog: (line) => logs.push(line),

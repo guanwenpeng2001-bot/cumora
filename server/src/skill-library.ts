@@ -441,7 +441,7 @@ export async function applyPendingAgentResources(agentId: string, version?: stri
     const result = { version: snapshot.resourceVersion, status: 'applied' as const }
     await reportAgentResources(snapshot, result)
     return result
-  } catch (error) {
+  } catch {
     await client.query('ROLLBACK').catch(() => {})
     const result = { version: version ?? snapshot?.resourceVersion ?? '', status: 'failed' as const, error: 'resource_application_failed' }
     if (snapshot) await reportAgentResources(snapshot, result).catch(() => {})

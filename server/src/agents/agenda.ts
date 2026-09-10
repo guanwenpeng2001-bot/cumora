@@ -28,7 +28,6 @@
  *   for: a fast yes/no on data, no real reasoning.
  */
 import { pool } from '../db/pool.js'
-import { env } from '../env.js'
 import { getTrackedLlmClient } from './llm-ledger.js'
 import { supportReasoningOptions, supportReasoningHeadroom } from './reasoning.js'
 import { getSupportModel, getServerSetting, automationEnabled, automationNumber, withServerSettingsSnapshot } from '../settings.js'

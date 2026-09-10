@@ -12,7 +12,6 @@
 import { pool } from '../db/pool.js'
 import type { PoolClient } from 'pg'
 import { storage, freshenAttachmentUrl, type StoredAttachment } from '../storage.js'
-import { env } from '../env.js'
 import { getImageModel } from '../settings.js'
 import type { CliResult, CliSideEffect } from './cli-result.js'
 import { fetchImageBytes } from './image-fetcher.js'

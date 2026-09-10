@@ -373,7 +373,7 @@ export async function refreshServerSettings(force = false): Promise<void> {
         const next = makeSnapshot(rows)
         if (startedGeneration === generation) installSnapshot(next)
       }
-    } catch (e) {
+    } catch {
       if (startedGeneration === generation) lastRefreshFailureAt = Date.now()
       console.warn(`[settings] refresh failed; retaining source=${snapshot?.source ?? 'env'} revision=${snapshot?.revision ?? '0'}`)
     } finally {

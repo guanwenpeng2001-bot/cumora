@@ -19,9 +19,8 @@
  */
 import type { ResponseInputItem, ResponseStreamEvent } from 'openai/resources/responses/responses'
 import { env } from '../env.js'
-import { supportReasoningOptions, supportReasoningHeadroom, reasoningOptions } from './reasoning.js'
-import { type AgentModelConfig } from './model-config.js'
-import { getBrainModel, getCompactionModel, getTurnBudgetPolicy, type TurnBudgetPolicy } from '../settings.js'
+import type { AgentModelConfig } from './model-config.js'
+import { getBrainModel, getTurnBudgetPolicy, type TurnBudgetPolicy } from '../settings.js'
 import { redis } from '../redis.js'
 import { readLocalMessageAttachment } from '../local-attachment-files.js'
 import { messageAttachmentStorageKey } from '../storage-keys.js'
@@ -46,7 +45,7 @@ import { runtime } from './runtime/select.js'
 import type { AgentRuntimeClient } from './runtime/client.js'
 import { BUSY_STATUS_HEARTBEAT_MS } from '../status.js'
 import { errorText, type AgentRunStatus } from './observability.js'
-import { enforceModelPolicy, realTaskModel, supportModel } from './model-policy.js'
+import { enforceModelPolicy, realTaskModel } from './model-policy.js'
 import { materializeImage } from './image-fetcher.js'
 import {
   applyResponseStreamEvent,
@@ -56,7 +55,7 @@ import {
 } from './turn-stream.js'
 import { compactHistoryWithSummary, DEFAULT_COMPACTION_POLICY, type CompactionPolicy, estimateHistoryTokens, estimateTokens, truncateChars, truncateUtf8 } from './turn-compaction.js'
 import { addUsage, EMPTY_USAGE, type TokenUsage } from './cost.js'
-import { recordLlmCall, readStreamUsage, readStreamReasoningTokens } from './llm-ledger.js'
+import { recordLlmCall } from './llm-ledger.js'
 import { resolveDeclaredAutoRelayTarget } from './auto-relay.js'
 import {
   canDrainSteer,
@@ -1002,45 +1001,6 @@ function traceContentPart(part: unknown): Record<string, unknown> {
   return { ...raw, type }
 }
 
-function traceInputItem(item: ResponseInputItem): Record<string, unknown> {
-  const raw = item as unknown as Record<string, unknown>
-  const out: Record<string, unknown> = {}
-  if (raw.type) out.type = raw.type
-  if (raw.role) out.role = raw.role
-  if (raw.call_id) out.callId = raw.call_id
-  if (typeof raw.output === 'string') out.output = traceText(raw.output)
-  else if (raw.output !== undefined) out.output = raw.output
-
-  if (Array.isArray(raw.content)) {
-    out.content = raw.content.map(traceContentPart)
-  } else if (typeof raw.content === 'string') {
-    out.content = traceText(raw.content)
-  } else if (raw.content !== undefined) {
-    out.content = raw.content
-  }
-  return out
-}
-
-function traceInput(items: ResponseInputItem[]): Record<string, unknown>[] {
-  return items.map(traceInputItem)
-}
-
-function traceToolDefinitions(extras: { name: string; description: string }[] = []): Record<string, unknown>[] {
-  return [
-    ...TOOL_DEFS_RESPONSES.map((tool) => ({
-      type: tool.type,
-      name: tool.name,
-      description: traceText(tool.description ?? ''),
-    })),
-    ...extras.map((tool) => ({
-      type: 'function',
-      name: tool.name,
-      description: traceText(tool.description),
-      mcp: true,
-    })),
-  ]
-}
-
 function traceResponseOutputItem(item: unknown): Record<string, unknown> {
   const raw = (item ?? {}) as Record<string, unknown>
   const type = String(raw.type ?? 'unknown')
@@ -1304,8 +1264,6 @@ Reply ONLY as JSON: {"complete":boolean,"reason":"short factual reason","next_st
       },
     })
     return result
-  } catch (err) {
-    throw err
   } finally {
     clearTimeout(timer)
   }
@@ -1935,7 +1893,7 @@ async function runAgentTurnWithBudget(agentId: string, options: AgentTurnOptions
   // MCP connectors (phase 6): connected right before the hop loop, closed
   // in the finally below. Outer scope so finally can always reach them.
   const mcpClients: McpClientHandle[] = []
-  let mcpToolDefs: ReturnType<typeof mcpToolToFunctionTool>[] = []
+  const mcpToolDefs: ReturnType<typeof mcpToolToFunctionTool>[] = []
 
   try {
     // Steering: discard any stale items left over from a previous turn

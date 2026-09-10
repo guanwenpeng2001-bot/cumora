@@ -206,7 +206,6 @@ async function adminFetch<T = unknown>(path: string, init: RequestInit = {}): Pr
 interface AdminUserResponse { id: number; email: string }
 interface ApiKeyResponse    { id: number; key: string }
 interface AdminAPIKeyRow    { id: number; group_id: number | null; name?: string; key?: string }
-interface AdminAPIKeyList   { items: AdminAPIKeyRow[]; total: number; page: number; page_size: number; pages: number }
 
 export interface ManagedIntegrationKey {
   id?: number
