@@ -14,7 +14,8 @@ import { TextArea } from '@/components/TextArea'
 import { Select } from '@/components/Select'
 import { Combobox, type ComboboxOption } from '@/components/Combobox'
 import type { Participant, EngineId } from '@/types'
-import { useT } from '@/lib/i18n'
+import { useT, useLocaleStore } from '@/lib/i18n'
+import { AgentEditorSave, bindingReplacement, type BindingStatus, type SaveStage, type StageStatus } from './agentEditorSave'
 import { engineLabel } from '@/lib/engines'
 
 const INHERIT_ENGINE = '__inherit__'
@@ -55,6 +56,47 @@ interface Props {
 export function AgentEditor({ agent, onClose, onSaved }: Props) {
   const t = useT()
   const editing = agent !== null
+  const locale = useLocaleStore((s) => s.locale)
+  const copy = locale === 'zh-CN' ? {
+    loading: '正在加载绑定…', loadError: '读取失败；保存档案不会替换此区绑定。',
+    retryLoad: '重新读取', empty: '暂无可用资源', dirty: '有未保存的绑定修改',
+    unchanged: '绑定未修改', retry: '重试未完成阶段',
+    frozen: '本次保存内容已锁定；重试会继续保存相同内容。已完成的阶段不会重复提交。',
+    contextChanged: '公司或登录身份已变化，此编辑器已失效。请关闭后重新打开。',
+    profile: '档案', host: '主机', skills: '技能', mcp: 'MCP',
+    pending: '待保存', saving: '保存中', saved: '已保存', skipped: '无需写入', error: '失败，待重试',
+    savedId: '已创建 Agent ID',
+  } : {
+    loading: 'Loading bindings…', loadError: 'Loading failed; saving the profile will preserve these bindings.',
+    retryLoad: 'Reload', empty: 'No resources available', dirty: 'Unsaved binding changes',
+    unchanged: 'Bindings unchanged', retry: 'Retry unfinished stages',
+    frozen: 'This save is locked to its original content. Retry continues that content and skips completed stages.',
+    contextChanged: 'The company or sign-in context changed. Close and reopen this editor.',
+    profile: 'Profile', host: 'Host', skills: 'Skills', mcp: 'MCP',
+    pending: 'Pending', saving: 'Saving', saved: 'Saved', skipped: 'No write needed', error: 'Failed; retry needed',
+    savedId: 'Created Agent ID',
+  }
+  const context = useRef(useAuth.getState())
+  const epoch = useAuth((s) => s.contextEpoch)
+  const mounted = useRef(true)
+  const requests = useRef(new AbortController())
+  const isCurrent = () => {
+    const current = useAuth.getState()
+    return mounted.current && current.contextEpoch === context.current.contextEpoch
+      && current.activeCompanyId === context.current.activeCompanyId && current.token === context.current.token
+  }
+  const contextChanged = epoch !== context.current.contextEpoch
+  const save = useRef<AgentEditorSave | null>(null)
+  const submitting = useRef(false)
+  const [progress, setProgress] = useState<Record<SaveStage, StageStatus> | null>(null)
+  useEffect(() => {
+    mounted.current = true
+    requests.current = new AbortController()
+    const unsubscribe = useAuth.subscribe(() => {
+      if (!isCurrent()) requests.current.abort()
+    })
+    return () => { mounted.current = false; requests.current.abort(); unsubscribe() }
+  }, [])
   const [name, setName] = useState(agent?.name ?? '')
   const [role, setRole] = useState(agent?.role ?? '')
   const [systemPrompt, setSystemPrompt] = useState(agent?.systemPrompt ?? '')
@@ -77,26 +119,58 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
   const [skillChecked, setSkillChecked] = useState<Set<string>>(new Set())
   const [connectorChoices, setConnectorChoices] = useState<Array<{ id: string; name: string; type: 'stdio' | 'http' }>>([])
   const [connectorChecked, setConnectorChecked] = useState<Set<string>>(new Set())
+  const [skillStatus, setSkillStatus] = useState<BindingStatus>('loading')
+  const [connectorStatus, setConnectorStatus] = useState<BindingStatus>('loading')
+  const [skillInitial, setSkillInitial] = useState<Set<string>>(new Set())
+  const [connectorInitial, setConnectorInitial] = useState<Set<string>>(new Set())
+  const [skillReload, setSkillReload] = useState(0)
+  const [connectorReload, setConnectorReload] = useState(0)
+  const skillDirty = bindingReplacement(skillStatus, skillInitial, skillChecked) !== null
+  const connectorDirty = bindingReplacement(connectorStatus, connectorInitial, connectorChecked) !== null
   useEffect(() => {
-    let cancelled = false
+    if (!isCurrent()) return
+    const controller = new AbortController()
+    const abort = () => controller.abort()
+    const parentSignal = requests.current.signal
+    parentSignal.addEventListener('abort', abort)
+    setSkillStatus('loading')
     const load = editing && agent
-      ? api.getAgentSkills(agent.id).then((r) => r.items.map((x) => ({ id: x.skill.id, name: x.skill.name, description: x.skill.description, enabled: x.enabled })))
-      : api.getSkills().then((r) => r.items.map((x) => ({ id: x.id, name: x.name, description: x.description, enabled: false })))
+      ? api.getAgentSkills(agent.id, controller.signal).then((r) => r.items.map((x) => ({ id: x.skill.id, name: x.skill.name, description: x.skill.description, enabled: x.enabled })))
+      : api.getSkills(controller.signal).then((r) => r.items.map((x) => ({ id: x.id, name: x.name, description: x.description, enabled: false })))
     void load.then((items) => {
-      if (cancelled) return
+      if (controller.signal.aborted || !isCurrent()) return
+      const initial = new Set(items.filter((x) => x.enabled).map((x) => x.id))
       setSkillChoices(items.map(({ id, name, description }) => ({ id, name, description })))
-      setSkillChecked(new Set(items.filter((x) => x.enabled).map((x) => x.id)))
-    }).catch(() => { /* skills are optional chrome */ })
-    const loadMcp = editing && agent
-      ? api.getAgentMcpConnectors(agent.id).then((r) => r.items.map((x) => ({ id: x.connector.id, name: x.connector.name, type: x.connector.type, enabled: x.enabled })))
-      : api.getMcpConnectors().then((r) => r.items.filter((x) => x.enabled).map((x) => ({ id: x.id, name: x.name, type: x.type, enabled: false })))
-    void loadMcp.then((items) => {
-      if (cancelled) return
+      setSkillInitial(initial)
+      setSkillChecked(new Set(initial))
+      setSkillStatus('ready')
+    }).catch(() => {
+      if (!controller.signal.aborted && isCurrent()) setSkillStatus('error')
+    })
+    return () => { controller.abort(); parentSignal.removeEventListener('abort', abort) }
+  }, [editing, agent?.id, skillReload])
+  useEffect(() => {
+    if (!isCurrent()) return
+    const controller = new AbortController()
+    const abort = () => controller.abort()
+    const parentSignal = requests.current.signal
+    parentSignal.addEventListener('abort', abort)
+    setConnectorStatus('loading')
+    const load = editing && agent
+      ? api.getAgentMcpConnectors(agent.id, controller.signal).then((r) => r.items.map((x) => ({ id: x.connector.id, name: x.connector.name, type: x.connector.type, enabled: x.enabled })))
+      : api.getMcpConnectors(controller.signal).then((r) => r.items.filter((x) => x.enabled).map((x) => ({ id: x.id, name: x.name, type: x.type, enabled: false })))
+    void load.then((items) => {
+      if (controller.signal.aborted || !isCurrent()) return
+      const initial = new Set(items.filter((x) => x.enabled).map((x) => x.id))
       setConnectorChoices(items.map(({ id, name, type }) => ({ id, name, type })))
-      setConnectorChecked(new Set(items.filter((x) => x.enabled).map((x) => x.id)))
-    }).catch(() => { /* connectors are optional chrome */ })
-    return () => { cancelled = true }
-  }, [editing, agent])
+      setConnectorInitial(initial)
+      setConnectorChecked(new Set(initial))
+      setConnectorStatus('ready')
+    }).catch(() => {
+      if (!controller.signal.aborted && isCurrent()) setConnectorStatus('error')
+    })
+    return () => { controller.abort(); parentSignal.removeEventListener('abort', abort) }
+  }, [editing, agent?.id, connectorReload])
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
   const [avatarUrl, setAvatarUrl] = useState<string | null>(agent?.avatarUrl ?? null)
@@ -201,7 +275,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
     setRepairCopied(false)
     setRepairErr(null)
     setRepairCode(null)
-    if (!selectedComputerOffline || !selectedComputer) return
+    if (!selectedComputerOffline || !selectedComputer || !isCurrent() || save.current) return
 
     let cancelled = false
     void api.repairComputer(selectedComputer.id)
@@ -247,90 +321,79 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
   }, [onClose])
 
   const submit = async () => {
+    if (submitting.current || generatingAvatar || !isCurrent()) return
+    submitting.current = true
     setErr(null)
     setBusy(true)
     try {
-      const target = computerId || cloud?.id
-      const current = agent?.computerId ?? cloud?.id
-      const targetComputer = target ? computersById[target] : undefined
-      const isByoaTarget = !!targetComputer && targetComputer.kind !== 'cloud'
-      const inherit = engineChoice === INHERIT_ENGINE
-      const pinned = inherit ? undefined : (engineChoice as EngineId)
-      const savedChoice = initialEngineChoice(agent, targetComputer)
-      const inheritChanged = isByoaTarget && inherit !== (savedChoice === INHERIT_ENGINE)
-      const engineChanged = isByoaTarget && !inherit && pinned !== ((agent?.engine as EngineId) ?? null)
-      const assignmentChanged = Boolean(target && (target !== current || inheritChanged || engineChanged))
-      // BYOA agents are engine-managed — never send modelConfig for them.
-      // Managed: build the object; null clears a previously saved config.
-      const modelConfigPayload = ((): AgentModelConfig | null | undefined => {
-        if (isByoaTarget) return undefined
-        const mc: AgentModelConfig = {}
-        if (mcEffort) mc.effort = mcEffort
-        const cw = Number(mcContextWindow)
-        if (mcContextWindow.trim() && Number.isFinite(cw) && cw > 0) mc.contextWindow = Math.floor(cw)
-        const mt = Number(mcMaxTokens)
-        if (mcMaxTokens.trim() && Number.isFinite(mt) && mt > 0) mc.maxOutputTokens = Math.floor(mt)
-        if (!mcThinking) mc.thinking = false
-        if (mcFallbacks.length > 0) mc.fallbackModels = mcFallbacks
-        return Object.keys(mc).length > 0 ? mc : null
-      })()
-      const payload: AgentInput = {
-        name, role, systemPrompt, bio, avatarBg,
-        model: model.trim() || null,
-        fastModel: fastModel.trim() || null,
-        modelConfig: modelConfigPayload,
-      }
-      // A host/engine change persists these pins in the assignment's single
-      // SQL UPDATE. Do not clear them earlier if that assignment may fail.
-      const profilePayload = assignmentChanged
-        ? { ...payload, model: undefined, fastModel: undefined }
-        : payload
-      let agentId = agent?.id
-      if (editing) {
-        // Only send avatarUrl on change so we don't clobber it on no-op edits.
-        if ((agent!.avatarUrl ?? null) !== avatarUrl) profilePayload.avatarUrl = avatarUrl
-        await api.updateAgent(agent!.id, profilePayload)
-      } else {
-        // Creation + initial host/engine assignment is one transaction. The
-        // stable request id makes retry-after-timeout return that same Agent.
-        const created = await api.createAgent({
-          ...payload,
-          requestId: createRequestId.current,
-          computerId: target || null,
-          engine: isByoaTarget ? pinned : undefined,
-          inherit: isByoaTarget ? inherit : false,
+      if (!save.current) {
+        const target = computerId || cloud?.id
+        const current = agent?.computerId ?? cloud?.id
+        const targetComputer = target ? computersById[target] : undefined
+        const isByoaTarget = !!targetComputer && targetComputer.kind !== 'cloud'
+        const inherit = engineChoice === INHERIT_ENGINE
+        const pinned = inherit ? undefined : (engineChoice as EngineId)
+        const savedChoice = initialEngineChoice(agent, targetComputer)
+        const inheritChanged = isByoaTarget && inherit !== (savedChoice === INHERIT_ENGINE)
+        const engineChanged = isByoaTarget && !inherit && pinned !== ((agent?.engine as EngineId) ?? null)
+        const assignmentChanged = Boolean(target && (target !== current || inheritChanged || engineChanged))
+        // BYOA agents are engine-managed — never send modelConfig for them.
+        // Managed: build the object; null clears a previously saved config.
+        const modelConfigPayload = ((): AgentModelConfig | null | undefined => {
+          if (isByoaTarget) return undefined
+          const mc: AgentModelConfig = {}
+          if (mcEffort) mc.effort = mcEffort
+          const cw = Number(mcContextWindow)
+          if (mcContextWindow.trim() && Number.isFinite(cw) && cw > 0) mc.contextWindow = Math.floor(cw)
+          const mt = Number(mcMaxTokens)
+          if (mcMaxTokens.trim() && Number.isFinite(mt) && mt > 0) mc.maxOutputTokens = Math.floor(mt)
+          if (!mcThinking) mc.thinking = false
+          if (mcFallbacks.length > 0) mc.fallbackModels = mcFallbacks
+          return Object.keys(mc).length > 0 ? mc : null
+        })()
+        const payload: AgentInput = {
+          name, role, systemPrompt, bio, avatarBg,
+          model: model.trim() || null,
+          fastModel: fastModel.trim() || null,
+          modelConfig: modelConfigPayload,
+        }
+        // A host/engine change persists these pins in the assignment's single
+        // SQL UPDATE. Do not clear them earlier if that assignment may fail.
+        const profilePayload = assignmentChanged
+          ? { ...payload, model: undefined, fastModel: undefined }
+          : payload
+        if (editing && (agent!.avatarUrl ?? null) !== avatarUrl) profilePayload.avatarUrl = avatarUrl
+        save.current = new AgentEditorSave({
+          agentId: agent?.id,
+          profile: profilePayload,
+          create: {
+            ...payload,
+            requestId: createRequestId.current,
+            computerId: target || null,
+            engine: isByoaTarget ? pinned : undefined,
+            inherit: isByoaTarget ? inherit : false,
+          },
+          assignment: editing && target && assignmentChanged ? {
+            computerId: target,
+            engine: isByoaTarget ? pinned : undefined,
+            inherit: isByoaTarget ? inherit : false,
+            model: model.trim() || null,
+            fastModel: fastModel.trim() || null,
+          } : undefined,
+          expectedEngine: (!editing || assignmentChanged) && isByoaTarget ? pinned : undefined,
+          engineError: t('agent.enginePinRejected', { engine: engineLabel(pinned ?? 'managed') }),
+          skills: bindingReplacement(skillStatus, skillInitial, skillChecked),
+          mcp: bindingReplacement(connectorStatus, connectorInitial, connectorChecked),
         })
-        agentId = created.id
-        if (isByoaTarget && pinned && created.engine !== pinned) {
-          throw new Error(t('agent.enginePinRejected', { engine: engineLabel(pinned) }))
-        }
       }
-      // Persist the host assignment when the computer OR the engine changed.
-      // (Engine lives in the same assign call; gating only on the computer
-      // would silently drop a Claude→Codex switch on the same machine.) Still
-      // skipped on a plain style edit to avoid the owner/admin-gated call.
-      // Skill enablement is a separate record (agent_skills), not part of
-      // the profile payload — persist it on its own endpoint.
-      const skillPersist = agentId
-        ? api.setAgentSkills(agentId, [...skillChecked]).then(() => undefined)
-        : Promise.resolve(undefined)
-      const connectorPersist = agentId
-        ? api.setAgentMcpConnectors(agentId, [...connectorChecked]).then(() => undefined)
-        : Promise.resolve(undefined)
-      await Promise.all([skillPersist, connectorPersist])
-      if (editing && agentId && target && assignmentChanged) {
-        const out = await api.assignAgentComputer(
-          agentId,
-          target,
-          isByoaTarget ? pinned : undefined,
-          isByoaTarget ? inherit : false,
-          model.trim() || null,
-          fastModel.trim() || null,
-        )
-        if (isByoaTarget && pinned && out.engine !== pinned) {
-          throw new Error(t('agent.enginePinRejected', { engine: engineLabel(pinned) }))
-        }
-      }
+      const attempt = save.current
+      const completed = await attempt.run(api, isCurrent, () => {
+        setProgress({ ...attempt.stages })
+        if (attempt.stages.skills === 'saved') setSkillInitial(new Set(attempt.snapshot.skills!))
+        if (attempt.stages.mcp === 'saved') setConnectorInitial(new Set(attempt.snapshot.mcp!))
+      }, requests.current.signal)
+      if (!completed || !isCurrent()) return
+      save.current = null
       onClose()
       if (onSaved) {
         onSaved()
@@ -339,28 +402,31 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
         void useConversations.getState().reload()
       }
     } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e))
+      if (isCurrent()) setErr(e instanceof Error ? e.message : String(e))
     } finally {
-      setBusy(false)
+      submitting.current = false
+      if (isCurrent()) setBusy(false)
     }
   }
 
   const initial = (name || agent?.id || '?').charAt(0).toUpperCase()
 
   const generateAvatar = async () => {
-    if (!editing || !agent) return
+    if (!editing || !agent || !isCurrent() || submitting.current || save.current || generatingAvatar) return
     setAvatarErr(null)
     setGeneratingAvatar(true)
     try {
       // First save any pending edits so the prompt reflects what the user typed.
       await api.updateAgent(agent.id, { name, role, systemPrompt, bio, avatarBg })
+      if (!isCurrent()) return
       const r = await api.generateAgentAvatar(agent.id)
+      if (!isCurrent()) return
       setAvatarUrl(r.url)
       await useParticipants.getState().refresh()
     } catch (e) {
-      setAvatarErr(e instanceof Error ? e.message : String(e))
+      if (isCurrent()) setAvatarErr(e instanceof Error ? e.message : String(e))
     } finally {
-      setGeneratingAvatar(false)
+      if (isCurrent()) setGeneratingAvatar(false)
     }
   }
 
@@ -400,7 +466,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
           >×</button>
         </div>
 
-        <div className="px-6 py-5 space-y-4 overflow-y-auto flex-1 min-h-0">
+        <fieldset disabled={busy || !!progress || contextChanged || generatingAvatar} className="px-6 py-5 space-y-4 overflow-y-auto flex-1 min-h-0">
           <Field label={t('agent.nameLabel')} hint={t('agent.nameHint')}>
             <Input
               type="text"
@@ -560,56 +626,62 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
             )}
           </div>
 
-          {skillChoices.length > 0 && (
-            <div className="rounded-[10px] border border-ink-100 bg-paper/60 px-3.5 py-2.5">
-              <div className="text-[12.5px] font-semibold text-ink-700 mb-1.5">{t('agent.skillsTitle')}</div>
-              <div className="space-y-1">
-                {skillChoices.map((sk) => (
-                  <Checkbox
-                    key={sk.id}
-                    checked={skillChecked.has(sk.id)}
-                    onCheckedChange={(next) => {
-                      setSkillChecked((prev) => {
-                        const copy = new Set(prev)
-                        if (next) copy.add(sk.id)
-                        else copy.delete(sk.id)
-                        return copy
-                      })
-                    }}
-                    label={sk.name}
-                    description={sk.description}
-                  />
-                ))}
-              </div>
+          <div className="rounded-[10px] border border-ink-100 bg-paper/60 px-3.5 py-2.5">
+            <div className="text-[12.5px] font-semibold text-ink-700 mb-1.5">{t('agent.skillsTitle')}</div>
+            <div className="text-[11.5px] text-ink-500" role="status">
+              {skillStatus === 'loading' ? copy.loading : skillStatus === 'error' ? copy.loadError
+                : skillChoices.length === 0 ? copy.empty : skillDirty ? copy.dirty : copy.unchanged}
+              {skillStatus === 'error' && <button type="button" className="ml-2 underline" onClick={() => setSkillReload((n) => n + 1)}>{copy.retryLoad}</button>}
             </div>
-          )}
+            <div className="space-y-1">
+              {skillStatus === 'ready' && skillChoices.map((sk) => (
+                <Checkbox
+                  key={sk.id}
+                  checked={skillChecked.has(sk.id)}
+                  onCheckedChange={(next) => {
+                    setSkillChecked((prev) => {
+                      const copy = new Set(prev)
+                      if (next) copy.add(sk.id)
+                      else copy.delete(sk.id)
+                      return copy
+                    })
+                  }}
+                  label={sk.name}
+                  description={sk.description}
+                />
+              ))}
+            </div>
+          </div>
 
-          {connectorChoices.length > 0 && (
-            <div className="rounded-[10px] border border-ink-100 bg-paper/60 px-3.5 py-2.5">
-              <div className="text-[12.5px] font-semibold text-ink-700 mb-1.5">{t('agent.connectorsTitle')}</div>
-              <div className="text-[10.5px] text-ink-400 italic mb-1.5">
-                {isByoa ? t('agent.connectorsByoaNote') : t('agent.connectorsManagedNote')}
-              </div>
-              <div className="space-y-1">
-                {connectorChoices.map((c) => (
-                  <Checkbox
-                    key={c.id}
-                    checked={connectorChecked.has(c.id)}
-                    onCheckedChange={(next) => {
-                      setConnectorChecked((prev) => {
-                        const copy = new Set(prev)
-                        if (next) copy.add(c.id)
-                        else copy.delete(c.id)
-                        return copy
-                      })
-                    }}
-                    label={c.name}
-                    description={c.type}
-                  />
-                ))}
-              </div>
+          <div className="rounded-[10px] border border-ink-100 bg-paper/60 px-3.5 py-2.5">
+            <div className="text-[12.5px] font-semibold text-ink-700 mb-1.5">{t('agent.connectorsTitle')}</div>
+            <div className="text-[11.5px] text-ink-500" role="status">
+              {connectorStatus === 'loading' ? copy.loading : connectorStatus === 'error' ? copy.loadError
+                : connectorChoices.length === 0 ? copy.empty : connectorDirty ? copy.dirty : copy.unchanged}
+              {connectorStatus === 'error' && <button type="button" className="ml-2 underline" onClick={() => setConnectorReload((n) => n + 1)}>{copy.retryLoad}</button>}
             </div>
-          )}
+            <div className="text-[10.5px] text-ink-400 italic mb-1.5">
+              {isByoa ? t('agent.connectorsByoaNote') : t('agent.connectorsManagedNote')}
+            </div>
+            <div className="space-y-1">
+              {connectorStatus === 'ready' && connectorChoices.map((c) => (
+                <Checkbox
+                  key={c.id}
+                  checked={connectorChecked.has(c.id)}
+                  onCheckedChange={(next) => {
+                    setConnectorChecked((prev) => {
+                      const copy = new Set(prev)
+                      if (next) copy.add(c.id)
+                      else copy.delete(c.id)
+                      return copy
+                    })
+                  }}
+                  label={c.name}
+                  description={c.type}
+                />
+              ))}
+            </div>
+          </div>
 
           <Field
             label={t('agent.runsOnLabel')}
@@ -825,12 +897,22 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
             </div>
           </Field>
 
-          {err && (
-            <div className="text-[12.5px] text-coral-deep bg-coral-soft py-2 px-3 rounded-lg">
-              {err}
-            </div>
-          )}
-        </div>
+        </fieldset>
+
+        {(progress || err || contextChanged) && (
+          <div className="px-6 py-3 text-[12px] border-t border-ink-100" aria-live="polite">
+            {contextChanged ? <div role="alert">{copy.contextChanged}</div> : <>
+              {progress && <>
+                <div>{copy.frozen}</div>
+                {save.current?.agentId && !editing && <div>{copy.savedId}: {save.current.agentId}</div>}
+                <ul>{(['profile', 'host', 'skills', 'mcp'] as const).map((stage) => (
+                  <li key={stage}>{copy[stage]}: {copy[progress[stage]]}</li>
+                ))}</ul>
+              </>}
+              {err && <div role="alert" className="text-coral-deep">{err}</div>}
+            </>}
+          </div>
+        )}
 
         <div className="px-6 py-4 border-t border-ink-100 flex items-center gap-2 bg-paper shrink-0">
           <button
@@ -843,14 +925,14 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
           <button
             type="button"
             onClick={submit}
-            disabled={busy || !name.trim() || !systemPrompt.trim()}
+            disabled={busy || generatingAvatar || contextChanged || !name.trim() || !systemPrompt.trim()}
             className="px-5 py-2 rounded-[9px] text-[12.5px] font-semibold text-white transition disabled:opacity-50"
             style={{
               background: 'var(--skype)',
               boxShadow: '0 4px 12px -3px rgba(0, 168, 240, 0.5)',
             }}
           >
-            {busy ? t('agent.saving') : (editing ? t('agent.saveChanges') : t('agent.createAgent'))}
+            {busy ? t('agent.saving') : progress ? copy.retry : (editing ? t('agent.saveChanges') : t('agent.createAgent'))}
           </button>
         </div>
       </div>
