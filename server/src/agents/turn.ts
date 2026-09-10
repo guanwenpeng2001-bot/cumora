@@ -1646,6 +1646,8 @@ export async function executeAgentTurnHop(args: {
 }
 
 export async function runAgentTurn(agentId: string, options: AgentTurnOptions = {}): Promise<void> {
+  const resources = await runtime.applyPendingResources(agentId)
+  if (resources.status !== 'applied') throw new Error('Pending resources failed to apply')
   const persona = await runtime.loadPersona(agentId)
   if (!persona) return
 
@@ -3485,6 +3487,9 @@ Mechanics:
       await client.close().catch((err) =>
         console.warn(`[turn] ${agentId} mcp close failed`, err instanceof Error ? err.message : err))
     }
+    await runtime.applyPendingResources(agentId).then(result => {
+      if (result.status === 'failed') console.warn(`[turn] ${agentId} pending resources failed to apply`)
+    }).catch(() => console.warn(`[turn] ${agentId} pending resources could not be confirmed`))
     if (typingStarted && recentConvo) {
       await runtime.publishTyping({
         conversationId: recentConvo, agentId, done: true,

@@ -116,13 +116,18 @@ export async function upsertConnector(companyId: string, input: {
      JSON.stringify(input.args ?? []), JSON.stringify(input.env ?? {}),
      input.url ?? null, JSON.stringify(input.headers ?? {}), input.enabled ?? true],
   )
-  return rows[0] ? toRow(rows[0]) : Promise.reject(new ResourceError(404, 'connector not found'))
+  if (!rows[0]) throw new ResourceError(404, 'connector not found')
+  const { invalidatePersonaCache } = await import('./agents/personas.js')
+  invalidatePersonaCache()
+  return toRow(rows[0])
 }
 
 export async function deleteConnector(companyId: string, id: string): Promise<boolean> {
   const { rowCount } = await pool.query(
     `DELETE FROM mcp_connectors WHERE company_id = $1 AND id = $2`, [companyId, id],
   )
+  const { invalidatePersonaCache } = await import('./agents/personas.js')
+  invalidatePersonaCache()
   return (rowCount ?? 0) > 0
 }
 
@@ -183,6 +188,8 @@ export async function setAgentConnectors(companyId: string, agentId: string, con
   } finally {
     client.release()
   }
+  const { invalidatePersonaCache } = await import('./agents/personas.js')
+  invalidatePersonaCache(agentId)
 }
 
 /** Connectors enabled for the agent (daemon payload path). */

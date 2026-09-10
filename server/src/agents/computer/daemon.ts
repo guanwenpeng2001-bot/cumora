@@ -37,7 +37,7 @@ import {
   memoryIndexPathsForScope,
   uniqueProjectIds,
 } from '../memory-scope.js'
-import type { RuntimeTriageReport } from '../runtime/client.js'
+import { canonicalAgentResources, type RuntimeTriageReport, type ResourceApplicationResult } from '../runtime/client.js'
 import { parseSseStream, wakeStreamWasStable } from '../runtime/sse-parse.js'
 import { parseComputerControlEvent } from './control-event.js'
 import {
@@ -423,6 +423,7 @@ interface DaemonConfig {
 }
 
 interface AgentInfo {
+  resourceVersion?: string
   id: string
   name: string
   role: string | null
@@ -1683,10 +1684,13 @@ class AgentRunner {
    *  during this turn carry it so the ledger can link them back to the run.
    *  Cleared at turn end. */
   private currentRunId: string | null = null
+  private pendingResources: AgentInfo | null = null
+  private resourcesDirty = false
+  private resourceReport: ResourceApplicationResult | null = null
 
   constructor(
     private readonly cfg: DaemonConfig,
-    private readonly agent: AgentInfo,
+    private agent: AgentInfo,
     engine: EngineId,
   ) {
     this.home = join(AGENTS_ROOT, agent.id)
@@ -1827,7 +1831,9 @@ class AgentRunner {
   }
 
   async start(): Promise<void> {
-    await this.adapter.seedHome(this.home, { id: this.agent.id, name: this.agent.name, role: this.agent.role, systemPrompt: this.agent.systemPrompt, skills: this.agent.skills ?? [], mcpConnectors: this.agent.mcpConnectors ?? [] })
+    this.pendingResources = this.agent
+    this.resourcesDirty = true
+    await this.applyPendingResources()
     const mcpCount = this.agent.mcpConnectors?.length ?? 0
     if (mcpCount > 0 && this.agent.engine && !['claude', 'codex'].includes(this.agent.engine)) {
       console.log(`[computer] ${this.agent.id}: ${mcpCount} MCP connector(s) enabled but engine "${this.agent.engine}" has no defined injection point — skipped`)
@@ -1888,18 +1894,63 @@ class AgentRunner {
     ])
   }
 
-  /** Does this runner's live config still match the latest server state? The
-   *  engine + model + persona are captured at construction (the adapter is
-   *  fixed, and seedHome runs once in start()), so when any of them changes in
-   *  Cumora, sync() must tear this runner down and build a fresh one — otherwise
-   *  e.g. a Claude→Codex switch wouldn't take effect until a daemon restart. */
+  executionConfigMatches(agent: AgentInfo, engine: EngineId): boolean {
+    return this.adapter.id === engine && this.agent.model === agent.model && this.agent.fastModel === agent.fastModel
+  }
+
   configMatches(agent: AgentInfo, engine: EngineId): boolean {
-    return this.adapter.id === engine
-      && this.agent.name === agent.name
-      && this.agent.role === agent.role
-      && this.agent.systemPrompt === agent.systemPrompt
-      && this.agent.model === agent.model
-      && this.agent.fastModel === agent.fastModel
+    return this.executionConfigMatches(agent, engine)
+      && canonicalAgentResources(this.agent) === canonicalAgentResources(agent)
+      && this.agent.resourceVersion === agent.resourceVersion
+  }
+
+  async queueResources(agent: AgentInfo): Promise<void> {
+    this.pendingResources = structuredClone(agent)
+    if (this.busy) return
+    this.busy = true
+    try { await this.applyPendingResources() }
+    finally { this.busy = false }
+  }
+
+  private resourceResult(agent: AgentInfo): ResourceApplicationResult {
+    const unsupported = !!agent.mcpConnectors?.length && !['claude', 'codex'].includes(this.adapter.id)
+    return { version: agent.resourceVersion!, status: unsupported ? 'failed' : 'applied',
+      ...(unsupported ? { error: 'resource_application_failed' } : {}) }
+  }
+
+  private async reportResources(): Promise<void> {
+    const report = this.resourceReport
+    if (!report) return
+    try {
+      const token = await this.ensureToken()
+      if (await runtimeBest(this.cfg.serverUrl, '/resources/report', token, report)) {
+        if (this.resourceReport === report) this.resourceReport = null
+      }
+    } catch { /* Keep the acknowledgement for the next sync/boundary. */ }
+  }
+
+  private async applyPendingResources(): Promise<boolean> {
+    const pending = this.pendingResources
+    if (!pending) { await this.reportResources(); return true }
+    try {
+      if (this.resourcesDirty || canonicalAgentResources(this.agent) !== canonicalAgentResources(pending)) {
+        this.resourcesDirty = true
+        // The same runner owns this boundary; no live send or one-shot may overlap it.
+        await this.engineSession?.stop()
+        this.engineSession = null
+        await this.adapter.seedHome(this.home, { ...pending, skills: pending.skills ?? [], mcpConnectors: pending.mcpConnectors ?? [] })
+      }
+      this.resourcesDirty = false
+      this.agent = pending
+      if (this.pendingResources === pending) this.pendingResources = null
+      if (pending.resourceVersion) this.resourceReport = this.resourceResult(pending)
+      await this.reportResources()
+      return this.pendingResources ? this.applyPendingResources() : true
+    } catch {
+      if (pending.resourceVersion) this.resourceReport = { version: pending.resourceVersion, status: 'failed', error: 'resource_application_failed' }
+      await this.reportResources()
+      return false
+    }
   }
 
   private async ensureToken(signal?: AbortSignal): Promise<string> {
@@ -2711,6 +2762,7 @@ class AgentRunner {
     try {
       do {
         this.pendingRerun = false
+        if (!await this.applyPendingResources()) break
         // Triage-trouble backoff: while triage is cooling down (after a rate-limit
         // or a fail-open), skip the WHOLE turn — no triage call, no engine spawn —
         // so we neither hammer a broken/throttled triage nor burn the big brain.
@@ -3081,7 +3133,8 @@ class AgentRunner {
       console.error(`[computer] ${this.agent.id} turn aborted (will retry on next wake/poll):`,
         err instanceof Error ? err.message : err)
     } finally {
-      this.busy = false
+      try { await this.applyPendingResources() }
+      finally { this.busy = false }
     }
   }
 
@@ -3267,7 +3320,11 @@ async function doRun(serverOverride?: string): Promise<void> {
       }
       const existing = runners.get(agent.id)
       if (existing) {
-        if (existing.configMatches(agent, engine)) continue
+        if (existing.executionConfigMatches(agent, engine)) {
+          await existing.queueResources(agent)
+          continue
+        }
+        if (existing.isBusy) continue
         // Engine/model/persona was edited in Cumora — restart the runner so the
         // change takes effect on the next wake without a daemon restart.
         console.log(`[computer] agent ${agent.name} (${agent.id}) config changed → restarting on ${engine}`)

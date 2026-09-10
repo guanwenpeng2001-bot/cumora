@@ -187,6 +187,28 @@ runtimeRouter.post('/cli', withAgent(async (c, req, res) => {
 
 // ─── reads ──────────────────────────────────────────────────────────
 
+runtimeRouter.post('/resources/apply-pending', withAgent(async (c, req, res) => {
+  if (req.body?.version !== undefined && (typeof req.body.version !== 'string' || !/^[a-f0-9]{64}$/.test(req.body.version))) {
+    res.status(400).json({ error: 'invalid resource version' }); return
+  }
+  res.json(await inprocClient.applyPendingResources(c.sub, req.body?.version))
+}))
+
+runtimeRouter.post('/resources/report', withAgent(async (c, req, res) => {
+  const { version, status } = req.body ?? {}
+  if (typeof version !== 'string' || !/^[a-f0-9]{64}$/.test(version) || !['applied', 'failed'].includes(status)) {
+    res.status(400).json({ error: 'invalid resource report' }); return
+  }
+  const { loadAgentResources, reportAgentResources } = await import('../computer/registry.js')
+  const snapshot = await loadAgentResources(c.sub, c.companyId)
+  if (!snapshot || snapshot.computerId !== c.computerId || snapshot.assignmentId !== c.assignmentId
+      || !snapshot.computerKind || snapshot.computerKind === 'cloud') {
+    res.status(403).json({ error: 'computer placement required' }); return
+  }
+  await reportAgentResources(snapshot, { version, status })
+  res.json({ ok: true })
+}))
+
 runtimeRouter.get('/persona', withAgent(async (c, _req, res) => {
   res.json({ persona: await inprocClient.loadPersona(c.sub) })
 }))

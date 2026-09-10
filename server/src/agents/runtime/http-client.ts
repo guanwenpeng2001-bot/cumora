@@ -117,6 +117,10 @@ export class HttpRuntimeClient implements AgentRuntimeClient {
 
   // ─── reads ────────────────────────────────────────────────────────
 
+  async applyPendingResources(_agentId: string, version?: string): Promise<import('./client.js').ResourceApplicationResult> {
+    return this.call('POST', '/resources/apply-pending', { version })
+  }
+
   async loadPersona(_agentId: string): Promise<PersonaRow | null> {
     const out = await this.call<{ persona: PersonaRow | null }>('GET', '/persona')
     return out.persona

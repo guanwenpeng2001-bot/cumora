@@ -20,7 +20,7 @@ import { join, relative, isAbsolute } from 'node:path'
 import { pool } from './db/pool.js'
 import { getServerSetting } from './settings.js'
 import {
-  installSkillFromManifest, parseSkillMd,
+  parseSkillMd,
   searchSkillHub, validateSkillName,
   type SkillManifest,
 } from './agents/skills.js'
@@ -303,24 +303,10 @@ export async function deleteSkill(companyId: string, id: string): Promise<boolea
   const client = await pool.connect()
   try {
     await client.query('BEGIN')
-    // Delete the materialized tree in the same transaction as the library
-    // row. The agent_skills FK cascade handles enablement rows, while this
-    // explicit cleanup handles their already-materialized workspace files.
-    const { rowCount } = await client.query(
-      `DELETE FROM agent_workspace aw
-        USING skills s
-       WHERE s.company_id = $1 AND s.id = $2
-         AND aw.company_id = s.company_id
-         AND aw.path LIKE 'skills/' || s.name || '/%'`,
-      [companyId, id],
-    )
     const deleted = await client.query(
       `DELETE FROM skills WHERE company_id = $1 AND id = $2`, [companyId, id],
     )
     await client.query('COMMIT')
-    if ((rowCount ?? 0) > 0) {
-      console.info('[skills] removed ' + rowCount + ' materialized file(s) for deleted skill ' + id)
-    }
     return (deleted.rowCount ?? 0) > 0
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {})
@@ -373,7 +359,7 @@ export async function enabledSkillsForAgent(agentId: string): Promise<SkillRow[]
 }
 
 /**
- * Set an agent's enabled skills, then materialize:
+ * Save an agent's enabled skills; apply them at the next runtime boundary:
  *  - managed: files land in agent_workspace under skills/<name>/ (the
  *    wake prompt's skills index reads from there); deselected ones are
  *    removed so the index shrinks too.
@@ -410,99 +396,61 @@ export async function setAgentSkills(companyId: string, agentId: string, skillId
   } finally {
     client.release()
   }
-  // Enablement is the source of truth. Materialization is deliberately
-  // asynchronous and serialized per agent so rapid checkbox changes cannot
-  // overlap destructive rewrite passes; each pass reads the latest DB state
-  // and is safe to repeat.
-  scheduleAgentSkillsMaterialization(agentId)
+  // The next runtime boundary reads the committed binding state.
 }
 
-interface MaterializationState {
-  revision: number
-  appliedRevision: number
-  running: Promise<void> | null
-}
-
-const materializationStates = new Map<string, MaterializationState>()
-
-/** Queue an idempotent, latest-state materialization for one agent. */
-export function scheduleAgentSkillsMaterialization(agentId: string): void {
-  const state = materializationStates.get(agentId) ?? { revision: 0, appliedRevision: 0, running: null }
-  state.revision += 1
-  materializationStates.set(agentId, state)
-  if (state.running) return
-
-  state.running = (async () => {
-    while (state.appliedRevision < state.revision) {
-      const targetRevision = state.revision
-      try {
-        await materializeAgentSkills(agentId)
-        state.appliedRevision = targetRevision
-      } catch (e) {
-        console.warn('[skills] materialization failed for ' + agentId + '; retrying', e instanceof Error ? e.message : e)
-        await new Promise<void>((resolve) => setTimeout(resolve, 1_000))
+export async function applyPendingAgentResources(agentId: string, version?: string): Promise<import('./agents/runtime/client.js').ResourceApplicationResult> {
+  const { loadAgentResources, reportAgentResources } = await import('./agents/computer/registry.js')
+  const { invalidatePersonaCache } = await import('./agents/personas.js')
+  const client = await pool.connect()
+  let snapshot: Awaited<ReturnType<typeof loadAgentResources>> = null
+  try {
+    await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ')
+    // Shared across replicas, and uses the same agent row lock as binding writes.
+    await client.query(`SELECT id FROM participants WHERE id = $1 AND kind = 'agent' AND departed_at IS NULL FOR UPDATE`, [agentId])
+    snapshot = await loadAgentResources(agentId, undefined, client)
+    if (!snapshot) throw new ResourceError(404, 'agent not found')
+    if (version && version !== snapshot.resourceVersion) throw new ResourceError(409, 'resource version changed')
+    if (snapshot.computerKind && snapshot.computerKind !== 'cloud') throw new ResourceError(409, 'resources are applied by the computer')
+    const skills = snapshot.skills ?? []
+    for (const skill of skills) validateLibraryManifest(skill)
+    const desired = new Map<string, string>(skills.flatMap(skill => skill.files.map(file => [`skills/${skill.name}/${file.path}`, file.body] as const)))
+    const { rows } = await client.query<{ path: string; body: string; managed: boolean }>(
+      `SELECT path, body, (meta->>'cumoraLibrarySkill' = 'true') AS managed FROM agent_workspace
+        WHERE agent_id = $1 AND company_id = $2 AND path LIKE 'skills/%' FOR UPDATE`, [agentId, snapshot.companyId],
+    )
+    for (const row of rows) {
+      if (!row.managed && desired.has(row.path) && desired.get(row.path) !== row.body) {
+        throw new ResourceError(409, 'resource conflicts with an unowned workspace file')
+      }
+      if (row.managed && !desired.has(row.path)) {
+        await client.query(`DELETE FROM agent_workspace WHERE agent_id = $1 AND company_id = $2 AND path = $3`, [agentId, snapshot.companyId, row.path])
       }
     }
-  })().finally(() => {
-    state.running = null
-    // A revision can arrive between the final loop check and cleanup.
-    if (state.appliedRevision < state.revision) scheduleAgentSkillsMaterialization(agentId)
-  })
-}
-
-/** Rewrite the agent's managed-workspace skills/ tree from agent_skills.
- *  Safe no-op for BYOA agents (daemon owns their skill dirs). */
-export async function materializeAgentSkills(agentId: string): Promise<void> {
-  const { rows } = await pool.query<{ kind: string; computer_kind: string | null }>(
-    `SELECT p.kind, c.kind AS computer_kind
-       FROM participants p
-       LEFT JOIN computers c ON c.id = p.computer_id
-      WHERE p.id = $1`,
-    [agentId],
-  )
-  const row = rows[0]
-  if (!row || row.kind !== 'agent') return
-  if (row.computer_kind && row.computer_kind !== 'cloud') return // BYOA — daemon seeds
-
-  const skills = await enabledSkillsForAgent(agentId)
-  const wanted = new Map<string, SkillRow>()
-  for (const s of skills) wanted.set(s.name, s)
-
-  // Managed workspace files go through the same validator+writer the CLI
-  // uses, so path/size rules stay single-sourced.
-  for (const skill of skills) {
-    const manifest: SkillManifest = { name: skill.name, description: skill.description, files: skill.files }
-    // installSkillFromManifest refuses to clobber — delete first when the
-    // skill is already present so re-syncs apply content changes.
-    await deleteWorkspaceSkill(agentId, skill.name)
-    await installSkillFromManifest({ agentId, manifest })
-  }
-
-  // Remove workspace skills no longer enabled (only those we know about —
-  // a workspace skill the agent wrote itself and that matches no library
-  // row is left alone).
-  const { rows: wsRows } = await pool.query<{ path: string }>(
-    `SELECT DISTINCT path FROM agent_workspace
-      WHERE agent_id = $1 AND path LIKE 'skills/%/SKILL.md'`,
-    [agentId],
-  )
-  for (const r of wsRows) {
-    const name = r.path.split('/')[1]
-    if (name && !wanted.has(name)) {
-      // Only remove skills that exist in the company library — agent-authored
-      // skills (no library row) belong to the agent.
-      const { rowCount } = await pool.query(
-        `SELECT 1 FROM skills s JOIN participants p ON p.company_id = s.company_id WHERE p.id = $2 AND s.name = $1 LIMIT 1`,
-        [name, agentId],
+    for (const [path, body] of desired) {
+      await client.query(
+        `INSERT INTO agent_workspace (agent_id, path, body, meta, company_id, updated_at)
+         VALUES ($1, $2, $3, '{"cumoraLibrarySkill":true}'::jsonb, $4, NOW())
+         ON CONFLICT (agent_id, path) DO UPDATE SET body = EXCLUDED.body,
+           meta = COALESCE(agent_workspace.meta, '{}'::jsonb) || EXCLUDED.meta,
+           company_id = EXCLUDED.company_id, updated_at = NOW()`, [agentId, path, body, snapshot.companyId],
       )
-      if ((rowCount ?? 0) > 0) await deleteWorkspaceSkill(agentId, name)
     }
-  }
+    await client.query('COMMIT')
+    invalidatePersonaCache(agentId)
+    const result = { version: snapshot.resourceVersion, status: 'applied' as const }
+    await reportAgentResources(snapshot, result)
+    return result
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {})
+    const result = { version: version ?? snapshot?.resourceVersion ?? '', status: 'failed' as const, error: 'resource_application_failed' }
+    if (snapshot) await reportAgentResources(snapshot, result).catch(() => {})
+    return result
+  } finally { client.release() }
 }
 
-async function deleteWorkspaceSkill(agentId: string, name: string): Promise<void> {
-  await pool.query(
-    `DELETE FROM agent_workspace WHERE agent_id = $1 AND path LIKE $2`,
-    [agentId, `skills/${name}/%`],
-  )
+/** Compatibility entry point; callers must already own a safe runtime boundary. */
+export async function materializeAgentSkills(agentId: string): Promise<void> {
+  const result = await applyPendingAgentResources(agentId)
+  if (result.status === 'failed') throw new Error(result.error)
 }

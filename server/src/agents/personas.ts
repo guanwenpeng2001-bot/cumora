@@ -37,15 +37,22 @@ export interface Persona {
 }
 
 /** id → Persona | null (null = looked up but not found / not an agent). */
-const personaCache = new Map<string, Persona | null>()
+const personaCache = new Map<string, { value: Persona | null; expiresAt: number }>()
+let personaCacheGeneration = 0
 
 export function invalidatePersonaCache(id?: string): void {
+  personaCacheGeneration++
   if (id) personaCache.delete(id)
   else personaCache.clear()
 }
 
 export async function getPersona(id: string): Promise<Persona | null> {
-  if (personaCache.has(id)) return personaCache.get(id) ?? null
+  // Positive runtime reads must observe the next turn's resources even across replicas.
+  const cached = personaCache.get(id)
+  if (cached && cached.value === null && cached.expiresAt > Date.now()) return null
+  const generation = personaCacheGeneration
+  const loadedAt = Date.now()
+  let connectorLoadFailed = false
   const { rows } = await pool.query<{
     id: string; name: string; role: string | null; style: string | null;
     model: string | null; model_config: unknown; company_id: string
@@ -64,10 +71,13 @@ export async function getPersona(id: string): Promise<Persona | null> {
       persona.mcpConnectors = await enabledConnectorsForAgent(id)
     } catch (e) {
       console.warn(`[persona] ${id} mcp connector load failed`, e instanceof Error ? e.message : e)
+      connectorLoadFailed = true
       persona.mcpConnectors = []
     }
   }
-  personaCache.set(id, persona)
+  if (!connectorLoadFailed && generation === personaCacheGeneration) {
+    personaCache.set(id, { value: persona, expiresAt: loadedAt + 5_000 })
+  }
   return persona
 }
 

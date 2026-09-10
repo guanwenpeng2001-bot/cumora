@@ -16,7 +16,8 @@
  */
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { pool } from '../../db/pool.js'
-import { CH_STATUS, publish } from '../../redis.js'
+import { CH_STATUS, publish, redis } from '../../redis.js'
+import { canonicalAgentResources, type AgentResourcePayload, type ResourceApplicationState, type ResourceApplicationResult } from '../runtime/client.js'
 import { normalizeTier, type Tier } from '../../tier.js'
 import { signAgentToken } from '../runtime/jwt.js'
 import type { EngineModelCatalog, EngineModelOption, FastModelScope, ModelCatalogSource } from './model-catalog.js'
@@ -656,7 +657,7 @@ export interface AgentMcpConnectorPayload {
 }
 
 export async function listAgentsForComputer(computerId: string): Promise<
-  Array<{ id: string; name: string; role: string | null; systemPrompt: string | null; engine: EngineId | null; model: string | null; fastModel: string | null; skills: AgentSkillPayload[]; mcpConnectors: AgentMcpConnectorPayload[] }>
+  Array<{ id: string; name: string; role: string | null; systemPrompt: string | null; engine: EngineId | null; model: string | null; fastModel: string | null; skills: AgentSkillPayload[]; mcpConnectors: AgentMcpConnectorPayload[]; resourceVersion?: string }>
 > {
   const { rows } = await pool.query<{
     id: string; name: string; role: string | null; systemPrompt: string | null
@@ -697,7 +698,7 @@ export async function listAgentsForComputer(computerId: string): Promise<
     const { availableEngines, detectedEngines, skillsJson, mcpJson, ...rest } = r
     const skills = (Array.isArray(skillsJson) ? skillsJson : []) as AgentSkillPayload[]
     const mcpConnectors = (Array.isArray(mcpJson) ? mcpJson : []) as AgentMcpConnectorPayload[]
-    const agent = { ...rest, skills, mcpConnectors }
+    const agent = { ...rest, skills, mcpConnectors, resourceVersion: agentResourceVersion({ ...rest, skills, mcpConnectors }) }
     const localCatalog = sanitizeDetectedEngines(detectedEngines, availableEngines ?? [])
       .find((entry) => entry.id === agent.engine)?.modelCatalog
     // A custom Claude endpoint owns its model namespace. Its reported defaults
@@ -1136,4 +1137,61 @@ export async function revokeComputer(args: { computerId: string; companyId: stri
   if (!rowCount) return false
   await broadcastComputerStatus(args.computerId, args.companyId, 'offline')
   return true
+}
+
+export function agentResourceVersion(resources: AgentResourcePayload): string {
+  return createHash('sha256').update(canonicalAgentResources(resources)).digest('hex')
+}
+
+export interface AgentResourceSnapshot extends AgentResourcePayload {
+  id: string
+  companyId: string
+  computerId: string | null
+  assignmentId: string
+  computerKind: string | null
+  resourceVersion: string
+}
+
+export async function loadAgentResources(agentId: string, companyId?: string, db: Queryable = pool): Promise<AgentResourceSnapshot | null> {
+  const { rows } = await db.query<AgentResourceSnapshot>(
+    `SELECT p.id, p.company_id AS "companyId", p.computer_id AS "computerId",
+            p.runtime_assignment_id AS "assignmentId", c.kind AS "computerKind",
+            p.name, p.role, p.system_prompt AS "systemPrompt",
+            COALESCE((SELECT jsonb_agg(jsonb_build_object('name', s.name, 'description', s.description, 'files', s.files))
+              FROM agent_skills a JOIN skills s ON s.id = a.skill_id
+              WHERE a.agent_id = p.id AND s.company_id = p.company_id), '[]'::jsonb) AS skills,
+            COALESCE((SELECT jsonb_agg(jsonb_build_object('name', m.name, 'type', m.type, 'command', m.command,
+              'args', m.args, 'env', m.env, 'url', m.url, 'headers', m.headers))
+              FROM agent_mcp_connectors a JOIN mcp_connectors m ON m.id = a.connector_id
+              WHERE a.agent_id = p.id AND m.company_id = p.company_id AND m.enabled), '[]'::jsonb) AS "mcpConnectors"
+       FROM participants p LEFT JOIN computers c ON c.id = p.computer_id AND c.company_id = p.company_id
+      WHERE p.id = $1 AND ($2::text IS NULL OR p.company_id = $2) AND p.kind = 'agent' AND p.departed_at IS NULL
+        AND (p.computer_id IS NULL OR (c.id IS NOT NULL AND c.revoked_at IS NULL))`,
+    [agentId, companyId ?? null],
+  )
+  const row = rows[0]
+  return row ? { ...row, resourceVersion: agentResourceVersion(row) } : null
+}
+
+function resourceStateKey(snapshot: AgentResourceSnapshot): string {
+  return `cumora:resources:${snapshot.companyId}:${snapshot.id}:${snapshot.assignmentId}`
+}
+
+export async function agentResourceState(companyId: string, agentId: string): Promise<ResourceApplicationState | null> {
+  const snapshot = await loadAgentResources(agentId, companyId)
+  if (!snapshot) return null
+  const raw = await redis.get(resourceStateKey(snapshot))
+  const report = raw ? JSON.parse(raw) as ResourceApplicationResult : null
+  return {
+    saved: true, version: snapshot.resourceVersion,
+    appliedVersion: report?.status === 'applied' ? report.version : null,
+    status: report?.version === snapshot.resourceVersion ? report.status : 'pending',
+    ...(report?.version === snapshot.resourceVersion && report.error ? { error: report.error } : {}),
+  }
+}
+
+export async function reportAgentResources(snapshot: AgentResourceSnapshot, report: ResourceApplicationResult): Promise<void> {
+  // Store by reported content version: a late acknowledgement cannot make a newer edit applied.
+  await redis.set(resourceStateKey(snapshot), JSON.stringify({ version: report.version, status: report.status,
+    ...(report.status === 'failed' ? { error: 'resource_application_failed' } : {}) }))
 }

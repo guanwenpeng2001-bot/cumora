@@ -212,6 +212,8 @@ export interface WorklogEntry {
  *  InProc impl + a stub HTTP impl; later sessions fill the HTTP impl
  *  in as the corresponding `/cli/*` server endpoints land. */
 export interface AgentRuntimeClient {
+  applyPendingResources(agentId: string, version?: string): Promise<ResourceApplicationResult>
+
   // === Read agent state ===
   /** Resolve the agent's persona (name / role / style / model / company).
    *  Returns null when the id isn't a real agent. */
@@ -409,4 +411,49 @@ export interface AgentRuntimeClient {
     conversationId: string
     upToMessageId: string
   }): Promise<void>
+}
+
+export interface AgentResourcePayload {
+  name: string
+  role: string | null
+  systemPrompt: string | null
+  skills?: Array<{ name: string; description: string; files: Array<{ path: string; body: string }> }>
+  mcpConnectors?: EngineMcpConnector[]
+  resourceVersion?: string
+}
+
+export interface ResourceApplicationState {
+  saved: true
+  version: string
+  appliedVersion: string | null
+  status: 'pending' | 'applied' | 'failed'
+  error?: string
+}
+
+export interface ResourceApplicationResult {
+  version: string
+  status: 'applied' | 'failed'
+  error?: string
+}
+
+/** Collection order is irrelevant; positional arrays such as MCP args are not. */
+export function canonicalAgentResources(resources: AgentResourcePayload): string {
+  const canonical = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(canonical)
+    if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value)
+      .filter(([, v]) => v !== undefined).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
+      .map(([key, v]) => [key, canonical(v)]))
+    return value
+  }
+  const sorted = <T>(values: T[]): T[] => [...values].sort((a, b) => {
+    const left = JSON.stringify(canonical(a)), right = JSON.stringify(canonical(b))
+    return left < right ? -1 : left > right ? 1 : 0
+  })
+  return JSON.stringify(canonical({
+    name: resources.name, role: resources.role ?? '', systemPrompt: resources.systemPrompt ?? '',
+    skills: sorted((resources.skills ?? []).map(s => ({ name: s.name, description: s.description,
+      files: sorted(s.files.map(f => ({ path: f.path, body: f.body }))) }))),
+    mcpConnectors: sorted((resources.mcpConnectors ?? []).map(c => ({ name: c.name, type: c.type,
+      command: c.command ?? null, args: c.args ?? [], env: c.env ?? {}, url: c.url ?? null, headers: c.headers ?? {} }))),
+  }))
 }
