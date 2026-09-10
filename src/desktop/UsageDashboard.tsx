@@ -5,14 +5,15 @@
  * All data from GET /api/usage/* (pure ledger reads).
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import {
-  api, ApiError, resolveAssetUrl,
-  type ApiUsageTrendPoint, type ApiUsageMetadata,
+import {ApiError, type ApiUsageMetadata,
+  type ApiUsageTrendPoint, 
+  api, resolveAssetUrl,
 } from '@/api/client'
 import { translate, useLocale, useT } from '@/lib/i18n'
 import { useAuth } from '@/stores/auth'
 
 type T = ReturnType<typeof useT>
+
 import { cn } from '@/lib/utils'
 
 type RangePreset = 'today' | 'week' | 'custom'
@@ -209,9 +210,9 @@ function UsageDashboardContent() {
   const to = range?.to ?? ''
   const summaryQuery = useUsageQuery(useCallback((signal: AbortSignal) => api.getUsageSummary(from, to, undefined, signal), [range, refresh]), enabled, epoch)
   const trendQuery = useUsageQuery(useCallback((signal: AbortSignal) => api.getUsageTrend(from, to, granularity, signal), [range, refresh, granularity]), enabled, epoch)
-  const agentQuery = useUsageQuery(useCallback((signal: AbortSignal) => api.getUsageByAgent(from, to, signal), [range, refresh]), enabled, epoch)
-  const modelQuery = useUsageQuery(useCallback((signal: AbortSignal) => api.getUsageByModel(from, to, signal), [range, refresh]), enabled, epoch)
-  const providerQuery = useUsageQuery(useCallback((signal: AbortSignal) => api.getUsageByProvider(from, to, signal), [range, refresh]), enabled, epoch)
+  const agentQuery = useUsageQuery(useCallback((signal: AbortSignal) => api.getUsageByAgent(from, to, signal), [range, refresh]), enabled && dim === 'agent', epoch)
+  const modelQuery = useUsageQuery(useCallback((signal: AbortSignal) => api.getUsageByModel(from, to, signal), [range, refresh]), enabled && dim === 'model', epoch)
+  const providerQuery = useUsageQuery(useCallback((signal: AbortSignal) => api.getUsageByProvider(from, to, signal), [range, refresh]), enabled && dim === 'provider', epoch)
   const logsQuery = useUsageQuery(useCallback((signal: AbortSignal) => api.getUsageLogs(from, to, page, 50, undefined, signal), [range, refresh, page]), enabled, epoch)
   const summary = summaryQuery.data
   const trend = trendQuery.data?.points ?? []

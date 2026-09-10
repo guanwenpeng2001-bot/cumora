@@ -1,25 +1,25 @@
-import { agentCliCommand, AGENT_CLI_RELEASE_TAG } from '@/lib/agentCliRelease'
 import { useCallback, useEffect, useState } from 'react'
-import { useParticipants } from '@/stores/participants'
-import { useComputers } from '@/stores/computers'
-import { usePrefs } from '@/stores/preferences'
-import { useSoundStore } from '@/stores/sound'
-import { useDevtools } from '@/stores/devtools'
-import { useAuth } from '@/stores/auth'
+import { type ApiProject, type ApiQuotaSnapshot, type ApiQuotaWindow, api, getPairingServerOrigin, getServerOrigin } from '@/api/client'
+import { AppearancePicker, ChatLayoutPicker } from '@/components/AppearancePicker'
 import { Avatar } from '@/components/Avatar'
 import { Checkbox } from '@/components/Checkbox'
-import { AppearancePicker, ChatLayoutPicker } from '@/components/AppearancePicker'
 import { LanguagePicker } from '@/components/LanguagePicker'
-import { translate, useT, useLocale, type MessageKey } from '@/lib/i18n'
+import { AGENT_CLI_RELEASE_TAG, agentCliCommand } from '@/lib/agentCliRelease'
+import { ENGINE_BIN, ENGINE_LABEL, engineLabel, RUNNABLE_ENGINE_IDS, RUNNABLE_ENGINES, type RunnableEngineId } from '@/lib/engines'
+import { type MessageKey, translate, useLocale, useT } from '@/lib/i18n'
+import { cn } from '@/lib/utils'
+import { useAuth } from '@/stores/auth'
+import { useComputers } from '@/stores/computers'
+import { useDevtools } from '@/stores/devtools'
+import { useParticipants } from '@/stores/participants'
+import { usePrefs } from '@/stores/preferences'
+import { useSoundStore } from '@/stores/sound'
+import type { Computer, EngineId } from '@/types'
+import { ConnectorsTab } from './ConnectorsTab'
 import { ModelsTab } from './ModelsTab'
 import { RuntimeSettingsPanel } from './RuntimeSettingsPanel'
-import { cn } from '@/lib/utils'
-import { UsageDashboard } from './UsageDashboard'
 import { SkillsTab } from './SkillsTab'
-import { ConnectorsTab } from './ConnectorsTab'
-import { api, getPairingServerOrigin, getServerOrigin, type ApiProject, type ApiQuotaSnapshot, type ApiQuotaWindow } from '@/api/client'
-import { ENGINE_BIN, ENGINE_LABEL, RUNNABLE_ENGINES, RUNNABLE_ENGINE_IDS, engineLabel, type RunnableEngineId } from '@/lib/engines'
-import type { Computer, EngineId } from '@/types'
+import { UsageDashboard } from './UsageDashboard'
 
 // The tab's identity is its `key`; the label is a message key resolved at
 // render. Before this they were the same string, which would have made
@@ -28,7 +28,7 @@ const tabs = [
   { key: 'profile', label: 'me.tab.profile' },
   { key: 'usage', label: 'me.tab.usage' },
   { key: 'models', label: 'me.tab.models' },
-  { key: 'runtime', label: 'me.tab.models' },
+  { key: 'runtime', label: 'me.tab.runtime' },
   { key: 'skills', label: 'me.tab.skills' },
   { key: 'connectors', label: 'me.tab.connectors' },
   { key: 'computers', label: 'me.tab.computers' },
@@ -1348,7 +1348,6 @@ function DaemonUpgradeBanner({ onJump }: { onJump: () => void }) {
 
 export function MeView({ initialTab = 'profile' }: { initialTab?: Tab } = {}) {
   const t = useT()
-  const zh = useLocale() === 'zh-CN'
   const [tab, setTab] = useState<Tab>(initialTab)
   const hasOutdated = useComputers((s) => Object.values(s.byId).some((c) => c.daemonOutdated))
   useEffect(() => { void useComputers.getState().refresh() }, [])
@@ -1380,7 +1379,7 @@ export function MeView({ initialTab = 'profile' }: { initialTab?: Tab } = {}) {
                 i === 0 ? 'pl-0 pr-3 sm:pr-5' : 'px-3 sm:px-5',
                 tab === tabDef.key ? 'border-skype text-skype-deep' : 'border-transparent text-ink-500 hover:text-ink-700',
               )}>
-              {tabDef.key === 'runtime' ? (translate(zh ? 'zh-CN' : 'en', 'settings.runtimeAutomation')) : t(tabDef.label)}
+              {t(tabDef.label)}
               {tabDef.key === 'computers' && hasOutdated && (
                 <span className="w-1.5 h-1.5 rounded-full" style={{ background: 'var(--gold-deep)' }} title={t('me.daemonNeedsUpdate')} />
               )}

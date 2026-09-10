@@ -4,9 +4,9 @@
  * configured, local hub import, paste a SKILL.md), delete.
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { api, type ApiSkill, type ApiLocalHubEntry } from '@/api/client'
+import { type ApiLocalHubEntry, type ApiSkill, api } from '@/api/client'
+import { translate, useLocaleStore, useT } from '@/lib/i18n'
 import { useAuth } from '@/stores/auth'
-import { translate, useT, useLocaleStore } from '@/lib/i18n'
 
 type T = ReturnType<typeof useT>
 type LocalHubEntry = ApiLocalHubEntry & { directory?: string; skillName?: string }
@@ -201,7 +201,7 @@ export function SkillsTab() {
           {!hubConfigured && (
             <div className="text-[11px] text-ink-400 italic">{t('me.skills.hubNotConfigured')}</div>
           )}
-          {errors.hub && <div role="alert" className="text-[11px] text-coral-deep">SkillHub: {errors.hub}</div>}
+          {errors.hub && <div role="alert" className="text-[11px] text-coral-deep">{t('me.skills.hubErrorPrefix')}{errors.hub}</div>}
           {!errors.hub && hubHits && hubHits.length === 0 && (
             <div className="text-[11px] text-ink-400 italic">{t('me.skills.hubNoHits')}</div>
           )}

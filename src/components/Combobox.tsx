@@ -1,4 +1,5 @@
-import { useEffect, useId, useMemo, useRef, useState } from 'react'
+import { type CSSProperties, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { initialActiveIndex } from '@/lib/combobox-highlight'
 import { useT } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
@@ -59,6 +60,8 @@ export function Combobox<T extends string = string>({
   const id = useId()
   const rootRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
+  const listRef = useRef<HTMLDivElement>(null)
+  const [menuStyle, setMenuStyle] = useState<CSSProperties>({})
   const [open, setOpen] = useState(false)
   const [query, setQuery] = useState('')
   const [activeIndex, setActiveIndex] = useState(0)
@@ -86,12 +89,53 @@ export function Combobox<T extends string = string>({
     setActiveIndex(initialActiveIndex(filtered, value, query))
   }, [open, filtered, value, query, customValue])
 
+  // Escape overflow containers; keep the menu within the visible viewport.
+  useLayoutEffect(() => {
+    if (!open) return
+    const position = () => {
+      const input = inputRef.current
+      if (!input || input.matches(':disabled')) { setOpen(false); return }
+      const rect = input.getBoundingClientRect()
+      const viewport = window.visualViewport
+      const left = viewport?.offsetLeft ?? 0
+      const top = viewport?.offsetTop ?? 0
+      const width = viewport?.width ?? window.innerWidth
+      const height = viewport?.height ?? window.innerHeight
+      const below = top + height - rect.bottom - 16
+      const above = rect.top - top - 16
+      const upwards = below < 180 && above > below
+      setMenuStyle({
+        position: 'fixed',
+        left: Math.max(left + 8, Math.min(rect.left, left + width - rect.width - 8)),
+        width: Math.min(rect.width, width - 16),
+        maxHeight: Math.max(0, Math.min(288, upwards ? above : below)),
+        top: upwards ? undefined : rect.bottom + 8,
+        bottom: upwards ? window.innerHeight - rect.top + 8 : undefined,
+      })
+    }
+    const onScroll = (event: Event) => {
+      if (event.target instanceof Node && listRef.current?.contains(event.target)) return
+      setOpen(false); setQuery('')
+    }
+    position()
+    window.addEventListener('resize', position)
+    window.addEventListener('scroll', onScroll, true)
+    window.visualViewport?.addEventListener('resize', position)
+    window.visualViewport?.addEventListener('scroll', onScroll)
+    return () => {
+      window.removeEventListener('resize', position)
+      window.removeEventListener('scroll', onScroll, true)
+      window.visualViewport?.removeEventListener('resize', position)
+      window.visualViewport?.removeEventListener('scroll', onScroll)
+    }
+  }, [open])
+
   // Close on outside click.
   useEffect(() => {
     if (!open) return
     const onDown = (e: MouseEvent) => {
       const t = e.target as Node | null
-      if (t && rootRef.current?.contains(t)) return
+      if (t && (rootRef.current?.contains(t) || listRef.current?.contains(t))) return
       setOpen(false); setQuery('')
     }
     window.addEventListener('mousedown', onDown, true)
@@ -100,12 +144,12 @@ export function Combobox<T extends string = string>({
 
   const openMenu = () => { setOpen(true); setQuery(''); queueMicrotask(() => inputRef.current?.focus()) }
   const commit = (o: ComboboxOption<T> | undefined) => {
-    if (!o || o.disabled) return
+    if (!o || o.disabled || inputRef.current?.matches(':disabled')) return
     onValueChange(o.value)
     setOpen(false); setQuery(''); inputRef.current?.blur()
   }
   const commitCustom = () => {
-    if (!customValue) return
+    if (!customValue || inputRef.current?.matches(':disabled')) return
     onValueChange(customValue as T)
     setOpen(false); setQuery(''); inputRef.current?.blur()
   }
@@ -143,7 +187,8 @@ export function Combobox<T extends string = string>({
             if (e.key === 'ArrowDown') { e.preventDefault(); if (!open) { openMenu(); return } setActiveIndex((i) => Math.min(resultCount - 1, i + 1)); return }
             if (e.key === 'ArrowUp')   { e.preventDefault(); if (!open) { openMenu(); return } setActiveIndex((i) => Math.max(0, i - 1)); return }
             if (e.key === 'Enter')     { e.preventDefault(); if (activeIndex < filtered.length) commit(filtered[activeIndex]); else commitCustom(); return }
-            if (e.key === 'Escape')    { e.preventDefault(); setOpen(false); setQuery('') }
+            if (e.key === 'Escape' && open) { e.preventDefault(); e.stopPropagation(); setOpen(false); setQuery('') }
+            if (e.key === 'Tab') { setOpen(false); setQuery('') }
           }}
           className="h-full min-w-0 flex-1 rounded-[14px] bg-transparent px-3.5 pr-10 text-[13px] font-semibold text-ink-900 outline-none placeholder:text-ink-300"
         />
@@ -170,12 +215,15 @@ export function Combobox<T extends string = string>({
         </button>
       </div>
 
-      {open && (
+      {open && createPortal(
         <div
+          ref={listRef}
+          style={menuStyle}
+          onClick={(e) => e.stopPropagation()}
           id={`${id}-listbox`}
           role="listbox"
           aria-label={ariaLabel}
-          className="absolute left-0 right-0 top-full z-[70] mt-2 max-h-72 overflow-auto rounded-[16px] border border-sky2-100 bg-cloud p-2.5 shadow-[0_22px_55px_-24px_rgba(10,30,60,0.38),0_8px_18px_-12px_rgba(10,30,60,0.2),0_0_0_1px_rgba(255,255,255,0.72)_inset] animate-rise"
+          className="fixed z-[70] overflow-auto rounded-[16px] border border-sky2-100 bg-cloud p-2.5 shadow-[0_22px_55px_-24px_rgba(10,30,60,0.38),0_8px_18px_-12px_rgba(10,30,60,0.2),0_0_0_1px_rgba(255,255,255,0.72)_inset] animate-rise"
         >
           {filtered.map((option, idx) => {
             const active = idx === activeIndex
@@ -229,7 +277,7 @@ export function Combobox<T extends string = string>({
           {filtered.length === 0 && !customValue && (
             <div className="px-3 py-3 text-[12.5px] font-semibold text-ink-400">{emptyText}</div>
           )}
-        </div>
+        </div>, document.body,
       )}
     </div>
   )

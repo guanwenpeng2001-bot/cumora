@@ -1,23 +1,22 @@
-import { agentCliCommand } from '@/lib/agentCliRelease'
 import { useEffect, useRef, useState } from 'react'
-import { api, http, getPairingServerOrigin, resolveAssetUrl, type AgentInput } from '@/api/client'
-import { AgentModelFields, CatalogStatus, modelSuggestions, EFFORT_OPTIONS, modelInteger } from '@/components/ModelFields'
-import { useModelCatalog, catalogSource } from '@/stores/modelCatalog'
+import { type AgentInput, api, getPairingServerOrigin, http, resolveAssetUrl } from '@/api/client'
 import { Checkbox } from '@/components/Checkbox'
-import type { AgentModelConfig } from '@/types'
+import { Combobox, type ComboboxOption } from '@/components/Combobox'
+import { Input } from '@/components/Input'
+import { AgentModelFields, CatalogStatus, EFFORT_OPTIONS, modelInteger, modelSuggestions } from '@/components/ModelFields'
+import { Select } from '@/components/Select'
+import { TextArea } from '@/components/TextArea'
+import { agentCliCommand } from '@/lib/agentCliRelease'
+import { engineLabel } from '@/lib/engines'
+import { translate, useLocaleStore, useT } from '@/lib/i18n'
 import { isNativePlatform } from '@/lib/native'
-import { useParticipants } from '@/stores/participants'
+import { useAuth } from '@/stores/auth'
 import { useComputers } from '@/stores/computers'
 import { useConversations } from '@/stores/conversations'
-import { useAuth } from '@/stores/auth'
-import { Input } from '@/components/Input'
-import { TextArea } from '@/components/TextArea'
-import { Select } from '@/components/Select'
-import { Combobox, type ComboboxOption } from '@/components/Combobox'
-import type { Participant, EngineId } from '@/types'
-import { translate, useT, useLocaleStore } from '@/lib/i18n'
-import { AgentEditorSave, bindingReplacement, type BindingStatus, type SaveStage, type StageStatus } from './agentEditorSave'
-import { engineLabel } from '@/lib/engines'
+import { catalogSource, useModelCatalog } from '@/stores/modelCatalog'
+import { useParticipants } from '@/stores/participants'
+import type { AgentModelConfig, EngineId, Participant } from '@/types'
+import { AgentEditorSave, type BindingStatus, bindingReplacement, type SaveStage, type StageStatus } from './agentEditorSave'
 
 const INHERIT_ENGINE = '__inherit__'
 
@@ -50,7 +49,7 @@ interface Props {
   /** if provided, edit mode; otherwise create mode */
   agent: Participant | null
   onClose: () => void
-  /** Called after a successful save, once the modal is already closed. */
+  /** Called after any persisted save stage, once the modal is already closed. */
   onSaved?: () => void
 }
 
@@ -74,7 +73,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
     profile: translate(locale, 'settings.profile'),
     host: translate(locale, 'settings.host'),
     skills: translate(locale, 'me.tab.skills'),
-    mcp: 'MCP',
+    mcp: t('agent.stageMcp'),
     pending: translate(locale, 'settings.pending2'),
     saving: translate(locale, 'settings.saving'),
     saved: translate(locale, 'settings.saved'),
@@ -309,13 +308,19 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
 
   // Esc to close
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') { onClose(); if (savedAgentId) onSaved?.() } }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape' || e.defaultPrevented
+        || document.querySelector('[role="combobox"][aria-expanded="true"]')
+        || Array.from(document.querySelectorAll<HTMLElement>('[role="listbox"]'))
+          .some((list) => list.getClientRects().length > 0 && getComputedStyle(list).visibility !== 'hidden')) return
+      close()
+    }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [onClose, onSaved, savedAgentId])
 
   const submit = async () => {
-    if (!canWrite || savedAgentId || submitting.current || generatingAvatar || !isCurrent()) return
+    if (!canWrite || savedAgentId || submitting.current || generatingAvatar || !name.trim() || !systemPrompt.trim() || !isCurrent()) return
     submitting.current = true
     setErr(null)
     setBusy(true)
@@ -393,6 +398,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
       setResourceRefresh((n) => n + 1)
       void useParticipants.getState().refresh()
       void useConversations.getState().reload()
+      return attempt.agentId
     } catch (e) {
       if (isCurrent()) setErr(e instanceof Error ? e.message : String(e))
     } finally {
@@ -402,8 +408,13 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
   }
 
   const close = () => {
+    const shouldRefresh = !!(save.current?.agentId || savedAgentId) && isCurrent()
     onClose()
-    if (savedAgentId) onSaved?.()
+    if (shouldRefresh) {
+      void useParticipants.getState().refresh()
+      void useConversations.getState().reload()
+      onSaved?.()
+    }
   }
 
   const initial = (name || agent?.id || '?').charAt(0).toUpperCase()
@@ -411,12 +422,12 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
   const generateAvatar = async () => {
     if (!canWrite || !editing || !agent || !isCurrent() || submitting.current || save.current || generatingAvatar) return
     setAvatarErr(null)
+    // Complete every stage before generating from the persisted profile.
+    const agentId = await submit()
+    if (!agentId || !isCurrent()) return
     setGeneratingAvatar(true)
     try {
-      // First save any pending edits so the prompt reflects what the user typed.
-      await api.updateAgent(agent.id, { name, role, systemPrompt, bio, avatarBg })
-      if (!isCurrent()) return
-      const r = await api.generateAgentAvatar(agent.id)
+      const r = await api.generateAgentAvatar(agentId)
       if (!isCurrent()) return
       setAvatarUrl(r.url)
       await useParticipants.getState().refresh()
@@ -796,7 +807,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
                 <button
                   type="button"
                   onClick={generateAvatar}
-                  disabled={!editing || generatingAvatar}
+                  disabled={!editing || generatingAvatar || !name.trim() || !systemPrompt.trim()}
                   className="self-start inline-flex items-center gap-1.5 px-3.5 py-2 rounded-[10px] text-[12.5px] font-semibold transition disabled:opacity-50 disabled:cursor-not-allowed"
                   style={{
                     // Hardcoded purple — this button intentionally keeps the
@@ -947,6 +958,7 @@ function ResourceApplication({ agentId, refresh, saving }: { agentId: string | n
     const controller = new AbortController()
     let timer: ReturnType<typeof setTimeout> | undefined
     const load = async () => {
+      let delay = 30_000
       try {
         const r = await http<ResourceApplicationState>(`/agents/${encodeURIComponent(agentId)}/resources/status`, { signal: controller.signal })
         if (controller.signal.aborted || useAuth.getState().contextEpoch !== epoch) return
@@ -954,12 +966,14 @@ function ResourceApplication({ agentId, refresh, saving }: { agentId: string | n
             || (r.status === 'applied' && r.appliedVersion !== r.version)) throw new Error(translate(zh ? 'zh-CN' : 'en', 'settings.invalidResourceStatusResponse'))
         setState(r)
         setError(null)
+        if (r.status === 'applied') return
+        delay = r.status === 'failed' ? 30_000 : 5_000
       } catch (e) {
         if (controller.signal.aborted || useAuth.getState().contextEpoch !== epoch) return
         setState(null)
         setError(e instanceof Error ? e.message : String(e))
       }
-      if (!controller.signal.aborted && useAuth.getState().contextEpoch === epoch) timer = setTimeout(() => void load(), 5000)
+      if (!controller.signal.aborted && useAuth.getState().contextEpoch === epoch) timer = setTimeout(() => void load(), delay)
     }
     void load()
     return () => { controller.abort(); clearTimeout(timer) }

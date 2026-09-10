@@ -7,6 +7,7 @@ import ts from 'typescript'
 
 // Execute the real TSX with a small hook host; no DOM, network or database required.
 function harness(initialSlots: unknown[] = [], mocks: Record<string, unknown> = {}) {
+  const body = {}
   const slots: unknown[] = [...initialSlots]
   let cursor = 0
   const react = {
@@ -21,6 +22,7 @@ function harness(initialSlots: unknown[] = [], mocks: Record<string, unknown> = 
     useId: () => 'model-picker',
     useMemo: (compute: () => unknown) => compute(),
     useEffect: () => {},
+    useLayoutEffect: () => {},
   }
   const require = createRequire(import.meta.url)
   const cache = new Map<string, Record<string, any>>()
@@ -33,10 +35,11 @@ function harness(initialSlots: unknown[] = [], mocks: Record<string, unknown> = 
       module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX, target: ts.ScriptTarget.ES2022,
     } }).outputText
     vm.runInNewContext(code, {
-      module, exports: module.exports, queueMicrotask: () => {},
+      module, exports: module.exports, queueMicrotask: () => {}, document: { body },
       require: (id: string) => {
         if (id in mocks) return mocks[id]
         if (id === 'react') return react
+        if (id === 'react-dom') return { createPortal: (child: unknown) => child }
         if (id === '@/lib/i18n') return { useT: () => (key: string) => key,
           translate: (_locale: string, key: string) => key,
           useLocaleStore: (select: (s: unknown) => unknown) => select({ locale: 'en' }) }
@@ -48,7 +51,7 @@ function harness(initialSlots: unknown[] = [], mocks: Record<string, unknown> = 
     })
     return module.exports
   }
-  return { load, render: (component: (props: any) => any, props: any) => {
+  return { body, load, render: (component: (props: any) => any, props: any) => {
     cursor = 0
     return component(props)
   } }
@@ -99,7 +102,7 @@ test('opening with a current value shows all platforms; only typing filters; reo
   assert.equal(options(render()).length, 4)
   input(render()).props.onChange({ target: { value: 'deepseek' } })
   assert.equal(options(render()).length, 1)
-  input(render()).props.onKeyDown({ key: 'Escape', nativeEvent: {}, preventDefault() {} })
+  input(render()).props.onKeyDown({ key: 'Escape', nativeEvent: {}, preventDefault() {}, stopPropagation() {} })
   input(render()).props.onFocus()
   assert.equal(options(render()).length, 4)
 })
@@ -158,6 +161,167 @@ test('ModelsTab wires all six roles to the full catalog and keeps embedding with
       assert.ok(fallback)
       assert.deepEqual(primary.props.options, fallback.props.options)
       assert.ok(primary.props.options.includes(fallback.props.value[0]))
+    }
+  }
+})
+
+// Execute selected handlers/effects from the real component in isolated API hosts.
+function sourceFunction(file: string, name: string, scope: Record<string, unknown>) {
+  const source = readFileSync(new URL(`../${file}`, import.meta.url), 'utf8')
+  const ast = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
+  let expression: string | undefined
+  const visit = (node: ts.Node) => {
+    if (ts.isVariableDeclaration(node) && node.name.getText(ast) === name && node.initializer) expression = node.initializer.getText(ast)
+    ts.forEachChild(node, visit)
+  }
+  visit(ast)
+  assert.ok(expression, name)
+  const code = ts.transpileModule(`result = (${expression})`, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText
+  const context = { ...scope, result: undefined }
+  vm.runInNewContext(code, context)
+  return context.result as unknown as (...args: any[]) => any
+}
+
+test('portal menu targets body and consumes only an open-menu Escape; Tab dismisses', () => {
+  let portalTarget: unknown
+  const h = harness([], { 'react-dom': { createPortal: (child: unknown, container: unknown) => { portalTarget = container; return child } } })
+  const { Combobox } = h.load('src/components/Combobox.tsx')
+  const render = () => h.render(Combobox, { value: 'one', options: [{ value: 'one', label: 'One' }], onValueChange() {} })
+  const input = () => elements(render()).find(e => e.props?.role === 'combobox')
+  let prevented = 0
+  let stopped = 0
+  const event = { key: 'Escape', nativeEvent: {}, preventDefault() { prevented++ }, stopPropagation() { stopped++ } }
+  input().props.onFocus()
+  assert.equal(input().props['aria-expanded'], true)
+  assert.equal(portalTarget, h.body)
+  input().props.onKeyDown(event)
+  assert.equal(input().props['aria-expanded'], false)
+  assert.equal(prevented, 1)
+  assert.equal(stopped, 1)
+  input().props.onKeyDown(event)
+  assert.equal(prevented, 1)
+  input().props.onFocus()
+  input().props.onKeyDown({ ...event, key: 'Tab' })
+  assert.equal(input().props['aria-expanded'], false)
+})
+
+test('desktop and mobile editor close refresh a partially created agent, even if close unmounts synchronously', () => {
+  for (const file of ['src/desktop/AgentsView.tsx', 'src/mobile/MobileAgents.tsx']) {
+    assert.match(readFileSync(new URL(`../${file}`, import.meta.url), 'utf8'), /<AgentEditor\s/)
+    let mounted = true
+    const calls: string[] = []
+    const close = sourceFunction('src/components/AgentEditor.tsx', 'close', {
+      save: { current: { agentId: 'created-before-bindings-failed' } }, savedAgentId: null,
+      isCurrent: () => mounted,
+      onClose: () => { calls.push('close'); mounted = false },
+      onSaved: file.includes('desktop') ? () => calls.push('roster') : undefined,
+      useParticipants: { getState: () => ({ refresh: () => calls.push('participants') }) },
+      useConversations: { getState: () => ({ reload: () => calls.push('conversations') }) },
+    })
+    let expanded = true
+    const onKey = sourceFunction('src/components/AgentEditor.tsx', 'onKey', {
+      close, document: { querySelector: () => expanded ? {} : null, querySelectorAll: () => [] },
+    })
+    onKey({ key: 'Escape', defaultPrevented: true })
+    onKey({ key: 'Escape', defaultPrevented: false })
+    assert.deepEqual(calls, [])
+    expanded = false
+    onKey({ key: 'Escape', defaultPrevented: false })
+    assert.deepEqual(calls, file.includes('desktop') ? ['close', 'participants', 'conversations', 'roster'] : ['close', 'participants', 'conversations'])
+  }
+})
+
+test('portrait waits for all staged writes; failed save never generates; retry skips committed stages', async () => {
+  const { AgentEditorSave } = await import('../src/components/agentEditorSave')
+  const calls: string[] = []
+  let fail = true
+  const attempt = new AgentEditorSave({ agentId: 'a', profile: { name: 'New', systemPrompt: 'Prompt', model: 'new-model' },
+    create: { name: 'New', systemPrompt: 'Prompt' }, skills: ['skill'], mcp: ['connector'], engineError: '' })
+  const client = {
+    updateAgent: async (_id: string, profile: any) => { assert.equal(profile.model, 'new-model'); calls.push('profile') },
+    setAgentSkills: async () => { calls.push('skills'); if (fail) throw new Error('binding failed') },
+    setAgentMcpConnectors: async () => { calls.push('mcp') },
+  }
+  const generate = () => sourceFunction('src/components/AgentEditor.tsx', 'generateAvatar', {
+    canWrite: true, editing: true, agent: { id: 'a' }, isCurrent: () => true,
+    submitting: { current: false }, save: { current: null }, generatingAvatar: false,
+    setAvatarErr() {}, setGeneratingAvatar() {}, setAvatarUrl() {},
+    submit: async () => { try { return await attempt.run(client as any, () => true, () => {}) ? attempt.agentId : undefined } catch { return undefined } },
+    api: { generateAgentAvatar: async () => { calls.push('portrait'); return { url: 'portrait.png' } } },
+    useParticipants: { getState: () => ({ refresh() {} }) },
+  })()
+  await generate()
+  assert.deepEqual(calls, ['profile', 'skills'])
+  fail = false
+  await generate()
+  assert.deepEqual(calls, ['profile', 'skills', 'skills', 'mcp', 'portrait'])
+})
+
+test('resource poll stops at applied, backs off failed, and ignores an aborted response', async () => {
+  for (const [status, expectedDelay] of [['pending', 5000], ['failed', 30000], ['applied', undefined]] as const) {
+    const controller = new AbortController()
+    const delays: number[] = []
+    const load = sourceFunction('src/components/AgentEditor.tsx', 'load', {
+      controller, epoch: 1, agentId: 'a', timer: undefined,
+      useAuth: { getState: () => ({ contextEpoch: 1 }) },
+      http: async () => ({ saved: true, version: 'v', appliedVersion: status === 'applied' ? 'v' : null, status }),
+      setState() {}, setError() {}, setTimeout: (_fn: unknown, delay: number) => delays.push(delay),
+    })
+    await load()
+    assert.deepEqual(delays, expectedDelay ? [expectedDelay] : [])
+    controller.abort()
+    await load()
+    assert.equal(delays.length, expectedDelay ? 1 : 0)
+  }
+})
+
+test('portal positioning stays inside desktop and mobile viewport and flips above a low input', () => {
+  for (const width of [390, 1440]) {
+    for (const y of [80, 700]) {
+      let style: any
+      const position = sourceFunction('src/components/Combobox.tsx', 'position', {
+        inputRef: { current: { matches: () => false, getBoundingClientRect: () => ({ left: 40, top: y, bottom: y + 44, width: 300 }) } },
+        window: { innerWidth: width, innerHeight: 800 },
+        setMenuStyle: (next: unknown) => { style = next }, setOpen() {},
+      })
+      position()
+      assert.equal(style.position, 'fixed')
+      assert.ok(style.left >= 8 && style.left + style.width <= width - 8)
+      assert.ok(style.maxHeight > 0 && style.maxHeight <= 288)
+      if (y === 700) assert.equal(style.bottom, 108)
+      else assert.equal(style.top, 132)
+    }
+  }
+})
+
+test('usage requests summary, trend, logs and only the selected breakdown on initial load and refresh', async () => {
+  const source = readFileSync(new URL('../src/desktop/UsageDashboard.tsx', import.meta.url), 'utf8')
+  const ast = ts.createSourceFile('UsageDashboard.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
+  const queries: string[] = []
+  const visit = (node: ts.Node) => {
+    if (ts.isVariableDeclaration(node) && node.initializer && ts.isCallExpression(node.initializer)
+      && node.initializer.expression.getText(ast) === 'useUsageQuery') queries.push(node.initializer.getText(ast))
+    ts.forEachChild(node, visit)
+  }
+  visit(ast)
+  assert.equal(queries.length, 6)
+  const js = ts.transpileModule(queries.join('\n'), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText
+  for (const dim of ['agent', 'model', 'provider', 'agent']) {
+    for (const refresh of [0, 1]) {
+      const calls: string[] = []
+      const pending: Promise<unknown>[] = []
+      const api = Object.fromEntries(['Summary', 'Trend', 'Logs', 'ByAgent', 'ByModel', 'ByProvider'].map(name => [
+        `getUsage${name}`, async () => { calls.push(name) },
+      ]))
+      vm.runInNewContext(js, {
+        api, dim, refresh, from: 'from', to: 'to', granularity: 'hour', page: 1, range: {}, enabled: true, epoch: 1,
+        useCallback: (callback: unknown) => callback,
+        useUsageQuery: (request: (signal: AbortSignal) => Promise<unknown>, enabled: boolean) => {
+          if (enabled) pending.push(request(new AbortController().signal))
+        },
+      })
+      await Promise.all(pending)
+      assert.deepEqual(calls.sort(), ['Summary', 'Trend', 'Logs', `By${dim[0].toUpperCase()}${dim.slice(1)}`].sort())
     }
   }
 })
