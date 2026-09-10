@@ -1,10 +1,9 @@
 import { agentCliCommand } from '@/lib/agentCliRelease'
 import { useEffect, useRef, useState } from 'react'
 import { api, http, getPairingServerOrigin, resolveAssetUrl, type AgentInput } from '@/api/client'
-import { FallbackChainEditor, CatalogStatus, EFFORT_OPTIONS, modelInteger } from '@/components/ModelFields'
+import { AgentModelFields, CatalogStatus, EFFORT_OPTIONS, modelInteger } from '@/components/ModelFields'
 import { useModelCatalog, catalogOptions, catalogSource } from '@/stores/modelCatalog'
 import { Checkbox } from '@/components/Checkbox'
-import { cn } from '@/lib/utils'
 import type { AgentModelConfig } from '@/types'
 import { isNativePlatform } from '@/lib/native'
 import { useParticipants } from '@/stores/participants'
@@ -119,7 +118,6 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
   const [mcMaxTokens, setMcMaxTokens] = useState(agent?.modelConfig?.maxOutputTokens != null ? String(agent.modelConfig.maxOutputTokens) : '')
   const [mcThinking, setMcThinking] = useState<boolean | undefined>(agent?.modelConfig?.thinking)
   const [mcFallbacks, setMcFallbacks] = useState<string[]>(agent?.modelConfig?.fallbackModels ?? [])
-  const [advancedOpen, setAdvancedOpen] = useState(false)
   // Skills: checkbox over the company library; edit mode loads the agent's
   // enablement, create mode saves after creation.
   const [skillChoices, setSkillChoices] = useState<Array<{ id: string; name: string; description: string }>>([])
@@ -463,7 +461,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
           >×</button>
         </div>
 
-        <fieldset disabled={!canWrite || busy || !!progress || contextChanged || generatingAvatar} className="px-6 py-5 space-y-4 overflow-y-auto flex-1 min-h-0">
+        <fieldset disabled={!canWrite || busy || !!progress || contextChanged || generatingAvatar} className="px-6 py-5 space-y-4 overflow-y-auto flex-1 min-h-0 min-w-0">
           <Field label={t('agent.nameLabel')} hint={t('agent.nameHint')}>
             <Input
               type="text"
@@ -551,83 +549,17 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
             </Field>
           )}
 
-          <div className="rounded-[10px] border border-ink-100 bg-paper/60">
-            <button
-              type="button"
-              onClick={() => setAdvancedOpen((v) => !v)}
-              className="w-full flex items-center gap-2 px-3.5 py-2.5 text-left"
-              aria-expanded={advancedOpen}
-            >
-              <span className={cn('text-[10px] text-ink-400 transition-transform inline-block', advancedOpen && 'rotate-90')}>▶</span>
-              <span className="text-[12.5px] font-semibold text-ink-700">{t('agent.advancedModelSettings')}</span>
-              {isByoa && (
-                <span className="ml-auto text-[10.5px] text-ink-400 italic">{t('agent.engineManagedTag')}</span>
-              )}
-            </button>
-            {advancedOpen && (
-              <div className="px-3.5 pb-3.5 pt-1 space-y-3 border-t border-ink-100">
-                {isByoa ? (
-                  <div className="text-[11.5px] text-ink-500 italic">{t('agent.engineManagedNote')}</div>
-                ) : (
-                  <>
-                    <div className="grid grid-cols-[96px_1fr] items-center gap-x-3 gap-y-2.5">
-                      <label className="text-[11.5px] font-semibold text-ink-500">{t('agent.mcEffort')}</label>
-                      <select
-                        value={mcEffort}
-                        onChange={(e) => setMcEffort(e.target.value)}
-                        className="h-8 px-2 rounded-[8px] text-[12.5px] text-ink-900 bg-paper outline-none focus:ring-2 focus:ring-skype/30"
-                        style={{ border: '1px solid var(--ink-100)' }}
-                      >
-                        <option value="">{t('agent.mcFollowGlobal')}</option>
-                        {mcEffort && !effortOptions.includes(mcEffort) && <option value={mcEffort} disabled>{mcEffort} — {translate(locale, 'settings.unsupportedChooseAnotherValue')}</option>}
-                        {effortOptions.map((o) => <option key={o} value={o}>{o}</option>)}
-                      </select>
-                      <label className="text-[11.5px] font-semibold text-ink-500">{t('agent.mcContextWindow')}</label>
-                      <input
-                        type="text" inputMode="numeric"
-                        value={mcContextWindow}
-                        onChange={(e) => setMcContextWindow(e.target.value)}
-                        placeholder={t('agent.mcContextWindowPh')}
-                        className="h-8 px-2.5 rounded-[8px] text-[12.5px] text-ink-900 bg-paper outline-none focus:ring-2 focus:ring-skype/30 font-mono"
-                        style={{ border: '1px solid var(--ink-100)' }}
-                      />
-                      <label className="text-[11.5px] font-semibold text-ink-500">{t('agent.mcMaxTokens')}</label>
-                      <input
-                        type="text" inputMode="numeric"
-                        value={mcMaxTokens}
-                        onChange={(e) => setMcMaxTokens(e.target.value)}
-                        placeholder={t('agent.mcMaxTokensPh')}
-                        className="h-8 px-2.5 rounded-[8px] text-[12.5px] text-ink-900 bg-paper outline-none focus:ring-2 focus:ring-skype/30 font-mono"
-                        style={{ border: '1px solid var(--ink-100)' }}
-                      />
-                      <label className="text-[11.5px] font-semibold text-ink-500">{t('agent.mcThinking')}</label>
-                      <select value={mcThinking === undefined ? '' : String(mcThinking)}
-                        onChange={(e) => setMcThinking(e.target.value === '' ? undefined : e.target.value === 'true')}
-                        className="h-8 px-2 rounded-[8px] text-[12.5px] bg-paper">
-                        <option value="">{t('agent.mcFollowGlobal')}</option>
-                        <option value="true">{translate(locale, 'settings.enabledSubjectToModelConfiguration')}</option>
-                        <option value="false">{translate(locale, 'settings.disabled')}</option>
-                      </select>
-                    </div>
-                    <div>
-                      <div className="text-[11.5px] font-semibold text-ink-500 mb-1.5">{t('agent.mcFallbacks')}</div>
-                      <div className="text-[10.5px] text-ink-400 mb-1.5 italic">{t('agent.mcFallbacksHint')}</div>
-                      <FallbackChainEditor
-                        value={mcFallbacks}
-                        onChange={setMcFallbacks}
-                        options={catalogText}
-                        primary={model}
-                        history={agent?.modelConfig?.fallbackModels}
-                        catalog={catalogState.catalog}
-                        listId="agent-mc-fallbacks"
-                        t={t}
-                      />
-                    </div>
-                  </>
-                )}
-              </div>
-            )}
-          </div>
+          <AgentModelFields
+            isByoa={isByoa}
+            mcEffort={mcEffort} setMcEffort={setMcEffort}
+            mcContextWindow={mcContextWindow} setMcContextWindow={setMcContextWindow}
+            mcMaxTokens={mcMaxTokens} setMcMaxTokens={setMcMaxTokens}
+            mcThinking={mcThinking} setMcThinking={setMcThinking}
+            mcFallbacks={mcFallbacks} setMcFallbacks={setMcFallbacks}
+            catalogText={catalogText} model={model}
+            history={agent?.modelConfig?.fallbackModels}
+            catalog={catalogState.catalog}
+          />
 
           <div className="rounded-[10px] border border-ink-100 bg-paper/60 px-3.5 py-2.5">
             <div className="text-[12.5px] font-semibold text-ink-700 mb-1.5">{t('agent.skillsTitle')}</div>
@@ -1028,14 +960,17 @@ function ResourceApplication({ agentId, refresh, saving }: { agentId: string | n
   if (!agentId) return null
   const label = state?.status === 'applied' ? (translate(zh ? 'zh-CN' : 'en', 'settings.applied'))
     : state?.status === 'failed' ? (translate(zh ? 'zh-CN' : 'en', 'settings.applicationFailed')) : (translate(zh ? 'zh-CN' : 'en', 'settings.pendingApplication'))
-  return <div className="px-6 py-3 border-t border-ink-100 text-[12px]" aria-live="polite">
+  return <div className="px-6 py-3 border-t border-ink-100 text-[12px] leading-relaxed shrink-0 min-w-0 max-h-[30vh] overflow-y-auto break-words space-y-1.5" aria-live="polite">
     <div className="font-semibold">{translate(zh ? 'zh-CN' : 'en', 'settings.skillsMcpResourceApplication')}</div>
     {saving ? <div>{translate(zh ? 'zh-CN' : 'en', 'settings.savingApplicationStatusWillRefreshAfterSaving')}</div>
       : error ? <div role="alert" className="text-coral-deep">{translate(zh ? 'zh-CN' : 'en', 'settings.applicationStatusUnavailable')}{error}</div>
       : state ? <>
-        <div>{translate(zh ? 'zh-CN' : 'en', 'settings.saved')} · {label}</div>
-        <div className="break-all text-[10.5px] text-ink-400">{translate(zh ? 'zh-CN' : 'en', 'settings.desiredVersion')}{state.version}</div>
-        {state.appliedVersion && <div className="break-all text-[10.5px] text-ink-400">{translate(zh ? 'zh-CN' : 'en', 'settings.appliedVersion')}{state.appliedVersion}</div>}
+        <div className="flex flex-wrap gap-x-3 gap-y-1">
+          <span>{translate(zh ? 'zh-CN' : 'en', 'settings.saved')}</span>
+          <span>{label}</span>
+        </div>
+        <div className="break-all text-[10.5px] text-ink-400">{translate(zh ? 'zh-CN' : 'en', 'settings.desiredVersion')}<span className="font-mono whitespace-nowrap" title={state.version}>{state.version.length > 8 ? state.version.slice(0, 8) + '…' : state.version}</span></div>
+        {state.appliedVersion && <div className="break-all text-[10.5px] text-ink-400">{translate(zh ? 'zh-CN' : 'en', 'settings.appliedVersion')}<span className="font-mono whitespace-nowrap" title={state.appliedVersion}>{state.appliedVersion.length > 8 ? state.appliedVersion.slice(0, 8) + '…' : state.appliedVersion}</span></div>}
         {state.status === 'failed' && <div role="alert" className="text-coral-deep">{state.error ?? (translate(zh ? 'zh-CN' : 'en', 'settings.theRuntimeCouldNotApplyResources'))}</div>}
       </> : <div>{translate(zh ? 'zh-CN' : 'en', 'settings.loadingApplicationStatus')}</div>}
     <div className="text-ink-500">{translate(zh ? 'zh-CN' : 'en', 'settings.savedChangesApplyAtTheNextSafeTurnBoundary')}</div>

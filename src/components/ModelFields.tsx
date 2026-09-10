@@ -7,7 +7,8 @@
 import { useId, useRef, useState } from 'react'
 import { translate, useLocaleStore } from '@/lib/i18n'
 import { catalogPlatforms, catalogSource, type Catalog } from '@/stores/modelCatalog'
-import type { MessageKey, useT } from '@/lib/i18n'
+import { useT, type MessageKey } from '@/lib/i18n'
+import { cn } from '@/lib/utils'
 
 type T = ReturnType<typeof useT>
 
@@ -98,7 +99,7 @@ export function FallbackChainEditor({ value, onChange, options, listId, t, prima
           value={adding}
           onChange={(e) => setAdding(e.target.value)}
           placeholder={t('me.models.addFallback' as MessageKey)}
-          className="flex-1 h-7 px-2 rounded-[7px] text-[12px] text-ink-900 bg-paper outline-none focus:ring-2 focus:ring-skype/30 font-mono"
+          className="flex-1 min-w-0 h-7 px-2 rounded-[7px] text-[12px] text-ink-900 bg-paper outline-none focus:ring-2 focus:ring-skype/30 font-mono"
           style={{ border: '1px solid var(--ink-100)' }}
           spellCheck={false}
           onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); add() } }}
@@ -110,6 +111,113 @@ export function FallbackChainEditor({ value, onChange, options, listId, t, prima
           {t('me.models.add' as MessageKey)}
         </button>
       </div>
+    </div>
+  )
+}
+
+/** The same controlled model overrides for creating and editing an agent. */
+export function AgentModelFields({
+  isByoa, mcEffort, setMcEffort, mcContextWindow, setMcContextWindow,
+  mcMaxTokens, setMcMaxTokens, mcThinking, setMcThinking, mcFallbacks,
+  setMcFallbacks, catalogText, model, history, catalog,
+}: {
+  isByoa: boolean
+  mcEffort: string
+  setMcEffort: (value: string) => void
+  mcContextWindow: string
+  setMcContextWindow: (value: string) => void
+  mcMaxTokens: string
+  setMcMaxTokens: (value: string) => void
+  mcThinking: boolean | undefined
+  setMcThinking: (value: boolean | undefined) => void
+  mcFallbacks: string[]
+  setMcFallbacks: (value: string[]) => void
+  catalogText: string[]
+  model: string
+  history?: string[]
+  catalog: Catalog | null
+}) {
+  const t = useT()
+  const locale = useLocaleStore((s) => s.locale)
+  const [advancedOpen, setAdvancedOpen] = useState(false)
+  const effortOptions = EFFORT_OPTIONS
+  return (
+    <div className="rounded-[10px] border border-ink-100 bg-paper/60">
+      <button
+        type="button"
+        onClick={() => setAdvancedOpen((v) => !v)}
+        className="w-full flex items-center gap-2 px-3.5 py-2.5 text-left"
+        aria-expanded={advancedOpen}
+      >
+        <span className={cn('text-[10px] text-ink-400 transition-transform inline-block', advancedOpen && 'rotate-90')}>▶</span>
+        <span className="text-[12.5px] font-semibold text-ink-700">{t('agent.advancedModelSettings')}</span>
+        {isByoa && (
+          <span className="ml-auto text-[10.5px] text-ink-400 italic">{t('agent.engineManagedTag')}</span>
+        )}
+      </button>
+      {advancedOpen && (
+        <div className="px-3.5 pb-3.5 pt-1 space-y-3 border-t border-ink-100">
+          {isByoa ? (
+            <div className="text-[11.5px] text-ink-500 italic">{t('agent.engineManagedNote')}</div>
+          ) : (
+            <>
+              <div className="grid grid-cols-1 sm:grid-cols-[96px_minmax(0,1fr)] items-center gap-x-3 gap-y-2.5">
+                <label className="text-[11.5px] font-semibold text-ink-500">{t('agent.mcEffort')}</label>
+                <select
+                  value={mcEffort}
+                  onChange={(e) => setMcEffort(e.target.value)}
+                  className="min-w-0 w-full h-8 px-2 rounded-[8px] text-[12.5px] text-ink-900 bg-paper outline-none focus:ring-2 focus:ring-skype/30"
+                  style={{ border: '1px solid var(--ink-100)' }}
+                >
+                  <option value="">{t('agent.mcFollowGlobal')}</option>
+                  {mcEffort && !effortOptions.includes(mcEffort) && <option value={mcEffort} disabled>{mcEffort} — {translate(locale, 'settings.unsupportedChooseAnotherValue')}</option>}
+                  {effortOptions.map((o) => <option key={o} value={o}>{o}</option>)}
+                </select>
+                <label className="text-[11.5px] font-semibold text-ink-500">{t('agent.mcContextWindow')}</label>
+                <input
+                  type="text" inputMode="numeric"
+                  value={mcContextWindow}
+                  onChange={(e) => setMcContextWindow(e.target.value)}
+                  placeholder={t('agent.mcContextWindowPh')}
+                  className="min-w-0 w-full h-8 px-2.5 rounded-[8px] text-[12.5px] text-ink-900 bg-paper outline-none focus:ring-2 focus:ring-skype/30 font-mono"
+                  style={{ border: '1px solid var(--ink-100)' }}
+                />
+                <label className="text-[11.5px] font-semibold text-ink-500">{t('agent.mcMaxTokens')}</label>
+                <input
+                  type="text" inputMode="numeric"
+                  value={mcMaxTokens}
+                  onChange={(e) => setMcMaxTokens(e.target.value)}
+                  placeholder={t('agent.mcMaxTokensPh')}
+                  className="min-w-0 w-full h-8 px-2.5 rounded-[8px] text-[12.5px] text-ink-900 bg-paper outline-none focus:ring-2 focus:ring-skype/30 font-mono"
+                  style={{ border: '1px solid var(--ink-100)' }}
+                />
+                <label className="text-[11.5px] font-semibold text-ink-500">{t('agent.mcThinking')}</label>
+                <select value={mcThinking === undefined ? '' : String(mcThinking)}
+                  onChange={(e) => setMcThinking(e.target.value === '' ? undefined : e.target.value === 'true')}
+                  className="min-w-0 w-full h-8 px-2 rounded-[8px] text-[12.5px] bg-paper">
+                  <option value="">{t('agent.mcFollowGlobal')}</option>
+                  <option value="true">{translate(locale, 'settings.enabledSubjectToModelConfiguration')}</option>
+                  <option value="false">{translate(locale, 'settings.disabled')}</option>
+                </select>
+              </div>
+              <div>
+                <div className="text-[11.5px] font-semibold text-ink-500 mb-1.5">{t('agent.mcFallbacks')}</div>
+                <div className="text-[10.5px] text-ink-400 mb-1.5 italic">{t('agent.mcFallbacksHint')}</div>
+                <FallbackChainEditor
+                  value={mcFallbacks}
+                  onChange={setMcFallbacks}
+                  options={catalogText}
+                  primary={model}
+                  history={history}
+                  catalog={catalog}
+                  listId="agent-mc-fallbacks"
+                  t={t}
+                />
+              </div>
+            </>
+          )}
+        </div>
+      )}
     </div>
   )
 }

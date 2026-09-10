@@ -620,7 +620,7 @@ export const zhCN: Partial<Record<keyof typeof en, string>> = {
   'agent.modelHintByoaAntigravity': 'Antigravity `agy models` 显示的完整模型名（例如 Gemini 3.5 Flash (High)）。',
   'agent.modelHintByoaClaude': 'Claude 别名或全名（例如 opus、sonnet、claude-sonnet-4-6）。',
   'agent.modelHintByoaSuffix': '留空 = 使用引擎默认。',
-  'agent.modelHintCloud': '可选 — 留空使用系统默认。任意 OpenAI 模型名都可以（例如 gpt-5.5、gpt-5.5-pro、gpt-5.5-mini）。加 novita/ 前缀可改走 Novita（例如 novita/deepseek/deepseek-v3.2）。',
+  'agent.modelHintCloud': '可选 — 从模型目录选择，或留空跟随系统默认。',
   'agent.fastLabelByoa': '轻量模型（小脑）',
   'agent.fastHintByoaCodex': '处理轻量辅助任务的便宜模型（例如 gpt-5.4-mini）。留空 = 与主力模型相同。',
   'agent.fastHintByoaGrok': '处理轻量辅助任务的更快更便宜的 Grok 模型（例如 grok-4.5）。留空 = 引擎默认。',

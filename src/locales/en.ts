@@ -618,7 +618,7 @@ export const en = {
   'agent.modelHintByoaAntigravity': 'An exact Antigravity model name shown by `agy models` (e.g. Gemini 3.5 Flash (High)).',
   'agent.modelHintByoaClaude': "A Claude alias or full name (e.g. opus, sonnet, claude-sonnet-4-6).",
   'agent.modelHintByoaSuffix': 'Blank = engine default.',
-  'agent.modelHintCloud': 'Optional — leave blank to use the system default. Any OpenAI model name works (e.g. gpt-5.5, gpt-5.5-pro, gpt-5.5-mini). Prefix with novita/ to run this agent on Novita instead (e.g. novita/deepseek/deepseek-v3.2).',
+  'agent.modelHintCloud': 'Optional — choose a model from the catalog, or leave blank to follow the system default.',
   'agent.fastLabelByoa': 'Small-brain model (小脑)',
   'agent.fastHintByoaCodex': 'Cheaper model for light auxiliary tasks (e.g. gpt-5.4-mini). Blank = same as big-brain.',
   'agent.fastHintByoaGrok': 'Cheaper/faster Grok model for light auxiliary tasks (e.g. grok-4.5). Blank = engine default.',
