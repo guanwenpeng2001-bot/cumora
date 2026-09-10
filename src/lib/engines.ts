@@ -3,6 +3,7 @@ export const ENGINE_LABEL: Record<string, string> = {
   managed: 'Cumora',
   claude: 'Claude Code',
   codex: 'Codex',
+  kimi: 'Kimi Code',
   grok: 'Grok Build',
   cursor: 'Cursor',
   opencode: 'OpenCode',
@@ -17,6 +18,7 @@ export const ENGINE_LABEL: Record<string, string> = {
 export const ENGINE_BIN: Record<string, string> = {
   claude: 'claude',
   codex: 'codex',
+  kimi: 'kimi',
   grok: 'grok',
   cursor: 'cursor-agent',
   opencode: 'opencode',
@@ -35,7 +37,7 @@ export const ENGINE_BIN: Record<string, string> = {
  *  state that holds a choice, and the set for membership tests. Engine pickers
  *  used to inline their own copy of this list *and* their own copy of the
  *  labels, which is how adding an engine could leave it unselectable. */
-export const RUNNABLE_ENGINES = ['claude', 'codex', 'grok', 'cursor', 'opencode', 'pi', 'gemini', 'qwen', 'antigravity'] as const
+export const RUNNABLE_ENGINES = ['claude', 'codex', 'kimi', 'grok', 'cursor', 'opencode', 'pi', 'gemini', 'qwen', 'antigravity'] as const
 
 export type RunnableEngineId = typeof RUNNABLE_ENGINES[number]
 

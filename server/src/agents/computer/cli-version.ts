@@ -85,6 +85,10 @@ export const ENGINE_VERSION_SPECS: Record<string, EngineVersionSpec> = {
     latestVia: 'cursor-about',
     selfUpdate: 'cursor-agent update',
   },
+  kimi: {
+    versionArgs: ['--version'],
+    selfUpdate: 'kimi upgrade',
+  },
   codex: {
     versionArgs: ['--version'],
     npm: '@openai/codex',

@@ -28,6 +28,7 @@ async function main(): Promise<void> {
     '  cumora agent computer --pair <code> [--server <url>]   pair this machine\n' +
     '  cumora agent computer [--server <url>]                 start the daemon\n\n' +
     'Secure default: Claude Code on macOS/Linux/WSL2, or Codex on macOS/Linux/WSL2/Windows.\n' +
+    'Kimi Code (kimi-code): install from https://moonshotai.github.io/kimi-code/ and run kimi login.\n' +
     'Other engines require the high-risk CUMORA_BYOA_ALLOW_UNSANDBOXED=1 compatibility switch. Get a pairing code from\n' +
     'Cumora → You → Computers → Add a computer.\n',
   )

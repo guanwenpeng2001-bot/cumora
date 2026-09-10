@@ -25,7 +25,7 @@ import { signAgentToken } from '../runtime/jwt.js'
 import type { EngineModelCatalog, EngineModelOption, FastModelScope, ModelCatalogSource } from './model-catalog.js'
 
 export type ComputerKind = 'cloud' | 'local' | 'vps'
-export type EngineId = 'managed' | 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini' | 'qwen' | 'antigravity'
+export type EngineId = 'managed' | 'claude' | 'codex' | 'kimi' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini' | 'qwen' | 'antigravity'
 export type ComputerStatus = 'online' | 'offline' | 'busy'
 
 /** How long a paired computer can go without a heartbeat before the sweep
@@ -62,6 +62,7 @@ export async function announceComputerOnline(computerId: string, companyId: stri
  *  plain `new Set([...])` accepted an incomplete list silently, and the engine
  *  left out of it could be detected and shown but never actually paired. */
 const PAIRABLE: Record<Exclude<EngineId, 'managed'>, true> = {
+  kimi: true,
   claude: true, codex: true, grok: true, cursor: true, opencode: true, pi: true, gemini: true,
   qwen: true,
   antigravity: true,
@@ -109,6 +110,7 @@ export function mergeDetectedEngines(current: string[], detected: string[]): str
 const ENGINE_BINS: Record<Exclude<EngineId, 'managed'>, string> = {
   claude: 'claude',
   codex: 'codex',
+  kimi: 'kimi',
   grok: 'grok',
   cursor: 'cursor-agent',
   opencode: 'opencode',
@@ -716,6 +718,7 @@ export async function listAgentsForComputer(computerId: string): Promise<
       }
     }
     if (agent.model) return agent
+    if (r.engine === 'kimi') return { ...agent, model: process.env.CUMORA_DEFAULT_KIMI_MODEL?.trim() || null }
     const dflt = r.engine === 'codex'
       ? codexDefault
       : r.engine === 'claude'

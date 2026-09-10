@@ -41,6 +41,14 @@ const PRESETS: Record<EngineId, EngineModelCatalog> = {
     fastModelScope: 'agent',
     source: 'presets',
   },
+  kimi: {
+    models: [],
+    defaultModel: null,
+    defaultFastModel: null,
+    supportsCustom: true,
+    fastModelScope: 'agent',
+    source: 'presets',
+  },
   codex: {
     models: [
       { id: 'gpt-5.4-mini', label: 'GPT-5.4 Mini', recommendedFor: ['small'] },

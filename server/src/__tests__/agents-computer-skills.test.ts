@@ -40,7 +40,7 @@ for (const engine of ENGINE_IDS) {
     const text = await readFile(join(home, personaFile), 'utf8')
     const path = text.match(/read `([^`]+\/example\/SKILL.md)`/)?.[1]
     assert.ok(path, 'persona must point to the actual skill file')
-    const native = ['codex', 'grok', 'antigravity'].includes(engine) ? 'agents' : engine
+    const native = ['codex', 'grok', 'antigravity'].includes(engine) ? 'agents' : engine === 'kimi' ? 'kimi-code' : engine
     assert.equal(path, `.${native}/skills/example/SKILL.md`)
     const actualSkill = join(home, path)
     assert.equal(await readFile(actualSkill, 'utf8'), fullBody)

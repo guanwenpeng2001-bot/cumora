@@ -351,10 +351,10 @@ function resolveCodexSpawn(): CodexSpawn {
   return { command: node, argsPrefix: [script], shell: false, wantsStdinPrompt: false }
 }
 
-export type EngineId = 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini' | 'qwen' | 'antigravity'
+export type EngineId = 'claude' | 'codex' | 'kimi' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini' | 'qwen' | 'antigravity'
 
 /** The pairable engine ids, in the daemon's default detection order. */
-export const ENGINE_IDS: EngineId[] = ['claude', 'codex', 'grok', 'cursor', 'opencode', 'pi', 'gemini', 'qwen', 'antigravity']
+export const ENGINE_IDS: EngineId[] = ['claude', 'codex', 'kimi', 'grok', 'cursor', 'opencode', 'pi', 'gemini', 'qwen', 'antigravity']
 
 /** Engines for which Cumora can impose a fail-closed filesystem + tool-network
  * boundary non-interactively. The remaining adapters still work for operators
@@ -5347,9 +5347,333 @@ class AntigravityAdapter implements EngineAdapter {
 }
 
 
+// ─── Kimi Code (kimi-code 0.42.0) ────────────────────────────────────────
+// Print mode is role-based JSONL, not Claude's stream-json. ACP is the native
+// persistent transport. Neither transport provides a verified host sandbox.
+const KIMI_INSTALL_HINT = 'missing-dependency: install Kimi Code (kimi-code) from https://moonshotai.github.io/kimi-code/ (tested 0.42.0), put kimi on PATH, then run `kimi login`.'
+
+export function resolveKimiCommand(env: NodeJS.ProcessEnv): string {
+  for (const dir of (env.PATH ?? env.Path ?? '').split(PATH_DELIMITER)) {
+    if (!dir) continue
+    const file = join(dir, IS_WIN ? 'kimi.exe' : 'kimi')
+    if (existsSync(file)) return file
+  }
+  // The vendor ships a native executable. Never feed prompts through a cmd
+  // shim: cmd.exe expands quotes, metacharacters and multiline arguments.
+  throw new Error(KIMI_INSTALL_HINT)
+}
+
+function kimiPermissionError(env: NodeJS.ProcessEnv): string | undefined {
+  return allowUnsandboxedByoa(env) ? undefined
+    : `Kimi Code has no verified host sandbox. Enable ${ALLOW_UNSANDBOXED_BYOA_ENV}=1 on the daemon only if you accept host-level execution.`
+}
+
+export function kimiPrintArgs(args: Pick<EngineRunArgs, 'prompt' | 'model' | 'resumeSessionId'>): string[] {
+  // -p already selects auto mode; --auto / --yolo / --plan are incompatible.
+  return ['--output-format', 'stream-json', ...(args.model ? ['--model', args.model] : []),
+    ...(args.resumeSessionId ? ['--session', args.resumeSessionId] : []),
+    '--prompt', stripLoneSurrogates(args.prompt)]
+}
+
+/** Exported transport seam: contract tests run a fixture with the real pipes,
+ * UTF-8 decoder and process-tree cancellation, including on Windows. */
+export async function spawnKimiPrint(command: string, argv: string[], args: EngineRunArgs): Promise<EngineRunResult & { text: string }> {
+  if (args.signal.aborted) return { exitCode: 128, error: 'kimi cancelled', text: '' }
+  let text = ''
+  let sessionId: string | null = null
+  let eventError: string | undefined
+  try {
+    const result = await spawnEngine(command, argv, { ...args, onHopUsage: undefined, onLog: (line) => {
+      if (/^Warning: this folder is not trusted; skipped .*project-level MCP/.test(line)) eventError = 'kimi skipped project MCP; pass the bound connectors through CUMORA_MCP_CONNECTORS_JSON for ACP injection'
+      args.onLog(line)
+    } }, {
+      shell: false,
+      onStdoutLine: (line) => {
+        let ev: { role?: string; type?: string; content?: unknown; session_id?: string; error?: unknown }
+        try { ev = JSON.parse(line) } catch { return }
+        if (ev.role === 'assistant' && typeof ev.content === 'string') text += ev.content
+        if (ev.role === 'meta' && ev.type === 'session.resume_hint' && typeof ev.session_id === 'string') sessionId = ev.session_id
+        if (ev.role === 'error' || ev.type === 'error') eventError = typeof ev.content === 'string' ? ev.content : JSON.stringify(ev.error ?? ev)
+      },
+    })
+    const error = args.signal.aborted ? 'kimi cancelled' : result.error ?? eventError
+      ?? (!sessionId ? 'kimi stream ended without session.resume_hint; turn completion was not confirmed' : undefined)
+    // 0.42.0 print JSONL does not report usage or actual model. Do not invent
+    // either from the requested model or emit a fabricated zero-usage hop.
+    return { exitCode: error ? result.exitCode || 1 : 0, error, sessionId, model: null, text }
+  } catch (err) {
+    return { exitCode: 1, error: (err as NodeJS.ErrnoException).code === 'ENOENT' ? KIMI_INSTALL_HINT : String(err), sessionId, text }
+  }
+}
+
+export function buildKimiMcpServers(connectors: EngineMcpConnector[]): Record<string, unknown> {
+  const servers: Record<string, unknown> = Object.create(null)
+  for (const c of connectors) {
+    if (!/^[A-Za-z0-9_-]+$/.test(c.name) || c.name === 'cumora' || Object.hasOwn(servers, c.name)) {
+      throw new Error(`kimi MCP connector name conflict or invalid name: ${c.name}`)
+    }
+    servers[c.name] = c.type === 'http'
+      ? { url: c.url, ...(c.headers ? { headers: c.headers } : {}) }
+      : { command: c.command, args: c.args ?? [], ...(c.env ? { env: c.env } : {}) }
+  }
+  return servers
+}
+
+async function seedKimiMcp(home: string, connectors: EngineMcpConnector[]): Promise<void> {
+  const directory = join(home, '.kimi-code')
+  await skillDirectory(directory, true)
+  const configPath = join(directory, 'mcp.json')
+  const manifestPath = join(directory, '.cumora-mcp.json')
+  const readObject = async (path: string): Promise<Record<string, unknown>> => {
+    try {
+      const st = await lstat(path)
+      if (!st.isFile() || st.isSymbolicLink()) throw new Error(`Refusing linked/non-file Kimi resource: ${path}`)
+      const value: unknown = JSON.parse(await readFile(path, 'utf8'))
+      if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`Invalid Kimi resource: ${path}`)
+      return value as Record<string, unknown>
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return {}
+      throw err
+    }
+  }
+  const config = await readObject(configPath)
+  const prior = await readObject(manifestPath)
+  if (config.mcpServers != null && (typeof config.mcpServers !== 'object' || Array.isArray(config.mcpServers))) throw new Error('Invalid Kimi mcpServers')
+  const servers = { ...(config.mcpServers as Record<string, unknown> | undefined) }
+  const desired = buildKimiMcpServers(connectors)
+  for (const [name, entry] of Object.entries(prior)) {
+    if (JSON.stringify(servers[name]) === JSON.stringify(entry)) delete servers[name]
+  }
+  for (const [name, entry] of Object.entries(desired)) {
+    if (Object.hasOwn(servers, name)) throw new Error(`kimi MCP connector conflicts with a user-owned entry: ${name}`)
+    servers[name] = entry
+  }
+  await atomicAgentWrite(configPath, JSON.stringify({ ...config, mcpServers: servers }, null, 2))
+  await atomicAgentWrite(manifestPath, JSON.stringify(desired, null, 2))
+}
+
+/** Kimi's ACP JSON-RPC transport, kept separate from Grok's vendor extensions. */
+export class KimiSession implements EngineSession {
+  private readonly child: ChildProcess
+  private readonly requests = new Map<number, { resolve: (value: Record<string, unknown>) => void; reject: (error: Error) => void; timer?: ReturnType<typeof setTimeout> }>()
+  private readonly ready: Promise<void>
+  private readonly decoder = new StringDecoder('utf8')
+  private buffer = ''
+  private nextId = 0
+  private closed = false
+  private busy = false
+  private sid: string | null
+  private failure: string | undefined
+  private currentModel: string | null = null
+  private turnText = ''
+  private permissionCancelled = false
+  private promptInFlight = false
+  private stopPromise?: Promise<void>
+  readonly carriesStandingPrompt = false
+
+  constructor(command: string, argv: string[], private readonly opts: EngineSessionArgs) {
+    this.sid = opts.resumeSessionId ?? null
+    this.child = spawnEngineChild(command, argv, { cwd: opts.home, env: opts.env, stdio: ['pipe', 'pipe', 'pipe'], shell: false })
+    this.child.stdout?.on('data', (chunk: Buffer) => this.consume(this.decoder.write(chunk)))
+    this.child.stderr?.on('data', (chunk: Buffer) => opts.onLog(cleanLine(chunk.toString('utf8'))))
+    this.child.on('error', (err) => this.fail((err as NodeJS.ErrnoException).code === 'ENOENT' ? KIMI_INSTALL_HINT : err.message))
+    this.child.on('close', (code) => { this.consume(this.decoder.end() + '\n'); this.fail(`kimi ACP exited (${code})`) })
+    this.ready = this.initialize().catch((err: unknown) => { this.fail(String(err)); void this.stop() })
+  }
+
+  get alive(): boolean { return !this.closed && this.child.stdin?.writable === true }
+  get sessionId(): string | null { return this.sid }
+  get text(): string { return this.turnText }
+
+  private async initialize(): Promise<void> {
+    const init = await this.rpc('initialize', { protocolVersion: 1, clientInfo: { name: 'cumora', version: '1' }, clientCapabilities: {} })
+    const info = init.agentInfo as { version?: string } | undefined
+    if (info?.version && !isCliVersionAtLeast(info.version, '0.42.0')) throw new Error('Kimi Code 0.42.0 or newer is required; run `kimi upgrade`.')
+    const connectors = engineMcpConnectorsFromEnv(this.opts.env)
+    buildKimiMcpServers(connectors) // reject reserved/duplicate names before RPC
+    const mcpServers: Record<string, unknown>[] = connectors.map(c => c.type === 'http'
+      ? { type: 'http', name: c.name, url: c.url, headers: Object.entries(c.headers ?? {}).map(([name, value]) => ({ name, value })) }
+      : { name: c.name, command: c.command, args: c.args ?? [], env: Object.entries(c.env ?? {}).map(([name, value]) => ({ name, value })) })
+    if (this.opts.env.CUMORA_AGENT_MCP_SHIM) mcpServers.push({ name: 'cumora', command: process.execPath,
+      args: [this.opts.env.CUMORA_AGENT_MCP_SHIM], env: [{ name: 'CUMORA_AGENT_IPC_DIR', value: this.opts.env.CUMORA_AGENT_IPC_DIR ?? '' }] })
+    const session = await this.rpc(this.sid ? 'session/load' : 'session/new', {
+      cwd: resolve(this.opts.home), mcpServers, ...(this.sid ? { sessionId: this.sid } : {}),
+    })
+    if (!this.sid && typeof session.sessionId === 'string') this.sid = session.sessionId
+    if (!this.sid) throw new Error('kimi ACP did not return a session ID')
+    await this.rpc('session/set_mode', { sessionId: this.sid, modeId: 'auto' })
+    if (this.opts.model) await this.rpc('session/set_model', { sessionId: this.sid, modelId: this.opts.model })
+    // Only a returned model selection is evidence of the actual model.
+    const models = session.models as { currentModelId?: string } | undefined
+    if (!this.opts.model && models?.currentModelId) this.currentModel = models.currentModelId
+  }
+
+  async send(prompt: string): Promise<EngineRunResult> {
+    if (this.busy) return { exitCode: 1, error: 'kimi session busy', sessionId: this.sid }
+    this.busy = true
+    this.turnText = ''
+    this.permissionCancelled = false
+    try {
+      await this.ready
+      if (this.failure || !this.alive) throw new Error(this.failure ?? 'kimi session stopped')
+      this.turnText = ''
+      this.promptInFlight = true
+      const result = await this.rpc('session/prompt', { sessionId: this.sid, prompt: [{ type: 'text', text: stripLoneSurrogates(prompt) }] }, false)
+      const usage = extractAcpUsage(result)
+      if (usage && this.currentModel) {
+        try { this.opts.onHopUsage?.({ model: this.currentModel, usage }) } catch { /* reporting cannot fail a turn */ }
+      }
+      const error = this.permissionCancelled ? 'kimi permission request cancelled in unattended mode'
+        : result.stopReason === 'end_turn' ? undefined : `kimi turn stopped: ${String(result.stopReason ?? 'missing stopReason')}`
+      return { exitCode: error ? 1 : 0, error, sessionId: this.sid, usage, model: this.currentModel }
+    } catch (err) {
+      return { exitCode: 1, error: String(err), sessionId: this.sid, model: this.currentModel }
+    } finally { this.busy = false; this.promptInFlight = false }
+  }
+
+  steer(_text: string): void {
+    this.opts.onLog('[kimi] ACP does not support same-turn steering; the ping is deferred to the next wake')
+  }
+
+  stop(options: { force?: boolean } = {}): Promise<void> {
+    if (this.stopPromise) return this.stopPromise
+    if (this.sid && this.alive) writeStdin(this.child, JSON.stringify({ jsonrpc: '2.0', method: 'session/cancel', params: { sessionId: this.sid } }) + '\n')
+    this.fail('kimi session cancelled')
+    this.stopPromise = terminateEngineTree(this.child, options.force)
+    return this.stopPromise
+  }
+
+  private fail(message: string): void {
+    this.failure ??= message
+    this.closed = true
+    for (const req of this.requests.values()) { clearTimeout(req.timer); req.reject(new Error(this.failure)) }
+    this.requests.clear()
+  }
+
+  private rpc(method: string, params: Record<string, unknown>, bounded = true): Promise<Record<string, unknown>> {
+    if (this.closed) return Promise.reject(new Error(this.failure ?? 'kimi session stopped'))
+    const id = ++this.nextId
+    return new Promise((resolve, reject) => {
+      const timer = bounded ? setTimeout(() => { this.requests.delete(id); reject(new Error(`kimi ACP ${method} timed out`)) }, 30_000) : undefined
+      timer?.unref?.()
+      this.requests.set(id, { resolve, reject, timer })
+      writeStdin(this.child, JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n')
+    })
+  }
+
+  private consume(text: string): void {
+    this.buffer += text
+    let nl: number
+    while ((nl = this.buffer.indexOf('\n')) >= 0) {
+      const line = this.buffer.slice(0, nl); this.buffer = this.buffer.slice(nl + 1)
+      let msg: { id?: number; method?: string; params?: Record<string, unknown>; result?: Record<string, unknown>; error?: { message?: string } }
+      try { msg = JSON.parse(line) } catch { continue }
+      if (msg.method && msg.id !== undefined) {
+        // Auto mode should not request approval. Never silently approve a
+        // residual question/permission; cancel it, and reject unknown methods.
+        if (msg.method === 'session/request_permission') this.permissionCancelled = true
+        const reply = msg.method === 'session/request_permission'
+          ? { result: { outcome: { outcome: 'cancelled' } } }
+          : { error: { code: -32601, message: 'Client method not supported' } }
+        writeStdin(this.child, JSON.stringify({ jsonrpc: '2.0', id: msg.id, ...reply }) + '\n')
+      } else if (msg.id !== undefined) {
+        const pending = this.requests.get(msg.id)
+        if (!pending) continue
+        this.requests.delete(msg.id); clearTimeout(pending.timer)
+        if (msg.error) pending.reject(new Error(msg.error.message ?? 'kimi ACP request failed'))
+        else pending.resolve(msg.result ?? {})
+      } else if (msg.method === 'session/update' && msg.params?.sessionId === this.sid) {
+        const update = msg.params.update as { sessionUpdate?: string; content?: { type?: string; text?: string }; configOptions?: Array<{ category?: string; currentValue?: string }> } | undefined
+        if (this.promptInFlight && update?.sessionUpdate === 'agent_message_chunk' && update.content?.type === 'text') {
+          this.turnText += update.content.text ?? ''
+          this.opts.onLog(`[kimi] ${update.content.text ?? ''}`)
+        }
+        for (const option of update?.configOptions ?? []) if (option.category === 'model' && option.currentValue) this.currentModel = option.currentValue
+      }
+    }
+  }
+}
+
+class KimiAdapter implements EngineAdapter {
+  readonly id = 'kimi' as const
+  readonly bin = 'kimi'
+
+  async seedHome(home: string, persona: EnginePersona): Promise<void> {
+    await ensureCommonHome(home)
+    await seedEngineSkills(home, '.kimi-code/skills', persona.skills ?? [])
+    await seedKimiMcp(home, persona.mcpConnectors ?? [])
+    await atomicAgentWrite(join(home, 'AGENTS.md'), PERSONA_HEADER(persona, { personaFile: 'AGENTS.md', skillsDir: '.kimi-code/skills/' }))
+  }
+
+  async run(args: EngineRunArgs): Promise<EngineRunResult> {
+    try {
+      const command = resolveKimiCommand(args.env)
+      const error = kimiPermissionError(args.env)
+      if (error) return { exitCode: 1, error }
+      // ACP passes operator-approved MCP explicitly: print mode skips project
+      // MCP in an untrusted directory. It also avoids native argv size limits.
+      if (args.prompt.length > 12_000 || engineMcpConnectorsFromEnv(args.env).length || args.env.CUMORA_AGENT_MCP_SHIM) {
+        const session = new KimiSession(command, ['acp'], args)
+        const abort = () => { void session.stop() }
+        args.signal.addEventListener('abort', abort, { once: true })
+        if (args.signal.aborted) abort()
+        try { return await session.send(args.prompt) } finally { args.signal.removeEventListener('abort', abort); await session.stop() }
+      }
+      return spawnKimiPrint(command, kimiPrintArgs(args), args)
+    } catch (err) { return { exitCode: 1, error: String(err) } }
+  }
+
+  startSession(args: EngineSessionArgs): EngineSession {
+    const command = resolveKimiCommand(args.env)
+    const error = kimiPermissionError(args.env)
+    if (error) throw new Error(error)
+    return new KimiSession(command, ['acp'], args)
+  }
+
+  async classify(args: EngineClassifyArgs): Promise<EngineClassifyResult> {
+    let profile: string | undefined
+    try {
+      const command = resolveKimiCommand(args.env)
+      const error = kimiPermissionError(args.env)
+      if (error) return { text: '', error }
+      // No persona or tools in the auxiliary brain. Keep the user's provider
+      // credentials in place; relocating KIMI_CODE_HOME would lose OAuth.
+      profile = await mkdtemp(join(args.cwd, '.cumora-kimi-triage-'))
+      const file = join(profile, 'triage.md')
+      await writeFile(file, '---\nname: cumora-triage\ndescription: Tool-free classification\ntools: []\n---\nReturn only the requested classification.\n')
+      const model = args.model || args.env.CUMORA_TRIAGE_MODEL?.trim() || null
+      const result = await spawnKimiPrint(command, [...kimiPrintArgs({ prompt: args.prompt, model }), '--agent-file', file], {
+        home: args.cwd, prompt: args.prompt, env: args.env, signal: args.signal, onLog: args.onLog ?? (() => {}),
+      })
+      return { text: result.text, error: result.error, usage: result.usage, model: result.model }
+    } catch (err) { return { text: '', error: String(err) } }
+    finally { if (profile) await rm(profile, { recursive: true, force: true }) }
+  }
+
+  probe(args: EngineProbeArgs): Promise<EngineClassifyResult> {
+    return this.classify({ ...args, env: { ...args.env, CUMORA_TRIAGE_MODEL: args.tier === 'small' ? args.env.CUMORA_TRIAGE_MODEL : '' },
+      prompt: DOCTOR_PROMPT, model: null })
+  }
+
+  async probeWake(args: EngineWakeProbeArgs): Promise<EngineWakeProbeResult> {
+    let session: EngineSession | undefined
+    const abort = () => { void session?.stop() }
+    try {
+      session = this.startSession({ home: args.cwd, env: args.env, onLog: () => {} })
+      args.signal.addEventListener('abort', abort, { once: true })
+      if (args.signal.aborted) abort()
+      const result = await session.send(DOCTOR_PROMPT)
+      return { ok: result.exitCode === 0, detail: result.error ?? '' }
+    } catch (err) { return { ok: false, detail: String(err) } }
+    finally { args.signal.removeEventListener('abort', abort); await session?.stop() }
+  }
+}
+
+
 const ADAPTERS: Record<EngineId, EngineAdapter> = {
   claude: new ClaudeAdapter(),
   codex: new CodexAdapter(),
+  kimi: new KimiAdapter(),
   grok: new GrokAdapter(),
   cursor: new CursorAdapter(),
   opencode: new OpenCodeAdapter(),

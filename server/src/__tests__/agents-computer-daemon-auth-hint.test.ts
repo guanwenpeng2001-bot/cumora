@@ -17,6 +17,8 @@ test('authFailureHint provides specific guidance for every supported engine', ()
 test('authFailureHint correctly mentions the relevant CLI/tool for each engine', () => {
   assert.match(authFailureHint('claude', 'quota exceeded'), /Claude Code/)
   assert.match(authFailureHint('codex', 'quota exceeded'), /Codex/)
+  assert.match(authFailureHint('kimi', '401 invalid api key'), /kimi login/)
+  assert.match(authFailureHint('kimi', 'quota exceeded'), /provider.*quota/)
   assert.match(authFailureHint('grok', 'quota exceeded'), /grok/)
   assert.match(authFailureHint('cursor', 'quota exceeded'), /cursor-agent/)
   assert.match(authFailureHint('opencode', 'quota exceeded'), /opencode/)

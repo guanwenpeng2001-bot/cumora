@@ -760,6 +760,9 @@ export function authFailureHint(engine: EngineId, detail: string): string {
   if (engine === 'claude') {
     return 'Open Claude Code on that computer and sign in, refresh quota, or add credits, then wake the agent again.'
   }
+  if (engine === 'kimi') {
+    return 'Run `kimi login` on that computer, or check the selected provider credentials / quota with `kimi provider`, then wake the agent again.'
+  }
   if (engine === 'codex') {
     return 'Open Codex on that computer and refresh its login or quota, then wake the agent again.'
   }
@@ -1823,7 +1826,7 @@ class AgentRunner {
     this.resourcesDirty = true
     await this.applyPendingResources()
     const mcpCount = this.agent.mcpConnectors?.length ?? 0
-    if (mcpCount > 0 && this.agent.engine && !['claude', 'codex'].includes(this.agent.engine)) {
+    if (mcpCount > 0 && this.agent.engine && !['claude', 'codex', 'kimi'].includes(this.agent.engine)) {
       console.log(`[computer] ${this.agent.id}: ${mcpCount} MCP connector(s) enabled but engine "${this.agent.engine}" has no defined injection point — skipped`)
     }
     if (allowUnsandboxedByoa()) await writeShim(this.binDir)
@@ -1901,7 +1904,7 @@ class AgentRunner {
   }
 
   private resourceResult(agent: AgentInfo): ResourceApplicationResult {
-    const unsupported = !!agent.mcpConnectors?.length && !['claude', 'codex'].includes(this.adapter.id)
+    const unsupported = !!agent.mcpConnectors?.length && !['claude', 'codex', 'kimi'].includes(this.adapter.id)
     const conflicts = this.adapter.id === 'codex'
       ? buildEngineCodexMcpInjection(agent.mcpConnectors ?? []).failures.length > 0
       : (agent.mcpConnectors ?? []).some(connector => connector.name === 'cumora')
@@ -2236,6 +2239,7 @@ class AgentRunner {
     if (pinned) return pinned
     if (this.adapter.id === 'claude') return 'haiku'
     if (this.adapter.id === 'grok') return 'grok-4.5'
+    if (this.adapter.id === 'kimi') return this.agent.model ?? '<kimi-default>'
     if (this.adapter.id === 'codex') return 'gpt-5.4-mini'
     if (this.adapter.id === 'gemini') return 'gemini-2.5-flash-lite'
     if (this.adapter.id === 'qwen') return 'qwen3-coder-flash'

@@ -3,6 +3,7 @@
 export const BYOA_SOURCES = [
   'byoa-claude',
   'byoa-codex',
+  'byoa-kimi',
   'byoa-grok',
   'byoa-cursor',
   'byoa-opencode',
