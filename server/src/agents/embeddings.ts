@@ -15,6 +15,7 @@
  */
 import { resolveRoleCall } from '../llm-resolver.js'
 import { getLlmCandidateClient } from '../llm.js'
+import { executeLlmPlan } from '../llm-execution.js'
 import { pool } from '../db/pool.js'
 import type { PoolClient } from 'pg'
 import { getServerSettingsSnapshot, writeInEmbeddingSpace, type ServerSettingsSnapshot } from '../settings.js'
@@ -52,16 +53,38 @@ export async function embedText(text: string, context: EmbeddingContext = {}, ca
     const plan = await resolveRoleCall(context.companyId ?? null, 'server', 'embed', context.purpose ?? 'memory', { id: context.agentId }, captured)
     const candidate = plan.candidates[0]
     if (!candidate?.available || candidate.protocol !== 'embeddings') return null
-    const client = await getLlmCandidateClient(plan, candidate)
-    const resp = await client.embeddings.create({
-      model: candidate.requestModel,
-      dimensions: EMBED_DIM,
-      input: trimmed.length > MAX_INPUT_CHARS ? trimmed.slice(0, MAX_INPUT_CHARS) : trimmed,
-    }, { timeout: 10_000, maxRetries: 0 })
-    const vec = resp.data[0]?.embedding
-    if (!Array.isArray(vec) || vec.length !== EMBED_DIM || !vec.every(n => typeof n === 'number' && Number.isFinite(n))) return null
-    // pgvector accepts the text form `[0.1,0.2,…]` and casts via ::vector.
-    return `[${vec.join(',')}]`
+    // Keep a single candidate even if resolver policy changes in the future.
+    return await executeLlmPlan({
+      plan: { ...plan, purpose: 'embedding', candidates: [candidate] },
+      context: {
+        companyId: plan.companyId, agentId: context.agentId,
+        role: 'embed', purpose: 'embedding',
+        extras: { embeddingPurpose: context.purpose ?? 'memory' },
+      },
+      sdkMaxRetries: 0,
+      prepare: async (selected, state) => {
+        const client = await getLlmCandidateClient(plan, selected)
+        return async () => {
+          const resp = await client.embeddings.create({
+            model: selected.requestModel,
+            dimensions: EMBED_DIM,
+            input: trimmed.length > MAX_INPUT_CHARS ? trimmed.slice(0, MAX_INPUT_CHARS) : trimmed,
+          }, { timeout: 10_000, maxRetries: 0 })
+          state.rawUsage = resp.usage ?? null
+          state.actualModel = typeof resp.model === 'string' ? resp.model : null
+          const tokens = resp.usage?.prompt_tokens
+          // Embeddings have no output tokens; missing input usage stays unknown.
+          state.usage = typeof tokens === 'number' && Number.isSafeInteger(tokens) && tokens >= 0
+            ? { inputTokens: tokens, cachedInputTokens: 0, cacheCreationTokens: 0, outputTokens: 0 }
+            : null
+          const vec = resp.data[0]?.embedding
+          if (!Array.isArray(vec) || vec.length !== EMBED_DIM || !vec.every(n => typeof n === 'number' && Number.isFinite(n))) {
+            throw new Error('Invalid embedding vector')
+          }
+          return '[' + vec.join(',') + ']'
+        }
+      },
+    })
   } catch (e) {
     console.warn('[embed] failed', e instanceof Error ? e.message : String(e))
     return null
