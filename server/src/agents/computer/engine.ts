@@ -1940,6 +1940,20 @@ function codexToolEnvironmentArgs(args: { home: string; env: NodeJS.ProcessEnv }
   return ['-c', `shell_environment_policy.set={${entries.join(',')}}`]
 }
 
+/** Compatibility mode still needs explicit runtime wiring: Codex filters shell
+ * environments independently of its sandbox, including in danger-full-access.
+ * Keep this separate from the secure profile so older CLIs can use the opt-in. */
+function codexCompatibilityConfigOverrides(args: { home: string; env: NodeJS.ProcessEnv }): string[] {
+  const overrides = codexToolEnvironmentArgs(args)
+  const mcpShim = args.env.CUMORA_AGENT_MCP_SHIM
+  const ipcDir = args.env.CUMORA_AGENT_IPC_DIR
+  if (mcpShim && ipcDir) {
+    overrides.push('-c', `mcp_servers.cumora={command=${tomlString(process.execPath)},args=[${tomlString(mcpShim)}],env={CUMORA_AGENT_IPC_DIR=${tomlString(ipcDir)}}}`)
+  }
+  overrides.push(...buildEngineCodexMcpArgs(engineMcpConnectorsFromEnv(args.env)))
+  return overrides
+}
+
 /** Codex rejects the whole invocation when any `-c` override fails to load, and
  *  the resulting error names `config.toml` without ever mentioning that Cumora
  *  authored that config — which is how 103 workspaces spent six hours looking at
@@ -2475,7 +2489,8 @@ class CodexAdapter implements EngineAdapter {
         : [...codexSecureExecArgs(args), '--skip-git-repo-check']
     const model = args.model ? ['--model', args.model] : []
     const { command, shell, argsPrefix } = resolveCodexSpawn()
-    return spawnEngine(command, [...argsPrefix, ...base, ...model, '-'], args, { shell, stdinText: args.prompt })
+    const compatibility = allowUnsandboxedByoa() ? codexCompatibilityConfigOverrides(args) : []
+    return spawnEngine(command, [...argsPrefix, ...base, ...model, ...compatibility, '-'], args, { shell, stdinText: args.prompt })
       .then((res) => {
         // A rejected -c override aborts codex before it reads the prompt, so the
         // turn fails with a config error that never mentions Cumora. Say it once.
@@ -2514,7 +2529,7 @@ class CodexAdapter implements EngineAdapter {
     // uses. `-c` are global flags and apply to app-server too, so filesystem,
     // network, environment and features are identical on both paths.
     const secure = allowUnsandboxedByoa()
-      ? []
+      ? codexCompatibilityConfigOverrides(args)
       : codexSecureConfigOverrides({ home: args.home, env: args.env })
     return new CodexSession(command, [...argsPrefix, ...secure, 'app-server', '--listen', 'stdio://'], args.home, args.env, args)
   }
