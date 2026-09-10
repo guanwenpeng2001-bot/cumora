@@ -128,7 +128,7 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
   if (token) headers.set('authorization', `Bearer ${token}`)
   if (company) headers.set('x-company-id', company)
   if (getDevModeEnabled()) headers.set('x-cumora-dev-mode', '1')
-  new Headers(init?.headers).forEach((value, key) => headers.set(key, value))
+  new Headers(init?.headers).forEach((value, key) => { headers.set(key, value) })
   const signal = init?.signal
   try {
     signal?.throwIfAborted()
