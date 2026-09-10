@@ -17,8 +17,8 @@
  * params, translates them into Chat Completions params, calls Novita's real
  * `chat.completions.create`, and translates the result (streaming or not)
  * back into the exact Responses-API shapes every existing call site already
- * expects. Nothing outside `llm.ts` needs to change — see `withProviderRouting`
- * there for how a per-call `model` id opts into this path.
+ * expects. Candidate clients select the adapter from the resolved protocol;
+ * the legacy shim below preserves the old prefixed input contract.
  *
  * Model selection convention: an agent (or an env default) opts into Novita
  * by prefixing its `model` with `novita/`, e.g. `novita/deepseek/deepseek-v3.2`.
@@ -253,7 +253,7 @@ function toResponseUsage(raw: unknown): Record<string, unknown> | null {
  *  — are model-specific and orthogonal); we drop it rather than guess. */
 function buildChatBody(args: ResponsesCreateArgs, stream: boolean): Record<string, unknown> {
   const body: Record<string, unknown> = {
-    model: stripNovitaPrefix(args.model),
+    model: args.model,
     messages: toChatMessages(args.instructions, args.input),
     stream,
   }
@@ -270,9 +270,9 @@ function buildChatBody(args: ResponsesCreateArgs, stream: boolean): Record<strin
  *  `getTrackedLlmClient`'s wrapper) — so translating just that + `.usage`
  *  covers convene.ts / agenda.ts / inbox-triage.ts / router.ts / etc. in
  *  full. */
-async function createNonStreaming(args: ResponsesCreateArgs, opts?: RequestOpts): Promise<Record<string, unknown>> {
-  const body = buildChatBody(args, false)
-  const completion = await novitaClient().chat.completions.create(
+async function createNonStreaming(args: ResponsesCreateArgs, opts?: RequestOpts, client = novitaClient(), chatBody?: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const body = chatBody ?? buildChatBody(args, false)
+  const completion = await client.chat.completions.create(
     body as unknown as Parameters<OpenAI['chat']['completions']['create']>[0] & { stream?: false },
     toRequestOptions(args, opts),
   )
@@ -449,10 +449,11 @@ function wrapAsyncIterable(gen: AsyncGenerator<ResponseStreamEvent>, controller:
 
 /** The Responses-API-shaped surface every call site actually uses off a
  *  client: `client.responses.create(...)`. Assigning this object as
- *  `client.responses` (see `withProviderRouting` in llm.ts) is sufficient —
+ *  `client.responses` is sufficient for legacy callers —
  *  nothing in this codebase touches any other `client.responses.*` method. */
 export const novitaResponsesShim = {
   create(args: ResponsesCreateArgs, opts?: RequestOpts): unknown {
+    args = { ...args, model: isNovitaModel(args.model) ? stripNovitaPrefix(args.model) : args.model }
     if (args.stream) {
       const controller = new AbortController()
       const parent = opts?.signal ?? args.signal
@@ -461,6 +462,22 @@ export const novitaResponsesShim = {
     }
     return createNonStreaming(args, opts)
   },
+}
+
+/** Adapt the already resolved client and model without provider routing. */
+export function createChatResponsesShim(client: OpenAI, requestModel: string) {
+  return {
+    create(args: ResponsesCreateArgs, opts?: RequestOpts): unknown {
+      const body = { ...buildChatBody(args, Boolean(args.stream)), model: requestModel }
+      if (args.stream) {
+        const controller = new AbortController()
+        const parent = opts?.signal ?? args.signal
+        const signal = parent ? AbortSignal.any([parent, controller.signal]) : controller.signal
+        return Promise.resolve(wrapAsyncIterable(createStreaming(args, { ...opts, signal }, client, body), controller))
+      }
+      return createNonStreaming(args, opts, client, body)
+    },
+  }
 }
 
 /** Reuse the Chat event translator for explicit Chat routes. */

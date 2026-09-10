@@ -45,6 +45,17 @@ const ALLOW = new Set([
   'server/src/agents/turn.ts',
 ])
 
+// Prefix translation belongs to config reads and the two legacy adapter exports.
+const PREFIX_ADAPTERS = new Set(['server/src/settings.ts', 'server/src/novita.ts', 'server/src/orcarouter.ts'])
+const PREFIX_ROUTING = /\b(?:isNovitaModel|isOrcaRouterModel|stripNovitaPrefix|stripOrcaRouterPrefix)\s*\(|\.startsWith\(\s*['"](?:novita|orcarouter)\//
+
+// Historical usage labels are a read-only compatibility projection, not routing.
+// Match just these expressions; the rest of usage.ts remains guarded.
+const LEGACY_USAGE_LABELS = new Set([
+  "if (m.startsWith('novita/') && m.length > 7) return 'Novita'",
+  "if (m.startsWith('orcarouter/') && m.length > 11) return 'OrcaRouter'",
+])
+
 const ROOT_LEN = ROOT.length + 1
 function* walk(dir) {
   const abs = join(ROOT, dir)
@@ -61,7 +72,6 @@ function* walk(dir) {
 const violations = []
 for (const dir of SCAN_DIRS) {
   for (const rel of walk(dir)) {
-    if (ALLOW.has(rel)) continue
     const text = readFileSync(join(ROOT, rel), 'utf8')
     // Match either:
     //   import { getLlmClient } from '../llm.js'
@@ -76,7 +86,8 @@ for (const dir of SCAN_DIRS) {
       // mentions in docs.
       const t = line.trimStart()
       if (t.startsWith('//') || t.startsWith('*') || t.startsWith('/*')) return
-      if (line.includes('getLlmClient(')) {
+      const legacyLabel = rel === 'server/src/usage.ts' && LEGACY_USAGE_LABELS.has(t.trimEnd())
+      if ((!ALLOW.has(rel) && line.includes('getLlmClient(')) || (!PREFIX_ADAPTERS.has(rel) && !legacyLabel && PREFIX_ROUTING.test(line))) {
         violations.push({ file: rel, line: i + 1, snippet: line.trim() })
       }
     })
@@ -84,11 +95,11 @@ for (const dir of SCAN_DIRS) {
 }
 
 if (violations.length === 0) {
-  console.log('[guard-llm-tracked] OK — every sub2api callsite is tracked.')
+  console.log('[guard-llm-tracked] OK — LLM tracking and provider-prefix boundaries are respected.')
   process.exit(0)
 }
 
-console.error('\n[guard-llm-tracked] FAIL — found getLlmClient() calls OUTSIDE the allowlist:\n')
+console.error('\n[guard-llm-tracked] FAIL — found untracked clients or provider-prefix routing outside their allowed boundaries:\n')
 for (const v of violations) {
   console.error(`  ${v.file}:${v.line}`)
   console.error(`    ${v.snippet}`)

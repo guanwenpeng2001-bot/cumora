@@ -45,7 +45,7 @@ export interface SettingDef {
 /** The full key inventory. Values are always stored as strings; list-typed
  *  keys are comma-separated. */
 export const SETTING_DEFS: readonly SettingDef[] = [
-  { key: 'llm_config', pod: true, type: 'json', envValue: () => '' },
+  { key: 'llm_config', pod: true, type: 'json', envValue: () => process.env.CUMORA_LLM_CONFIG ?? '' },
   { key: 'sub2api_group_config', type: 'json', envValue: () => '' },
   { key: 'brain_model', pod: true, type: 'model', required: true, envValue: () => env.OPENAI_MODEL ?? '' },
   { key: 'brain_fallback_models', pod: true, type: 'list', envValue: () => '' },
@@ -736,7 +736,14 @@ export interface LlmModelMetadata {
   tools?: boolean
   vision?: boolean
 }
-export interface LlmRoleConfig { role: LlmRole; purpose?: string; models: string[] }
+export interface LlmDirectTarget { model: string; route: string; protocol?: LlmProtocol }
+export interface LlmRoleConfig {
+  role: LlmRole
+  purpose?: string
+  models: string[]
+  fallbackPolicy?: 'disabled' | 'env_after_chain'
+  directTargets?: LlmDirectTarget[]
+}
 export interface LlmConfig { version: 1; routes: LlmRouteConfig[]; models: LlmModelMetadata[]; roles: LlmRoleConfig[] }
 const object = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v)
 const nonempty = (v: unknown): v is string => typeof v === 'string' && !!v.trim() && v === v.trim()
@@ -775,11 +782,21 @@ export function parseLlmConfig(raw: string, strict = false): LlmConfig {
     }
     const roles = new Set<string>()
     for (const r of config.roles) {
-      check(object(r) && Object.keys(r).every(k => ['role', 'purpose', 'models'].includes(k)))
+      check(object(r) && Object.keys(r).every(k => ['role', 'purpose', 'models', 'fallbackPolicy', 'directTargets'].includes(k)))
       check(LLM_ROLES.includes(r.role) && (r.purpose === undefined || nonempty(r.purpose)))
       const id = JSON.stringify([r.role, r.purpose]); check(!roles.has(id)); roles.add(id)
       check(Array.isArray(r.models) && r.models.length > 0 && r.models.every(nonempty))
-      check(r.role !== 'embed' || (r.models.length === 1 && r.purpose === undefined))
+      check(r.fallbackPolicy === undefined || ['disabled', 'env_after_chain'].includes(r.fallbackPolicy))
+      check(r.directTargets === undefined || Array.isArray(r.directTargets))
+      for (const target of r.directTargets ?? []) {
+        check(object(target) && Object.keys(target).every(k => ['model', 'route', 'protocol'].includes(k)))
+        check(nonempty(target.model) && config.routes.some(route => route.id === target.route && route.kind === 'direct'))
+        check(target.protocol === undefined || protocols.includes(target.protocol))
+        const protocol = target.protocol ?? config.routes.find(route => route.id === target.route)?.protocol
+        check(protocol === undefined || (['brain', 'support', 'compaction'].includes(r.role) ? ['responses', 'chat'].includes(protocol)
+          : r.role === 'image' ? ['images', 'dashscope-image'].includes(protocol) : r.role === 'audio' && protocol === 'chat'))
+      }
+      check(r.role !== 'embed' || (r.models.length === 1 && r.purpose === undefined && r.fallbackPolicy === undefined && r.directTargets === undefined))
     }
     return config
   } catch {
@@ -787,6 +804,18 @@ export function parseLlmConfig(raw: string, strict = false): LlmConfig {
     console.warn('[settings] invalid llm_config; using legacy role settings')
     return empty
   }
+}
+
+/** Translate only recognized legacy model settings; explicit routes keep model IDs verbatim. */
+export function readLlmModelTarget(model: string, config: LlmConfig, target?: LlmDirectTarget) {
+  const metadata = config.models.find(m => m.model === model)
+  const explicit = config.routes.find(r => r.id === (target?.route ?? metadata?.route))
+  if (explicit) return { requestModel: model, route: explicit, protocol: target ? target.protocol ?? explicit.protocol ?? metadata?.protocol : metadata?.protocol ?? explicit.protocol, metadata }
+  const provider = model.startsWith('novita/') ? 'novita' : model.startsWith('orcarouter/') ? 'orcarouter' : undefined
+  if (provider) return { requestModel: model.slice(provider.length + 1),
+    route: { id: 'direct:' + provider, kind: 'direct', env: provider, protocol: provider === 'novita' ? 'chat' : 'responses' } as LlmRouteConfig,
+    protocol: metadata?.protocol, metadata }
+  return { requestModel: model, route: undefined, protocol: metadata?.protocol, metadata }
 }
 
 export type Sub2apiGroupConfig = Partial<Record<'free' | 'pro' | 'max', Partial<Record<'openai' | 'kimi' | 'deepseek' | 'grok', number>>>>

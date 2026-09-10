@@ -26,7 +26,7 @@ function fixture(behavior: (request: any, signal?: AbortSignal) => AsyncIterable
     ...['completion-verify', 'compaction', 'steer-summary'].map(purpose => ({ role: 'compaction', purpose, models: ['same', `${purpose}-backup`] })),
   ], models: [], routes: [] }
   const settings = { getServerSettingsSnapshot: () => ({ revision: '17', settings: { llm_config: JSON.stringify(config) }, sources: {} }),
-    parseLlmConfig: JSON.parse, LLM_ROLES: ['brain', 'support', 'compaction'] }
+    parseLlmConfig: JSON.parse, readLlmModelTarget: (model: string) => ({ requestModel: model }), LLM_ROLES: ['brain', 'support', 'compaction'] }
   const resolver = compile(read('../llm-resolver.ts'), {
     './settings.js': settings, './env.js': { resolveDirectLlmEnv: () => ({ configured: true, protocol }) },
     './tenant-llm-context.js': {}, './sub2api.js': { sub2apiRoutingConfigured: () => false, sub2apiConfigured: () => false },

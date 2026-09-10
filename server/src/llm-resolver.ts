@@ -1,4 +1,4 @@
-import { getServerSettingsSnapshot, parseLlmConfig, LLM_ROLES, type LlmRole, type LlmProtocol, type ServerSettingsSnapshot } from './settings.js'
+import { getServerSettingsSnapshot, parseLlmConfig, readLlmModelTarget, LLM_ROLES, type LlmRole, type LlmProtocol, type ServerSettingsSnapshot } from './settings.js'
 import { resolveDirectLlmEnv, type DirectLlmSlot } from './env.js'
 import { resolveTenantLlmContext, tenantModelSnapshot } from './tenant-llm-context.js'
 import { sub2apiRoutingConfigured, sub2apiConfigured, pickPlatformForModel, SUB2API_PLATFORMS, type Platform } from './sub2api.js'
@@ -75,16 +75,18 @@ export async function resolveRoleCall(company: string | null, domain: RoleCallPl
     if (raw) diagnostics.push(`invalid-setting:${key}`)
     return fallback
   }
-  const candidates = models.map((model): RoleCallCandidate => {
+  const targets = role !== 'embed' && selected?.fallbackPolicy === 'env_after_chain' ? selected.directTargets ?? [] : []
+  const entries = [...models.map(model => ({ model, target: undefined as typeof targets[number] | undefined })),
+    ...targets.map(target => ({ model: target.model, target }))]
+  const candidates = entries.map(({ model, target }): RoleCallCandidate => {
     const sourceKey = model === primary ? `${role}_model` : `${role}_fallback_models`
-    const metadata = config.models.find(m => m.model === model)
-    const explicit = config.routes.find(r => r.id === metadata?.route)
-    const prefix = model.startsWith('novita/') ? 'novita' : model.startsWith('orcarouter/') ? 'orcarouter' : undefined
-    const slot: DirectLlmSlot = explicit?.env ?? prefix ?? (['image', 'audio', 'embed'].includes(role) ? role as DirectLlmSlot : 'text')
+    const translated = readLlmModelTarget(model, config, target)
+    const { metadata, route: explicit } = translated
+    const slot: DirectLlmSlot = explicit?.env ?? (['image', 'audio', 'embed'].includes(role) ? role as DirectLlmSlot : 'text')
     const direct = resolveDirectLlmEnv(slot)
-    const kind = explicit?.kind ?? (role === 'embed' ? direct.configured || !sub2apiRoutingConfigured() ? 'direct' : 'gateway' : prefix && direct.configured ? 'direct' : available.length ? 'gateway' : 'direct')
+    const kind = explicit?.kind ?? (role === 'embed' ? direct.configured || !sub2apiRoutingConfigured() ? 'direct' : 'gateway' : available.length ? 'gateway' : 'direct')
     const platform = kind === 'gateway' ? explicit?.platform ?? (role === 'embed' ? 'openai' : pickPlatformForModel(modelsByPlatform, model, available)) : undefined
-    const protocol = metadata?.protocol ?? explicit?.protocol ?? (kind === 'direct' ? direct.protocol as LlmProtocol : role === 'image' ? 'images' : role === 'audio' ? 'chat' : role === 'embed' ? 'embeddings' : 'responses')
+    const protocol = translated.protocol ?? explicit?.protocol ?? (kind === 'direct' ? direct.protocol as LlmProtocol : role === 'image' ? 'images' : role === 'audio' ? 'chat' : role === 'embed' ? 'embeddings' : 'responses')
     const effortKey = role === 'brain' ? 'agent_reasoning_effort' : 'support_reasoning_effort'
     const rawEffort = snapshot.settings[effortKey]?.trim().toLowerCase() ?? 'none'
     const effort = mc?.effort ?? metadata?.effort ?? (REASONING_EFFORTS.has(rawEffort) ? rawEffort : 'none')
@@ -94,13 +96,13 @@ export async function resolveRoleCall(company: string | null, domain: RoleCallPl
     const contextWindow = metadata?.contextWindow === undefined ? mc?.contextWindow : Math.min(mc?.contextWindow ?? metadata.contextWindow, metadata.contextWindow)
     const compatible = (!metadata?.roles || metadata.roles.includes(role)) && (text ? ['responses', 'chat'].includes(protocol) : role === 'image' ? ['images', 'dashscope-image'].includes(protocol) : role === 'embed' ? protocol === 'embeddings' : protocol === 'chat')
     return {
-      model, requestModel: kind === 'direct' && prefix === slot ? model.slice(prefix.length + 1) : model,
+      model, requestModel: translated.requestModel,
       route: { id: explicit?.id ?? `${kind}:${kind === 'gateway' ? platform : slot}`, kind, platform,
         env: kind === 'direct' ? slot : undefined,
         endpointSource: kind === 'gateway' ? 'sub2api-env' : direct.endpointSource,
         credentialSource: kind === 'gateway' ? 'owner-key-map' : direct.keySource },
       protocol, available: compatible && (kind === 'gateway' ? Boolean(context?.baseURL && platform && context.keys[platform]) : direct.configured),
-      source: role === 'brain' && ((model === primary && agent?.model?.trim()) || (model !== primary && mc?.fallbackModels)) ? 'agent' : selected ? `${snapshot.sources.llm_config}:llm_config` : `${snapshot.sources[sourceKey] ?? 'env'}:${sourceKey}`,
+      source: target ? 'llm_config:env_after_chain' : role === 'brain' && ((model === primary && agent?.model?.trim()) || (model !== primary && mc?.fallbackModels)) ? 'agent' : selected ? `${snapshot.sources.llm_config}:llm_config` : `${snapshot.sources[sourceKey] ?? 'env'}:${sourceKey}`,
       parameterSources: { effort: mc?.thinking !== undefined || mc?.effort !== undefined ? 'agent' : metadata?.thinking !== undefined || metadata?.effort !== undefined ? 'llm_config' : effortKey,
         maxOutputTokens: mc?.maxOutputTokens !== undefined ? 'agent:model-cap' : metadata?.maxOutputTokens !== undefined ? 'llm_config' : role === 'brain' ? 'agent_max_output_tokens' : 'caller-budget',
         contextWindow: metadata?.contextWindow !== undefined ? 'llm_config:model-cap' : mc?.contextWindow !== undefined ? 'agent' : 'unspecified' },
@@ -111,5 +113,12 @@ export async function resolveRoleCall(company: string | null, domain: RoleCallPl
       diagnostic: !compatible ? 'incompatible-capability' : kind === 'direct' && !direct.configured ? 'direct-unconfigured' : kind === 'gateway' && !context?.keys[platform!] ? 'gateway-unprovisioned' : undefined,
     }
   })
-  return freeze({ ...plan, candidates, diagnostics: [...new Set(diagnostics)] })
+  const seen = new Set<string>()
+  const unique = candidates.filter(candidate => {
+    const key = JSON.stringify([candidate.route.kind, candidate.route.kind === 'gateway' ? candidate.route.platform : candidate.route.env, candidate.requestModel])
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+  return freeze({ ...plan, candidates: unique, diagnostics: [...new Set(diagnostics)] })
 }

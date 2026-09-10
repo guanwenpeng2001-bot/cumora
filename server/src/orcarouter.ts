@@ -11,9 +11,9 @@
  * (server/src/novita.ts) — OrcaRouter speaks Responses natively, so the call
  * is forwarded straight to the OrcaRouter client.
  *
- * Mirrors the Novita convention: `isOrcaRouterModel` gates the route in
- * llm.ts's `withProviderRouting`, and an unset key degrades to the tenant's
- * normal client instead of failing the run.
+ * These exports preserve the legacy adapter contract. Production candidate
+ * clients use the route and request model resolved at the settings boundary;
+ * request strings cannot switch a candidate to another provider.
  */
 import OpenAI from 'openai'
 import { env } from './env.js'
@@ -56,7 +56,7 @@ export function orcarouterResponsesCreate(
 ): unknown {
   const { model, ...rest } = args
   return orcarouterClient().responses.create(
-    { ...rest, model: stripOrcaRouterPrefix(model ?? '') } as never,
+    { ...rest, model: isOrcaRouterModel(model) ? stripOrcaRouterPrefix(model!) : model ?? '' } as never,
     opts as never,
   )
 }

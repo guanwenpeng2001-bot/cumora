@@ -62,9 +62,8 @@ export const env = {
   OPENAI_COMPACTION_MODEL: process.env.OPENAI_COMPACTION_MODEL ?? DEFAULT_SUPPORT_MODEL,
   /**
    * Novita LLM API key. Optional — when unset, agents configured with a
-   * `novita/<model>` model id (see server/src/novita.ts) fall back to the
-   * legacy/sub2api client instead, so an unconfigured deployment doesn't
-   * break the run; the model just won't resolve to Novita as intended.
+   * `novita/<model>` model id is translated at the settings boundary to the
+   * direct Novita route. Without credentials that candidate is unavailable.
    */
   get NOVITA_API_KEY(): string { return getManagedPodSettings()?.direct.novita.apiKey ?? (process.env.NOVITA_API_KEY ?? '') },
   /** Novita's OpenAI-compatible Chat Completions base. Override for a
@@ -72,9 +71,8 @@ export const env = {
   get NOVITA_BASE_URL(): string { return getManagedPodSettings()?.direct.novita.baseURL ?? ((process.env.NOVITA_BASE_URL ?? 'https://api.novita.ai/openai').replace(/\/+$/, '')) },
   /**
    * OrcaRouter LLM API key. Optional — when unset, agents configured with a
-   * `orcarouter/<model>` model id (see server/src/orcarouter.ts) fall back to
-   * the legacy/sub2api client instead, so an unconfigured deployment doesn't
-   * break the run; the model just won't resolve to OrcaRouter as intended.
+   * `orcarouter/<model>` model id is translated at the settings boundary to the
+   * direct OrcaRouter route. Without credentials that candidate is unavailable.
    */
   get ORCAROUTER_API_KEY(): string { return getManagedPodSettings()?.direct.orcarouter.apiKey ?? (process.env.ORCAROUTER_API_KEY ?? '') },
   /** OrcaRouter's OpenAI-compatible Responses base. OrcaRouter speaks the

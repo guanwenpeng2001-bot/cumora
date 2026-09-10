@@ -5,6 +5,9 @@ import { posix } from 'node:path'
 import { test } from 'node:test'
 import { runInNewContext } from 'node:vm'
 import ts from 'typescript'
+import OpenAI from 'openai'
+import { createServer } from 'node:http'
+import { once } from 'node:events'
 import type * as Settings from '../settings.js'
 import type * as Managed from '../managed-pod-settings.js'
 import type * as Env from '../env.js'
@@ -22,7 +25,7 @@ function deferred<T>() {
   return { promise, resolve }
 }
 
-function fixture(bootstrap?: Managed.ManagedPodSettings, extraEnv: Record<string, string> = {}) {
+function fixture(bootstrap?: Managed.ManagedPodSettings, extraEnv: Record<string, string> = {}, dependencies: Record<string, unknown> = {}) {
   const processEnv: Record<string, string> = {
     OPENAI_API_KEY: 'direct-text-key', OPENAI_BASE_URL: 'https://direct.invalid/v1',
     OPENAI_MODEL: 'env-brain', OPENAI_MODEL_SUPPORT: 'env-support',
@@ -77,11 +80,12 @@ function fixture(bootstrap?: Managed.ManagedPodSettings, extraEnv: Record<string
     const exports: Record<string, any> = {}
     modules.set(name, exports)
     runInNewContext(transpile(read(name)), {
-      exports, URL, Date: Clock, setTimeout, clearTimeout,
+      exports, URL, Date: Clock, setTimeout, clearTimeout, AbortController, AbortSignal, DOMException,
       setInterval(fn: () => void, ms: number) { intervals.push({ fn, ms }); return { unref() {} } },
       console: { warn: (...args: unknown[]) => messages.push(args.join(' ')), log: (...args: unknown[]) => messages.push(args.join(' ')) },
       process: { env: processEnv, exit(code: number) { throw new Error(`unexpected exit ${code}`) } },
       require(dep: string) {
+        if (dep in dependencies) return dependencies[dep]
         if (dep === 'dotenv/config') return {}
         if (dep === 'node:crypto') return { randomBytes, randomUUID }
         const target = posix.normalize(posix.join(posix.dirname(name), dep)).replace(/\.js$/, '')
@@ -99,7 +103,7 @@ function fixture(bootstrap?: Managed.ManagedPodSettings, extraEnv: Record<string
   load('sub2api').listKeyModelsWithStatus = async (_base: string, key: string) => ({
     models: new Set([key.replace('owner-', '') + '-model']), ok: true, status: 'ok',
   })
-  return { settings, env, managed, tenant, resolver, queries, messages, intervals, processEnv,
+  return { settings, env, managed, tenant, resolver, queries, messages, intervals, processEnv, load,
     advance(ms: number) { now += ms },
     fail(value = true) { failure = value },
     setRows(next: typeof rows) { rows = next },
@@ -326,4 +330,219 @@ test('legacy Pod bootstrap inherits the optional turn policy and refreshes it wi
   assert.equal(pod.settings.getTurnBudgetPolicy().autoEnabled, false)
   assert.equal(pod.settings.getTurnBudgetPolicy().hardRatio, 0.95)
   assert.equal(first.maxHops, 200)
+})
+
+function fallbackConfig(role: Settings.LlmRole = 'brain', fallbackPolicy: 'disabled' | 'env_after_chain' = 'env_after_chain') {
+  const slot = role === 'image' || role === 'audio' ? role : 'text'
+  const protocol = role === 'image' ? 'images' : role === 'audio' ? 'chat' : 'responses'
+  return { version: 1 as const,
+    routes: [{ id: 'gateway', kind: 'gateway' as const, platform: 'openai' as const, protocol },
+      { id: 'backup', kind: 'direct' as const, env: slot, protocol },
+      { id: 'backup-alias', kind: 'direct' as const, env: slot, protocol }],
+    models: [{ model: 'gateway-a', route: 'gateway' }, { model: 'gateway-b', route: 'gateway' }],
+    roles: [{ role, models: ['gateway-a', 'gateway-b'], fallbackPolicy,
+      directTargets: [{ model: 'gateway-b', route: 'backup' }, { model: 'gateway-b', route: 'backup-alias' }] }],
+  }
+}
+
+async function fallbackFixture(configValue: unknown, base: string, extraEnv: Record<string, string> = {}) {
+  const { config } = await bootstrap(extraEnv)
+  const saved = plain(config)
+  saved.policy = { ...saved.policy, settings: { ...saved.policy.settings, llm_config: JSON.stringify(configValue) } }
+  saved.gateway.baseURL = base + '/gateway/v1'
+  for (const direct of Object.values(saved.direct)) direct.baseURL = base + '/direct/v1'
+  const records: any[] = []
+  const pod = fixture(saved, {}, {
+    openai: { default: OpenAI },
+    './agents/cost.js': {
+      captureCallPricing: async () => () => null,
+      measuredUsage: () => ({ input: 3, output: 2 }),
+    },
+    './agents/llm-ledger.js': {
+      recordLlmCall: async (record: unknown) => records.push(record),
+      classifyLlmCallError: (error: unknown) => error ? 'failed' : 'ok',
+    },
+  })
+  pod.fail()
+  await pod.settings.initializeManagedPodSettings(1)
+  const execution = pod.load('llm-execution')
+  const llm = pod.load('llm')
+  return { ...pod, execution, llm, records }
+}
+
+test('T52: gateway exhaustion reaches real direct HTTP with one plan, budget and ledger', async t => {
+  const requests: Array<{ path: string; key: string; body: any }> = []
+  const server = createServer(async (req, res) => {
+    let body = ''
+    for await (const chunk of req) body += chunk
+    const parsed = JSON.parse(body)
+    requests.push({ path: req.url!, key: req.headers.authorization ?? '', body: parsed })
+    res.setHeader('Content-Type', 'application/json')
+    if (req.url!.startsWith('/gateway/')) {
+      res.statusCode = parsed.model === 'gateway-a' ? 503 : 401
+      res.end(JSON.stringify({ error: { message: 'isolated gateway failure' } }))
+    } else if (req.url!.endsWith('/chat/completions')) {
+      res.end(JSON.stringify({ id: 'chat-test', model: parsed.model,
+        choices: [{ message: { role: 'assistant', content: 'direct-ok' }, finish_reason: 'stop', index: 0 }],
+        usage: { prompt_tokens: 3, completion_tokens: 2 } }))
+    } else if (req.url!.endsWith('/images/generations')) {
+      res.end(JSON.stringify({ data: [{ b64_json: Buffer.from('fake-image').toString('base64') }] }))
+    } else {
+      res.end(JSON.stringify({ id: 'resp-test', model: parsed.model, output_text: 'direct-ok',
+        output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'direct-ok', annotations: [] }] }],
+        usage: { input_tokens: 3, output_tokens: 2 } }))
+    }
+  })
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  t.after(() => new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())))
+  const address = server.address() as { address: string; port: number }
+  const base = 'http://' + address.address + ':' + address.port
+  for (const role of ['brain', 'support', 'compaction'] as const) {
+    await t.test(role + ': direct after both gateway failures, no duplicate exit/model', async () => {
+      requests.length = 0
+      const f = await fallbackFixture(fallbackConfig(role), base)
+      const result = await f.execution.executeTrackedText({ companyId: 'company-a', purpose: 'isolated', role },
+        'responses', { input: 'hello', max_output_tokens: 31 }, { maxRetries: 0 })
+      assert.equal(result.output_text, 'direct-ok')
+      assert.deepEqual(requests.map(r => r.path), ['/gateway/v1/responses', '/gateway/v1/responses', '/direct/v1/responses'])
+      assert.deepEqual(requests.map(r => r.key), ['Bearer owner-openai', 'Bearer owner-openai', 'Bearer direct-text-key'])
+      assert.deepEqual(requests.map(r => r.body.model), ['gateway-a', 'gateway-b', 'gateway-b'])
+      assert.ok(requests.every(r => r.body.max_output_tokens === 31))
+      assert.deepEqual(f.records.map(r => r.extras.routeKind), ['gateway', 'gateway', 'direct'])
+      assert.equal(new Set(f.records.map(r => r.extras.logicalCallId)).size, 1)
+      assert.deepEqual(f.records.map(r => r.extras.attempt), [1, 2, 3])
+      assert.equal(f.records[2].extras.platform, null)
+      assert.equal(f.records[2].status, 'ok')
+      assert.doesNotMatch(JSON.stringify(f.records), /owner-openai|direct-text-key/)
+    })
+  }
+  for (const role of ['image', 'audio'] as const) {
+    await t.test(role + ': role direct target reaches its own API', async () => {
+      requests.length = 0
+      const f = await fallbackFixture(fallbackConfig(role), base)
+      const plan = await f.resolver.resolveRoleCall('company-a', 'managed', role, 'isolated')
+      await f.execution.executeLlmPlan({ plan, context: { companyId: 'company-a', purpose: 'isolated' }, sdkMaxRetries: 0,
+        prepare: async (candidate: Resolver.RoleCallCandidate) => {
+          const client = await f.llm.getLlmCandidateClient(plan, candidate)
+          return () => role === 'image'
+            ? client.images.generate({ model: candidate.requestModel, prompt: 'fake' }, { maxRetries: 0 })
+            : client.chat.completions.create({ model: candidate.requestModel, messages: [{ role: 'user', content: 'fake-audio' }] }, { maxRetries: 0 })
+        },
+      })
+      assert.equal(requests.length, 3)
+      assert.ok(requests[2].path.startsWith('/direct/'))
+      assert.equal(requests[2].key, 'Bearer direct-image-key')
+      assert.equal(f.records[2].extras.role, role)
+    })
+  }
+  await t.test('disabled or missing policy never appends a direct attempt', async () => {
+    for (const policy of ['disabled', undefined] as const) {
+      requests.length = 0
+      const config = fallbackConfig()
+      config.roles[0].fallbackPolicy = policy as any
+      const f = await fallbackFixture(config, base)
+      await assert.rejects(f.execution.executeTrackedText({ companyId: 'company-a', purpose: 'isolated', role: 'brain' },
+        'responses', { input: 'hello' }, { maxRetries: 0 }), /isolated gateway failure/)
+      assert.equal(requests.length, 2)
+      assert.ok(requests.every(r => r.path.startsWith('/gateway/')))
+    }
+  })
+  await t.test('missing direct key fails without an empty bearer or extra gateway attempt', async () => {
+    requests.length = 0
+    const f = await fallbackFixture(fallbackConfig(), base, { OPENAI_API_KEY: '' })
+    await assert.rejects(f.execution.executeTrackedText({ companyId: 'company-a', purpose: 'isolated', role: 'brain' },
+      'responses', { input: 'hello' }, { maxRetries: 0 }), /direct-unconfigured/)
+    assert.equal(requests.length, 2)
+    assert.ok(requests.every(r => r.path.startsWith('/gateway/')))
+  })
+  await t.test('cancellation and committed output cannot open direct fallback', async () => {
+    for (const committed of [false, true]) {
+      requests.length = 0
+      const f = await fallbackFixture(fallbackConfig(), base)
+      const plan = await f.resolver.resolveRoleCall('company-a', 'managed', 'brain', 'isolated')
+      const controller = new AbortController()
+      await assert.rejects(f.execution.executeLlmPlan({ plan, context: { companyId: 'company-a', purpose: 'isolated' },
+        signal: controller.signal, sdkMaxRetries: 0,
+        record: async () => { if (!committed) controller.abort() },
+        prepare: async (candidate: Resolver.RoleCallCandidate, state: { committed: boolean }) => {
+          const client = await f.llm.getLlmCandidateClient(plan, candidate)
+          state.committed = committed
+          return () => client.responses.create({ model: candidate.requestModel, input: 'hello' }, { maxRetries: 0 })
+        },
+      }))
+      assert.equal(requests.length, 1)
+    }
+  })
+  await t.test('legacy prefixes and explicit configs reach identical endpoints, models and protocols', async () => {
+    for (const provider of ['novita', 'orcarouter']) {
+      const variants: unknown[] = [
+        { version: 1, roles: [{ role: 'brain', models: [provider + '/vendor/model'] }] },
+        { version: 1, routes: [{ id: 'explicit', kind: 'direct', env: provider, protocol: provider === 'novita' ? 'chat' : 'responses' }],
+          models: [{ model: 'vendor/model', route: 'explicit' }], roles: [{ role: 'brain', models: ['vendor/model'] }] },
+      ]
+      const observed: unknown[] = []
+      for (const config of variants) {
+        requests.length = 0
+        const f = await fallbackFixture(config, base)
+        const result = await f.execution.executeTrackedText({ companyId: 'company-a', purpose: 'isolated', role: 'brain' },
+          'responses', { input: 'hello', max_output_tokens: 19 }, { maxRetries: 0 })
+        assert.equal(result.output_text, 'direct-ok')
+        assert.equal(requests.length, 1)
+        assert.equal(requests[0].body.model, 'vendor/model')
+        observed.push(plain(requests[0]))
+      }
+      assert.deepEqual(observed[0], observed[1])
+    }
+  })
+  await t.test('an explicitly routed model may itself begin with a legacy prefix', async () => {
+    requests.length = 0
+    const f = await fallbackFixture({ version: 1,
+      routes: [{ id: 'explicit', kind: 'direct', env: 'orcarouter', protocol: 'responses' }],
+      models: [{ model: 'novita/vendor/model', route: 'explicit' }],
+      roles: [{ role: 'brain', models: ['novita/vendor/model'] }] }, base)
+    await f.execution.executeTrackedText({ companyId: 'company-a', purpose: 'isolated', role: 'brain' },
+      'responses', { input: 'hello' }, { maxRetries: 0 })
+    assert.equal(requests.length, 1)
+    assert.equal(requests[0].key, 'Bearer direct-orcarouter-key')
+    assert.equal(requests[0].body.model, 'novita/vendor/model')
+  })
+  await t.test('pure env text deployment works without any SUB2API configuration', async () => {
+    requests.length = 0
+    const f = fixture(undefined, { SUB2API_INTERNAL_URL: '', SUB2API_PUBLIC_URL: '', SUB2API_ADMIN_KEY: '',
+      OPENAI_BASE_URL: base + '/direct/v1', OPENAI_MODEL: 'vendor/model' }, { openai: { default: OpenAI } })
+    const plan = await f.resolver.resolveRoleCall('company-a', 'managed', 'brain', 'isolated')
+    assert.equal(plan.routable, false)
+    const client = await f.load('llm').getLlmCandidateClient(plan, plan.candidates[0])
+    await client.responses.create({ model: plan.candidates[0].requestModel, input: 'hello' }, { maxRetries: 0 })
+    assert.equal(requests.length, 1)
+    assert.equal(requests[0].body.model, 'vendor/model')
+    assert.equal(requests[0].key, 'Bearer direct-text-key')
+    assert.ok(f.queries.every(query => query === 'SELECT key, value FROM server_settings'), 'no tenant or gateway lookup in pure env mode')
+  })
+})
+
+test('T52: fallback schema is strict, embed excluded, configuration crosses Pod snapshots', async () => {
+  const main = fixture()
+  for (const invalid of [
+    { ...fallbackConfig(), roles: [{ role: 'embed', models: ['embed'], fallbackPolicy: 'env_after_chain' }] },
+    { ...fallbackConfig(), roles: [{ role: 'brain', models: ['a'], fallbackPolicy: 'always' }] },
+    { ...fallbackConfig(), roles: [{ role: 'brain', models: ['a'], directTargets: [{ model: 'b', route: 'gateway' }] }] },
+    { ...fallbackConfig(), roles: [{ role: 'brain', models: ['a'], directTargets: [{ model: 'b', route: 'backup', apiKey: 'forbidden' }] }] },
+    { ...fallbackConfig(), roles: [{ role: 'brain', models: ['a'], directTargets: [{ model: 'b', route: 'backup', protocol: 'images' }] }] },
+  ]) assert.throws(() => main.settings.parseLlmConfig(JSON.stringify(invalid), true), /invalid llm_config schema/)
+  const raw = JSON.stringify(fallbackConfig())
+  const { config } = await bootstrap({ CUMORA_LLM_CONFIG: raw })
+  const pod = fixture(config)
+  pod.fail()
+  await pod.settings.initializeManagedPodSettings(1)
+  assert.equal(pod.settings.getServerSettingsSnapshot().settings.llm_config, raw)
+  const plan = await pod.resolver.resolveRoleCall('company-a', 'managed', 'brain', 'isolated')
+  assert.equal(plan.candidates.length, 3)
+  assert.equal(plan.candidates[2].route.kind, 'direct')
+  assert.ok(Object.isFrozen(plan.candidates))
+  const embed = await pod.resolver.resolveRoleCall('company-a', 'managed', 'embed', 'isolated')
+  assert.equal(embed.candidates.length, 1)
+  const byoa = await pod.resolver.resolveRoleCall('company-a', 'byoa', 'brain', 'isolated')
+  assert.equal(byoa.candidates.length, 0)
 })

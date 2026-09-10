@@ -21,31 +21,16 @@
  *
  * Database lookup failures propagate; they do not authorize env fallback.
  *
- * Provider routing (model-based, on top of the above): whichever client is
- * chosen by the tenant rules is wrapped by `withProviderRouting` before it's
- * returned. That wrapper inspects the `model` on each individual
- * `responses.create()` call — not the tenant — and reroutes calls whose
- * model carries a recognized provider prefix:
- *   - `novita/<model>`       → Novita's real Chat Completions API via
- *                              server/src/novita.ts's translation shim, since
- *                              Novita has no Responses API to swap a base URL
- *                              onto.
- *   - `orcarouter/<model>`   → OrcaRouter (https://www.orcarouter.ai) via a
- *                              pure base-URL swap (server/src/orcarouter.ts),
- *                              since OrcaRouter speaks the Responses API
- *                              natively — no translation needed.
- * Everything else about the returned client (chat.completions, images,
- * embeddings, non-prefixed responses.create calls) is the same object
- * callers already know.
+ * Provider routes are resolved from configuration before constructing a candidate client.
+ * Request model strings cannot change a candidate's endpoint or credentials.
  */
 import { resolveTenantLlmContext, tenantModelSnapshot, invalidateTenantModelSnapshot, onTenantLlmInvalidated } from './tenant-llm-context.js'
 import OpenAI from 'openai'
-import { env, resolveDirectLlmEnv } from './env.js'
+import { resolveDirectLlmEnv } from './env.js'
 export { resolveRoleCall } from './llm-resolver.js'
 import type { RoleCallPlan, RoleCallCandidate } from './llm-resolver.js'
-import { isNovitaModel, novitaResponsesShim } from './novita.js'
+import { createChatResponsesShim } from './novita.js'
 import { fallbackReason, isLlmCancellation } from './agents/fallback.js'
-import { isOrcaRouterModel, orcarouterResponsesCreate } from './orcarouter.js'
 import { sub2apiRoutingConfigured, pickPlatformForModel, SUB2API_PLATFORMS, type Platform, type ApiKeyMap } from './sub2api.js'
 
 interface CachedClient {
@@ -89,82 +74,13 @@ export function __isLlmTestOverrideActive(): boolean {
   return testLlmOverride !== null
 }
 
-/** Wrap a client so any call whose `model` carries a recognized provider
- *  prefix is routed to that provider instead of this client's own
- *  `responses.create`:
- *    - `novita/<model>`     → Novita (server/src/novita.ts), translated
- *                             through `novitaResponsesShim` so the caller sees
- *                             an ordinary Responses-API stream/return.
- *    - `orcarouter/<model>` → OrcaRouter (server/src/orcarouter.ts), a pure
- *                             base-URL swap — OrcaRouter speaks the Responses
- *                             API natively.
- *
- *  Model, not tenant, decides the provider: `getLlmClient` is resolved
- *  once per tenant/hop before the model for that specific call is even
- *  read off `args.model`, so routing has to happen at `.responses.create()`
- *  call time, not here. Every caller in this codebase reads only
- *  `client.responses.create(...)`, so wrapping just that property is a
- *  complete, minimal interception — everything else (chat.completions,
- *  images, embeddings) passes through to the real client untouched. */
-let novitaUnconfiguredWarned = false
-let orcarouterUnconfiguredWarned = false
-/** One log line per provider, not one per call — this fires on every hop of
- *  every turn of an agent whose model names an unconfigured provider. */
-function warnProviderUnconfiguredOnce(provider: 'Novita' | 'OrcaRouter', model: string | undefined): void {
-  if (provider === 'Novita') {
-    if (novitaUnconfiguredWarned) return
-    novitaUnconfiguredWarned = true
-    console.warn(`[llm] model "${model}" requests Novita but NOVITA_API_KEY is unset — using the tenant's normal client instead`)
-    return
-  }
-  if (orcarouterUnconfiguredWarned) return
-  orcarouterUnconfiguredWarned = true
-  console.warn(`[llm] model "${model}" requests OrcaRouter but ORCAROUTER_API_KEY is unset — using the tenant's normal client instead`)
-}
-
-function withProviderRouting(client: OpenAI): OpenAI {
-  return new Proxy(client, {
-    get(target, prop, receiver): unknown {
-      if (prop !== 'responses') return Reflect.get(target, prop, receiver)
-      const real = target.responses
-      return new Proxy(real, {
-        get(rt, p, rr): unknown {
-          if (p !== 'create') return Reflect.get(rt, p, rr)
-          return (args: { model?: string } & Record<string, unknown>, opts?: unknown) => {
-            if (isNovitaModel(args.model)) {
-              // Route to Novita only when this deployment actually configured
-              // a key — otherwise fall through to the tenant's normal client,
-              // exactly as env.ts documents. Without this guard an unset key
-              // sent the call to api.novita.ai with an empty bearer and the
-              // agent died on an unexplained 401 instead of degrading.
-              if (env.NOVITA_API_KEY) {
-                return novitaResponsesShim.create(args as never, opts as never)
-              }
-              warnProviderUnconfiguredOnce('Novita', args.model)
-            } else if (isOrcaRouterModel(args.model)) {
-              // Same degrade-not-die guard for OrcaRouter: an unset key must
-              // fall through to the tenant's normal client, not send a bare
-              // bearer to api.orcarouter.ai.
-              if (env.ORCAROUTER_API_KEY) {
-                return orcarouterResponsesCreate(args, opts)
-              }
-              warnProviderUnconfiguredOnce('OrcaRouter', args.model)
-            }
-            return (real.create as (a: unknown, o?: unknown) => unknown)(args, opts)
-          }
-        },
-      })
-    },
-  })
-}
-
 interface LlmClientOptions {
   /** The caller owns an explicit hop chain and must avoid a second wrapper. */
   skipModelFallback?: boolean
 }
 
 function prepareLlmClient(client: OpenAI, _options: LlmClientOptions): OpenAI {
-  return withProviderRouting(client)
+  return client
 }
 
 /** A resolved candidate is one route; it never contains an application retry chain. */
@@ -182,7 +98,14 @@ export async function getLlmCandidateClient(plan: RoleCallPlan, candidate: RoleC
   const direct = resolveDirectLlmEnv(candidate.route.env ?? 'text')
   if (!direct.configured) throw new Error('Direct LLM route is not configured')
   const client = new OpenAI({ apiKey: direct.apiKey, baseURL: direct.baseURL, maxRetries: SDK_MAX_RETRIES, timeout: SDK_TIMEOUT_MS })
-  if (candidate.route.env === 'novita' || candidate.route.env === 'orcarouter') return withProviderRouting(client)
+  if (candidate.route.env === 'novita' || candidate.route.env === 'orcarouter') {
+    const responses = candidate.protocol === 'chat' ? createChatResponsesShim(client, candidate.requestModel) : {
+      create: (args: Record<string, unknown>, opts?: unknown) => client.responses.create({ ...args, model: candidate.requestModel } as never, opts as never),
+    }
+    return new Proxy(client, {
+      get(target, prop, receiver): unknown { return prop === 'responses' ? responses : Reflect.get(target, prop, receiver) },
+    })
+  }
   return client
 }
 

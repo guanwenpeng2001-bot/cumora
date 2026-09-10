@@ -51,7 +51,7 @@ async function byoaModels(companyId: string, computerId?: string, engine?: strin
  *  config stays selectable even when no live source lists it. */
 function configuredModels(): Set<string> {
   const config = parseLlmConfig(getServerSettingsSnapshot().settings.llm_config ?? '')
-  const out = new Set<string>([...config.models.map(m => m.model), ...config.roles.flatMap(r => r.models)])
+  const out = new Set<string>([...config.models.map(m => m.model), ...config.roles.flatMap(r => [...r.models, ...(r.directTargets ?? []).map(t => t.model)])])
   for (const def of SETTING_DEFS) {
     // `*_model` primaries only — `*_fallback_models` keys don't match this
     // suffix and are collected below.
@@ -84,7 +84,7 @@ export async function availableModels(userId: string, refresh: boolean, companyI
   const catalog: ModelCatalog = { text: [], image: [], audio: [], embedding: [], gateway: false, platforms: {}, byoa }
   const config = parseLlmConfig(getServerSettingsSnapshot().settings.llm_config ?? '')
   const addModel = (model: string) => {
-    const roles = config.models.find(m => m.model === model)?.roles ?? config.roles.filter(r => r.models.includes(model)).map(r => r.role)
+    const roles = config.models.find(m => m.model === model)?.roles ?? config.roles.filter(r => r.models.includes(model) || r.directTargets?.some(t => t.model === model)).map(r => r.role)
     const targets: Bucket[] = roles.length ? roles.map(r => r === 'embed' ? 'embedding' : r === 'image' || r === 'audio' ? r : 'text') : [bucketOf(model)]
     for (const target of targets) buckets[target].add(model)
   }
