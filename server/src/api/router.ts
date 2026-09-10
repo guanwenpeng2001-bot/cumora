@@ -22,7 +22,7 @@ import { LLM_ROLES, type LlmRole, getServerSettingsSnapshot, writeServerSettings
 import { availableModels, invalidateModelCatalog } from '../models-catalog.js'
 import { TenantLlmAccessError, resolveTenantLlmContext } from '../tenant-llm-context.js'
 import { parseUsageRange, usageSummary, usageTrend, usageByAgent, usageByModel, usageByProvider, usageLogs } from '../usage.js'
-import { modelPricingTable, upsertModelPricing } from '../model-pricing.js'
+import { modelPricingTable, upsertModelPricing, validateModelPricing } from '../model-pricing.js'
 import {
   ResourceError, listSkills, createSkillFromPaste, deleteSkill, installFromHub, searchHub,
   listLocalHub, importLocalSkill, agentSkillsFor, setAgentSkills,
@@ -870,6 +870,14 @@ api.delete('/skills/:id', resourceSafe(async (req, res) => {
 
 /** Per-agent enablement: read flags, or set them (writes materialize the
  *  managed workspace / land in the next BYOA daemon seed). */
+api.get('/agents/:id/resources/status', resourceSafe(async (req, res) => {
+  const { companyId } = await requireCompany(req)
+  const { agentResourceState } = await import('../agents/computer/registry.js')
+  const state = await agentResourceState(companyId, String(req.params.id))
+  if (!state) throw new HttpError(404, 'agent not found')
+  res.json(state)
+}))
+
 api.get('/agents/:id/skills', resourceSafe(async (req, res) => {
   const { companyId } = await requireCompany(req)
   res.json({ items: await agentSkillsFor(companyId, String(req.params.id)) })
@@ -959,24 +967,10 @@ api.put('/agents/:id/mcp-connectors', resourceSafe(async (req, res) => {
 
 api.put('/usage/pricing', safe(async (req, res) => {
   await requireSiteAdmin(req)
-  const b = (req.body ?? {}) as Record<string, unknown>
-  const model = typeof b.model === 'string' ? b.model.trim() : ''
-  if (!model) throw new HttpError(400, 'model required')
-  const num = (v: unknown): number => {
-    const n = Number(v)
-    if (!Number.isFinite(n) || n < 0) throw new HttpError(400, 'rates must be non-negative numbers')
-    return n
-  }
-  await upsertModelPricing({
-    model,
-    inPer1M: num(b.inPer1M ?? 0),
-    cachedInPer1M: num(b.cachedInPer1M ?? 0),
-    cacheWritePer1M: num(b.cacheWritePer1M ?? 0),
-    outPer1M: num(b.outPer1M ?? 0),
-    note: typeof b.note === 'string' ? b.note : null,
-    sourceUrl: typeof b.sourceUrl === 'string' ? b.sourceUrl : null,
-    pricedAt: typeof b.pricedAt === 'string' ? b.pricedAt : null,
-  })
+  let row
+  try { row = validateModelPricing(req.body ?? {}) }
+  catch (error) { throw new HttpError(400, error instanceof Error ? error.message : 'invalid pricing') }
+  await upsertModelPricing(row)
   res.json({ ok: true })
 }))
 
