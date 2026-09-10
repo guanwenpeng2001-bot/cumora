@@ -24,12 +24,12 @@ import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, constants as FS_CONSTANTS, type FSWatcher, watch } from 'node:fs'
 import { chmod, copyFile, lstat, mkdir, open, readdir, readFile, realpath, rename, rm, stat, truncate, writeFile } from 'node:fs/promises'
 import { homedir, hostname } from 'node:os'
-import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { delimiter, dirname, isAbsolute, join, relative, resolve, sep, win32, posix } from 'node:path'
 import { promisify } from 'node:util'
 
 const execFileP = promisify(execFile)
 
-import { type TokenUsage, usageFromClaude } from '../cost.js'
+import { type TokenUsage, usageFromClaude } from '../token-usage.js'
 import { GLANCE_YIELD_RULES } from '../glance-protocol.js'
 import {
   composeMemoryDigest,
@@ -388,6 +388,8 @@ export function resolveCurrentVersion(bundledVersion: string | undefined, envVer
 const CURRENT_VERSION = resolveCurrentVersion(
   typeof __CUMORA_VERSION__ === 'string' ? __CUMORA_VERSION__ : undefined,
 )
+declare const __CUMORA_RELEASE__: boolean | undefined
+const RELEASE_BUILD = typeof __CUMORA_RELEASE__ === 'boolean' && __CUMORA_RELEASE__
 const UPDATE_CHECK_MS = 6 * 60 * 60 * 1000 // re-check npm every 6h
 // Log rotation: the service supervisor (launchd StandardOutPath / systemd) writes
 // the daemon's stdout to ~/.cumora/daemon.log and NEVER rotates it — left alone it
@@ -395,9 +397,7 @@ const UPDATE_CHECK_MS = 6 * 60 * 60 * 1000 // re-check npm every 6h
 const MAX_LOG_BYTES = 20 * 1024 * 1024 // rotate when the live log passes 20MB
 const LOG_ROTATE_MS = 5 * 60 * 1000 // check every 5 minutes
 const SERVICE_LABEL = 'io.cumora.daemon'
-/** The supervisor (`--install-service`) sets this so the daemon knows a clean
- *  exit will be auto-restarted on `cumora@latest` — only then do we self-exit
- *  to apply an update. A manually-run daemon just logs the available version. */
+/** Set by the installed supervisor; reported with the running version. */
 const SUPERVISED = process.env.CUMORA_SUPERVISED === '1'
 
 export function windowsTaskName(home = homedir()): string {
@@ -817,7 +817,7 @@ function missingEngineMessage(): string {
     '  - Antigravity: install the `agy` CLI, then run `agy` once to sign in',
     '',
     'After that, rerun:',
-    '  npx cumora@latest agent computer --pair <code>',
+    '  cumora agent computer --pair <code>',
   ].join('\n')
 }
 
@@ -832,7 +832,7 @@ function sandboxedEngineMessage(installed: readonly EngineId[]): string {
     'a Cumora-verified fail-closed host boundary.',
     '',
     'Compatibility only (grants the model your host files, environment, and network):',
-    '  CUMORA_BYOA_ALLOW_UNSANDBOXED=1 npx cumora@latest agent computer ...',
+    '  CUMORA_BYOA_ALLOW_UNSANDBOXED=1 cumora agent computer ...',
   ].join('\n')
 }
 
@@ -843,7 +843,7 @@ function incapableEngineMessage(blocked: ReadonlyArray<{ id: EngineId; reason: s
     '',
     'Update the CLI and install any named sandbox dependencies, then retry.',
     'Compatibility only (disables this capability gate and host boundary):',
-    '  CUMORA_BYOA_ALLOW_UNSANDBOXED=1 npx cumora@latest agent computer ...',
+    '  CUMORA_BYOA_ALLOW_UNSANDBOXED=1 cumora agent computer ...',
   ].join('\n')
 }
 
@@ -858,8 +858,8 @@ function helpText(): string {
     'Pair once, then the daemon runs in the background.',
     '',
     'Usage:',
-    '  npx cumora@latest agent computer --pair <code> [--server <url>] [--engine <id>]',
-    '  npx cumora@latest agent computer [--server <url>]',
+    '  cumora agent computer --pair <code> [--server <url>] [--engine <id>]',
+    '  cumora agent computer [--server <url>]',
     '',
     'Setup:',
     '  --pair <code>        pair this machine to your account (code from',
@@ -3288,7 +3288,7 @@ async function doRun(serverOverride?: string): Promise<void> {
   if (windowsShutdownRequest) await rm(windowsShutdownRequest, { force: true }).catch(() => {})
   await writeRunningState()
   if (!SUPERVISED) {
-    console.log(`[computer] 💡 tip: run \`npx cumora@latest agent computer --install-service\` to keep this running in the background — auto-start when you sign in, auto-restart on crash, and auto-update. (This terminal must stay open otherwise.)`)
+    console.log(`[computer] 💡 tip: run \`cumora agent computer --install-service\` to keep this running in the background — auto-start when you sign in, auto-restart on crash, and fixed-version startup. (This terminal must stay open otherwise.)`)
   }
 
   const runners = new Map<string, AgentRunner>()
@@ -3502,7 +3502,6 @@ async function doRun(serverOverride?: string): Promise<void> {
   logrot.unref?.()
 
   let upd: ReturnType<typeof setInterval> | undefined
-  let idleWatch: ReturnType<typeof setInterval> | undefined
   let controlWatch: ReturnType<typeof setInterval> | undefined
   const anyBusy = (): boolean => [...runners.values()].some((r) => r.isBusy)
 
@@ -3516,7 +3515,6 @@ async function doRun(serverOverride?: string): Promise<void> {
     controlStreamAbort.abort()
     clearInterval(poll); clearInterval(beat); clearInterval(logrot); clearInterval(rescan)
     if (upd) clearInterval(upd)
-    if (idleWatch) clearInterval(idleWatch)
     if (controlWatch) clearInterval(controlWatch)
     if (windowsShutdownRequest) await rm(windowsShutdownRequest, { force: true }).catch(() => {})
     for (const runner of runners.values()) runner.beginStop() // no new turns; leave in-flight running
@@ -3538,60 +3536,88 @@ async function doRun(serverOverride?: string): Promise<void> {
     controlWatch.unref?.()
   }
 
-  // Self-update: compare to npm's latest periodically. When supervised
-  // (--install-service), a clean exit relaunches the service on cumora@latest =
-  // the update. Crucially we do NOT interrupt a live turn for a (non-urgent)
-  // update: once an update is detected we wait for ALL agents to go idle, then
-  // exit. First check a minute after boot, then every UPDATE_CHECK_MS.
-  let updateReady = false
-  const exitForUpdateWhenIdle = (): void => {
-    if (!updateReady || shuttingDown) return
-    if (anyBusy()) return // mid-turn — defer; the idle watch retries
-    void shutdown('auto-update')
+  // Fixed Release builds never poll the official registry. Source builds only
+  // notify: restarting a fixed installation cannot install a newer package.
+  if (!RELEASE_BUILD) {
+    const runUpdateCheck = (): void => { void checkForUpdate() }
+    upd = setInterval(runUpdateCheck, UPDATE_CHECK_MS)
+    setTimeout(runUpdateCheck, 60_000).unref?.()
   }
-  const runUpdateCheck = (): void => {
-    void checkForUpdate(() => {
-      if (!updateReady) {
-        updateReady = true
-        console.log('[computer] update ready — will restart to apply it as soon as all agents are idle')
-      }
-      exitForUpdateWhenIdle()
-    })
-  }
-  upd = setInterval(runUpdateCheck, UPDATE_CHECK_MS)
-  idleWatch = setInterval(exitForUpdateWhenIdle, 30_000); idleWatch.unref?.()
-  setTimeout(runUpdateCheck, 60_000).unref?.()
 }
 
 // ─── self-update + service ────────────────────────────────────────────────
 
-/** Compare the running version to npm's `latest`. If behind: when supervised,
- *  exit cleanly so the service relaunches on `cumora@latest` (= the update);
- *  otherwise just log that an update is available. Never throws. */
-async function checkForUpdate(onSupervisedUpdate: () => void): Promise<void> {
+export async function checkForUpdate(releaseBuild = RELEASE_BUILD): Promise<void> {
+  if (releaseBuild) return
   try {
     const res = await fetch('https://registry.npmjs.org/cumora/latest', { headers: { Accept: 'application/json' } })
     if (!res.ok) return
     const latest = (await res.json() as { version?: string })?.version
     if (typeof latest !== 'string' || !versionGt(latest, CURRENT_VERSION)) return
-    if (SUPERVISED) {
-      console.log(`[computer] 🆕 cumora ${latest} available (running ${CURRENT_VERSION}) — will restart to apply once idle (in-flight turns are never interrupted for an update)`)
-      onSupervisedUpdate()
-    } else {
-      console.log(`[computer] 🆕 cumora ${latest} available (running ${CURRENT_VERSION}). Restart to update, or run \`cumora agent computer --install-service\` for auto-updates.`)
-    }
+    console.log(`[computer] official cumora ${latest} available (running ${CURRENT_VERSION}). Install a chosen fixed fork Release URL explicitly, then run \`cumora agent computer --restart\`.`)
   } catch { /* offline / npm hiccup — try the next tick */ }
 }
 
-/** Absolute path to npx next to the node that's running us, so the supervisor
- *  doesn't depend on its (minimal) PATH resolving `npx`. Falls back to PATH. */
-export function resolveNpx(
+/** Capture the installed CLI and Node directories before entering a service's
+ *  minimal environment. Paths are resolved on the target machine at install. */
+export async function resolveServicePath(
   platform: NodeJS.Platform = process.platform,
+  currentPath = process.env.PATH ?? '',
   execPath = process.execPath,
-): string {
-  const executable = platform === 'win32' ? 'npx.cmd' : 'npx'
-  const sibling = join(dirname(execPath), executable)
-  return existsSync(sibling) ? sibling : executable
+  locate: (file: string, args: string[]) => Promise<{ stdout: string }> = execFileP,
+): Promise<string> {
+  const windows = platform === 'win32'
+  const { stdout } = await locate(windows ? 'where.exe' : 'which', [windows ? 'cumora.cmd' : 'cumora'])
+  const command = stdout.split(/\r?\n/).map((line) => line.trim()).find(Boolean)
+  if (!command) throw new Error('Install a fixed fork Release globally and put cumora on PATH before installing the service')
+  const pathApi = windows ? win32 : posix
+  if (!pathApi.isAbsolute(command)) throw new Error('cumora on PATH must resolve to an absolute installed command')
+  const separator = windows ? ';' : ':'
+  return [...new Set([pathApi.dirname(command), pathApi.dirname(execPath), ...currentPath.split(separator)].filter(Boolean))].join(separator)
+}
+
+function escapeXml(value: string): string {
+  return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&apos;')
+}
+
+export function renderLaunchAgent(serverUrl: string, logPath: string, path: string): string {
+  const args = ['/usr/bin/env', 'cumora', 'agent', 'computer', '--server', serverUrl]
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>${SERVICE_LABEL}</string>
+  <key>ProgramArguments</key><array>${args.map((a) => `<string>${escapeXml(a)}</string>`).join('')}</array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>${escapeXml(logPath)}</string>
+  <key>StandardErrorPath</key><string>${escapeXml(logPath)}</string>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>${escapeXml(path)}</string>
+    <key>CUMORA_SUPERVISED</key><string>1</string>
+  </dict>
+</dict></plist>
+`
+}
+
+function quoteSystemd(value: string): string {
+  return JSON.stringify(value).replaceAll('%', '%%')
+}
+
+export function renderSystemdUnit(serverUrl: string, path: string): string {
+  return `[Unit]
+Description=Cumora BYOA daemon
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/env cumora agent computer --server ${quoteSystemd(serverUrl).replaceAll('$', () => '$$')}
+Restart=always
+RestartSec=5
+Environment=${quoteSystemd(`PATH=${path}`)}
+Environment=CUMORA_SUPERVISED=1
+
+[Install]
+WantedBy=default.target
+`
 }
 
 function windowsSupervisorPath(): string {
@@ -3615,9 +3641,8 @@ function quotePowerShell(value: string): string {
 }
 
 /** The scheduled task starts this watchdog at login. It deliberately restarts
- *  after every daemon exit, including the clean exit used to apply an update. */
+ *  after every daemon exit, using the explicitly installed package. */
 export function renderWindowsSupervisor(
-  npx: string,
   serverUrl: string,
   logPath: string,
   disabledPath = windowsSupervisorDisabledPath(),
@@ -3629,7 +3654,7 @@ export function renderWindowsSupervisor(
     `$env:PATH = ${quotePowerShell(path)}`,
     '$utf8 = New-Object System.Text.UTF8Encoding($false)',
     `while (-not (Test-Path -LiteralPath ${quotePowerShell(disabledPath)})) {`,
-    `  & ${quotePowerShell(npx)} -y cumora@latest agent computer --server ${quotePowerShell(serverUrl)} 2>&1 | ForEach-Object {`,
+    `  & cumora agent computer --server ${quotePowerShell(serverUrl)} 2>&1 | ForEach-Object {`,
     `    [System.IO.File]::AppendAllText(${quotePowerShell(logPath)}, ([string]$_ + [Environment]::NewLine), $utf8)`,
     '  }',
     '  Start-Sleep -Seconds 5',
@@ -3692,16 +3717,13 @@ async function isWindowsTaskInstalled(taskName = windowsTaskName()): Promise<boo
   }
 }
 
-/** Install a per-user supervisor (LaunchAgent on macOS, systemd --user on
- *  Linux, Task Scheduler on Windows) that runs
- *  `npx -y cumora@latest agent computer --server <url>` with auto-restart +
- *  start-at-login. `@latest` + restart-on-update is what makes the daemon
- *  self-update (see checkForUpdate). Must be paired first. */
+/** Install a per-user supervisor that runs the fixed global cumora package
+ *  with auto-restart and start-at-login. Must be paired first. */
 async function installService(serverUrl: string): Promise<void> {
   if (!(await loadConfig())) {
     throw new Error('pair this computer first: cumora agent computer --pair <code>')
   }
-  const npx = resolveNpx()
+  const servicePath = await resolveServicePath()
   const logPath = join(CONFIG_DIR, 'daemon.log')
   await mkdir(CONFIG_DIR, { recursive: true })
 
@@ -3709,26 +3731,11 @@ async function installService(serverUrl: string): Promise<void> {
     const dir = join(homedir(), 'Library', 'LaunchAgents')
     await mkdir(dir, { recursive: true })
     const plistPath = join(dir, `${SERVICE_LABEL}.plist`)
-    const args = [npx, '-y', 'cumora@latest', 'agent', 'computer', '--server', serverUrl]
-    const plist = `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>${SERVICE_LABEL}</string>
-  <key>ProgramArguments</key><array>${args.map((a) => `<string>${a}</string>`).join('')}</array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>${logPath}</string>
-  <key>StandardErrorPath</key><string>${logPath}</string>
-  <key>EnvironmentVariables</key><dict>
-    <key>PATH</key><string>${process.env.PATH ?? ''}</string>
-    <key>CUMORA_SUPERVISED</key><string>1</string>
-  </dict>
-</dict></plist>
-`
+    const plist = renderLaunchAgent(serverUrl, logPath, servicePath)
     await writeFile(plistPath, plist, 'utf8')
     await execFileP('launchctl', ['unload', plistPath]).catch(() => { /* not loaded yet */ })
     await execFileP('launchctl', ['load', plistPath])
-    console.log(`[computer] installed LaunchAgent ${SERVICE_LABEL} — auto-start, auto-restart, auto-update. Logs: ${logPath}`)
+    console.log(`[computer] installed LaunchAgent ${SERVICE_LABEL} — auto-start, auto-restart, fixed-version startup. Logs: ${logPath}`)
     console.log(`[computer] you can now close this terminal; the service is running in the background.`)
     return
   }
@@ -3737,24 +3744,12 @@ async function installService(serverUrl: string): Promise<void> {
     const dir = join(homedir(), '.config', 'systemd', 'user')
     await mkdir(dir, { recursive: true })
     const unitPath = join(dir, 'cumora.service')
-    const unit = `[Unit]
-Description=Cumora BYOA daemon
-After=network-online.target
-
-[Service]
-ExecStart=${npx} -y cumora@latest agent computer --server ${serverUrl}
-Restart=always
-RestartSec=5
-Environment=PATH=${process.env.PATH ?? ''}
-Environment=CUMORA_SUPERVISED=1
-
-[Install]
-WantedBy=default.target
-`
+    const unit = renderSystemdUnit(serverUrl, servicePath)
     await writeFile(unitPath, unit, 'utf8')
     await execFileP('systemctl', ['--user', 'daemon-reload'])
-    await execFileP('systemctl', ['--user', 'enable', '--now', 'cumora'])
-    console.log(`[computer] installed systemd --user service 'cumora' — auto-start, auto-restart, auto-update. Logs: journalctl --user -u cumora -f`)
+    await execFileP('systemctl', ['--user', 'enable', 'cumora'])
+    await execFileP('systemctl', ['--user', 'restart', 'cumora'])
+    console.log(`[computer] installed systemd --user service 'cumora' — auto-start, auto-restart, fixed-version startup. Logs: journalctl --user -u cumora -f`)
     return
   }
 
@@ -3764,7 +3759,7 @@ WantedBy=default.target
     const disabledPath = windowsSupervisorDisabledPath()
     const taskName = windowsTaskName()
     const replacing = await isWindowsTaskInstalled(taskName)
-    await writeFile(scriptPath, renderWindowsSupervisor(npx, serverUrl, logPath, disabledPath), 'utf8')
+    await writeFile(scriptPath, renderWindowsSupervisor(serverUrl, logPath, disabledPath, servicePath), 'utf8')
     await writeFile(launcherPath, renderWindowsSupervisorLauncher(scriptPath), 'utf8')
     try {
       // Always recreate with /F: an existing task may still point at the old
@@ -3797,7 +3792,7 @@ WantedBy=default.target
     } catch (err) {
       throw new Error(`scheduled task installed but could not be started; retry with --restart (${err instanceof Error ? err.message : String(err)})`)
     }
-    console.log(`[computer] installed scheduled task '${taskName}' — start-at-login, auto-restart, auto-update. Logs: ${logPath}`)
+    console.log(`[computer] installed scheduled task '${taskName}' — start-at-login, auto-restart, fixed-version startup. Logs: ${logPath}`)
     console.log(`[computer] you can now close this terminal; the task is running in the background.`)
     return
   }
@@ -3864,67 +3859,33 @@ async function isServiceInstalled(): Promise<boolean> {
  *  after a re-pair so the running service adopts the new config instead of a
  *  second foreground daemon racing it. */
 async function reloadService(): Promise<void> {
-  if (process.platform === 'darwin') {
-    const p = darwinPlistPath()
-    await execFileP('launchctl', ['unload', p]).catch(() => {})
-    await execFileP('launchctl', ['load', p])
-    return
-  }
-  if (process.platform === 'linux') {
-    await execFileP('systemctl', ['--user', 'restart', 'cumora'])
-    return
-  }
-  if (process.platform === 'win32') {
-    const taskName = windowsTaskName()
-    const disabledPath = windowsSupervisorDisabledPath()
-    await mkdir(CONFIG_DIR, { recursive: true })
-    await writeFile(disabledPath, '', 'utf8')
-    await killRunningDaemons()
-    await stopWindowsWatchdog(taskName)
-    await killRunningDaemons()
-    await rm(disabledPath, { force: true })
-    await execFileP('schtasks.exe', ['/Run', '/TN', taskName])
-  }
+  const cfg = await loadConfig()
+  if (!cfg) throw new Error('pair this computer first: cumora agent computer --pair <code>')
+  await installService(cfg.serverUrl)
 }
 
-/** `--restart`: a friendly wrapper so users don't have to remember
- *  `launchctl kickstart …`. Restarts the installed service (which relaunches on
- *  cumora@latest, so it's also the "apply the update now" button). */
+/** Refresh the supervisor too, so an old floating-version template cannot survive a restart. */
 interface RestartServiceHooks {
   platform?: NodeJS.Platform
   isServiceInstalled?: () => Promise<boolean>
   loadConfig?: () => Promise<DaemonConfig | null>
   installService?: (serverUrl: string) => Promise<void>
-  reloadService?: () => Promise<void>
 }
 
 export async function restartService(hooks: RestartServiceHooks = {}): Promise<void> {
   const platform = hooks.platform ?? process.platform
   const serviceInstalled = hooks.isServiceInstalled ?? isServiceInstalled
   if (!(await serviceInstalled())) {
-    console.log('[computer] service not installed — run: npx cumora@latest agent computer --install-service')
+    console.log('[computer] service not installed — run: cumora agent computer --install-service')
     return
   }
-  if (platform === 'win32') {
-    const cfg = await (hooks.loadConfig ?? loadConfig)()
-    if (!cfg) throw new Error('pair this computer first: cumora agent computer --pair <code>')
-    await (hooks.installService ?? installService)(cfg.serverUrl)
-    console.log('[computer] Windows service refreshed and restarted — its supervisor now launches cumora@latest')
-  } else if (platform === 'darwin') {
-    const uid = process.getuid?.() ?? 0
-    try {
-      await execFileP('launchctl', ['kickstart', '-k', `gui/${uid}/${SERVICE_LABEL}`])
-    } catch {
-      await (hooks.reloadService ?? reloadService)() // not currently loaded → load it
-    }
-  } else if (platform === 'linux') {
-    await (hooks.reloadService ?? reloadService)()
-  } else {
+  if (!['win32', 'darwin', 'linux'].includes(platform)) {
     throw new Error(`--restart is not supported on ${platform}`)
   }
-  if (platform !== 'win32') {
-    console.log('[computer] service restarted — it relaunches on cumora@latest (also applies any pending update). Check: npx cumora@latest agent computer --status')
-  }
+  const cfg = await (hooks.loadConfig ?? loadConfig)()
+  if (!cfg) throw new Error('pair this computer first: cumora agent computer --pair <code>')
+  await (hooks.installService ?? installService)(cfg.serverUrl)
+  console.log('[computer] service refreshed and restarted using the installed fixed package. Check: cumora agent computer --status')
 }
 
 /** `--stop`: stop the background service NOW, without uninstalling it. The job is
@@ -4129,7 +4090,7 @@ async function stopService(): Promise<void> {
     console.log('[computer] no background service installed — killing any running daemon process directly.')
   }
   if (process.platform !== 'win32') await killRunningDaemons()
-  console.log('[computer] stopped — service removed and daemon process(es) killed. Re-pair to start again: npx cumora@latest agent computer --pair <code>')
+  console.log('[computer] stopped — service removed and daemon process(es) killed. Re-pair to start again: cumora agent computer --pair <code>')
 }
 
 /** `--status`: a one-glance summary — version, pairing, whether the background
@@ -4137,12 +4098,12 @@ async function stopService(): Promise<void> {
 async function printStatus(): Promise<void> {
   const cfg = await loadConfig()
   // The version of the binary running THIS command. May differ from what the
-  // background service is actually running (it auto-updates on its own cycle),
+  // background service is actually running after an explicit package upgrade,
   // so we report the service's running version separately, read from its log.
   console.log(`cli:     cumora ${CURRENT_VERSION} (this command)`)
-  console.log(cfg ? `paired:  computer ${cfg.computerId} @ ${cfg.serverUrl}` : 'paired:  NO — run: npx cumora@latest agent computer --pair <code>')
+  console.log(cfg ? `paired:  computer ${cfg.computerId} @ ${cfg.serverUrl}` : 'paired:  NO — run: cumora agent computer --pair <code>')
   if (!(await isServiceInstalled())) {
-    console.log('service: not installed — run: npx cumora@latest agent computer --install-service')
+    console.log('service: not installed — run: cumora agent computer --install-service')
     return
   }
   let livePid: number | null = null
@@ -4174,11 +4135,11 @@ async function printStatus(): Promise<void> {
   }
   const running = await resolveRunningVersion(livePid)
   if (running) {
-    console.log(`running: cumora ${running}${running === CURRENT_VERSION ? ' (latest)' : ' (differs from this cli — `npx cumora@latest agent computer --restart` to pick up the latest)'}`)
+    console.log(`running: cumora ${running}${running === CURRENT_VERSION ? ' (matches installed CLI)' : ' (differs from this cli — `cumora agent computer --restart` to use the installed package)'}`)
   } else {
-    console.log('running: unknown — `npx cumora@latest agent computer --restart` to (re)start it and record the version')
+    console.log('running: unknown — `cumora agent computer --restart` to (re)start it and record the version')
   }
-  console.log(`logs:    ${process.platform === 'linux' ? 'journalctl --user -u cumora -f' : join(CONFIG_DIR, 'daemon.log')}  (or: npx cumora@latest agent computer --logs)`)
+  console.log(`logs:    ${process.platform === 'linux' ? 'journalctl --user -u cumora -f' : join(CONFIG_DIR, 'daemon.log')}  (or: cumora agent computer --logs)`)
 }
 
 const RUNNING_STATE_PATH = join(CONFIG_DIR, 'running.json')
@@ -4224,7 +4185,7 @@ async function tailLogs(): Promise<void> {
   }
   const logPath = join(CONFIG_DIR, 'daemon.log')
   if (!existsSync(logPath)) {
-    console.log(`no log at ${logPath} yet — is the service installed and running? (npx cumora@latest agent computer --status)`)
+    console.log(`no log at ${logPath} yet — is the service installed and running? (cumora agent computer --status)`)
     return
   }
   await new Promise<void>((resolve) => {

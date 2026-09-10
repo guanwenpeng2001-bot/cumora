@@ -5,7 +5,10 @@ import {
   parseWindowsProcessList,
   renderWindowsSupervisor,
   renderWindowsSupervisorLauncher,
-  resolveNpx,
+  resolveServicePath,
+  renderLaunchAgent,
+  renderSystemdUnit,
+  checkForUpdate,
   restartService,
   windowsScheduledTaskCommand,
   windowsScheduledTaskCreateArgs,
@@ -14,16 +17,21 @@ import {
   windowsTaskName,
 } from '../agents/computer/daemon.js'
 
-test('Windows service resolves the executable command shim', () => {
-  assert.equal(resolveNpx('win32', 'Z:\\missing\\node.exe'), 'npx.cmd')
-  assert.equal(resolveNpx('linux', '/missing/node'), 'npx')
+test('service PATH includes the installed CLI shim and Node directories', async () => {
+  assert.equal(await resolveServicePath('win32', 'C:/bin', 'C:/node/node.exe', async (file, args) => {
+    assert.equal(file, 'where.exe')
+    assert.deepEqual(args, ['cumora.cmd'])
+    return { stdout: 'C:/npm/cumora.cmd' + String.fromCharCode(13, 10) }
+  }), 'C:/npm;C:/node;C:/bin')
+  assert.equal(await resolveServicePath('linux', '/bin', '/opt/node/bin/node', async () => ({ stdout: '/opt/npm/bin/cumora' })), '/opt/npm/bin:/opt/node/bin:/bin')
+  await assert.rejects(resolveServicePath('linux', '', '/bin/node', async () => ({ stdout: '' })), /Install a fixed fork Release/)
 })
 
-test('Windows restart refreshes an existing service definition', async () => {
+for (const platform of ['win32', 'darwin', 'linux'] as const) test(`${platform} restart refreshes an existing service definition`, async () => {
   const installedUrls: string[] = []
 
   await restartService({
-    platform: 'win32',
+    platform,
     isServiceInstalled: async () => true,
     loadConfig: async () => ({
       serverUrl: 'https://example.test',
@@ -36,9 +44,8 @@ test('Windows restart refreshes an existing service definition', async () => {
   assert.deepEqual(installedUrls, ['https://example.test'])
 })
 
-test('Windows supervisor restarts the latest daemon with supervision enabled', () => {
+test('Windows supervisor restarts the installed fixed daemon with supervision enabled', () => {
   const script = renderWindowsSupervisor(
-    'C:\\Program Files\\nodejs\\npx.cmd',
     "https://example.test/tenant's-api",
     "C:\\Users\\O'Brien\\.cumora\\daemon.log",
     "C:\\Users\\O'Brien\\.cumora\\daemon-supervisor.disabled",
@@ -47,7 +54,8 @@ test('Windows supervisor restarts the latest daemon with supervision enabled', (
 
   assert.match(script, /\$env:CUMORA_SUPERVISED = '1'/)
   assert.match(script, /while \(-not \(Test-Path -LiteralPath/)
-  assert.match(script, /& 'C:\\Program Files\\nodejs\\npx\.cmd' -y cumora@latest agent computer --server/)
+  assert.match(script, /& cumora agent computer --server/)
+  assert.doesNotMatch(script, /npx|@latest/)
   assert.match(script, /tenant''s-api/)
   assert.match(script, /O''Brien/)
   assert.match(script, /2>&1 \| ForEach-Object/)
@@ -127,4 +135,20 @@ test('Windows watchdog matching requires PowerShell -File with the exact script'
     Name: 'powershell.exe',
     CommandLine: 'powershell.exe -File "C:\\other\\daemon-supervisor.ps1"',
   }, scriptPath), false)
+})
+
+test('macOS and Linux templates preserve configured addresses and fixed entrypoints', () => {
+  const plist = renderLaunchAgent('https://example.test/?a=1&b=2', '/tmp/test log', '/opt/npm/bin:/usr/bin')
+  assert.match(plist, /<string>cumora<\/string><string>agent<\/string><string>computer<\/string><string>--server<\/string>/)
+  assert.match(plist, /a=1&amp;b=2/)
+  const unit = renderSystemdUnit('https://example.test/%20/$tenant', '/opt/npm bin:/usr/bin')
+  assert.match(unit, /ExecStart=\/usr\/bin\/env cumora agent computer --server "https:\/\/example.test\/%%20\/\$\$tenant"/)
+  assert.match(unit, /Environment="PATH=\/opt\/npm bin:\/usr\/bin"/)
+  assert.doesNotMatch(plist + unit, /npx|@latest/)
+})
+
+test('Release builds skip the official update request entirely', async (t) => {
+  const fetchMock = t.mock.method(globalThis, 'fetch', async () => { throw new Error('unexpected network') })
+  await checkForUpdate(true)
+  assert.equal(fetchMock.mock.callCount(), 0)
 })

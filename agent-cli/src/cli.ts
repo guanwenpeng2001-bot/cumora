@@ -1,7 +1,7 @@
 /**
  * `cumora` — the published, standalone BYOA agent-daemon CLI.
  *
- * This is the entry point for the public npm package (`npx cumora …`). It is
+ * This is the entry point for the fixed Release package (`cumora …`). It is
  * intentionally tiny: it only knows how to run the BYOA "agent computer"
  * daemon, which talks to a Cumora server purely over HTTP (no DB/Redis, no
  * repo). The daemon source lives in the main repo
@@ -10,8 +10,14 @@
  */
 import { runComputerDaemon } from '../../server/src/agents/computer/daemon.js'
 
+declare const __CUMORA_VERSION__: string
+
 async function main(): Promise<void> {
   const argv = process.argv.slice(2)
+  if (argv[0] === '--version' || argv[0] === '-v') {
+    console.log(__CUMORA_VERSION__)
+    return
+  }
   if (argv[0] === 'agent' && argv[1] === 'computer') {
     await runComputerDaemon(argv.slice(2))
     return
@@ -19,13 +25,13 @@ async function main(): Promise<void> {
   process.stderr.write(
     'cumora — run your Cumora agents on this machine (BYOA)\n\n' +
     'Usage:\n' +
-    '  npx cumora@latest agent computer --pair <code> [--server <url>]   pair this machine\n' +
-    '  npx cumora@latest agent computer [--server <url>]                 start the daemon\n\n' +
+    '  cumora agent computer --pair <code> [--server <url>]   pair this machine\n' +
+    '  cumora agent computer [--server <url>]                 start the daemon\n\n' +
     'Secure default: Claude Code on macOS/Linux/WSL2, or Codex on macOS/Linux/WSL2/Windows.\n' +
     'Other engines require the high-risk CUMORA_BYOA_ALLOW_UNSANDBOXED=1 compatibility switch. Get a pairing code from\n' +
     'Cumora → You → Computers → Add a computer.\n',
   )
-  process.exit(argv.length ? 1 : 0)
+  process.exit(argv.length && argv[0] !== '--help' && argv[0] !== '-h' ? 1 : 0)
 }
 
 void main().catch((err) => {

@@ -1,6 +1,7 @@
 {
   "name": "cumora",
-  "version": "0.16.2",
+  "version": "0.16.2-fork.1",
+  "private": true,
   "description": "Run Cumora agents on your own machine with Claude Code, Codex, Antigravity, and other BYOA engines.",
   "license": "MIT",
   "type": "module",
@@ -24,6 +25,6 @@
   ],
   "scripts": {
     "build": "node build.mjs",
-    "prepublishOnly": "node build.mjs"
+    "prepack": "node -e \"const fs=require('node:fs');fs.accessSync('dist/cli.js');const b=JSON.parse(fs.readFileSync('dist/build-info.json'));const p=require('./package.json');if(b.packageVersion!==p.version||b.version!==p.version+'+'+b.commit||!b.release||!/^[a-f0-9]{40}$/.test(b.commit))throw Error('Build the matching fork Release before pack')\""
   }
 }

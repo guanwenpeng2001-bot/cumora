@@ -1,0 +1,71 @@
+name: Agent CLI fixed Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing immutable agent-cli-v<fork-version> tag
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Validate tag and source
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          version=$(node -p "require('./agent-cli/package.json').version")
+          test "$RELEASE_TAG" = "agent-cli-v$version"
+          echo "CUMORA_BUILD_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - run: npm ci --ignore-scripts
+      - name: Build then pack in staging
+        run: |
+          export CUMORA_CLI_OUTDIR="$RUNNER_TEMP/agent-cli-package/dist"
+          npm run build --prefix agent-cli
+          cp agent-cli/package.json agent-cli/README.md "$RUNNER_TEMP/agent-cli-package/"
+          mkdir -p "$RUNNER_TEMP/agent-cli-assets"
+          cd "$RUNNER_TEMP/agent-cli-package"
+          npm pack --pack-destination "$RUNNER_TEMP/agent-cli-assets"
+      - name: Verify isolated installation and checksum
+        run: |
+          npm install --global --prefix "$RUNNER_TEMP/agent-cli-install" --ignore-scripts --offline "$RUNNER_TEMP"/agent-cli-assets/*.tgz
+          version=$(node -p "require('./agent-cli/package.json').version")
+          test "$("$RUNNER_TEMP/agent-cli-install/bin/cumora" --version)" = "$version+$CUMORA_BUILD_COMMIT"
+          cd "$RUNNER_TEMP/agent-cli-assets"
+          sha256sum *.tgz > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-cli-release
+          path: ${{ runner.temp }}/agent-cli-assets/*
+          if-no-files-found: error
+
+  draft-release:
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: agent-cli-release
+          path: assets
+      - name: Create draft Release with fixed assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          gh release create "$RELEASE_TAG" assets/* --verify-tag --draft --title "$RELEASE_TAG" --notes "Fixed fork BYOA CLI. Verify SHA256SUMS before installation. Machine rollout is a separate deployment step."
