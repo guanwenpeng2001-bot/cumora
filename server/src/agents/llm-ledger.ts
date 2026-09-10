@@ -133,6 +133,7 @@ function llmCallValues(rec: LlmCallRecord): unknown[] {
     && [rec.usage.inputTokens, rec.usage.cachedInputTokens, rec.usage.cacheCreationTokens, rec.usage.outputTokens]
       .every(n => typeof n === 'number' && Number.isSafeInteger(n) && n >= 0)
   const unpriced = rec.extras?.unpriced || price.unpriced
+    || (price.match === 'fallback' ? 'no-price' : null)
     || (rec.purpose === 'avatar-image' || rec.purpose === 'agent-image' ? 'image-pricing-unavailable' : null)
     || (rec.purpose === 'audio-transcription' ? 'duration-pricing-unavailable' : null)
     || (!validUsage ? 'usage-unavailable' : null)

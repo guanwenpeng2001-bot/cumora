@@ -64,8 +64,8 @@ const SEED_PRICES: Record<string, ModelPrice> = {
   'claude-haiku':  { inPer1M: 1, cachedInPer1M: 0.1, cacheWritePer1M: 1.25, outPer1M: 5, verified: false },
 }
 
-// Last-resort rate for an unrecognized model: mid-tier, ALWAYS flagged estimated.
-const FALLBACK_PRICE: ModelPrice = { inPer1M: 3, cachedInPer1M: 0.3, cacheWritePer1M: 3.75, outPer1M: 15, verified: false }
+// Unknown models have no billable rate; preserve the missing-price reason.
+const FALLBACK_PRICE: ModelPrice = { inPer1M: 0, cachedInPer1M: 0, cacheWritePer1M: 0, outPer1M: 0, verified: false, unpriced: 'no-price' }
 
 export function validModelPrice(value: unknown): value is ModelPrice {
   if (!value || typeof value !== 'object') return false
@@ -78,12 +78,20 @@ export function priceVersion(price: ModelPrice): string {
   return createHash('sha256').update(JSON.stringify(price)).digest('hex')
 }
 
-/** Valid legacy env rates are imported once into the editable DB menu. */
+let cachedEnvSource: string | undefined
+let cachedEnvPrices: Record<string, ModelPrice> = Object.freeze(Object.create(null))
+
+/** Cache by env contents: setting/env refreshes invalidate on the next read,
+ * while previously captured calls retain their immutable price map. */
 export function legacyEnvPrices(): Record<string, ModelPrice> {
+  const source = process.env.CUMORA_MODEL_PRICES_JSON ?? '{}'
+  if (source === cachedEnvSource) return cachedEnvPrices
   const result: Record<string, ModelPrice> = Object.create(null)
+  cachedEnvSource = source
+  cachedEnvPrices = Object.freeze(Object.create(null))
   try {
-    const parsed: unknown = JSON.parse(process.env.CUMORA_MODEL_PRICES_JSON ?? '{}')
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return result
+    const parsed: unknown = JSON.parse(source)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return cachedEnvPrices
     for (const [key, value] of Object.entries(parsed)) {
       const id = key.trim().toLowerCase()
       if (!id || !value || typeof value !== 'object' || Array.isArray(value)) continue
@@ -93,12 +101,13 @@ export function legacyEnvPrices(): Record<string, ModelPrice> {
       const price = { inPer1M: rate(raw.inPer1M), cachedInPer1M: rate(raw.cachedInPer1M),
         cacheWritePer1M: rate(raw.cacheWritePer1M), outPer1M: rate(raw.outPer1M) }
       if (!validModelPrice(price)) continue
-      result[id] = { ...price, verified: true, source: 'env' }
+      result[id] = Object.freeze({ ...price, verified: true, source: 'env' })
     }
   } catch (err) {
     console.warn('[cost] CUMORA_MODEL_PRICES_JSON is not valid JSON — ignoring:', err instanceof Error ? err.message : err)
   }
-  return result
+  cachedEnvPrices = Object.freeze(result)
+  return cachedEnvPrices
 }
 
 // Explicit compatibility aliases only; unknown suffixes never inherit a tier price.

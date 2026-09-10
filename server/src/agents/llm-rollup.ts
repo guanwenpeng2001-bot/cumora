@@ -128,6 +128,17 @@ export async function refreshLlmRollup(sinceHours: number, connection?: PoolClie
        reasoning_tokens = EXCLUDED.reasoning_tokens,
        cost_usd = EXCLUDED.cost_usd,
        cost_estimated = EXCLUDED.cost_estimated`, params)
+    const retentionHours = automationNumber('llm_rollup_retention_hours')
+    if (retentionHours > 0) {
+      await client.query(
+        `DELETE FROM llm_calls_rollup WHERE bucket_hour < NOW() - ($1::int * INTERVAL '1 hour')`,
+        [retentionHours],
+      )
+      await client.query(
+        `DELETE FROM llm_calls_rollup_v2 WHERE bucket_hour < NOW() - ($1::int * INTERVAL '1 hour')`,
+        [retentionHours],
+      )
+    }
     await client.query(
       `UPDATE llm_rollup_state SET
          coverage_from = CASE WHEN completed_through < $1::timestamptz THEN $1::timestamptz
@@ -167,17 +178,6 @@ export async function runLlmRollupTick(): Promise<{ skipped?: boolean; buckets?:
         ? MAX_BACKFILL_HOURS
         : Math.min(MAX_BACKFILL_HOURS, Math.max(STEADY_WINDOW_HOURS, gap + 1))
       const buckets = await refreshLlmRollup(sinceHours, client)
-      const retentionHours = automationNumber('llm_rollup_retention_hours')
-      if (retentionHours > 0) {
-        await client.query(
-          `DELETE FROM llm_calls_rollup WHERE bucket_hour < NOW() - ($1::int * INTERVAL '1 hour')`,
-          [retentionHours],
-        )
-        await client.query(
-          `DELETE FROM llm_calls_rollup_v2 WHERE bucket_hour < NOW() - ($1::int * INTERVAL '1 hour')`,
-          [retentionHours],
-        )
-      }
       return { buckets, sinceHours }
     } catch (error) {
       await client.query("UPDATE llm_rollup_state SET status = 'failed', attempted_at = NOW() WHERE id").catch(() => {})

@@ -47,7 +47,7 @@ export function parseUsagePagination(q: { page?: unknown; pageSize?: unknown }):
   }
   const page = integer(q.page, 1)
   const pageSize = integer(q.pageSize, 50)
-  if (pageSize > 200 || !Number.isSafeInteger((page - 1) * pageSize)) throw new UsageInputError('pagination exceeds supported bounds')
+  if (pageSize > 200 || !Number.isSafeInteger((page - 1) * pageSize) || page * pageSize > 10_000) throw new UsageInputError('pagination exceeds supported bounds')
   return { page, pageSize }
 }
 
@@ -67,7 +67,8 @@ const WINDOW_SQL = `WITH bounds AS (
          0::bigint AS unknown_calls, 0::bigint AS unpriced_calls, r.calls AS quality_unknown_calls
     FROM llm_calls_rollup r CROSS JOIN bounds b JOIN llm_rollup_state st ON st.id
    WHERE r.company_id = $1 AND r.bucket_hour >= b.lo AND r.bucket_hour < b.hi
-     AND (st.coverage_from IS NULL OR r.bucket_hour < st.coverage_from OR r.bucket_hour >= st.completed_through)
+     AND st.completed_through IS NOT NULL AND r.bucket_hour < st.completed_through
+     AND r.bucket_hour < st.coverage_from
   UNION ALL
   SELECT date_trunc('hour', l.created_at, 'UTC'), l.company_id, l.agent_id, l.purpose, l.model, l.source, l.daemon_version,
          1::bigint, (l.status = 'ok')::int, (l.status <> 'ok')::int, (l.status = 'rate_limited')::int,
@@ -75,13 +76,15 @@ const WINDOW_SQL = `WITH bounds AS (
          COALESCE(l.output_tokens, 0), COALESCE(l.reasoning_tokens, 0), l.cost_usd, l.cost_estimated,
          l.extras->>'route', l.extras->>'platform', (l.measured IS NOT TRUE)::int,
          (COALESCE(l.extras->>'unpriced', '') NOT IN ('', 'false'))::int, 0::bigint
-    FROM bounds b CROSS JOIN LATERAL (
+    FROM bounds b LEFT JOIN llm_rollup_state st ON st.id CROSS JOIN LATERAL (
       SELECT * FROM llm_calls
        WHERE company_id = $1 AND created_at >= $2::timestamptz
          AND created_at < LEAST(b.lo, $3::timestamptz)
       UNION ALL
       SELECT * FROM llm_calls
-       WHERE company_id = $1 AND created_at >= GREATEST(b.lo, b.hi, $2::timestamptz)
+       WHERE company_id = $1 AND created_at >= GREATEST(b.lo, $2::timestamptz,
+           CASE WHEN st.coverage_from IS NULL OR st.completed_through IS NULL THEN b.lo
+                ELSE LEAST(b.hi, st.completed_through) END)
          AND created_at < $3::timestamptz
     ) l
 ) `
@@ -148,6 +151,18 @@ export function providerForModel(model: string | null | undefined): string {
     Antigravity: ['antigravity'],
   }
   return Object.entries(models).find(([, ids]) => ids.includes(m))?.[0] ?? 'other'
+}
+
+function usageProvider(model: string, platform: string | null): string {
+  const family = providerForModel(model)
+  const key = platform?.trim().toLowerCase()
+  if (!key) return family
+  const labels: Record<string, string> = {
+    openai: 'OpenAI', anthropic: 'Anthropic', google: 'Google', xai: 'xAI',
+    kimi: 'Kimi', deepseek: 'DeepSeek', dashscope: 'DashScope', novita: 'Novita',
+    orcarouter: 'OrcaRouter', 'chatgpt-web': 'ChatGPT Web', antigravity: 'Antigravity',
+  }
+  return labels[key] ?? key
 }
 
 export interface UsageSummary {
@@ -284,7 +299,7 @@ export async function usageByAgent(tenant: string, range: UsageRange): Promise<A
             COALESCE(SUM(l.cost_usd), 0)::text       AS cost_usd,
             COALESCE(SUM(l.ok_calls), 0)::text       AS ok
        FROM usage_window l
-       LEFT JOIN participants p ON p.id = l.agent_id
+       LEFT JOIN participants p ON p.id = l.agent_id AND p.company_id = l.company_id
       WHERE l.company_id = $1
       GROUP BY l.agent_id, p.name, p.avatar_url, l.source
       ORDER BY SUM(l.cost_usd) DESC NULLS LAST`,
@@ -335,9 +350,12 @@ interface ModelRollupRow {
   cost_estimated: boolean
 }
 
-async function queryUsageByModelRows(tenant: string, range: UsageRange): Promise<ModelRollupRow[]> {
+async function queryUsageByModelRows(tenant: string, range: UsageRange, byPlatform = false): Promise<ModelRollupRow[]> {
   const { rows } = await pool.query<ModelRollupRow>(
-    `${WINDOW_SQL}SELECT model, route, platform, source,
+    `${WINDOW_SQL}SELECT model,
+            CASE WHEN COUNT(route) = COUNT(*) AND COUNT(DISTINCT route) = 1 THEN MIN(route) END AS route,
+            CASE WHEN COUNT(DISTINCT LOWER(platform)) = 1 THEN MIN(LOWER(platform)) END AS platform,
+            CASE WHEN COUNT(DISTINCT source) = 1 THEN MIN(source) ELSE 'mixed' END AS source,
             COALESCE(SUM(calls), 0)::text AS requests,
             COALESCE(SUM(input_tokens + cached_input_tokens), 0)::text AS input_tokens,
             COALESCE(SUM(output_tokens), 0)::text AS output_tokens,
@@ -348,7 +366,7 @@ async function queryUsageByModelRows(tenant: string, range: UsageRange): Promise
             COALESCE(SUM(quality_unknown_calls), 0)::text AS quality_unknown_calls
        FROM usage_window
       WHERE company_id = $1
-      GROUP BY model, route, platform, source
+      GROUP BY model${byPlatform ? ', LOWER(platform)' : ''}
       ORDER BY SUM(cost_usd) DESC NULLS LAST`,
     [tenant, range.from.toISOString(), range.to.toISOString()],
   )
@@ -359,7 +377,7 @@ export async function usageByModel(tenant: string, range: UsageRange): Promise<M
   const rows = await queryUsageByModelRows(tenant, range)
   return rows.map((r) => ({
     model: r.model,
-    provider: r.platform ?? providerForModel(r.model),
+    provider: usageProvider(r.model, r.platform),
     route: r.route, platform: r.platform, source: r.source,
     unknownRequests: Number(r.unknown_calls ?? 0), unpricedRequests: Number(r.unpriced_calls ?? 0),
     qualityUnknownRequests: Number(r.quality_unknown_calls ?? 0),
@@ -380,10 +398,10 @@ export interface ProviderUsageRow {
 }
 
 export async function usageByProvider(tenant: string, range: UsageRange): Promise<ProviderUsageRow[]> {
-  const models = await queryUsageByModelRows(tenant, range)
+  const models = await queryUsageByModelRows(tenant, range, true)
   const acc = new Map<string, ProviderUsageRow>()
   for (const model of models) {
-    const provider = model.platform ?? providerForModel(model.model)
+    const provider = usageProvider(model.model, model.platform)
     const row = acc.get(provider) ?? { provider, requests: 0, inputTokens: 0, outputTokens: 0, costUsd: 0 }
     row.requests += Number(model.requests)
     row.inputTokens += Number(model.input_tokens)
@@ -473,7 +491,7 @@ export async function usageLogs(
             COALESCE(NULLIF(l.extras->>'logicalCallId', ''), NULLIF(l.extras->>'callId', '')) AS call_id,
             l.extras->>'attempt' AS attempt
        FROM llm_calls l
-       LEFT JOIN participants p ON p.id = l.agent_id
+       LEFT JOIN participants p ON p.id = l.agent_id AND p.company_id = l.company_id
       WHERE ${where}
       ORDER BY l.created_at DESC, l.id DESC
       LIMIT $5 OFFSET $6`,
@@ -486,7 +504,7 @@ export async function usageLogs(
       agentId: r.agent_id,
       agentName: r.agent_name,
       model: r.model,
-      provider: r.platform ?? providerForModel(r.model),
+      provider: usageProvider(r.model, r.platform),
       purpose: r.purpose,
       source: r.source,
       inputTokens: Number(r.input_tokens ?? 0),

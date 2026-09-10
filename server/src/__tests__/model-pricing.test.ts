@@ -36,9 +36,11 @@ function fixture(env: Record<string, unknown> = {}) {
     rows.set(model, row)
     return { rows: [row] }
   } }
+  const environment = { CUMORA_MODEL_PRICES_JSON: JSON.stringify(env) }
+  let parses = 0
   const pricing: Record<string, any> = {}
   const cost = compile(read('../agents/cost.ts'), { './token-usage.js': compile(read('../agents/token-usage.ts'), {}), '../model-pricing.js': pricing, 'node:crypto': { createHash } },
-    { process: { env: { CUMORA_MODEL_PRICES_JSON: JSON.stringify(env) } }, console: { warn: (...args: any[]) => warnings.push(args) } })
+    { process: { env: environment }, JSON: { stringify: JSON.stringify, parse: (value: string) => { parses++; return JSON.parse(value) } }, console: { warn: (...args: any[]) => warnings.push(args) } })
   Object.assign(pricing, compile(read('../model-pricing.ts'), { './db/pool.js': { pool }, './agents/cost.js': cost },
     { console: { warn: (...args: any[]) => warnings.push(args) } }))
   const ledgerSource = read('../agents/llm-ledger.ts')
@@ -55,7 +57,7 @@ function fixture(env: Record<string, unknown> = {}) {
   const execute = (prepare: any, models = ['priced-model']) => execution.executeLlmPlan({
     plan: { ...context, role: 'brain', revision: '1', candidates: models.map(candidate) }, context, prepare, log: () => {},
   })
-  return { pricing, cost, recorder, rows, calls, ledger, warnings, execute, setSelect: (fn?: () => Promise<any>) => { select = fn } }
+  return { environment, parses: () => parses, pricing, cost, recorder, rows, calls, ledger, warnings, execute, setSelect: (fn?: () => Promise<any>) => { select = fn } }
 }
 
 test('exact route/model, explicit aliases and compatibility estimates never substring-match', async () => {
@@ -275,4 +277,47 @@ test('refresh failures are throttled even without a snapshot; forced refresh can
   await f.pricing.upsertModelPricing(priceInput())
   await f.pricing.refreshModelPricing(true)
   assert.equal(f.pricing.captureDbPricing()('priced-model').inPer1M, 2)
+})
+
+test('unknown models remain measured but never bill compatibility fallback rates', async () => {
+  const f = fixture()
+  await f.pricing.refreshModelPricing(true)
+  const base = { companyId: 'company-a', purpose: 'agent-turn', model: 'unknown-model', usage, latencyMs: 1, status: 'ok' }
+  const frozen = f.cost.capturePricing()('unknown-model')
+  assert.equal(frozen.unpriced, 'no-price')
+  assert.equal(f.cost.effectiveCostUsd('unknown-model', usage).usd, 0)
+  for (const pricing of [undefined, frozen, { ...frozen, inPer1M: 3, outPer1M: 15, unpriced: undefined }]) {
+    await f.recorder.recordLlmCall({ ...base, pricing })
+    const row = f.ledger.at(-1)
+    assert.equal(row[13], 0)
+    assert.equal(row[15], true)
+    assert.equal(row[8], usage.inputTokens)
+    assert.equal(JSON.parse(row[19]).unpriced, 'no-price')
+  }
+  await f.execute(async (_candidate: any, state: any) => async () => { state.usage = usage; return 'ok' }, ['unknown-model'])
+  assert.equal(f.ledger.at(-1)[13], 0)
+  assert.equal(JSON.parse(f.ledger.at(-1)[19]).unpriced, 'no-price')
+})
+
+test('env pricing parses once per change and captured calls retain the old immutable map', async () => {
+  const f = fixture({ 'env-only': priceInput('env-only', 3) })
+  await f.pricing.refreshModelPricing(true)
+  const frozen = f.cost.capturePricing()
+  const initial = f.parses()
+  for (let i = 0; i < 100; i++) assert.equal(f.cost.priceFor('env-only').inPer1M, 3)
+  assert.equal(f.parses(), initial)
+  assert.ok(Object.isFrozen(f.cost.legacyEnvPrices()))
+  assert.ok(Object.isFrozen(f.cost.legacyEnvPrices()['env-only']))
+  f.environment.CUMORA_MODEL_PRICES_JSON = JSON.stringify({ 'env-only': priceInput('env-only', 9) })
+  await f.pricing.refreshModelPricing(true)
+  assert.equal(f.cost.priceFor('env-only').inPer1M, 9)
+  assert.equal(frozen('env-only').inPer1M, 3)
+  assert.equal(f.parses(), initial + 1)
+  f.environment.CUMORA_MODEL_PRICES_JSON = '{broken'
+  for (let i = 0; i < 10; i++) assert.equal(f.cost.priceFor('env-only').unpriced, 'no-price')
+  assert.equal(f.parses(), initial + 2)
+  assert.equal(f.warnings.length, 1)
+  f.environment.CUMORA_MODEL_PRICES_JSON = '{}'
+  assert.equal(f.cost.priceFor('env-only').unpriced, 'no-price')
+  assert.equal(f.parses(), initial + 3)
 })

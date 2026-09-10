@@ -5,7 +5,7 @@ import ts from 'typescript'
 import { USAGE_ROLLUP_V2_SQL, usageRollupV2Checksum } from '../db/migrations/0013-usage-rollup-v2.js'
 import { SCHEMA_MIGRATIONS } from '../db/migrations/manifest.js'
 
-function fixture(failV2 = false, locked = true, gap: number | null = null, settings: Record<string, number> = {}) {
+function fixture(failV2 = false, locked = true, gap: number | null = null, settings: Record<string, number> = {}, failDelete = '') {
   const calls: { sql: string; params: unknown[] }[] = []
   let released = 0
   const since = new Date('2026-09-01T00:00:00Z'), until = new Date('2026-09-02T12:43:00Z')
@@ -14,6 +14,7 @@ function fixture(failV2 = false, locked = true, gap: number | null = null, setti
     if (sql.includes('pg_try_advisory_lock')) return { rows: [{ ok: locked }] }
     if (sql.includes('AS gap_hours')) return { rows: [{ gap_hours: gap }] }
     if (sql.includes('AS retained_from')) return { rows: [{ since, until, retained_from: since }] }
+    if (failDelete && sql.startsWith(`DELETE FROM ${failDelete} WHERE`)) throw new Error('injected delete failure')
     if (failV2 && sql.includes('INSERT INTO llm_calls_rollup_v2')) throw new Error('injected write failure')
     return { rows: [], rowCount: 2 }
   } }
@@ -43,6 +44,7 @@ test('rollup holds one connection for lock, transaction, both versions and water
   assert.ok(begin > 0 && commit > begin)
   assert.equal(sql.slice(begin, commit).filter(s => s.includes('INSERT INTO llm_calls_rollup')).length, 2)
   assert.ok(sql.slice(begin, commit).some(s => s.includes("status = 'ready'")))
+  assert.equal(sql.slice(begin, commit).filter(s => s.startsWith('DELETE FROM llm_calls_rollup')).length, 2)
   const v2 = f.calls.find(c => c.sql.includes('INSERT INTO llm_calls_rollup_v2'))!
   assert.match(v2.sql, /extras->>'route', extras->>'platform'/)
   assert.match(v2.sql, /measured IS NOT TRUE/)
@@ -101,4 +103,18 @@ test('explicit rollup stop is visible even after an in-flight writer could have 
   settings.llm_rollup_interval_ms = 0
   assert.equal(f.exports.isLlmRollupPaused(), true)
   assert.deepEqual(f.calls, [], 'pause visibility never overwrites a peer replica watermark')
+})
+
+test('either retention deletion failure rolls back the entire tick before publishing ready', async () => {
+  for (const table of ['llm_calls_rollup', 'llm_calls_rollup_v2']) {
+    const f = fixture(false, true, 24, {}, table)
+    await assert.rejects(f.exports.runLlmRollupTick(), /injected delete failure/)
+    const sql = f.calls.map(c => c.sql)
+    assert.ok(sql.includes('ROLLBACK'))
+    assert.ok(!sql.includes('COMMIT'))
+    assert.ok(!sql.some(s => s.includes("status = 'ready'")))
+    assert.ok(sql.findIndex(s => s.includes("status = 'failed'")) > sql.indexOf('ROLLBACK'))
+    assert.match(sql.at(-1)!, /pg_advisory_unlock/)
+    assert.equal(f.released(), 1)
+  }
 })

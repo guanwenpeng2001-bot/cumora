@@ -22,13 +22,30 @@ function compile(path: string, pool: unknown) {
 // Explicit test database only. All objects are connection-local temporary
 // tables, so this suite cannot overwrite application tables or require cleanup.
 const url = process.env.T34_TEST_DATABASE_URL ?? process.env.INTEGRATION_DATABASE_URL
+const pgliteModule = process.env.FIX_C_PGLITE_MODULE
 
-test('PostgreSQL: exact windows, versioned rollup convergence, routes, quality and retention', { skip: !url }, async () => {
-  const database = decodeURIComponent(new URL(url!).pathname.slice(1))
-  assert.match(database, /(?:^|_)(?:test|tests)(?:_|$)/i, 'use a dedicated test database')
-  const { Client } = await import('pg')
-  const client = new Client({ connectionString: url })
-  await client.connect()
+test('PostgreSQL: exact windows, versioned rollup convergence, routes, quality and retention', { skip: !url && !pgliteModule }, async () => {
+  const client = await (async () => {
+    if (pgliteModule) {
+      const { PGlite } = await import(pathToFileURL(pgliteModule).href)
+      const db = new PGlite()
+      return {
+        query: async (sql: string, values?: unknown[]) => {
+          // Advisory locks are covered by the connection/lock unit fixture.
+          if (sql.includes('pg_try_advisory_lock')) return { rows: [{ ok: true }] }
+          if (sql.includes('pg_advisory_unlock')) return { rows: [] }
+          return values ? db.query(sql, values) : (await db.exec(sql)).at(-1)
+        },
+        end: () => db.close(),
+      }
+    }
+    const database = decodeURIComponent(new URL(url!).pathname.slice(1))
+    assert.match(database, /(?:^|_)(?:test|tests)(?:_|$)/i, 'use a dedicated test database')
+    const { Client } = await import('pg')
+    const pg = new Client({ connectionString: url })
+    await pg.connect()
+    return pg
+  })()
   try {
     await client.query("SET timezone = 'Asia/Shanghai'")
     const baseline = readFileSync(new URL('../db/migrate.ts', import.meta.url), 'utf8')
@@ -42,10 +59,14 @@ test('PostgreSQL: exact windows, versioned rollup convergence, routes, quality a
     await client.query(`CREATE UNIQUE INDEX test_legacy_key ON llm_calls_rollup
       (bucket_hour, company_id, agent_id, purpose, model, source, daemon_version) NULLS NOT DISTINCT`)
     await client.query('CREATE INDEX test_raw_company_created ON llm_calls(company_id, created_at)')
-    await client.query('CREATE TEMP TABLE participants(id text PRIMARY KEY, name text, avatar_url text)')
+    await client.query('CREATE TEMP TABLE participants(id text, company_id text, name text, avatar_url text, PRIMARY KEY(id, company_id))')
     await client.query(USAGE_ROLLUP_V2_SQL.replaceAll('CREATE TABLE ', 'CREATE TEMP TABLE '))
-    const pool = { query: (sql: string, values: unknown[]) => client.query(sql, values),
-      connect: async () => ({ query: (sql: string, values: unknown[]) => client.query(sql, values), release() {} }) }
+    let failPrune = false
+    const query = (sql: string, values: unknown[]) => {
+      if (failPrune && sql.startsWith('DELETE FROM llm_calls_rollup_v2')) throw new Error('injected prune failure')
+      return client.query(sql, values)
+    }
+    const pool = { query, connect: async () => ({ query, release() {} }) }
     const usage = compile('../usage.ts', pool), rollup = compile('../agents/llm-rollup.ts', pool)
     const base = Math.floor(Date.now() / 3600000) * 3600000 - 4 * 3600000
     const from = new Date(base + 17 * 60000), to = new Date(base + 2 * 3600000 + 43 * 60000)
@@ -63,7 +84,7 @@ test('PostgreSQL: exact windows, versioned rollup convergence, routes, quality a
     await insert('right', to.getTime() - 1, 'env')
     await insert('outside-after', to.getTime(), 'env')
     await insert('other-tenant', from.getTime(), 'gateway', true, false, 'other')
-    await rollup.runLlmRollupTick()
+    await client.query("INSERT INTO participants(id, company_id, name) VALUES ('a', 'tenant', 'Tenant A'), ('a', 'other', 'Other A')")
     const expected = async (window = range) => (await client.query(`SELECT COUNT(*)::int AS requests, SUM(cost_usd)::float AS cost
       FROM llm_calls WHERE company_id = 'tenant' AND created_at >= $1 AND created_at < $2`, [window.from, window.to])).rows[0]
     const check = async (window = range) => {
@@ -73,17 +94,53 @@ test('PostgreSQL: exact windows, versioned rollup convergence, routes, quality a
       const trend = await usage.usageTrend('tenant', window, 'hour')
       assert.equal(trend.reduce((sum: number, row: any) => sum + row.costUsd, 0), raw.cost ?? 0)
     }
+    await check() // pending: all whole hours must fall back to raw
+    await check({ from: new Date(base), to: new Date(base + 3 * 3600000) })
+    await rollup.runLlmRollupTick()
     await check()
+    await client.query('UPDATE llm_rollup_state SET completed_through = $1', [new Date(base + 3600000)])
+    await insert('stale-new', base + 3600000 + 4000, 'gateway')
+    await check() // stale v1/v2 must not hide a new raw call
+    await client.query("DELETE FROM llm_calls WHERE id = 'stale-new'")
+    await rollup.runLlmRollupTick()
     await check({ from, to: new Date(base + 40 * 60000) })
     await check({ from: new Date(base + 3600000), to: new Date(base + 2 * 3600000) })
     await check({ from: new Date(base + 2 * 3600000 + 40000), to })
     assert.equal((await usage.usageSummary('tenant', range)).unknownRequests, 1)
     assert.equal((await usage.usageSummary('tenant', range)).unpricedRequests, 1)
     const models = await usage.usageByModel('tenant', range)
-    assert.equal(models.length, 2)
-    assert.deepEqual(new Set(models.map((r: any) => r.route)), new Set(['gateway', 'env']))
+    assert.equal(models.length, 1)
+    assert.equal(models[0].requests, 4)
+    assert.equal(models[0].route, null)
     assert.equal((await usage.usageLogs('tenant', range, { page: 1, pageSize: 50 })).total, 4)
-    assert.equal((await usage.usageByAgent('tenant', range))[0].actualSource, 'server')
+    const agents = await usage.usageByAgent('tenant', range)
+    assert.equal(agents.length, 1)
+    assert.equal(agents[0].actualSource, 'server')
+    assert.equal(agents[0].name, 'Tenant A')
+    assert.equal(agents[0].requests, 4)
+    assert.equal(agents[0].costUsd, 2)
+    const logs = await usage.usageLogs('tenant', range, { page: 1, pageSize: 50 })
+    assert.equal(logs.items.length, 4)
+    assert.equal(new Set(logs.items.map((r: any) => r.id)).size, 4)
+    assert.ok(logs.items.every((r: any) => r.agentName === 'Tenant A'))
+    // Legacy NULL platform and modern explicit platform must merge.
+    await client.query("UPDATE llm_calls SET model = 'gpt-5.5'")
+    await client.query('TRUNCATE llm_calls_rollup, llm_calls_rollup_v2')
+    await rollup.refreshLlmRollup(95 * 24)
+    await client.query('UPDATE llm_rollup_state SET coverage_from = $1', [new Date(base + 2 * 3600000)])
+    const mixed = { from: new Date(base), to: new Date(base + 3 * 3600000) }
+    await check(mixed)
+    const mixedModels = await usage.usageByModel('tenant', mixed)
+    assert.equal(mixedModels.length, 1)
+    assert.equal(mixedModels[0].requests, 6)
+    assert.equal(mixedModels[0].qualityUnknownRequests, 4)
+    const providers = await usage.usageByProvider('tenant', mixed)
+    assert.deepEqual(providers, [{ provider: 'OpenAI', requests: 6, inputTokens: 60, outputTokens: 12, costUsd: 3 }])
+    // Restore fixture dimensions and clear rebuilt buckets before convergence checks.
+    await client.query("UPDATE llm_calls SET model = 'same-model'")
+    await client.query('TRUNCATE llm_calls_rollup, llm_calls_rollup_v2')
+    await client.query('UPDATE llm_rollup_state SET coverage_from = NULL, completed_through = NULL')
+    await rollup.runLlmRollupTick()
     await insert('late', base + 3600000 + 3000, 'env')
     await rollup.runLlmRollupTick()
     await check()
@@ -99,6 +156,27 @@ test('PostgreSQL: exact windows, versioned rollup convergence, routes, quality a
     assert.equal(legacy.unknownRequests, 0)
     assert.equal((await usage.usageMetadata('tenant', historical)).logsComplete, false)
     assert.equal((await usage.usageLogs('tenant', historical, { page: 1, pageSize: 50 })).total, 0)
+    const expired = new Date(base - 100 * 86400000)
+    for (const table of ['llm_calls_rollup', 'llm_calls_rollup_v2']) {
+      await client.query(`INSERT INTO ${table}(bucket_hour, company_id, purpose, model, source, calls, cost_usd)
+        VALUES ($1, 'tenant', 'chat', 'expired', 'server', 1, 99)`, [expired])
+    }
+    const before = (await client.query('SELECT coverage_from, completed_through, aggregated_at FROM llm_rollup_state')).rows
+    const counts = async () => Promise.all(['llm_calls_rollup', 'llm_calls_rollup_v2'].map(async table =>
+      (await client.query(`SELECT COUNT(*)::int AS n, SUM(calls)::int AS calls FROM ${table}`)).rows))
+    const beforeCounts = await counts()
+    await insert('rollback-new', base + 2 * 3600000 + 5000, 'env')
+    failPrune = true
+    await assert.rejects(rollup.refreshLlmRollup(95 * 24), /injected prune failure/)
+    assert.deepEqual(await counts(), beforeCounts, 'both upserts and the first deletion roll back')
+    assert.deepEqual((await client.query('SELECT coverage_from, completed_through, aggregated_at FROM llm_rollup_state')).rows, before)
+    assert.equal((await client.query('SELECT status FROM llm_rollup_state')).rows[0].status, 'failed')
+    failPrune = false
+    await rollup.refreshLlmRollup(95 * 24)
+    for (const table of ['llm_calls_rollup', 'llm_calls_rollup_v2']) {
+      assert.equal((await client.query(`SELECT COUNT(*)::int AS n FROM ${table} WHERE model = 'expired'`)).rows[0].n, 0)
+    }
+    await check()
   } finally {
     await client.end()
   }
@@ -106,7 +184,6 @@ test('PostgreSQL: exact windows, versioned rollup convergence, routes, quality a
 
 // Optional standalone PostgreSQL WASM engine, installed outside the repository.
 // No service connection, database files or changes to the project dependencies.
-const pgliteModule = process.env.FIX_C_PGLITE_MODULE
 
 test('PostgreSQL in memory: callId migration replays on empty and existing histories and supports the runtime lookup', { skip: !pgliteModule }, async () => {
   const { PGlite } = await import(pathToFileURL(pgliteModule!).href)
@@ -118,7 +195,7 @@ test('PostgreSQL in memory: callId migration replays on empty and existing histo
       const end = baseline.indexOf('\n);', start) + 3
       assert.ok(start > 0 && end > start)
       await db.exec(baseline.slice(start, end))
-      await db.exec('CREATE TABLE participants(id text PRIMARY KEY, name text)')
+      await db.exec('CREATE TABLE participants(id text, company_id text, name text, PRIMARY KEY(id, company_id))')
       const insert = (id: string, extras: unknown, company = 'tenant', agent = 'agent', source = 'byoa-codex', status = 'failed') => db.query(
         `INSERT INTO llm_calls(id, company_id, agent_id, source, purpose, model, extras, status)
          VALUES ($1, $2, $3, $4, 'inbox-triage', 'requested', $5, $6)`,

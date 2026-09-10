@@ -89,6 +89,12 @@ test('pagination rejects malformed or unsafe SQL parameters before any query', a
   }
   assert.throws(() => parseUsagePagination({ pageSize: 201 }), UsageInputError)
   assert.throws(() => parseUsagePagination({ page: Number.MAX_SAFE_INTEGER, pageSize: 200 }), UsageInputError)
+  assert.deepEqual(parseUsagePagination({ page: 50, pageSize: 200 }), { page: 50, pageSize: 200 })
+  assert.deepEqual(parseUsagePagination({ page: 10_000, pageSize: 1 }), { page: 10_000, pageSize: 1 })
+  for (const args of [{ page: 51, pageSize: 200 }, { page: 10_001, pageSize: 1 }, { page: 10_000_000, pageSize: 200 }]) {
+    assert.throws(() => parseUsagePagination(args), UsageInputError)
+    await assert.rejects(usage.usageLogs('tenant', { from: new Date(0), to: new Date(1) }, args))
+  }
   assert.deepEqual(parseUsagePagination({}), { page: 1, pageSize: 50 })
   assert.deepEqual(parseUsagePagination({ page: '2', pageSize: '200' }), { page: 2, pageSize: 200 })
 })
@@ -108,15 +114,17 @@ test('non-hour-aligned trend retains returned values and fills UTC bucket bounda
   assert.equal(day[0].costUsd, 7)
 })
 
-test('models keep the same model separated by recorded route and source', async () => {
+test('model aggregation uses one model group across routes and sources', async () => {
   const usage = loadUsage(async (sql) => {
-    assert.match(sql, /GROUP BY model, route, platform, source/)
-    return { rows: ['sub2api:openai', 'env:openai'].map(route => ({ model: 'gpt-5.5', route, platform: 'openai', source: 'server', requests: '1', input_tokens: '4', output_tokens: '2', cost_usd: '0.2', cost_estimated: true, unknown_calls: '1', unpriced_calls: '1', quality_unknown_calls: '0' })) }
+    assert.match(sql, /GROUP BY model\s+ORDER BY/)
+    return { rows: [{ model: 'gpt-5.5', route: null, platform: 'openai', source: 'mixed', requests: '2', input_tokens: '8', output_tokens: '4', cost_usd: '0.4', cost_estimated: true, unknown_calls: '1', unpriced_calls: '1', quality_unknown_calls: '0' }] }
   })
   const rows = await usage.usageByModel('tenant', { from: new Date(0), to: new Date(1) })
-  assert.equal(rows.length, 2)
-  assert.notEqual(rows[0].route, rows[1].route)
-  assert.equal(rows[0].source, 'server')
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0].route, null)
+  assert.equal(rows[0].source, 'mixed')
+  assert.equal(rows[0].provider, 'OpenAI')
+  assert.equal(rows[0].requests, 2)
   assert.equal(rows[0].unknownRequests, 1)
   assert.equal(rows[0].unpricedRequests, 1)
 })
