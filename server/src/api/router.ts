@@ -12,12 +12,11 @@ import { enqueueWorkspaceCleanup, nudgeWorkspaceCleanupWorker } from '../workspa
 import { collectDocumentStorageKeys, evictDocumentRoom } from '../documents/rooms.js'
 import { createPoll, castVote, closePoll, PollError } from '../polls.js'
 import { env } from '../env.js'
-import { getImageModel, getSupportModel } from '../settings.js'
+import { getSupportModel } from '../settings.js'
 import { parseAgentModelConfig, validateAgentModelConfig, InvalidAgentModelConfigError, type AgentModelConfig } from '../agents/model-config.js'
 import { publicBodyParserError } from '../body-parser-errors.js'
 import { startConvene } from '../agents/convene.js'
 import { ensureDirectConversation } from '../agents/private_chat.js'
-import { fetchImageBytes } from '../agents/image-fetcher.js'
 import { transcribeAudio } from '../llm.js'
 import { LLM_ROLES, type LlmRole, getServerSettingsSnapshot, writeServerSettings, validateServerSettings, InvalidServerSettingError } from '../settings.js'
 import { availableModels, invalidateModelCatalog } from '../models-catalog.js'
@@ -3536,67 +3535,27 @@ export async function generateAndPersistAvatar(args: {
     '- The portrait should feel like it was drawn for a profile in a magazine that cares deeply about who this person is — Refinery29 / Vice / Kinfolk / Cereal magazine youth-feature energy.',
   ].filter(Boolean).join('\n')
 
-  const { getImageClient } = await import('../llm.js')
-  const { recordLlmCall, classifyLlmCallError } = await import('../agents/llm-ledger.js')
-  const client = getImageClient()
-  const model = getImageModel()
-  const t0 = Date.now()
-  let r: Awaited<ReturnType<typeof client.images.generate>>
-  try {
-    r = await client.images.generate({
-      model,
-      prompt,
-      size: '1024x1024',
-      n: 1,
+  const { executeImage } = await import('../llm.js')
+  return executeImage({ purpose: 'avatar-image', companyId: tenant, agentId: id },
+    { prompt, size: '1024x1024', n: 1 }, async (imageBuf) => {
+      const key = `avatars/avatar-${id}-${randomUUID().slice(0, 8)}.png`
+      const url = await storage.put(key, imageBuf, 'image/png')
+      await withOutboxTransaction(async (client) => {
+        await client.query(
+          `UPDATE participants SET avatar_url = $2 WHERE id = $1 AND company_id = $3`,
+          [id, url, tenant],
+        )
+        await enqueueBroadcast(client, CH_STATUS, {
+          type: 'participants.avatar',
+          participantId: id,
+          avatarUrl: url,
+          companyId: tenant,
+        })
+      })
+      const { invalidatePersonaCache } = await import('../agents/personas.js')
+      invalidatePersonaCache(id)
+      return { url }
     })
-    void recordLlmCall({
-      purpose: 'avatar-image', companyId: tenant, agentId: id,
-      model, usage: null, latencyMs: Date.now() - t0, status: 'ok',
-      extras: { n: 1, size: '1024x1024' },
-    })
-  } catch (e) {
-    void recordLlmCall({
-      purpose: 'avatar-image', companyId: tenant, agentId: id,
-      model, usage: null, latencyMs: Date.now() - t0,
-      status: classifyLlmCallError(e), error: e instanceof Error ? e.message : String(e),
-      extras: { n: 1, size: '1024x1024' },
-    })
-    throw e
-  }
-  const first = r.data?.[0]
-  const b64 = first?.b64_json
-  const remoteUrl = first?.url
-  let imageBuf: Buffer
-  if (b64) {
-    imageBuf = Buffer.from(b64, 'base64')
-  } else if (remoteUrl) {
-    const fetched = await fetchImageBytes(remoteUrl, {
-      maxBytes: 20 * 1024 * 1024,
-      timeoutMs: 30_000,
-    })
-    if (!fetched.ok) throw new HttpError(502, `image API download failed (${fetched.reason})`)
-    imageBuf = fetched.buffer
-  } else {
-    throw new HttpError(502, 'image API returned no image')
-  }
-
-  const key = `avatars/avatar-${id}-${randomUUID().slice(0, 8)}.png`
-  const url = await storage.put(key, imageBuf, 'image/png')
-  await withOutboxTransaction(async (client) => {
-    await client.query(
-      `UPDATE participants SET avatar_url = $2 WHERE id = $1 AND company_id = $3`,
-      [id, url, tenant],
-    )
-    await enqueueBroadcast(client, CH_STATUS, {
-      type: 'participants.avatar',
-      participantId: id,
-      avatarUrl: url,
-      companyId: tenant,
-    })
-  })
-  const { invalidatePersonaCache } = await import('../agents/personas.js')
-  invalidatePersonaCache(id)
-  return { url }
 }
 
 api.post('/agents/:id/avatar/generate', async (req, res) => {

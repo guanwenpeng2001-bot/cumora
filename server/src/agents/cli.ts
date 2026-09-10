@@ -2467,70 +2467,31 @@ async function generateAndUploadImage(opts: {
   // get pooled with avatar regeneration. Both ultimately hit the same image
   // model but the spend driver is very different (per agent action vs per
   // agent creation), and the operator will want to slice them apart.
-  const { getImageClient } = await import('../llm.js')
-  const { recordLlmCall, classifyLlmCallError } = await import('./llm-ledger.js')
-  const client = getImageClient()
-  const model = getImageModel()
-  const t0 = Date.now()
-  let r: Awaited<ReturnType<typeof client.images.generate>>
-  try {
-    r = await client.images.generate({
-      model,
-      prompt: opts.prompt,
-      size,
-      n: 1,
+  const { executeImage } = await import('../llm.js')
+  return executeImage({ purpose: 'agent-image', companyId: opts.tenant, agentId: opts.agentId },
+    { prompt: opts.prompt, size, n: 1 }, async (buf) => {
+      const { randomUUID } = await import('node:crypto')
+      const id = randomUUID().replace(/-/g, '')
+      const key = `attachments/${id}.png`
+      const url = await storage.put(key, buf, 'image/png')
+      // Slug the prompt into a friendly filename for the bubble caption.
+      const slug = opts.prompt
+        .toLowerCase()
+        .replace(/[^a-z0-9\s-]+/g, '')
+        .trim()
+        .split(/\s+/)
+        .slice(0, 5)
+        .join('-')
+        .slice(0, 40) || 'image'
+      return {
+        url,
+        key,
+        name: `${slug}.png`,
+        kind: 'img',
+        mime: 'image/png',
+        size: buf.length,
+      }
     })
-    void recordLlmCall({
-      purpose: 'agent-image', companyId: opts.tenant, agentId: opts.agentId,
-      model, usage: null, latencyMs: Date.now() - t0, status: 'ok',
-      extras: { n: 1, size },
-    })
-  } catch (e) {
-    void recordLlmCall({
-      purpose: 'agent-image', companyId: opts.tenant, agentId: opts.agentId,
-      model, usage: null, latencyMs: Date.now() - t0,
-      status: classifyLlmCallError(e), error: e instanceof Error ? e.message : String(e),
-      extras: { n: 1, size },
-    })
-    throw e
-  }
-  const first = r.data?.[0]
-  const b64 = first?.b64_json
-  const remoteUrl = first?.url
-  let buf: Buffer
-  if (b64) {
-    buf = Buffer.from(b64, 'base64')
-  } else if (remoteUrl) {
-    const fetched = await fetchImageBytes(remoteUrl, {
-      maxBytes: 20 * 1024 * 1024,
-      timeoutMs: 30_000,
-    })
-    if (!fetched.ok) throw new Error(`image API download failed (${fetched.reason})`)
-    buf = fetched.buffer
-  } else {
-    throw new Error('image API returned no data')
-  }
-  const { randomUUID } = await import('node:crypto')
-  const id = randomUUID().replace(/-/g, '')
-  const key = `attachments/${id}.png`
-  const url = await storage.put(key, buf, 'image/png')
-  // Slug the prompt into a friendly filename for the bubble caption.
-  const slug = opts.prompt
-    .toLowerCase()
-    .replace(/[^a-z0-9\s-]+/g, '')
-    .trim()
-    .split(/\s+/)
-    .slice(0, 5)
-    .join('-')
-    .slice(0, 40) || 'image'
-  return {
-    url,
-    key,
-    name: `${slug}.png`,
-    kind: 'img',
-    mime: 'image/png',
-    size: buf.length,
-  }
 }
 
 /** `cumora image generate "<prompt>" [--size square|wide|tall] [--as <id>] [--json]`

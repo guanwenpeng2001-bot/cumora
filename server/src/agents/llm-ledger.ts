@@ -125,7 +125,8 @@ const LLM_CALL_COLUMNS = `
 `
 
 function llmCallValues(rec: LlmCallRecord): unknown[] {
-  const measured = !!rec.usage
+  const unpriced = rec.extras?.unpriced
+  const measured = !!rec.usage && !unpriced
   const usage = rec.usage ?? EMPTY_USAGE
   // Cost is computed at insert time so the row is meaningful on its own.
   // A later operator price change re-prices new rows only; if we later want
@@ -137,7 +138,7 @@ function llmCallValues(rec: LlmCallRecord): unknown[] {
     rec.purpose, rec.source ?? 'cloud', rec.model,
     usage.inputTokens, usage.cachedInputTokens, usage.cacheCreationTokens,
     usage.outputTokens, rec.reasoningTokens ?? 0,
-    measured ? cost.usd : 0, cost.estimated, measured,
+    measured ? cost.usd : 0, unpriced ? true : cost.estimated, measured,
     rec.latencyMs, rec.status,
     rec.error ? rec.error.slice(0, 500) : null,
     JSON.stringify({ ...rec.extras, usage: rec.usage ?? null, measurement: measured ? 'measured' : 'unknown' }),

@@ -350,19 +350,11 @@ interface DashscopeTaskResponse {
   }
 }
 
-function dashscopeImageClient(apiKey: string, base: string): OpenAI {
+function dashscopeImageClient(apiKey: string, base: string, progress?: (stage: 'poll', taskId?: string) => void): OpenAI {
+  base = base.replace(/\/$/, '')
 
   function dashscopeHttpError(message: string, status: number): Error & { status: number } {
     return Object.assign(new Error(message), { status })
-  }
-
-  async function downloadAsB64(url: string): Promise<{ b64_json: string }> {
-    // Download here and return b64_json instead of the URL: the caller's
-    // fetchImageBytes SSRF guard DNS-pins the host, which breaks on fake-ip
-    // VPN DNS (resolves to reserved ranges).
-    const img = await fetch(url, { signal: AbortSignal.timeout(30_000) })
-    if (!img.ok) throw dashscopeHttpError(`dashscope result download failed: ${img.status}`, img.status)
-    return { b64_json: Buffer.from(await img.arrayBuffer()).toString('base64') }
   }
 
   // qwen-image* models live on the synchronous multimodal-generation API;
@@ -379,12 +371,13 @@ function dashscopeImageClient(apiKey: string, base: string): OpenAI {
       signal: AbortSignal.timeout(180_000),
     })
     if (!resp.ok) throw dashscopeHttpError(`dashscope multimodal-generation failed: ${resp.status} ${await resp.text()}`, resp.status)
+    progress?.('poll')
     const body = (await resp.json()) as {
       output?: { choices?: { message?: { content?: { image?: string }[] } }[] }
     }
     const url = body.output?.choices?.[0]?.message?.content?.find((c) => c.image)?.image
     if (!url) throw new Error(`dashscope multimodal-generation returned no image: ${JSON.stringify(body).slice(0, 300)}`)
-    return { data: [await downloadAsB64(url)] }
+    return { data: [{ url }] }
   }
 
   async function generateAsync(model: string, prompt: string, size?: string, n?: number) {
@@ -403,10 +396,12 @@ function dashscopeImageClient(apiKey: string, base: string): OpenAI {
       signal: AbortSignal.timeout(30_000),
     })
     if (!create.ok) throw dashscopeHttpError(`dashscope task create failed: ${create.status} ${await create.text()}`, create.status)
+    progress?.('poll')
     const created = (await create.json()) as DashscopeTaskResponse
     const taskId = created.output?.task_id
     if (!taskId) throw new Error(`dashscope task create returned no task_id: ${JSON.stringify(created)}`)
 
+    progress?.('poll', taskId)
     const deadline = Date.now() + 180_000
     for (;;) {
       await new Promise((r) => setTimeout(r, 2000))
@@ -420,7 +415,7 @@ function dashscopeImageClient(apiKey: string, base: string): OpenAI {
       if (state === 'SUCCEEDED') {
         const url = status.output?.results?.[0]?.url
         if (!url) throw new Error('dashscope task succeeded with no result url')
-        return { data: [await downloadAsB64(url)] }
+        return { data: [{ url }] }
       }
       if (state === 'FAILED' || state === 'CANCELED') {
         throw dashscopeHttpError(`dashscope task ${state}: ${status.output?.message ?? 'no message'}`, 400)
@@ -430,28 +425,9 @@ function dashscopeImageClient(apiKey: string, base: string): OpenAI {
   }
 
   async function generate(args: { model: string; prompt: string; size?: string; n?: number }) {
-    // Chain from runtime settings (server_settings, env fallback): the image
-    // role's primary + ordered fallbacks. A caller-passed model that differs
-    // from the settings primary is honored as the first hop. Only
-    // fallbackable errors (402/429/5xx/network) advance the chain.
-    const settingsChain = resolvedChain('image')
-    const chain = args.model && !settingsChain.includes(args.model)
-      ? [args.model, ...settingsChain]
-      : settingsChain.length > 0 ? settingsChain : [args.model]
-    let lastErr: unknown = null
-    for (const model of chain) {
-      try {
-        if (model.startsWith('qwen-image')) {
-          return await generateSync(model, args.prompt, args.size, args.n)
-        }
-        return await generateAsync(model, args.prompt, args.size, args.n)
-      } catch (e) {
-        lastErr = e
-        if (!isFallbackableError(e)) throw e
-        console.warn(`[image] ${model} failed, trying next:`, e instanceof Error ? e.message.slice(0, 200) : e)
-      }
-    }
-    throw lastErr instanceof Error ? lastErr : new Error(String(lastErr))
+    return args.model.startsWith('qwen-image')
+      ? generateSync(args.model, args.prompt, args.size, args.n)
+      : generateAsync(args.model, args.prompt, args.size, args.n)
   }
 
   return { images: { generate } } as unknown as OpenAI
@@ -465,11 +441,68 @@ export function getImageClient(): OpenAI {
   if (protocol === 'dashscope-image' && apiKey) {
     _imageClient = dashscopeImageClient(apiKey, baseURL)
   } else if (baseURL && apiKey) {
-    _imageClient = new OpenAI({ apiKey, baseURL, maxRetries: SDK_MAX_RETRIES, timeout: SDK_TIMEOUT_MS })
+    _imageClient = new OpenAI({ apiKey, baseURL, maxRetries: 0, timeout: SDK_TIMEOUT_MS })
   } else {
     _imageClient = legacyClient()
   }
   return _imageClient
+}
+
+/** One image attempt includes generation, polling and delivery; external state forbids replay. */
+export async function executeImage<T>(context: import('./agents/llm-ledger.js').LlmCallContext,
+  args: { prompt: string; size: '1024x1024' | '1536x1024' | '1024x1536'; n?: number },
+  store: (buffer: Buffer) => Promise<T>): Promise<T> {
+  const { resolveRoleCall } = await import('./llm-resolver.js')
+  const { executeLlmPlan } = await import('./llm-execution.js')
+  const { recordLlmCall } = await import('./agents/llm-ledger.js')
+  const { fetchImageBytes } = await import('./agents/image-fetcher.js')
+  if (!args.prompt.trim()) throw new Error('Image prompt is empty')
+  const plan = await resolveRoleCall(context.companyId, context.domain ?? (context.companyId ? 'managed' : 'server'),
+    'image', context.purpose, { id: context.agentId ?? undefined })
+  let stage: 'generation' | 'poll' | 'download' | 'storage' = 'generation'
+  let taskId: string | undefined
+  let generationCompleted = false
+  return executeLlmPlan({ plan, context: { ...context, role: 'image' }, sdkMaxRetries: 0,
+    record: record => recordLlmCall({ ...record, extras: { ...record.extras,
+      n: args.n ?? 1, size: args.size, unpriced: 'image-pricing-unavailable',
+      imageStage: stage, failureStage: record.status === 'ok' ? null : stage,
+      taskId: taskId ?? null, generationCompleted } }),
+    prepare: async (candidate, state) => {
+      stage = 'generation'
+      taskId = undefined
+      generationCompleted = false
+      if (!['images', 'dashscope-image'].includes(candidate.protocol)) throw new Error('Non-image LLM protocol')
+      const routed = await getLlmCandidateClient(plan, candidate)
+      if (candidate.protocol === 'dashscope-image' && !routed.apiKey) throw new Error('Image route has no API key')
+      const client = candidate.protocol === 'dashscope-image'
+        ? dashscopeImageClient(routed.apiKey!, routed.baseURL, (nextStage, id) => {
+          state.committed = true
+          // Synchronous success also commits, but has no polling phase.
+          if (!candidate.requestModel.startsWith('qwen-image')) stage = nextStage
+          if (id) taskId = id
+        }) : routed
+      return async () => {
+        const response = await client.images.generate({ ...args, model: candidate.requestModel }, { maxRetries: 0 })
+        state.committed = true
+        const actualModel = (response as unknown as { model?: unknown }).model
+        state.actualModel = typeof actualModel === 'string' ? actualModel : null
+        const first = response.data?.[0]
+        if (!first?.b64_json && !first?.url) throw new Error('image API returned no image')
+        generationCompleted = true
+        stage = 'download'
+        let buffer: Buffer
+        if (first.b64_json) buffer = Buffer.from(first.b64_json, 'base64')
+        else {
+          const fetched = await fetchImageBytes(first.url!, { maxBytes: 20 * 1024 * 1024, timeoutMs: 30_000 })
+          if (!fetched.ok) throw new Error(`image API download failed (${fetched.reason})`)
+          buffer = fetched.buffer
+        }
+        if (!buffer.length) throw new Error('image API returned empty image')
+        stage = 'storage'
+        return store(buffer)
+      }
+    },
+  })
 }
 
 /** Transcribe an audio clip via DashScope's OpenAI-compatible chat
