@@ -4,6 +4,10 @@
  * Run: node --import tsx --test server/src/__tests__/agents-computer-model-catalog.test.ts
  */
 import { test } from 'node:test'
+import childProcess from 'node:child_process'
+import { EventEmitter } from 'node:events'
+import { syncBuiltinESMExports } from 'node:module'
+import { PassThrough } from 'node:stream'
 import assert from 'node:assert/strict'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -120,4 +124,98 @@ test('Antigravity catalog parses tab-separated models, ignores fetching banner, 
     { id: 'gemini-3.1-pro-high', label: 'Gemini 3.1 Pro (High)', description: null, recommendedFor: ['big'] },
     { id: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6 (Thinking)', description: null, recommendedFor: ['big'] },
   ])
+})
+
+test('CLI prose and punctuated diagnostics are not model ids', () => {
+  for (const style of ['cursor', 'antigravity'] as const) {
+    for (const output of [
+      'No models available for this account.',
+      'Error: not authenticated. Run login.',
+      'Failed to fetch models: connect ETIMEDOUT',
+      'Es sind keine Modelle verfügbar.',
+      '该账户没有可用的模型',
+      'Error:  authentication required',
+      'Warning:\trequest failed',
+    ]) assert.deepEqual(parseListedModels(output, style), [])
+  }
+  assert.deepEqual(parseListedModels('auto\ngpt-5.5\n', 'cursor').map(m => m.id), ['auto', 'gpt-5.5'])
+})
+
+test('Antigravity accepts space-aligned labels', () => {
+  assert.deepEqual(parseListedModels('gemini-3.8-flash-high   Gemini 3.8 Flash (High)', 'antigravity'), [
+    { id: 'gemini-3.8-flash-high', label: 'Gemini 3.8 Flash (High)', description: null, recommendedFor: ['small'] },
+  ])
+})
+
+test('failed CLI discovery preserves the last valid catalog and can recover', async (t) => {
+  let output = 'gpt-5.5\n'
+  let stderr = 'stderr-only-model\n'
+  let code: number | null = 0
+  let spawnError = false
+  let probes = 0
+  t.mock.method(childProcess, 'spawn', () => {
+    probes++
+    if (spawnError) throw new Error('spawn failed')
+    const child = Object.assign(new EventEmitter(), {
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+    })
+    queueMicrotask(() => {
+      child.stdout.end(output)
+      child.stderr.end(stderr)
+      child.emit('close', code)
+    })
+    return child
+  })
+  syncBuiltinESMExports()
+  clearModelCatalogCache()
+  try {
+    const bin = '/fixture/catalog-cli'
+    const good = await discoverEngineModelCatalog('cursor', bin, true)
+    assert.equal(good.source, 'cli')
+    assert.deepEqual(good.models.map(m => m.id), ['gpt-5.5'])
+
+    // Expired successful entries remain a fallback, without refreshing their age on failure.
+    const now = Date.now()
+    t.mock.method(Date, 'now', () => now + 16 * 60 * 1000)
+    output = 'invalid-but-model-shaped\n'
+    code = 1
+    assert.deepEqual(await discoverEngineModelCatalog('cursor', bin), good)
+    const beforeRetry = probes
+    assert.deepEqual(await discoverEngineModelCatalog('cursor', bin), good)
+    assert.equal(probes, beforeRetry + 1)
+    code = null
+    assert.deepEqual(await discoverEngineModelCatalog('cursor', bin, true), good)
+    code = 0
+    output = 'No models available for this account.'
+    assert.deepEqual(await discoverEngineModelCatalog('cursor', bin, true), good)
+    output = ''
+    assert.deepEqual(await discoverEngineModelCatalog('cursor', bin, true), good)
+    spawnError = true
+    assert.deepEqual(await discoverEngineModelCatalog('cursor', bin, true), good)
+    spawnError = false
+
+    // A different CLI path cannot inherit this entry; an engine with presets keeps them.
+    output = 'No models available for this account.'
+    const empty = await discoverEngineModelCatalog('cursor', '/fixture/other-cli', true)
+    assert.equal(empty.source, 'presets')
+    assert.deepEqual(empty.models, [])
+    const preset = await discoverEngineModelCatalog('antigravity', bin, true)
+    assert.equal(preset.source, 'presets')
+    assert.equal(preset.models[0]?.id, 'gemini-3.8-flash-high')
+    code = 1
+    output = 'invalid-but-model-shaped'
+    assert.equal((await discoverEngineModelCatalog('antigravity', bin, true)).source, 'presets')
+
+    code = 0
+    output = 'gpt-5.6'
+    stderr = 'another-stderr-model'
+    const recovered = await discoverEngineModelCatalog('cursor', bin, true)
+    assert.equal(recovered.source, 'cli')
+    assert.deepEqual(recovered.models.map(m => m.id), ['gpt-5.6'])
+  } finally {
+    clearModelCatalogCache()
+    t.mock.restoreAll()
+    syncBuiltinESMExports()
+  }
 })

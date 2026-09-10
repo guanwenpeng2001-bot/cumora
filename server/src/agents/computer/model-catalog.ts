@@ -201,19 +201,33 @@ function runText(command: string, args: string[]): Promise<string> {
       if (output.length < MODEL_OUTPUT_LIMIT) output += chunk.toString('utf8').slice(0, MODEL_OUTPUT_LIMIT - output.length)
     }
     child.stdout?.on('data', append)
-    child.stderr?.on('data', append)
+    child.stderr?.resume()
     let settled = false
-    const finish = () => {
+    const finish = (success = false) => {
       if (settled) return
       settled = true
       clearTimeout(timer)
-      resolve(output.trim())
+      resolve(success ? output.trim() : '')
     }
     const timer = setTimeout(() => { stopChild(child); finish() }, MODEL_PROBE_TIMEOUT_MS)
     timer.unref?.()
-    child.once('error', finish)
-    child.once('close', finish)
+    child.once('error', () => finish())
+    child.once('close', (code) => finish(code === 0))
   })
+}
+
+/** CLI table columns use tabs or multiple spaces; keep prose intact for validation. */
+function splitIdColumn(line: string): [string, string] {
+  const stripped = line.replace(/^[*✓>•-]+\s*/, '')
+  const sep = stripped.search(/\t| {2,}/)
+  if (sep < 0) return [stripped.trim(), '']
+  return [stripped.slice(0, sep).trim(), stripped.slice(sep).trim()]
+}
+
+function modelIdToken(column: string): string | null {
+  if (!column || /\s/.test(column)) return null
+  if (/^[a-z]+[.:,;!?]+$/i.test(column)) return null
+  return column.match(/^[a-z0-9][\w./:@+-]*$/i)?.[0] ?? null
 }
 
 /** Parse model-list output shared by OpenCode, pi, Cursor and Antigravity. Exported so new
@@ -237,10 +251,8 @@ export function parseListedModels(text: string, style: 'provider' | 'pi' | 'curs
         }
       }
     } else if (style === 'antigravity') {
-      const tabIdx = line.indexOf('\t')
-      const idPart = (tabIdx >= 0 ? line.slice(0, tabIdx) : line).trim()
-      const labelPart = (tabIdx >= 0 ? line.slice(tabIdx + 1) : idPart).trim()
-      const candidate = idPart.replace(/^[*✓>•-]+\s*/, '').match(/^([a-z0-9][\w./:@+-]*)/i)?.[1] ?? null
+      const [idPart, labelPart] = splitIdColumn(line)
+      const candidate = modelIdToken(idPart)
       if (candidate) {
         id = candidate
         label = labelPart || candidate
@@ -253,7 +265,7 @@ export function parseListedModels(text: string, style: 'provider' | 'pi' | 'curs
         if (recs.length) recommendedFor = recs
       }
     } else {
-      const candidate = line.replace(/^[*✓>•-]+\s*/, '').match(/^([a-z0-9][\w./:@+-]*)/i)?.[1] ?? null
+      const candidate = modelIdToken(splitIdColumn(line)[0])
       if (candidate && !/^(available|current|default|name|model)$/i.test(candidate)) id = candidate
     }
     const normalized = clean(id, 160)
@@ -402,5 +414,5 @@ export async function discoverEngineModelCatalog(
   }
 
   if (catalog) catalogCache.set(cacheKey, { at: Date.now(), catalog })
-  return catalog ?? preset
+  return catalog ?? (id === 'claude' ? preset : cached?.catalog ?? preset)
 }

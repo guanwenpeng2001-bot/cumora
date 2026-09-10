@@ -946,6 +946,16 @@ export function shouldReportEngineSnapshot(fingerprint: string, previous: string
   return force || fingerprint !== previous
 }
 
+/** Scans are serialized by createEngineRescanQueue; only acknowledged reports deduplicate. */
+export function createEngineSnapshotReporter() {
+  let lastSuccessfulFingerprint = ''
+  return async (fingerprint: string, force: boolean, post: () => Promise<unknown>): Promise<void> => {
+    if (!shouldReportEngineSnapshot(fingerprint, lastSuccessfulFingerprint, force)) return
+    await post()
+    lastSuccessfulFingerprint = fingerprint
+  }
+}
+
 // ─── config ─────────────────────────────────────────────────────────────
 
 async function loadConfig(): Promise<DaemonConfig | null> {
@@ -3346,8 +3356,7 @@ async function doRun(serverOverride?: string): Promise<void> {
     return running
   }
 
-  // Last snapshot we successfully described to the server, as a JSON fingerprint.
-  let lastEngineSnapshot = ''
+  const reportEngineSnapshot = createEngineSnapshotReporter()
   let lastCapabilityWarning = ''
 
   // Engines this machine can currently run, re-scanned on a slow timer. Reported
@@ -3395,16 +3404,13 @@ async function doRun(serverOverride?: string): Promise<void> {
       // of the fingerprint: fixing the cause (upgrading the CLI, installing
       // bwrap) has to clear the card, not wait for an unrelated change.
       const fingerprint = JSON.stringify(snapshot)
-      if (shouldReportEngineSnapshot(fingerprint, lastEngineSnapshot, forceReport)) {
-        lastEngineSnapshot = fingerprint
-        await api(cfg.serverUrl, '/api/computers/me/engines', {
-          method: 'POST',
-          headers: { Authorization: `Bearer ${cfg.deviceToken}` },
-          body: JSON.stringify({ engines: next, detected: snapshot, blocked: blockedIds }),
-        }).catch((err) => {
-          console.warn('[computer] engine snapshot report failed', err instanceof Error ? err.message : err)
-        })
-      }
+      await reportEngineSnapshot(fingerprint, forceReport, () => api(cfg.serverUrl, '/api/computers/me/engines', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${cfg.deviceToken}` },
+        body: JSON.stringify({ engines: next, detected: snapshot, blocked: blockedIds }),
+      })).catch((err) => {
+        console.warn('[computer] engine snapshot report failed', err instanceof Error ? err.message : err)
+      })
       // This is the same live inventory sync() uses to choose an agent's
       // adapter. Updating only a heartbeat cache would advertise a newly
       // installed engine while silently running that agent on the old default.
