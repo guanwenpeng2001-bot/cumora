@@ -4,11 +4,13 @@
  * primary model (datalist from the catalog API, free input allowed), an
  * ordered fallback chain, and for text roles the reasoning knobs.
  */
-import { useEffect, useMemo, useState } from 'react'
-import { api, type ApiModelCatalog } from '@/api/client'
-import { useT, type MessageKey } from '@/lib/i18n'
-import { ModelInput, FallbackChainEditor } from '@/components/ModelFields'
+import { useEffect, useRef, useState } from 'react'
+import { api, type ApiModelCatalog, type ApiModelSettings } from '@/api/client'
+import { useT, useLocaleStore, type MessageKey } from '@/lib/i18n'
+import { ModelInput, FallbackChainEditor, CatalogStatus, EFFORT_OPTIONS, modelInteger } from '@/components/ModelFields'
 import { cn } from '@/lib/utils'
+import { useAuth } from '@/stores/auth'
+import { useModelCatalog, catalogOptions } from '@/stores/modelCatalog'
 
 interface RoleDef {
   key: string
@@ -32,81 +34,120 @@ const ROLES: RoleDef[] = [
   { key: 'embed', labelKey: 'me.models.embed', subKey: 'me.models.embedSub', modelKey: 'embed_model', bucket: 'embedding', embedNote: true },
 ]
 
-const EFFORT_OPTIONS = ['low', 'medium', 'high', 'max'] as const
+const MODEL_KEYS = ROLES.flatMap((r) => [r.modelKey, r.fallbackKey, r.effortKey, r.tokensKey, r.headroomKey].filter((k): k is string => !!k))
+
+export function dirtyModelSettings(draft: Record<string, string>, initial: Record<string, string>, inherited: ReadonlySet<string> = new Set()): Record<string, string | null> {
+  return Object.fromEntries(MODEL_KEYS.filter((k) => inherited.has(k) || draft[k] !== initial[k]).map((k) => [k, inherited.has(k) ? null : draft[k]]))
+}
 
 function splitList(v: string): string[] {
   return v.split(',').map((s) => s.trim()).filter(Boolean)
 }
 
 export function ModelsTab() {
+  const epoch = useAuth((s) => s.contextEpoch)
+  const company = useAuth((s) => s.activeCompanyId)
+  return <ModelsTabContent key={`${epoch}:${company}`} />
+}
+
+function ModelsTabContent() {
   const t = useT()
-  const [catalog, setCatalog] = useState<ApiModelCatalog | null>(null)
+  const zh = useLocaleStore((s) => s.locale) === 'zh-CN'
+  const catalogState = useModelCatalog()
+  const catalog = catalogState.catalog
   const [draft, setDraft] = useState<Record<string, string> | null>(null)
   const [initial, setInitial] = useState<Record<string, string> | null>(null)
+  const [metadata, setMetadata] = useState<ApiModelSettings['metadata']>()
+  const [inherited, setInherited] = useState<Set<string>>(new Set())
   const [forbidden, setForbidden] = useState(false)
   const [loadError, setLoadError] = useState<string | null>(null)
+  const [saveError, setSaveError] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
   const [savedTick, setSavedTick] = useState(false)
+  const requests = useRef<AbortController | null>(null)
+  const submitting = useRef(false)
+  const context = useRef(useAuth.getState())
+  const current = () => !requests.current?.signal.aborted && useAuth.getState().contextEpoch === context.current.contextEpoch
+    && useAuth.getState().token === context.current.token && useAuth.getState().activeCompanyId === context.current.activeCompanyId
 
   useEffect(() => {
-    let cancelled = false
-    void Promise.all([api.getModelSettings(), api.getAvailableModels()])
-      .then(([s, c]) => {
-        if (cancelled) return
-        setDraft(s.settings)
-        setInitial(s.settings)
-        setCatalog(c)
-      })
-      .catch((e) => {
-        if (cancelled) return
-        const status = (e as { status?: number })?.status
-        if (status === 403) setForbidden(true)
-        else setLoadError(e instanceof Error ? e.message : String(e))
-      })
-    return () => { cancelled = true }
+    const controller = new AbortController()
+    requests.current = controller
+    void api.getModelSettings(controller.signal).then((s) => {
+      if (!current()) return
+      setDraft(s.settings)
+      setInitial(s.settings)
+      setMetadata(s.metadata)
+    }).catch((e) => {
+      if (!current()) return
+      if ((e as { status?: number })?.status === 403) setForbidden(true)
+      else setLoadError(e instanceof Error ? e.message : String(e))
+    })
+    return () => controller.abort()
   }, [])
 
-  const refreshCatalog = () => {
-    void api.getAvailableModels(true).then(setCatalog).catch(() => { /* keep old */ })
-  }
-
-  const dirty = useMemo(() => draft !== null && initial !== null && JSON.stringify(draft) !== JSON.stringify(initial), [draft, initial])
+  const dirty = draft !== null && initial !== null && Object.keys(dirtyModelSettings(draft, initial, inherited)).length > 0
   if (forbidden) {
     return <div className="text-[12.5px] text-ink-500 italic">{t('me.models.adminOnly')}</div>
   }
   if (loadError) {
     return <div className="text-[12.5px] text-coral-deep">{t('me.models.loadFailed')}: {loadError}</div>
   }
-  if (!draft || !catalog) {
+  if (!draft || !initial) {
     return <div className="text-[12.5px] text-ink-500 italic">{t('me.models.loading')}</div>
   }
 
-  const set = (k: string, v: string) => setDraft({ ...draft, [k]: v })
+  const set = (k: string, v: string) => {
+    setDraft({ ...draft, [k]: v })
+    setInherited((old) => { const next = new Set(old); next.delete(k); return next })
+    setSavedTick(false)
+  }
 
   const save = async () => {
+    if (submitting.current || !current()) return
+    submitting.current = true
     setSaving(true)
+    setSaveError(null)
+    setSavedTick(false)
     try {
-      await api.putModelSettings(draft)
-      setInitial(draft)
+      const patch = dirtyModelSettings(draft, initial, inherited)
+      for (const role of ROLES) {
+        for (const [key, min] of [[role.tokensKey, 1], [role.headroomKey, 0]] as const) {
+          if (key && typeof patch[key] === 'string' && modelInteger(patch[key], key, min) === undefined) throw new Error(`${key}: ${zh ? '请输入整数或恢复继承' : 'Enter an integer or restore inheritance'}`)
+        }
+        const effort = role.effortKey ? patch[role.effortKey] : undefined
+        if (typeof effort === 'string' && !EFFORT_OPTIONS.includes(effort)) throw new Error('effort: ' + EFFORT_OPTIONS.join('/'))
+        if (typeof patch[role.modelKey] === 'string' && !patch[role.modelKey]?.trim()) throw new Error(`${role.modelKey}: ${zh ? '主模型不能为空；可恢复继承' : 'Primary required; use restore inheritance'}`)
+      }
+      const result = await api.putModelSettings(patch, requests.current?.signal)
+      if (!current()) return
+      // T3 returns the committed snapshot; older servers require a read after restore.
+      const committed = result as typeof result & Partial<ApiModelSettings>
+      const snapshot = committed.settings ? committed : await api.getModelSettings(requests.current?.signal)
+      if (!current()) return
+      setDraft(snapshot.settings!)
+      setInitial(snapshot.settings!)
+      setMetadata(snapshot.metadata)
+      setInherited(new Set())
       setSavedTick(true)
-      window.setTimeout(() => setSavedTick(false), 3200)
-      refreshCatalog()
+      catalogState.refresh()
+    } catch (e) {
+      if (current()) setSaveError(e instanceof Error ? e.message : String(e))
     } finally {
-      setSaving(false)
+      submitting.current = false
+      if (current()) setSaving(false)
     }
   }
 
   return (
     <div className="space-y-6">
-      {!catalog.gateway && (
-        <div className="text-[12px] py-2 px-3 rounded-[10px] text-gold-deep"
-          style={{ background: 'var(--gold-soft, rgba(212,160,32,0.10))', border: '1px solid rgba(212,160,32,0.25)' }}>
-          {t('me.models.gatewayDown')}
-        </div>
-      )}
+      <CatalogStatus {...catalogState} />
+      {saveError && <div role="alert" className="text-[12px] text-coral-deep">{saveError}</div>}
+      <fieldset disabled={saving} className="space-y-6">
       {ROLES.map((role) => {
         const listId = `models-catalog-${role.key}`
-        const options = catalog[role.bucket]
+        const options = catalogOptions(catalog, role.bucket)
+        const efforts = EFFORT_OPTIONS.filter((v) => !role.effortKey || !metadata?.[role.effortKey]?.allowedValues || metadata[role.effortKey]!.allowedValues!.includes(v))
         return (
           <div key={role.key} className="bg-cloud rounded-[14px] p-4 space-y-3"
             style={{ border: '1px solid var(--ink-100)' }}>
@@ -116,16 +157,22 @@ export function ModelsTab() {
             </div>
             <div className="grid grid-cols-[110px_1fr] items-center gap-x-3 gap-y-2.5">
               <label className="text-[11.5px] font-semibold text-ink-500">{t('me.models.primary')}</label>
-              <ModelInput value={draft[role.modelKey] ?? ''} onChange={(v) => set(role.modelKey, v)} options={options} listId={listId} />
+              <ModelInput value={draft[role.modelKey] ?? ''} onChange={(v) => set(role.modelKey, v)} options={options} listId={listId} catalog={catalog} />
+            </div>
+            {(role.effortKey || role.tokensKey || role.headroomKey) && <details>
+              <summary className="text-[12px] font-semibold text-ink-500 cursor-pointer">{t('agent.advancedModelSettings')}</summary>
+              <div className="grid grid-cols-[110px_1fr] items-center gap-x-3 gap-y-2.5 mt-2">
               {role.effortKey && (
                 <>
                   <label className="text-[11.5px] font-semibold text-ink-500">{t('me.models.effort')}</label>
                   <select
-                    value={draft[role.effortKey] ?? 'low'}
-                    onChange={(e) => set(role.effortKey!, e.target.value)}
+                    value={inherited.has(role.effortKey) ? '' : draft[role.effortKey] ?? ''}
+                    onChange={(e) => e.target.value ? set(role.effortKey!, e.target.value) : setInherited((old) => new Set([...old, role.effortKey!]))}
                     className="h-8 px-2 rounded-[8px] text-[12.5px] text-ink-900 bg-paper outline-none focus:ring-2 focus:ring-skype/30"
                     style={{ border: '1px solid var(--ink-100)' }}>
-                    {EFFORT_OPTIONS.map((o) => <option key={o} value={o}>{o}</option>)}
+                    <option value="">{zh ? '继承' : 'Inherit'}</option>
+                    {draft[role.effortKey] && !efforts.includes(draft[role.effortKey]) && <option value={draft[role.effortKey]} disabled>{draft[role.effortKey]} — {zh ? '不支持' : 'Unsupported'}</option>}
+                    {efforts.map((o) => <option key={o} value={o}>{o}</option>)}
                   </select>
                 </>
               )}
@@ -133,7 +180,7 @@ export function ModelsTab() {
                 <>
                   <label className="text-[11.5px] font-semibold text-ink-500">{t('me.models.maxTokens')}</label>
                   <input
-                    type="number" min={1}
+                    type="text" inputMode="numeric"
                     value={draft[role.tokensKey] ?? ''}
                     onChange={(e) => set(role.tokensKey!, e.target.value)}
                     className="h-8 px-2.5 rounded-[8px] text-[12.5px] text-ink-900 bg-paper outline-none focus:ring-2 focus:ring-skype/30 font-mono"
@@ -144,13 +191,16 @@ export function ModelsTab() {
                 <>
                   <label className="text-[11.5px] font-semibold text-ink-500">{t('me.models.headroom')}</label>
                   <input
-                    type="number" min={0}
+                    type="text" inputMode="numeric"
                     value={draft[role.headroomKey] ?? ''}
                     onChange={(e) => set(role.headroomKey!, e.target.value)}
                     className="h-8 px-2.5 rounded-[8px] text-[12.5px] text-ink-900 bg-paper outline-none focus:ring-2 focus:ring-skype/30 font-mono"
                     style={{ border: '1px solid var(--ink-100)' }} />
                 </>
               )}
+              </div>
+            </details>}
+            <div className="grid grid-cols-[110px_1fr] items-center gap-x-3 gap-y-2.5">
               {role.fallbackKey && (
                 <>
                   <label className="text-[11.5px] font-semibold text-ink-500 self-start pt-1">{t('me.models.fallbacks')}</label>
@@ -158,6 +208,9 @@ export function ModelsTab() {
                     value={splitList(draft[role.fallbackKey] ?? '')}
                     onChange={(v) => set(role.fallbackKey!, v.join(','))}
                     options={options}
+                    primary={draft[role.modelKey]}
+                    history={splitList(initial[role.fallbackKey] ?? '')}
+                    catalog={catalog}
                     listId={listId}
                     t={t} />
                 </>
@@ -166,9 +219,24 @@ export function ModelsTab() {
                 <div className="col-span-2 text-[11px] text-gold-deep italic">{t('me.models.embedWarn')}</div>
               )}
             </div>
+            <details className="text-[11px] text-ink-500">
+              <summary className="cursor-pointer">{zh ? '恢复继承（保存后生效）' : 'Restore inheritance (on save)'}</summary>
+              <div className="flex flex-wrap gap-3 mt-2">
+              {[role.modelKey, role.fallbackKey, role.effortKey, role.tokensKey, role.headroomKey].filter((k): k is string => !!k).map((key) => <label key={key} className="flex items-center gap-1">
+                <input type="checkbox" checked={inherited.has(key)} onChange={(e) => setInherited((old) => {
+                  const next = new Set(old)
+                  if (e.target.checked) next.add(key)
+                  else next.delete(key)
+                  return next
+                })} />
+                {t(key === role.modelKey ? 'me.models.primary' : key === role.fallbackKey ? 'me.models.fallbacks' : key === role.effortKey ? 'me.models.effort' : key === role.tokensKey ? 'me.models.maxTokens' : 'me.models.headroom')}
+              </label>)}
+              </div>
+            </details>
           </div>
         )
       })}
+      </fieldset>
       <div className="flex items-center gap-3">
         <button type="button" onClick={() => void save()} disabled={!dirty || saving}
           className={cn('h-8 px-4 rounded-full text-[12.5px] font-semibold text-white transition disabled:cursor-not-allowed')}
@@ -176,10 +244,7 @@ export function ModelsTab() {
           {saving ? t('me.models.saving') : t('me.models.save')}
         </button>
         {savedTick && <span className="text-[12px] text-skype-deep font-medium">{t('me.models.saved')}</span>}
-        <button type="button" onClick={refreshCatalog}
-          className="ml-auto text-[11.5px] text-ink-400 hover:text-skype-deep transition">
-          {t('me.models.refreshCatalog')}
-        </button>
+
       </div>
     </div>
   )

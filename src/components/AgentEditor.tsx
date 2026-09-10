@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { api, getPairingServerOrigin, resolveAssetUrl, type AgentInput } from '@/api/client'
-import { ModelInput, FallbackChainEditor } from '@/components/ModelFields'
+import { FallbackChainEditor, CatalogStatus, EFFORT_OPTIONS, modelInteger } from '@/components/ModelFields'
+import { useModelCatalog, catalogOptions, catalogSource } from '@/stores/modelCatalog'
 import { Checkbox } from '@/components/Checkbox'
 import { cn } from '@/lib/utils'
 import type { AgentModelConfig } from '@/types'
@@ -108,9 +109,9 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
   // mean "inherit the global role setting". Managed agents only — BYOA is
   // engine-managed.
   const [mcEffort, setMcEffort] = useState(agent?.modelConfig?.effort ?? '')
-  const [mcContextWindow, setMcContextWindow] = useState(agent?.modelConfig?.contextWindow ? String(agent.modelConfig.contextWindow) : '')
-  const [mcMaxTokens, setMcMaxTokens] = useState(agent?.modelConfig?.maxOutputTokens ? String(agent.modelConfig.maxOutputTokens) : '')
-  const [mcThinking, setMcThinking] = useState(agent?.modelConfig?.thinking ?? true)
+  const [mcContextWindow, setMcContextWindow] = useState(agent?.modelConfig?.contextWindow != null ? String(agent.modelConfig.contextWindow) : '')
+  const [mcMaxTokens, setMcMaxTokens] = useState(agent?.modelConfig?.maxOutputTokens != null ? String(agent.modelConfig.maxOutputTokens) : '')
+  const [mcThinking, setMcThinking] = useState<boolean | undefined>(agent?.modelConfig?.thinking)
   const [mcFallbacks, setMcFallbacks] = useState<string[]>(agent?.modelConfig?.fallbackModels ?? [])
   const [advancedOpen, setAdvancedOpen] = useState(false)
   // Skills: checkbox over the company library; edit mode loads the agent's
@@ -242,22 +243,9 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
   ]
   // Managed agents pick from the global models catalog (text bucket);
   // BYOA keeps using the host engine's reported catalog (modelOptions).
-  const [catalogText, setCatalogText] = useState<string[]>([])
-  useEffect(() => {
-    if (isByoa) return
-    let cancelled = false
-    void api.getAvailableModels()
-      .then((c) => { if (!cancelled) setCatalogText(c.text) })
-      .catch(() => { /* catalog is a nicety; free input still works */ })
-    return () => { cancelled = true }
-  }, [isByoa])
-  /** Effort options follow the selected model's provider family. */
-  const effortOptions = ((): string[] => {
-    const m = (model || '').toLowerCase()
-    if (/^(k3|kimi|moonshot)/.test(m)) return ['low', 'high', 'max']
-    if (/^deepseek/.test(m)) return ['low', 'high', 'max']
-    return ['none', 'minimal', 'low', 'medium', 'high', 'xhigh']
-  })()
+  const catalogState = useModelCatalog(!isByoa && !contextChanged)
+  const catalogText = catalogOptions(catalogState.catalog, 'text')
+  const effortOptions = EFFORT_OPTIONS
 
   const origin = getPairingServerOrigin()
   const repairCommand = repairCode
@@ -342,12 +330,13 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
         const modelConfigPayload = ((): AgentModelConfig | null | undefined => {
           if (isByoaTarget) return undefined
           const mc: AgentModelConfig = {}
+          if (mcEffort && !effortOptions.includes(mcEffort)) throw new Error('effort: ' + effortOptions.join('/'))
           if (mcEffort) mc.effort = mcEffort
-          const cw = Number(mcContextWindow)
-          if (mcContextWindow.trim() && Number.isFinite(cw) && cw > 0) mc.contextWindow = Math.floor(cw)
-          const mt = Number(mcMaxTokens)
-          if (mcMaxTokens.trim() && Number.isFinite(mt) && mt > 0) mc.maxOutputTokens = Math.floor(mt)
-          if (!mcThinking) mc.thinking = false
+          const cw = modelInteger(mcContextWindow, t('agent.mcContextWindow'), 1, 2_000_000)
+          if (cw !== undefined) mc.contextWindow = cw
+          const mt = modelInteger(mcMaxTokens, t('agent.mcMaxTokens'), 1, 1_000_000)
+          if (mt !== undefined) mc.maxOutputTokens = mt
+          if (mcThinking !== undefined) mc.thinking = mcThinking
           if (mcFallbacks.length > 0) mc.fallbackModels = mcFallbacks
           return Object.keys(mc).length > 0 ? mc : null
         })()
@@ -526,7 +515,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
                 onValueChange={setModel}
                 options={[
                   { value: '', label: t('agent.followGlobalDefault') },
-                  ...catalogText.map((m) => ({ value: m, label: m })),
+                  ...[...new Set([...catalogText, model, ...(agent?.modelConfig?.fallbackModels ?? [])].filter(Boolean))].map((m) => ({ value: m, label: m, hint: catalogSource(catalogState.catalog, m) })),
                 ]}
                 searchPlaceholder={t('agent.searchModels')}
                 allowCustom
@@ -534,6 +523,8 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
               />
             )}
           </Field>
+
+          {!isByoa && <CatalogStatus {...catalogState} />}
 
           {isByoa && (!modelCatalog || modelCatalog.fastModelScope === 'agent') && (
             <Field
@@ -580,11 +571,12 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
                         style={{ border: '1px solid var(--ink-100)' }}
                       >
                         <option value="">{t('agent.mcFollowGlobal')}</option>
+                        {mcEffort && !effortOptions.includes(mcEffort) && <option value={mcEffort} disabled>{mcEffort} — {locale === 'zh-CN' ? '不支持，请重新选择' : 'Unsupported; choose another value'}</option>}
                         {effortOptions.map((o) => <option key={o} value={o}>{o}</option>)}
                       </select>
                       <label className="text-[11.5px] font-semibold text-ink-500">{t('agent.mcContextWindow')}</label>
                       <input
-                        type="number" min={0}
+                        type="text" inputMode="numeric"
                         value={mcContextWindow}
                         onChange={(e) => setMcContextWindow(e.target.value)}
                         placeholder={t('agent.mcContextWindowPh')}
@@ -593,7 +585,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
                       />
                       <label className="text-[11.5px] font-semibold text-ink-500">{t('agent.mcMaxTokens')}</label>
                       <input
-                        type="number" min={0}
+                        type="text" inputMode="numeric"
                         value={mcMaxTokens}
                         onChange={(e) => setMcMaxTokens(e.target.value)}
                         placeholder={t('agent.mcMaxTokensPh')}
@@ -601,13 +593,13 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
                         style={{ border: '1px solid var(--ink-100)' }}
                       />
                       <label className="text-[11.5px] font-semibold text-ink-500">{t('agent.mcThinking')}</label>
-                      <div>
-                        <Checkbox
-                          checked={mcThinking}
-                          onCheckedChange={(next) => setMcThinking(next)}
-                          label=""
-                        />
-                      </div>
+                      <select value={mcThinking === undefined ? '' : String(mcThinking)}
+                        onChange={(e) => setMcThinking(e.target.value === '' ? undefined : e.target.value === 'true')}
+                        className="h-8 px-2 rounded-[8px] text-[12.5px] bg-paper">
+                        <option value="">{t('agent.mcFollowGlobal')}</option>
+                        <option value="true">{locale === 'zh-CN' ? '启用（仍受模型配置约束）' : 'Enabled (subject to model configuration)'}</option>
+                        <option value="false">{locale === 'zh-CN' ? '关闭' : 'Disabled'}</option>
+                      </select>
                     </div>
                     <div>
                       <div className="text-[11.5px] font-semibold text-ink-500 mb-1.5">{t('agent.mcFallbacks')}</div>
@@ -616,6 +608,9 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
                         value={mcFallbacks}
                         onChange={setMcFallbacks}
                         options={catalogText}
+                        primary={model}
+                        history={agent?.modelConfig?.fallbackModels}
+                        catalog={catalogState.catalog}
                         listId="agent-mc-fallbacks"
                         t={t}
                       />
