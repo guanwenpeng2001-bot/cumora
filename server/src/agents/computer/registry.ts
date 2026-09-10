@@ -15,14 +15,14 @@
  *     runtime/jwt.ts — the same token a pod gets)
  */
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
-import { getByoaRuntimePolicyValues } from '../../settings.js'
-import { BYOA_SYNC_INTERVALS, makeByoaPolicy, parseByoaPolicyReport, type ByoaPolicyReport } from './runtime-policy.js'
 import { pool } from '../../db/pool.js'
 import { CH_STATUS, publish, redis } from '../../redis.js'
-import { canonicalAgentResources, type AgentResourcePayload, type ResourceApplicationState, type ResourceApplicationResult } from '../runtime/client.js'
+import { getByoaRuntimePolicyValues } from '../../settings.js'
 import { normalizeTier, type Tier } from '../../tier.js'
+import { type AgentResourcePayload, canonicalAgentResources, type ResourceApplicationResult, type ResourceApplicationState } from '../runtime/client.js'
 import { signAgentToken } from '../runtime/jwt.js'
 import type { EngineModelCatalog, EngineModelOption, FastModelScope, ModelCatalogSource } from './model-catalog.js'
+import { BYOA_SYNC_INTERVALS, type ByoaPolicyReport, makeByoaPolicy, parseByoaPolicyReport } from './runtime-policy.js'
 
 export type ComputerKind = 'cloud' | 'local' | 'vps'
 export type EngineId = 'managed' | 'claude' | 'codex' | 'kimi' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini' | 'qwen' | 'antigravity'
@@ -325,7 +325,11 @@ async function getLatestDaemonRelease(): Promise<{ version: string; downloadUrl:
       const releases = await res.json() as Array<{ tag_name?: string; published_at?: string; assets?: Array<{ name: string; browser_download_url: string }> }>
       const cli = releases
         .filter((r) => r.tag_name?.startsWith('agent-cli-v'))
-        .sort((a, b) => (b.published_at ?? '').localeCompare(a.published_at ?? ''))[0]
+        .sort((a, b) => {
+          const va = a.tag_name!.replace('agent-cli-v', '')
+          const vb = b.tag_name!.replace('agent-cli-v', '')
+          return versionGt(vb, va) ? 1 : versionGt(va, vb) ? -1 : 0
+        })[0]
       const asset = cli?.assets?.find((a) => a.name.endsWith('.tgz'))
       if (cli?.tag_name && asset) {
         latestCache = { version: cli.tag_name.replace('agent-cli-v', ''), downloadUrl: asset.browser_download_url, at: now }
