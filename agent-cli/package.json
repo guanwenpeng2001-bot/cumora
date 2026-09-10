@@ -1,6 +1,6 @@
 {
   "name": "cumora",
-  "version": "0.16.2-fork.1",
+  "version": "0.16.2-fork.2",
   "private": true,
   "description": "Run Cumora agents on your own machine with Claude Code, Codex, Antigravity, and other BYOA engines.",
   "license": "MIT",
