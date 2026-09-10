@@ -5,12 +5,13 @@
  * All data from GET /api/usage/* (pure ledger reads).
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import {ApiError, type ApiUsageMetadata,
+import { TableVirtuoso } from 'react-virtuoso'
+import {ApiError, type ApiUsageLogRow, type ApiUsageMetadata,
   type ApiUsageTrendPoint, 
   api, resolveAssetUrl,
 } from '@/api/client'
 import { modelPlatformLabel } from '@/lib/modelPlatforms'
-import { translate, useLocale, useT } from '@/lib/i18n'
+import { translate, useLocale, useT, type Locale } from '@/lib/i18n'
 import { useAuth } from '@/stores/auth'
 
 type T = ReturnType<typeof useT>
@@ -64,6 +65,22 @@ function fmtTime(iso: string, granularity: 'hour' | 'day'): string {
     : `${d.getMonth() + 1}/${d.getDate()}`
 }
 
+/** Keep at most `maxPoints` samples, always including the first and last. */
+export function downsampleTrend<T>(points: T[], maxPoints: number): T[] {
+  if (maxPoints <= 0 || points.length <= maxPoints) return points
+  if (maxPoints === 1) return points.slice(0, 1)
+  const last = points.length - 1
+  const out: T[] = []
+  let prev = -1
+  for (let i = 0; i < maxPoints; i++) {
+    const idx = Math.round((i * last) / (maxPoints - 1))
+    if (idx === prev) continue
+    prev = idx
+    out.push(points[idx]!)
+  }
+  return out
+}
+
 /** Self-drawn multi-line SVG chart — one polyline per metric, each
  *  normalized to its own max (absolute scales differ wildly across cost
  *  vs tokens). No chart lib; the repo stays dependency-free. */
@@ -75,19 +92,20 @@ function TrendChart({ points, granularity, t }: {
   const W = 720
   const H = 180
   const PAD = { l: 8, r: 8, t: 10, b: 22 }
+  const sampled = downsampleTrend(points, Math.max(64, Math.min(240, Math.floor((W - PAD.l - PAD.r) / 3))))
   const series = [
     { key: 'costUsd' as const, color: 'var(--coral-deep)', label: t('me.usage.chartCost') },
     { key: 'inputTokens' as const, color: 'var(--skype)', label: t('me.usage.chartInput') },
     { key: 'outputTokens' as const, color: 'var(--gold-deep)', label: t('me.usage.chartOutput') },
     { key: 'cacheReadTokens' as const, color: 'var(--ink-300)', label: t('me.usage.chartCacheRead') },
   ]
-  const n = points.length
+  const n = sampled.length
   if (n === 0) return null
   const x = (i: number) => PAD.l + (i / Math.max(1, n - 1)) * (W - PAD.l - PAD.r)
   const lines = series.map((s) => {
-    const max = Math.max(...points.map((p) => p[s.key]), 1e-9)
+    const max = Math.max(...sampled.map((p) => p[s.key]), 1e-9)
     const y = (v: number) => PAD.t + (1 - v / max) * (H - PAD.t - PAD.b)
-    return { ...s, max, d: points.map((p, i) => `${i === 0 ? 'M' : 'L'}${x(i).toFixed(1)},${y(p[s.key]).toFixed(1)}`).join(' ') }
+    return { ...s, max, d: sampled.map((p, i) => `${i === 0 ? 'M' : 'L'}${x(i).toFixed(1)},${y(p[s.key]).toFixed(1)}`).join(' ') }
   })
   const labelEvery = Math.max(1, Math.ceil(n / 8))
   return (
@@ -96,7 +114,7 @@ function TrendChart({ points, granularity, t }: {
         {lines.map((l) => (
           <path key={l.key} d={l.d} fill="none" stroke={l.color} strokeWidth={1.8} strokeLinejoin="round" opacity={0.9} />
         ))}
-        {points.map((p, i) => i % labelEvery === 0 && (
+        {sampled.map((p, i) => i % labelEvery === 0 && (
           <text key={p.bucket} x={x(i)} y={H - 6} fontSize={9} fill="var(--ink-300)" textAnchor="middle">
             {fmtTime(p.bucket, granularity)}
           </text>
@@ -136,6 +154,35 @@ function UsageMetadata({ metadata }: { metadata?: ApiUsageMetadata }) {
   </div>
 }
 
+function LogAttemptDetails({ r, locale, t, unknown }: {
+  r: ApiUsageLogRow
+  locale: Locale
+  t: T
+  unknown: string
+}) {
+  const [open, setOpen] = useState(false)
+  return (
+    <details className="text-[11px] whitespace-normal min-w-[220px] max-w-[360px] break-words" onToggle={(e) => {
+      setOpen((e.currentTarget as HTMLDetailsElement).open)
+    }}>
+      <summary className="cursor-pointer">{translate(locale, 'settings.attemptDetails')} · #{r.attempt ?? unknown}</summary>
+      {open && <>
+        <div>{translate(locale, 'settings.requestedModel')}: {r.requestedModel || r.model || unknown}</div>
+        <div>{translate(locale, 'settings.actualModel')}: {r.actualModel || unknown}</div>
+        <div>{t('settings.route')}: {r.route ?? unknown} · {t('settings.platform')}: {r.platform ? modelPlatformLabel(r.platform) : unknown}</div>
+        <div>{t('adminobs.colSource')}: {r.source || unknown} · {t('settings.provider')}: {r.provider || unknown}</div>
+        <div>{t('settings.purpose')}: {r.purpose || unknown}</div>
+        <div>{t('settings.callId')}: {r.callId ?? unknown} · {t('settings.attempt')}: {r.attempt ?? unknown}</div>
+        <div>{translate(locale, 'settings.ledgerId')}: {r.id}</div>
+        <div>{t('settings.agentId')}: {r.agentId ?? unknown}</div>
+        <div>{translate(locale, 'settings.sanitizedReason')}: {r.failureReason ?? unknown}</div>
+        <div>{translate(locale, 'settings.failureStage')}: {r.failureStage ?? unknown} · HTTP: {r.httpStatus ?? unknown}</div>
+        <div>{translate(locale, 'settings.latency')}: {r.latencyMs == null ? unknown : `${r.latencyMs} ms`}</div>
+      </>}
+    </details>
+  )
+}
+
 function Card({ label, value, sub }: { label: string; value: string; sub?: string }) {
   return (
     <div className="bg-cloud rounded-[14px] p-4 min-w-0" style={{ border: '1px solid var(--ink-100)' }}>
@@ -150,32 +197,38 @@ type Dim = 'agent' | 'model' | 'provider'
 
 type QueryState<D> = { loading: boolean; error: unknown; data: D | null }
 
-function useUsageQuery<D>(request: (signal: AbortSignal) => Promise<D>, enabled: boolean, epoch: number): QueryState<D> {
+export function useUsageQuery<D>(request: (signal: AbortSignal) => Promise<D>, enabled: boolean, epoch: number): QueryState<D> {
   const sequence = useRef(0)
+  const cache = useRef(new Map<typeof request, { epoch: number; data: D | null; error: unknown }>())
   const [result, setResult] = useState<{ request: typeof request; epoch: number; state: QueryState<D> } | null>(null)
   useEffect(() => {
+    if (!enabled) return
     const id = ++sequence.current
     const controller = new AbortController()
-    if (enabled) {
-      const commit = (state: QueryState<D>) => {
-        if (!controller.signal.aborted && sequence.current === id && useAuth.getState().contextEpoch === epoch) {
-          setResult({ request, epoch, state })
-        }
+    const cached = cache.current.get(request)
+    const stale = cached && cached.epoch === epoch ? cached : null
+    const commit = (state: QueryState<D>) => {
+      if (!controller.signal.aborted && sequence.current === id && useAuth.getState().contextEpoch === epoch) {
+        if (!state.loading) cache.current.set(request, { epoch, data: state.data, error: state.error })
+        setResult({ request, epoch, state })
       }
-      commit({ loading: true, error: null, data: null })
-      void Promise.resolve().then(() => {
-        if (controller.signal.aborted) return
-        return request(controller.signal).then(
-          (data) => commit({ loading: false, error: null, data }),
-          (error: unknown) => commit({ loading: false, error, data: null }),
-        )
-      }).catch((error: unknown) => commit({ loading: false, error, data: null }))
     }
+    commit({ loading: stale?.data == null, error: stale?.error ?? null, data: stale?.data ?? null })
+    void Promise.resolve().then(() => {
+      if (controller.signal.aborted) return
+      return request(controller.signal).then(
+        (data) => commit({ loading: false, error: null, data }),
+        (error: unknown) => commit({ loading: false, error, data: stale?.data ?? null }),
+      )
+    }).catch((error: unknown) => commit({ loading: false, error, data: stale?.data ?? null }))
     return () => { controller.abort(); sequence.current++ }
   }, [request, enabled, epoch])
-  return enabled && result?.request === request && result.epoch === epoch
-    ? result.state
-    : { loading: enabled, error: null, data: null }
+  if (result?.request === request && result.epoch === epoch) return result.state
+  const cached = cache.current.get(request)
+  if (cached && cached.epoch === epoch) {
+    return { loading: enabled && cached.data == null, error: cached.error, data: cached.data }
+  }
+  return { loading: enabled, error: null, data: null }
 }
 
 export function UsageDashboard() {
@@ -422,51 +475,45 @@ function UsageDashboardContent() {
         {logs && <UsageMetadata metadata={logs.metadata} />}
         <div className="text-[11px] text-ink-500">{translate(locale, 'settings.eachRowIsAnApplicationAttemptUseCallidTo')}</div>
         <div className="overflow-x-auto">
-          <table className="w-full border-collapse">
-            <thead><tr>
-              <th className={th}>{t('me.usage.colTime')}</th><th className={th}>{t('me.usage.colAgent')}</th>
-              <th className={th}>{t('me.usage.colModel')}</th><th className={th}>{t('me.usage.colIn')}</th>
-              <th className={th}>{t('me.usage.colOut')}</th><th className={th}>{translate(locale, 'settings.referenceCostKnown')}</th>
-              <th className={th}>{t('me.usage.colStatus')}</th>
-            </tr></thead>
-            <tbody>
-              {(logs?.items ?? []).map((r) => (
-                <tr key={r.id} className="border-t border-ink-100">
-                  <td className={cn(td, 'whitespace-nowrap')}>{new Date(r.createdAt).toLocaleString()}</td>
-                  <td className={td}>{r.agentName ?? '—'}</td>
-                  <td className={cn(td, 'font-mono')}>
-                    {r.actualModel || unknown}
-                    <details className="text-[11px] whitespace-normal min-w-[220px] max-w-[360px] break-words">
-                      <summary className="cursor-pointer">{translate(locale, 'settings.attemptDetails')} · #{r.attempt ?? unknown}</summary>
-                      <div>{translate(locale, 'settings.requestedModel')}: {r.requestedModel || r.model || unknown}</div>
-                      <div>{translate(locale, 'settings.actualModel')}: {r.actualModel || unknown}</div>
-                      <div>{t('settings.route')}: {r.route ?? unknown} · {t('settings.platform')}: {r.platform ? modelPlatformLabel(r.platform) : unknown}</div>
-                      <div>{t('adminobs.colSource')}: {r.source || unknown} · {t('settings.provider')}: {r.provider || unknown}</div>
-                      <div>{t('settings.purpose')}: {r.purpose || unknown}</div>
-                      <div>{t('settings.callId')}: {r.callId ?? unknown} · {t('settings.attempt')}: {r.attempt ?? unknown}</div>
-                      <div>{translate(locale, 'settings.ledgerId')}: {r.id}</div>
-                      <div>{t('settings.agentId')}: {r.agentId ?? unknown}</div>
-                      <div>{translate(locale, 'settings.sanitizedReason')}: {r.failureReason ?? unknown}</div>
-                      <div>{translate(locale, 'settings.failureStage')}: {r.failureStage ?? unknown} · HTTP: {r.httpStatus ?? unknown}</div>
-                      <div>{translate(locale, 'settings.latency')}: {r.latencyMs == null ? unknown : `${r.latencyMs} ms`}</div>
-                    </details>
-                  </td>
-                  <td className={td}>{r.measured === true ? fmtTokens(r.inputTokens) : unknown}</td>
-                  <td className={td}>{r.measured === true ? fmtTokens(r.outputTokens) : unknown}</td>
-                  <td className={td}>{r.unpriced === true ? translate(locale, 'settings.unpriced') : r.measured !== true || r.unpriced !== false ? unknown : fmtUsd(r.costUsd)}
-                    {r.costEstimated && <div>{t('me.usage.estimated')}</div>}
-                  </td>
-                  <td className={td}>
-                    <span className={cn('text-[10.5px] font-semibold px-1.5 py-0.5 rounded', r.status === 'ok' ? 'text-skype-deep bg-sky2-50' : 'text-coral-deep bg-coral-soft')}>
-                      {r.status}
-                    </span>
-                    <div className="text-[10px] whitespace-normal">{t('settings.measuredLabel')}: {r.measured === true ? translate(locale, 'settings.measured') : r.measured === false ? translate(locale, 'settings.unmeasured') : unknown}</div>
-                    <div className="text-[10px] whitespace-normal">{t('settings.unpricedLabel')}: {r.unpriced === true ? translate(locale, 'settings.unpriced') : r.unpriced === false ? translate(locale, 'settings.priced') : unknown}</div>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+          <TableVirtuoso
+            style={{ height: Math.min(420, Math.max(160, (logs?.items.length ?? 0) * 72)) }}
+            data={logs?.items ?? []}
+            increaseViewportBy={160}
+            defaultItemHeight={72}
+            components={{
+              Table: (props) => <table {...props} className="w-full border-collapse" />,
+            }}
+            fixedHeaderContent={() => (
+              <tr>
+                <th className={th}>{t('me.usage.colTime')}</th><th className={th}>{t('me.usage.colAgent')}</th>
+                <th className={th}>{t('me.usage.colModel')}</th><th className={th}>{t('me.usage.colIn')}</th>
+                <th className={th}>{t('me.usage.colOut')}</th><th className={th}>{translate(locale, 'settings.referenceCostKnown')}</th>
+                <th className={th}>{t('me.usage.colStatus')}</th>
+              </tr>
+            )}
+            itemContent={(_index, r) => (
+              <>
+                <td className={cn(td, 'whitespace-nowrap')}>{new Date(r.createdAt).toLocaleString()}</td>
+                <td className={td}>{r.agentName ?? '—'}</td>
+                <td className={cn(td, 'font-mono')}>
+                  {r.actualModel || unknown}
+                  <LogAttemptDetails r={r} locale={locale} t={t} unknown={unknown} />
+                </td>
+                <td className={td}>{r.measured === true ? fmtTokens(r.inputTokens) : unknown}</td>
+                <td className={td}>{r.measured === true ? fmtTokens(r.outputTokens) : unknown}</td>
+                <td className={td}>{r.unpriced === true ? translate(locale, 'settings.unpriced') : r.measured !== true || r.unpriced !== false ? unknown : fmtUsd(r.costUsd)}
+                  {r.costEstimated && <div>{t('me.usage.estimated')}</div>}
+                </td>
+                <td className={td}>
+                  <span className={cn('text-[10.5px] font-semibold px-1.5 py-0.5 rounded', r.status === 'ok' ? 'text-skype-deep bg-sky2-50' : 'text-coral-deep bg-coral-soft')}>
+                    {r.status}
+                  </span>
+                  <div className="text-[10px] whitespace-normal">{t('settings.measuredLabel')}: {r.measured === true ? translate(locale, 'settings.measured') : r.measured === false ? translate(locale, 'settings.unmeasured') : unknown}</div>
+                  <div className="text-[10px] whitespace-normal">{t('settings.unpricedLabel')}: {r.unpriced === true ? translate(locale, 'settings.unpriced') : r.unpriced === false ? translate(locale, 'settings.priced') : unknown}</div>
+                </td>
+              </>
+            )}
+          />
         </div>
         {logs && logs.total > logs.pageSize && (
           <div className="flex items-center gap-3 mt-3 justify-end">

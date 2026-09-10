@@ -1,9 +1,9 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { type AgentInput, api, getPairingServerOrigin, http, resolveAssetUrl } from '@/api/client'
 import { Checkbox } from '@/components/Checkbox'
 import { Combobox, type ComboboxOption } from '@/components/Combobox'
 import { Input } from '@/components/Input'
-import { AgentModelFields, CatalogStatus, EFFORT_OPTIONS, modelInteger, modelSuggestions } from '@/components/ModelFields'
+import { AgentModelFields, CatalogStatus, EFFORT_OPTIONS, modelComboboxOptions, modelInteger, modelSuggestions } from '@/components/ModelFields'
 import { Select } from '@/components/Select'
 import { TextArea } from '@/components/TextArea'
 import { agentCliCommand } from '@/lib/agentCliRelease'
@@ -13,12 +13,20 @@ import { isNativePlatform } from '@/lib/native'
 import { useAuth } from '@/stores/auth'
 import { useComputers } from '@/stores/computers'
 import { useConversations } from '@/stores/conversations'
-import { catalogSource, useModelCatalog } from '@/stores/modelCatalog'
+import { useModelCatalog } from '@/stores/modelCatalog'
 import { useParticipants } from '@/stores/participants'
 import type { AgentModelConfig, EngineId, Participant } from '@/types'
 import { AgentEditorSave, type BindingStatus, bindingReplacement, type SaveStage, type StageStatus } from './agentEditorSave'
 
 const INHERIT_ENGINE = '__inherit__'
+
+const formatAvatarError = (error: unknown, t: (key: 'agent.avatarGatewayNoAccounts') => string): string => {
+  const message = error instanceof Error ? error.message : String(error)
+  if (/no available compatible accounts|gateway group has no available accounts|没有可用账号/i.test(message)) {
+    return t('agent.avatarGatewayNoAccounts')
+  }
+  return message
+}
 
 function newCreateRequestId(): string {
   return typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
@@ -247,8 +255,17 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
   // Managed primary and fallback pickers share the full global model catalog;
   // BYOA keeps using the host engine's reported catalog (modelOptions).
   const catalogState = useModelCatalog(!isByoa && !contextChanged)
-  const catalogText = modelSuggestions(catalogState.catalog,
-    [model, agent?.model ?? ''], mcFallbacks, agent?.modelConfig?.fallbackModels ?? [],
+  const catalog = catalogState.catalog
+  const catalogText = useMemo(
+    () => modelSuggestions(catalog, [model, agent?.model ?? ''], mcFallbacks, agent?.modelConfig?.fallbackModels ?? []),
+    [catalog, model, agent?.model, mcFallbacks, agent?.modelConfig?.fallbackModels],
+  )
+  const managedModelOptions = useMemo(
+    () => [
+      { value: '', label: t('agent.followGlobalDefault') },
+      ...modelComboboxOptions(catalog, [model, agent?.model ?? ''], mcFallbacks, agent?.modelConfig?.fallbackModels ?? []),
+    ],
+    [catalog, model, agent?.model, mcFallbacks, agent?.modelConfig?.fallbackModels, locale],
   )
   const effortOptions = EFFORT_OPTIONS
 
@@ -432,7 +449,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
       setAvatarUrl(r.url)
       await useParticipants.getState().refresh()
     } catch (e) {
-      if (isCurrent()) setAvatarErr(e instanceof Error ? e.message : String(e))
+      if (isCurrent()) setAvatarErr(formatAvatarError(e, t))
     } finally {
       if (isCurrent()) setGeneratingAvatar(false)
     }
@@ -536,10 +553,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
                 ariaLabel={t('agent.modelLabel')}
                 value={model}
                 onValueChange={setModel}
-                options={[
-                  { value: '', label: t('agent.followGlobalDefault') },
-                  ...catalogText.map((m) => ({ value: m, label: m, hint: catalogSource(catalogState.catalog, m) })),
-                ]}
+                options={managedModelOptions}
                 searchPlaceholder={t('agent.searchModels')}
                 allowCustom
                 customLabel={(value) => t('agent.useCustomModel', { model: value })}

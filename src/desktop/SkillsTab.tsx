@@ -59,6 +59,7 @@ export function SkillsTab() {
       if (useAuth.getState().contextEpoch !== epoch || sequence !== localSequence.current) return
       setLocalHub(r.items)
       setLocalPath(r.path)
+      setLocalPathDraft(r.path ?? '')
     } catch (e) { if (sequence === localSequence.current) fail('local', e) }
     finally { if (current() && sequence === localSequence.current) setLocalLoading(false) }
   }, [epoch, isSiteAdmin])
@@ -91,9 +92,6 @@ export function SkillsTab() {
     active.current.clear()
     void load()
     if (isSiteAdmin) void loadLocal()
-    if (isSiteAdmin) void api.getModelSettings().then((r) => {
-      if (current()) setLocalPathDraft(r.settings.local_skillhub_path ?? '')
-    }).catch((e) => fail('path', e))
   }, [load, loadLocal, canWrite, isSiteAdmin])
 
   const run = async (key: string, source: string, fn: () => Promise<unknown>) => {

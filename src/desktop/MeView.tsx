@@ -938,16 +938,29 @@ function ComputersTab() {
       await api.requestComputerEngineDetect(id)
 
       // A paired daemon receives the request on its next heartbeat and then
-      // reports a fresh snapshot. Keep the button busy until that report lands,
-      // instead of presenting a cached GET as a completed engine refresh.
-      const deadline = Date.now() + 50_000
-      while (Date.now() < deadline) {
-        await new Promise((resolve) => window.setTimeout(resolve, 750))
-        await useComputers.getState().refresh()
-        const after = useComputers.getState().byId[id]?.enginesDetectedAt ?? null
-        if (after && after !== before) return
-      }
-      throw new Error(t('me.agentsRefreshTimedOut'))
+      // reports a fresh snapshot. Subscribe for store updates (WS / other
+      // refresh) and poll every 4s instead of a 750ms busy-loop.
+      await new Promise<void>((resolve, reject) => {
+        const timeout = window.setTimeout(() => {
+          cleanup()
+          reject(new Error(t('me.agentsRefreshTimedOut')))
+        }, 50_000)
+        const check = () => {
+          const after = useComputers.getState().byId[id]?.enginesDetectedAt ?? null
+          if (after && after !== before) {
+            cleanup()
+            resolve()
+          }
+        }
+        const unsub = useComputers.subscribe(check)
+        const poll = window.setInterval(() => { void useComputers.getState().refresh() }, 4_000)
+        const cleanup = () => {
+          window.clearTimeout(timeout)
+          window.clearInterval(poll)
+          unsub()
+        }
+        void useComputers.getState().refresh().then(check, check)
+      })
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e))
     } finally {
@@ -1355,7 +1368,6 @@ export function MeView({ initialTab = 'profile' }: { initialTab?: Tab } = {}) {
   const t = useT()
   const [tab, setTab] = useState<Tab>(initialTab)
   const hasOutdated = useComputers((s) => Object.values(s.byId).some((c) => c.daemonOutdated))
-  useEffect(() => { void useComputers.getState().refresh() }, [])
 
   return (
     <main className="min-w-0 w-full flex-1 overflow-y-auto p-4 sm:p-8 sm:pt-6 [overflow-wrap:anywhere] [&_input]:min-w-0 [&_input]:max-w-full [&_select]:min-w-0 [&_select]:max-w-full [&_.grid]:min-w-0 [&_.grid>*]:min-w-0 max-sm:[&_.grid]:grid-cols-[minmax(0,1fr)]"

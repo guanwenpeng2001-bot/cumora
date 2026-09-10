@@ -30,18 +30,39 @@ function fromApi(c: ApiComputer): Computer {
     latestDaemonVersion: c.latest_daemon_version ?? null,
     latestDaemonDownloadUrl: c.latest_daemon_download_url ?? null,
     daemonOutdated: c.daemon_outdated ?? false,
+    runtimePolicy: c.runtimePolicy,
   }
 }
 
-async function fetchInto(set: (partial: Partial<ComputersState>) => void): Promise<void> {
+function computersEqual(a: Record<string, Computer>, b: Record<string, Computer>): boolean {
+  const ids = Object.keys(b)
+  if (Object.keys(a).length !== ids.length) return false
+  for (const id of ids) {
+    if (!a[id] || JSON.stringify(a[id]) !== JSON.stringify(b[id])) return false
+  }
+  return true
+}
+
+let inflight: Promise<void> | null = null
+
+async function fetchInto(set: (partial: Partial<ComputersState> | ((s: ComputersState) => ComputersState | Partial<ComputersState>)) => void): Promise<void> {
+  if (inflight) return inflight
+  const mine = (async () => {
+    try {
+      await commitIfContextCurrent(() => api.getComputers(), (list) => {
+        const byId: Record<string, Computer> = {}
+        for (const c of list) byId[c.id] = fromApi(c)
+        set((s) => (s.loaded && computersEqual(s.byId, byId) ? s : { byId, loaded: true }))
+      })
+    } catch (err) {
+      console.warn('[computers] fetch failed', err)
+    }
+  })()
+  inflight = mine
   try {
-    await commitIfContextCurrent(() => api.getComputers(), (list) => {
-      const byId: Record<string, Computer> = {}
-      for (const c of list) byId[c.id] = fromApi(c)
-      set({ byId, loaded: true })
-    })
-  } catch (err) {
-    console.warn('[computers] fetch failed', err)
+    await mine
+  } finally {
+    if (inflight === mine) inflight = null
   }
 }
 

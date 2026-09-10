@@ -1,5 +1,6 @@
 import { type CSSProperties, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
+import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso'
 import { initialActiveIndex } from '@/lib/combobox-highlight'
 import { useT } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
@@ -20,8 +21,13 @@ export interface ComboboxOption<T extends string = string> {
   value: T
   label: string
   hint?: string
+  group?: string
   disabled?: boolean
 }
+
+type MenuRow<T extends string> =
+  | { kind: 'group'; key: string; label: string }
+  | { kind: 'option'; key: string; option: ComboboxOption<T>; optionIndex: number }
 
 interface ComboboxProps<T extends string = string> {
   value: T
@@ -61,6 +67,7 @@ export function Combobox<T extends string = string>({
   const rootRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
   const listRef = useRef<HTMLDivElement>(null)
+  const virtuosoRef = useRef<VirtuosoHandle>(null)
   const [menuStyle, setMenuStyle] = useState<CSSProperties>({})
   const [open, setOpen] = useState(false)
   const [query, setQuery] = useState('')
@@ -75,6 +82,19 @@ export function Combobox<T extends string = string>({
       o.label.toLowerCase().includes(needle) || (o.hint?.toLowerCase().includes(needle) ?? false),
     )
   }, [options, query])
+  const rows = useMemo(() => {
+    const out: Array<MenuRow<T>> = []
+    let lastGroup: string | undefined
+    const grouped = options.some((o) => o.group)
+    filtered.forEach((option, optionIndex) => {
+      if (grouped && option.group && option.group !== lastGroup) {
+        out.push({ kind: 'group', key: `g:${option.group}`, label: option.group })
+        lastGroup = option.group
+      }
+      out.push({ kind: 'option', key: option.value, option, optionIndex })
+    })
+    return out
+  }, [filtered, options])
   const customValue = allowCustom && query.trim()
     && !options.some((option) => option.value.toLowerCase() === query.trim().toLowerCase())
     ? query.trim()
@@ -88,6 +108,12 @@ export function Combobox<T extends string = string>({
     if (!open) return
     setActiveIndex(initialActiveIndex(filtered, value, query))
   }, [open, filtered, value, query, customValue])
+
+  useEffect(() => {
+    if (!open) return
+    const index = rows.findIndex((row) => row.kind === 'option' && row.optionIndex === activeIndex)
+    if (index >= 0) virtuosoRef.current?.scrollIntoView({ index, align: 'center' })
+  }, [activeIndex, open, rows])
 
   // Escape overflow containers; keep the menu within the visible viewport.
   useLayoutEffect(() => {
@@ -223,38 +249,56 @@ export function Combobox<T extends string = string>({
           id={`${id}-listbox`}
           role="listbox"
           aria-label={ariaLabel}
-          className="fixed z-[70] overflow-auto rounded-[16px] border border-sky2-100 bg-cloud p-2.5 shadow-[0_22px_55px_-24px_rgba(10,30,60,0.38),0_8px_18px_-12px_rgba(10,30,60,0.2),0_0_0_1px_rgba(255,255,255,0.72)_inset] animate-rise"
+          className="fixed z-[70] overflow-hidden rounded-[16px] border border-sky2-100 bg-cloud p-2.5 shadow-[0_22px_55px_-24px_rgba(10,30,60,0.38),0_8px_18px_-12px_rgba(10,30,60,0.2),0_0_0_1px_rgba(255,255,255,0.72)_inset] animate-rise"
         >
-          {filtered.map((option, idx) => {
-            const active = idx === activeIndex
-            const selectedOption = option.value === value
-            return (
-              <button
-                key={option.value}
-                id={`${id}-option-${idx}`}
-                type="button"
-                role="option"
-                aria-selected={selectedOption}
-                disabled={option.disabled}
-                onMouseDown={(e) => e.preventDefault()}
-                onMouseEnter={() => setActiveIndex(idx)}
-                onClick={() => commit(option)}
-                className={cn(
-                  'flex h-9 w-full items-center gap-2.5 rounded-[10px] px-3 text-left text-[12.5px] font-semibold transition disabled:cursor-not-allowed disabled:opacity-45',
-                  selectedOption
-                    ? 'bg-skype text-white shadow-[0_10px_22px_-16px_rgba(0,120,200,0.82)]'
-                    : active
-                      ? 'bg-sky2-50 text-skype-deep'
-                      : 'text-ink-700 hover:bg-sky2-50 hover:text-skype-deep',
-                )}
-              >
-                <span className="min-w-0 flex-1 truncate">{option.label}</span>
-                {option.hint && (
-                  <span className={cn('shrink-0 pl-3 text-[11.5px] tabular-nums', selectedOption ? 'text-white/80' : 'text-ink-400')}>{option.hint}</span>
-                )}
-              </button>
-            )
-          })}
+          {rows.length > 0 && (
+            <Virtuoso
+              ref={virtuosoRef}
+              data={rows}
+              style={{ height: Math.max(80, (typeof menuStyle.maxHeight === 'number' ? menuStyle.maxHeight : 288) - 20) }}
+              defaultItemHeight={36}
+              increaseViewportBy={80}
+              itemContent={(_, row) => {
+                if (row.kind === 'group') {
+                  return (
+                    <div data-combobox-group={row.label} className="px-3 py-1 text-[10.5px] font-bold uppercase tracking-wider text-ink-400">
+                      {row.label}
+                    </div>
+                  )
+                }
+                const option = row.option
+                const idx = row.optionIndex
+                const active = idx === activeIndex
+                const selectedOption = option.value === value
+                return (
+                  <button
+                    key={option.value}
+                    id={`${id}-option-${idx}`}
+                    type="button"
+                    role="option"
+                    aria-selected={selectedOption}
+                    disabled={option.disabled}
+                    onMouseDown={(e) => e.preventDefault()}
+                    onMouseEnter={() => setActiveIndex(idx)}
+                    onClick={() => commit(option)}
+                    className={cn(
+                      'flex h-9 w-full items-center gap-2.5 rounded-[10px] px-3 text-left text-[12.5px] font-semibold transition disabled:cursor-not-allowed disabled:opacity-45',
+                      selectedOption
+                        ? 'bg-skype text-white shadow-[0_10px_22px_-16px_rgba(0,120,200,0.82)]'
+                        : active
+                          ? 'bg-sky2-50 text-skype-deep'
+                          : 'text-ink-700 hover:bg-sky2-50 hover:text-skype-deep',
+                    )}
+                  >
+                    <span className="min-w-0 flex-1 truncate">{option.label}</span>
+                    {option.hint && (
+                      <span className={cn('shrink-0 pl-3 text-[11.5px] tabular-nums', selectedOption ? 'text-white/80' : 'text-ink-400')}>{option.hint}</span>
+                    )}
+                  </button>
+                )
+              }}
+            />
+          )}
           {customValue && (
             <button
               id={`${id}-option-${filtered.length}`}

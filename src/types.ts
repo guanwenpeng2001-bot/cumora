@@ -68,6 +68,16 @@ export interface Computer {
   latestDaemonDownloadUrl?: string | null
   /** True when the daemon is behind the latest version → show the upgrade banner. */
   daemonOutdated?: boolean
+  /** BYOA runtime-policy application state, when the daemon reports it. */
+  runtimePolicy?: {
+    desired: string
+    received: string | null
+    applied: string | null
+    status: 'unknown' | 'unsupported' | 'pending' | 'received' | 'applied'
+    reportedAt: string | null
+    policyHeartbeatMs: number
+    resourceSyncMs: number
+  }
 }
 
 /** Per-agent model settings (participants.model_config). All fields

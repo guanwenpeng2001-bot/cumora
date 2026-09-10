@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState } from 'react'
-import { api, type ApiComputer, type ApiModelGroup, type ApiModelRole, type ApiModelRoutePreview, type ApiModelSettings, type ApiSettingDefinition } from '@/api/client'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { api, type ApiModelGroup, type ApiModelRole, type ApiModelRoutePreview, type ApiModelSettings, type ApiSettingDefinition } from '@/api/client'
 import { modelPlatformLabel } from '@/lib/modelPlatforms'
 import { useAuth } from '@/stores/auth'
+import { useComputers } from '@/stores/computers'
 import { translate, useLocaleStore } from '@/lib/i18n'
 
 const controlClass = 'w-full rounded-lg border border-ink-100 bg-paper px-3 py-2 text-[12px] text-ink-900'
@@ -118,37 +119,23 @@ function SettingFields({ snapshot, definitions, onSaved }: { snapshot: ApiModelS
 
 export function ByoaPolicyStatus() {
   const zh = useLocaleStore(s => s.locale) === 'zh-CN'
-  const [computers, setComputers] = useState<ApiComputer[]>([])
-  const [error, setError] = useState('')
-  const [loading, setLoading] = useState(true)
-  const [refresh, setRefresh] = useState(0)
+  const byId = useComputers(s => s.byId)
+  const loaded = useComputers(s => s.loaded)
+  const computers = useMemo(() => Object.values(byId).filter(c => c.kind !== 'cloud'), [byId])
   useEffect(() => {
-    const controller = new AbortController()
-    const context = useAuth.getState()
-    let inFlight = false
-    const current = () => !controller.signal.aborted && useAuth.getState().contextEpoch === context.contextEpoch
-      && useAuth.getState().token === context.token && useAuth.getState().activeCompanyId === context.activeCompanyId
-    const load = async () => {
-      if (inFlight || !current()) return
-      inFlight = true
-      try { const result = await api.getComputers(controller.signal); if (current()) { setComputers(result.filter(c => c.kind !== 'cloud')); setError('') } }
-      catch (e) { if (current()) setError(e instanceof Error ? e.message : String(e)) }
-      finally { inFlight = false; if (current()) setLoading(false) }
-    }
-    void load()
-    const timer = setInterval(() => void load(), 30_000)
-    return () => { controller.abort(); clearInterval(timer) }
-  }, [refresh])
+    void useComputers.getState().refresh()
+    const timer = window.setInterval(() => { void useComputers.getState().refresh() }, 30_000)
+    return () => window.clearInterval(timer)
+  }, [])
   const labels = { unknown: translate(zh ? 'zh-CN' : 'en', 'settings.unknownNotReported'), unsupported: translate(zh ? 'zh-CN' : 'en', 'settings.unsupportedByOlderDaemon'), pending: translate(zh ? 'zh-CN' : 'en', 'settings.pendingReceipt'), received: translate(zh ? 'zh-CN' : 'en', 'settings.receivedAwaitingSafeBoundary'), applied: translate(zh ? 'zh-CN' : 'en', 'settings.applied') }
   return <section className="space-y-3">
     <h3 className="font-semibold">{translate(zh ? 'zh-CN' : 'en', 'settings.byoaPolicyAndDaemonApplicationVersions')}</h3>
     <p className="text-[12px] text-ink-500">{translate(zh ? 'zh-CN' : 'en', 'settings.policyDiscoveryUses30sHeartbeatsResourcesSync60sApplication')}</p>
-    <button type="button" className={buttonClass} onClick={() => setRefresh(x => x + 1)}>{translate(zh ? 'zh-CN' : 'en', 'settings.refreshApplicationStatus')}</button>
-    {error && <p role="alert" className="text-coral-deep text-[12px]">{translate(zh ? 'zh-CN' : 'en', 'settings.refreshFailedDisplayedStateMayBeStale')}{error}</p>}
-    {loading && <p>{translate(zh ? 'zh-CN' : 'en', 'settings.loading')}</p>}
-    {!loading && !computers.length && !error && <p className="text-[12px]">{translate(zh ? 'zh-CN' : 'en', 'settings.noByoaComputersInThisCompany')}</p>}
+    <button type="button" className={buttonClass} onClick={() => { void useComputers.getState().refresh() }}>{translate(zh ? 'zh-CN' : 'en', 'settings.refreshApplicationStatus')}</button>
+    {!loaded && <p>{translate(zh ? 'zh-CN' : 'en', 'settings.loading')}</p>}
+    {loaded && !computers.length && <p className="text-[12px]">{translate(zh ? 'zh-CN' : 'en', 'settings.noByoaComputersInThisCompany')}</p>}
     {computers.map(c => <div key={c.id} className="rounded-xl bg-cloud border border-ink-100 p-4 text-[12px] space-y-1 break-all">
-      <div className="font-semibold">{c.name} · daemon {c.daemon_version ?? (translate(zh ? 'zh-CN' : 'en', 'me.agentsCliUnknown'))} · {c.status}</div>
+      <div className="font-semibold">{c.name} · daemon {c.daemonVersion ?? (translate(zh ? 'zh-CN' : 'en', 'me.agentsCliUnknown'))} · {c.status}</div>
       <div>{labels[c.runtimePolicy?.status ?? 'unknown'] ?? (translate(zh ? 'zh-CN' : 'en', 'settings.unknownState'))}</div>
       <div>{translate(zh ? 'zh-CN' : 'en', 'settings.desired')}: {c.runtimePolicy?.desired ?? '—'}</div>
       <div>{translate(zh ? 'zh-CN' : 'en', 'settings.received')}: {c.runtimePolicy?.received ?? '—'}</div>
@@ -169,6 +156,7 @@ function RuntimeSettingsContent() {
   const isAdmin = useAuth(s => s.user?.isAdmin === true)
   const [snapshot, setSnapshot] = useState<ApiModelSettings | null>(null)
   const [error, setError] = useState('')
+  const [opened, setOpened] = useState<Record<string, boolean>>({})
   useEffect(() => {
     if (!isAdmin) return
     const controller = new AbortController()
@@ -176,6 +164,20 @@ function RuntimeSettingsContent() {
       .catch(e => { if (!controller.signal.aborted) setError(e instanceof Error ? e.message : String(e)) })
     return () => controller.abort()
   }, [isAdmin])
+  const onSaved = useCallback((next: ApiModelSettings) => {
+    setSnapshot(current => newerSettings(current, next))
+  }, [])
+  const definitionsByDomain = useMemo(() => {
+    const grouped: Record<string, ApiSettingDefinition[]> = {
+      automation: [], triage: [], pod: [], turn: [], operations: [], byoa: [],
+    }
+    for (const d of snapshot?.definitions ?? []) {
+      if (!d.scope) continue
+      const domain = runtimeDomain(d)
+      ;(grouped[domain] ?? grouped.pod).push(d)
+    }
+    return grouped
+  }, [snapshot])
   const domains = [ ['automation', 'settings.automationWake'], ['triage', 'settings.cerebellumTriage'], ['pod', 'settings.podSafety'], ['turn', 'settings.compactionTurn'], ['operations', 'settings.operationsRetention'], ['byoa', 'settings.byoaRuntimePolicy'] ] as const
   return <div className="space-y-6">
     <p className="text-[12px] text-ink-500">{translate(zh ? 'zh-CN' : 'en', 'settings.onlySiteAdminsCanWriteGlobalSettingsSavingInstalls')}</p>
@@ -186,9 +188,12 @@ function RuntimeSettingsContent() {
       <p className="text-[12px]">{translate(zh ? 'zh-CN' : 'en', 'settings.savedSnapshotRevision')}: {snapshot.revision ?? '—'}</p>
       {!snapshot.definitions && <p>{translate(zh ? 'zh-CN' : 'en', 'settings.olderServerLacksSettingDefinitionsEditingIsUnavailable')}</p>}
       {snapshot.diagnostics?.map(d => <p key={d} role="alert" className="text-[12px] text-coral-deep">{d}</p>)}
-      {domains.map(([domain, label]) => <details key={domain} open className="space-y-3">
+      {domains.map(([domain, label]) => <details key={domain} className="space-y-3" onToggle={(e) => {
+        const open = (e.currentTarget as HTMLDetailsElement).open
+        setOpened(s => (s[domain] === open ? s : { ...s, [domain]: open }))
+      }}>
         <summary className="font-semibold cursor-pointer">{translate(zh ? 'zh-CN' : 'en', label)}</summary>
-        <SettingFields snapshot={snapshot} definitions={snapshot.definitions?.filter(d => d.scope && runtimeDomain(d) === domain) ?? []} onSaved={next => setSnapshot(current => newerSettings(current, next))} />
+        {opened[domain] && <SettingFields snapshot={snapshot} definitions={definitionsByDomain[domain] ?? []} onSaved={onSaved} />}
       </details>)}
     </>}
     <ByoaPolicyStatus />
