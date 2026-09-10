@@ -529,6 +529,56 @@ test('resolveSpawn runs a native Windows executable without cmd.exe', { skip: !I
   assert.equal(r.wantsStdinPrompt, false)
 })
 
+test('unsandboxed Codex forwards IPC to the engine, tool environment and MCP bridge', async () => {
+  process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED = '1'
+  const previousArgs = process.env.CUMORA_CODEX_ARGS
+  const root = await mkdtemp(join(tmpdir(), 'cumora-codex-ipc-'))
+  tempDirs.push(root)
+  const binDir = join(root, 'bin')
+  const home = join(root, 'agent home')
+  await mkdir(binDir)
+  await mkdir(home)
+  const source = "process.stdin.resume(); process.stdin.on('end', () => console.log(JSON.stringify({ argv: process.argv.slice(2), ipc: process.env.CUMORA_AGENT_IPC_DIR, shim: process.env.CUMORA_AGENT_MCP_SHIM })))"
+  await writeFakeCli(binDir, 'codex', source)
+  if (IS_WIN) {
+    const packageBin = join(binDir, 'node_modules', '@openai', 'codex', 'bin')
+    await mkdir(packageBin, { recursive: true })
+    await writeFile(join(packageBin, 'codex.js'), source)
+  }
+  useFakeCliPath(binDir)
+  const ipc = join(root, 'private ipc')
+  const shim = join(root, 'trusted', 'cumora-mcp')
+  try {
+    for (const customArgs of [undefined, '--skip-git-repo-check']) {
+      if (customArgs === undefined) delete process.env.CUMORA_CODEX_ARGS
+      else process.env.CUMORA_CODEX_ARGS = customArgs
+      const logs: string[] = []
+      const result = await getAdapter('codex').run({
+        home, prompt: 'reply ok', model: null, fastModel: null,
+        env: { ...process.env, CUMORA_AGENT_IPC_DIR: ipc, CUMORA_AGENT_MCP_SHIM: shim, CUMORA_AGENT_ID: 'test-codex-01' },
+        onLog: line => logs.push(line), signal: new AbortController().signal,
+      })
+      assert.equal(result.exitCode, 0, result.error)
+      const capture = JSON.parse(logs.at(-1) ?? '{}') as { argv: string[]; ipc: string; shim: string }
+      assert.equal(capture.ipc, ipc)
+      assert.equal(capture.shim, shim)
+      const toolPolicy = capture.argv.find(arg => arg.startsWith('shell_environment_policy.set='))
+      assert.ok(toolPolicy, 'explicit tool env must survive Codex user environment filtering')
+      assert.ok(toolPolicy.includes(`CUMORA_AGENT_IPC_DIR=${JSON.stringify(ipc)}`))
+      assert.ok(toolPolicy.includes('CUMORA_AGENT_ID="test-codex-01"'))
+      assert.ok(toolPolicy.includes(`PATH=${JSON.stringify(process.env.PATH)}`))
+      assert.ok(capture.argv.some(arg => arg.startsWith('mcp_servers.cumora=')
+        && arg.includes(`args=[${JSON.stringify(shim)}]`)
+        && arg.includes(`CUMORA_AGENT_IPC_DIR=${JSON.stringify(ipc)}`)))
+      assert.equal(capture.argv.includes('--strict-config'), false)
+      assert.equal(capture.argv.includes('default_permissions="cumora"'), false)
+    }
+  } finally {
+    if (previousArgs === undefined) delete process.env.CUMORA_CODEX_ARGS
+    else process.env.CUMORA_CODEX_ARGS = previousArgs
+  }
+})
+
 test('Codex one-shot paths send prompts through stdin', async () => {
   delete process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED
   const root = await mkdtemp(join(tmpdir(), 'cumora-codex-stdin-'))

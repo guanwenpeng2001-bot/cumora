@@ -584,3 +584,33 @@ test('F17: an obsolete directory refresh cannot replace the next authorization v
   assert.equal(await tenant.tenantRoutingSnapshot(nextContext), nextSnapshot)
   assert.equal(nextSnapshot.platforms.openai.models.has('old-model'), false)
 })
+
+for (const discovery of ['cold', 'empty', 'reseller-only'] as const) test('fix-i: support DeepSeek first hop uses its native key with ' + discovery + ' discovery', async () => {
+  const gateway = gatewayFixture()
+  const query = pool.query
+  pool.query = async (sql: any, values?: any[]) => {
+    const result = await query(sql, values)
+    if (typeof sql === 'object' && sql.text.includes('owner_user_id')) {
+      result.rows[0].sub2api_api_key = JSON.stringify({ openai: 'gateway-key', deepseek: 'deepseek-key' })
+    }
+    return result
+  }
+  settings.support_model = 'deepseek-v4-flash'
+  settings.support_fallback_models = ''
+  await refreshServerSettings(true)
+  gateway.sub.listKeyModelsWithStatus = discovery === 'cold' ? () => new Promise(() => {})
+    : async (_base: string, key: string) => ({ models: new Set(discovery === 'reseller-only' && key === 'gateway-key' ? ['deepseek-v4-flash'] : []), ok: true, status: 'success' })
+  const resolver = load('llm-resolver.ts')
+  const plan = await resolver.resolveRoleCall('company-a', 'managed', 'support', 'palette')
+  assert.equal(plan.candidates.length, 1)
+  assert.equal(plan.candidates[0].route.platform, 'deepseek')
+  assert.equal(plan.candidates[0].available, true)
+  let credential: string | undefined
+  setSdkClientFactory(options => { credential = options.apiKey; return {} })
+  await load('llm.ts').getLlmCandidateClient(plan, plan.candidates[0])
+  assert.equal(credential, 'deepseek-key')
+  settings.llm_config = JSON.stringify({ version: 1, routes: [{ id: 'reseller', kind: 'gateway', platform: 'openai' }], models: [{ model: 'deepseek-v4-flash', route: 'reseller' }], roles: [] })
+  await refreshServerSettings(true)
+  const explicit = await resolver.resolveRoleCall('company-a', 'managed', 'support', 'palette')
+  assert.equal(explicit.candidates[0].route.platform, 'openai', 'explicit operator routes remain authoritative')
+})

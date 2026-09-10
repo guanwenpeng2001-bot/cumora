@@ -187,3 +187,13 @@ test('getUserQuota ignores active subscriptions past expires_at', async () => {
     restoreSub2apiTestState()
   }
 })
+
+test('DeepSeek routing survives cold, empty and reseller-only discovery without inventing access', () => {
+  for (const models of [{}, { deepseek: new Set<string>() }, { openai: new Set(['deepseek-v4-flash']) }]) {
+    assert.equal(pickPlatformForModel(models, 'deepseek-v4-flash', ['openai', 'deepseek']), 'deepseek')
+  }
+  assert.equal(pickPlatformForModel({}, ' DeepSeek-V4-Flash ', ['openai', 'deepseek']), 'deepseek')
+  assert.equal(pickPlatformForModel({}, 'deepseek-v4-flash', ['openai']), 'openai')
+  assert.equal(pickPlatformForModel({}, 'deepseekish-model', ['openai', 'deepseek']), 'openai')
+  assert.equal(pickPlatformForModel({ grok: new Set(['custom-model']) }, 'custom-model', ['openai', 'deepseek', 'grok']), 'grok')
+})

@@ -512,14 +512,15 @@ export function supportsGatewayImages(model: string): boolean {
 
 export const MODEL_PLATFORM_PRIORITY: readonly Platform[] = ['kimi', 'deepseek', 'grok', 'openai']
 
-/** Pick the platform whose model list claims `model`. Falls back to
- *  `openai` when no list claims it (unknown models keep historical
- *  behavior) or when openai is the only platform available. */
+/** Prefer the native DeepSeek pool even while discovery is cold or stale.
+ *  Other model ids use discovered ownership, then the historical fallback.
+ *  Explicit route overrides are handled by the resolver before this helper. */
 export function pickPlatformForModel(
   modelsByPlatform: Partial<Record<Platform, ReadonlySet<string>>>,
   model: string,
   available: readonly Platform[],
 ): Platform {
+  if (/^deepseek-/i.test(model.trim()) && available.includes('deepseek')) return 'deepseek'
   for (const platform of MODEL_PLATFORM_PRIORITY) {
     if (!available.includes(platform)) continue
     if (modelsByPlatform[platform]?.has(model)) return platform
