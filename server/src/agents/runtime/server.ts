@@ -39,7 +39,7 @@ import {
 } from './authorization.js'
 import { normalizeByoaSource } from './byoa-source.js'
 import { buildRuntimeArgv } from './cli-argv.js'
-import type { RuntimeTokenUsage } from './client.js'
+import type { RuntimeTokenUsage, RuntimeTriageReport } from './client.js'
 import { attachFsEndpoints } from './fs-endpoints.js'
 import { inprocClient } from './inproc-client.js'
 import { type AgentRuntimeClaims, verifyAgentToken } from './jwt.js'
@@ -487,59 +487,33 @@ runtimeRouter.post('/events', withAgent(async (c, req, res) => {
 // daemon posts it here. Identity comes from the JWT. Best-effort. (Cloud triage
 // is recorded inline in classifyInboxTriage — it never hits this route.)
 runtimeRouter.post('/triage', withAgent(async (c, req, res) => {
-  const body = req.body as {
-    source?: string
-    model?: string | null
-    actionable?: boolean
-    reason?: string | null
-    usage?: import('./client.js').RuntimeTokenUsage | null
-    daemonVersion?: string
-  } | undefined
+  const body = req.body as RuntimeTriageReport | undefined
   if ((body !== undefined && !isPlainRecord(body))
     || (body?.source !== undefined && typeof body.source !== 'string')
     || (body?.model !== undefined && body.model !== null && typeof body.model !== 'string')
+    || (body?.actualModel !== undefined && body.actualModel !== null && typeof body.actualModel !== 'string')
     || (body?.actionable !== undefined && typeof body.actionable !== 'boolean')
     || (body?.reason !== undefined && body.reason !== null && typeof body.reason !== 'string')
     || (body?.usage !== undefined && body.usage !== null && !isRuntimeTokenUsage(body.usage))
     || (body?.daemonVersion !== undefined && typeof body.daemonVersion !== 'string')) {
     res.status(400).json({ error: 'invalid triage payload' }); return
   }
-  const daemonVersion = typeof body?.daemonVersion === 'string' && body.daemonVersion.trim() ? body.daemonVersion.trim().slice(0, 32) : null
-  const source = normalizeByoaSource(body?.source)
-  void recordTriage({
-    agentId: c.sub,
-    companyId: c.companyId,
-    source,
-    model: body?.model ?? null,
-    actionable: body?.actionable === true,
-    reason: body?.reason ?? null,
-    usage: body?.usage ?? null,
-  })
-  // ALSO mirror to the universal ledger so BYOA local triage shows up next to
-  // cloud spend on the Observability page. The agent_triages row keeps the
-  // verdict / reason for the triage-economics view; llm_calls just holds the
-  // raw call shape. Same fire-and-forget discipline as recordTriage above.
-  if (body?.usage) {
-    const { recordLlmCall } = await import('../llm-ledger.js')
-    void recordLlmCall({
+  req.body = {
+    source: body?.source,
+    daemonVersion: body?.daemonVersion,
+    hops: [{
       purpose: 'inbox-triage',
-      companyId: c.companyId,
-      agentId: c.sub,
-      source,
-      model: body.model ?? '<unknown>',
-      usage: {
-        inputTokens: body.usage.inputTokens ?? 0,
-        cachedInputTokens: body.usage.cachedInputTokens ?? 0,
-        cacheCreationTokens: body.usage.cacheCreationTokens ?? 0,
-        outputTokens: body.usage.outputTokens ?? 0,
-      },
-      latencyMs: 0,
-      status: 'ok',
-      extras: { actionable: body.actionable === true, reason: (body.reason ?? '').slice(0, 200) },
-      daemonVersion,
-    })
+      callId: body?.callId,
+      model: body?.model ?? '<unknown>',
+      usage: body?.usage,
+      latencyMs: body?.latencyMs,
+      status: body?.status,
+      error: body?.error,
+      extras: { actionable: body?.actionable === true, reason: (body?.reason ?? '').slice(0, 200),
+        actualModel: body?.actualModel ?? null, role: 'support', purpose: 'inbox-triage' },
+    }],
   }
-  res.json({ ok: true })
+  await recordRuntimeLlmCalls(c, req, res)
 }))
 
 // Per-HOP trajectory for BYOA agents. The daemon's ClaudeSession /
@@ -550,7 +524,7 @@ runtimeRouter.post('/triage', withAgent(async (c, req, res) => {
 // 'byoa-codex' | 'byoa-grok' | 'byoa-cursor' | 'byoa-opencode' | 'byoa-pi').
 // The server commits the bounded batch atomically; the daemon still treats an
 // HTTP/DB failure as best-effort so observability can never break the wake.
-runtimeRouter.post('/llm-calls', withAgent(async (c, req, res) => {
+async function recordRuntimeLlmCalls(c: AuthorizedAgentRuntimeClaims, req: Request, res: Response): Promise<void> {
   const body = req.body as {
     source?: string
     /** agent-cli (npm cumora) version of the daemon emitting this batch. One
@@ -559,6 +533,7 @@ runtimeRouter.post('/llm-calls', withAgent(async (c, req, res) => {
     daemonVersion?: string
     hops?: Array<{
       purpose?: string
+      callId?: string
       runId?: string | null
       conversationId?: string | null
       model?: string
@@ -593,6 +568,10 @@ runtimeRouter.post('/llm-calls', withAgent(async (c, req, res) => {
       }
       runIds.push(hop.runId)
     }
+    const callId = hop.callId !== undefined ? hop.callId : hop.extras?.callId
+    if (callId !== undefined && (typeof callId !== 'string' || !callId.trim() || callId.length > 128)) {
+      res.status(400).json({ error: 'invalid callId' }); return
+    }
     if ((hop.purpose !== undefined && typeof hop.purpose !== 'string')
       || (hop.conversationId !== undefined && hop.conversationId !== null && typeof hop.conversationId !== 'string')
       || (hop.model !== undefined && typeof hop.model !== 'string')
@@ -612,7 +591,7 @@ runtimeRouter.post('/llm-calls', withAgent(async (c, req, res) => {
     'compaction', 'completion-verify', 'steer-summary',
   ])
   const records = hops.map((h) => {
-    const purpose = (typeof h.purpose === 'string' && KNOWN_PURPOSES.has(h.purpose) ? h.purpose : 'agent-turn') as 'agent-turn'
+    const purpose = (typeof h.purpose === 'string' && KNOWN_PURPOSES.has(h.purpose) ? h.purpose : 'agent-turn') as import('../llm-ledger.js').LlmCallPurpose
     const model = typeof h.model === 'string' && h.model ? h.model : '<unknown>'
     return {
       purpose,
@@ -631,7 +610,7 @@ runtimeRouter.post('/llm-calls', withAgent(async (c, req, res) => {
       latencyMs: typeof h.latencyMs === 'number' && Number.isFinite(h.latencyMs) ? h.latencyMs : 0,
       status: h.status ?? 'ok',
       error: h.error ?? null,
-      extras: h.extras,
+      extras: { ...h.extras, ...(h.callId !== undefined ? { callId: h.callId } : {}) } as Record<string, unknown>,
       daemonVersion,
     }
   })
@@ -640,11 +619,44 @@ runtimeRouter.post('/llm-calls', withAgent(async (c, req, res) => {
     agentId: c.sub,
     companyId: c.companyId,
     runIds,
-    task: (client) => recordLlmCallsBatch(records, client),
+    task: async (client) => {
+      const callIds = records.map((r) => r.extras.callId).filter((id): id is string => typeof id === 'string')
+      const seen = new Set<string>()
+      if (callIds.length > 0) {
+        // Serialize identified reports across both routes and server processes.
+        await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
+          [JSON.stringify(['runtime-llm-calls', c.companyId, c.sub])])
+        const existing = await client.query<{ call_id: string }>(
+          `SELECT extras->>'callId' AS call_id FROM llm_calls
+            WHERE company_id = $1 AND agent_id = $2 AND source = $3
+              AND extras->>'callId' = ANY($4::text[])`,
+          [c.companyId, c.sub, source, callIds],
+        )
+        for (const row of existing.rows) seen.add(row.call_id)
+      }
+      const pending = records.filter((r) => {
+        const id = r.extras.callId
+        if (typeof id !== 'string') return true
+        if (seen.has(id)) return false
+        seen.add(id)
+        return true
+      })
+      await recordLlmCallsBatch(pending, client)
+      return pending
+    },
   })
   if (!gate.authorized) { res.status(404).json({ error: 'agent run not found' }); return }
-  res.json({ ok: true, inserted: hops.length })
-}))
+  for (const record of gate.result ?? []) {
+    if (record.purpose === 'inbox-triage') {
+      void recordTriage({ agentId: c.sub, companyId: c.companyId, source,
+        model: record.model, actionable: record.extras.actionable === true,
+        reason: typeof record.extras.reason === 'string' ? record.extras.reason : null, usage: record.usage })
+    }
+  }
+  res.json({ ok: true, inserted: gate.result?.length ?? 0 })
+}
+
+runtimeRouter.post('/llm-calls', withAgent(recordRuntimeLlmCalls))
 
 // Heartbeat a long engine turn so the 10-min stale-run sweeper doesn't reap it.
 // BYOA emits no mid-run events (cloud does), so its daemon pings this while the

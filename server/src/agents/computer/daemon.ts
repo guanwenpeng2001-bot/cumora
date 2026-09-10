@@ -37,6 +37,7 @@ import {
   memoryIndexPathsForScope,
   uniqueProjectIds,
 } from '../memory-scope.js'
+import type { RuntimeTriageReport } from '../runtime/client.js'
 import { parseSseStream, wakeStreamWasStable } from '../runtime/sse-parse.js'
 import { parseComputerControlEvent } from './control-event.js'
 import {
@@ -2131,9 +2132,13 @@ class AgentRunner {
     await spawnPacer.gate()
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), TRIAGE_TIMEOUT_MS)
+    const callId = randomUUID()
+    const startedAt = Date.now()
+    let attempted = false
     let res: { text: string; error?: string; usage?: EngineUsage; model?: string | null }
     try {
       await mkdir(TRIAGE_DIR, { recursive: true })
+      attempted = true
       res = await this.adapter.classify({
         cwd: TRIAGE_DIR,
         prompt: `${payload.instructions}\n\n${payload.input}`,
@@ -2150,28 +2155,35 @@ class AgentRunner {
       triageSem.release()
     }
 
+    let verdict: RuntimeInboxTriageResponse
     if (res.error || !res.text.trim() || controller.signal.aborted) {
       const errText = res.error ?? 'no output'
       const limited = isRateLimited(errText)
-      return deferTriage(limited || controller.signal.aborted ? 'rate-limited' : payload.failClosed ? 'fail-closed' : 'fail-open',
+      verdict = deferTriage(limited || controller.signal.aborted ? 'rate-limited' : payload.failClosed ? 'fail-closed' : 'fail-open',
         `local triage failed (${errText.slice(0, 120)}); deferred`,
         controller.signal.aborted ? 'timeout' : limited ? 'rate-limited' : res.error ? 'classifier-error' : 'invalid-result')
+    } else {
+      const parsed = parseTriage(res.text)
+      verdict = parsed ? finalizeTriage(parsed, 'support-model-local') : deferTriage(payload.failClosed ? 'fail-closed' : 'fail-open',
+        'local triage produced no usable verdict; deferred', 'invalid-result')
     }
-    const parsed = parseTriage(res.text)
-    // A valid "don't reply" verdict (actionable:false) legitimately has no
-    // promptNote — accept it so the gate actually gates. Partial output carries
-    // a defer outcome even when its legacy actionable field can be recovered.
-    if (parsed) {
-      const verdict = finalizeTriage(parsed, 'support-model-local')
-      // Record the gate's cache-aware cost (fire-and-forget). A BYOA triage runs
-      // LOCAL + cold-session — its input is uncached, the cost this ledger exists
-      // to weigh. usage is present for Claude, Cursor, and OpenCode; absent for
-      // the current Codex/Grok one-shot classifiers.
-      void this.recordTriageUsage(token, verdict.actionable, verdict.reason, res.usage, res.model)
-      return verdict
+    if (attempted) {
+      await this.recordTriageUsage(token, {
+        callId,
+        source: `byoa-${this.adapter.id}`,
+        model: res.model || this.triageModel(),
+        actualModel: res.model || null,
+        actionable: verdict.actionable,
+        reason: verdict.reason,
+        usage: res.usage ? usageFromClaude(res.usage) : null,
+        latencyMs: Date.now() - startedAt,
+        status: verdict.outcome !== 'defer' ? 'ok' : verdict.failureCategory === 'timeout' ? 'timeout'
+          : verdict.failureCategory === 'rate-limited' ? 'rate_limited' : 'failed',
+        error: verdict.outcome === 'defer' ? verdict.failureCategory : null,
+        daemonVersion: CURRENT_VERSION,
+      })
     }
-    return deferTriage(payload.failClosed ? 'fail-closed' : 'fail-open',
-      'local triage produced no usable verdict; deferred', 'invalid-result')
+    return verdict
   }
 
   /** Triage model id for pricing, honoring the agent pin then CUMORA_TRIAGE_MODEL. Cursor,
@@ -2192,18 +2204,12 @@ class AgentRunner {
     return this.agent.model ?? '<cursor-default>'
   }
 
-  /** Post one local-triage record to the cost ledger. Best-effort. */
-  private async recordTriageUsage(token: string, actionable: boolean, reason: string, usage?: EngineUsage, model?: string | null): Promise<void> {
-    await runtimeBest(this.cfg.serverUrl, '/triage', token, {
-      source: `byoa-${this.adapter.id}`,
-      model: model || this.triageModel(),
-      actionable,
-      reason,
-      usage: usage ? usageFromClaude(usage) : null,
-      // Mirror the hop reporter — every BYOA-emitted row in llm_calls carries
-      // the daemon version that produced it.
-      daemonVersion: CURRENT_VERSION,
-    })
+  /** Post one local classification attempt; retries retain its correlation ID. */
+  private async recordTriageUsage(token: string, report: RuntimeTriageReport): Promise<void> {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (await runtimeBest(this.cfg.serverUrl, '/triage', token, report)) return
+    }
+    console.warn(`[computer] ${this.agent.id} triage report failed (callId=${report.callId})`)
   }
 
   /** Snapshot the unread inbox: the {conversationId → latest unread message id}

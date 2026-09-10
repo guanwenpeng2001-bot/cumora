@@ -85,6 +85,21 @@ export interface InboxRow {
 
 export interface ReactionSummary { emoji: string; users: string[] }
 
+/** Local classifier attempt. New fields are optional for older daemons. */
+export interface RuntimeTriageReport {
+  source?: string
+  model?: string | null
+  actualModel?: string | null
+  actionable?: boolean
+  reason?: string | null
+  usage?: RuntimeTokenUsage | null
+  daemonVersion?: string
+  callId?: string
+  latencyMs?: number
+  status?: 'ok' | 'rate_limited' | 'timeout' | 'failed'
+  error?: string | null
+}
+
 /** Cache-aware token breakdown for cost accounting (mirrors cost.ts TokenUsage;
  *  defined here so the runtime interface stays free of server-only imports). */
 export interface RuntimeTokenUsage {
