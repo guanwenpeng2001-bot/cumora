@@ -35,6 +35,13 @@
 # advertises /dev/fuse (800 slots per node in prod) plus a handful of other generic devices
 # (audio, tun, kvm) which we don't use but don't hurt.
 #
-# If the cluster runs without this plugin installed, agent Pods
-# will fail to schedule with:
-#   0/1 nodes are available: 1 Insufficient devic.es/fuse.
+# Without positive devic.es/fuse capacity the orchestrator refuses new Pods
+# with capacity_denied and installation guidance. This includes Docker Desktop:
+# enabling Kubernetes alone does not install a FUSE device plugin. Admission
+# remains fail-closed if /dev/fuse is unavailable, the API/RBAC read fails, or
+# capacity is exhausted. After fixing the plugin, the next wake reads capacity
+# again; missing-capacity failures are not cached.
+# Verify /dev/fuse exists on worker nodes and positive capacity/allocatable in
+# kubectl describe nodes. For Forbidden, check nodes get/list and namespaced
+# pods get/list permissions for the server ServiceAccount. The ClusterRoleBinding
+# subject namespace must match the server namespace (render CUMORA_NAMESPACE).

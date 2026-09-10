@@ -48,6 +48,9 @@ const KUBECTL = process.env.CUMORA_KUBECTL ?? 'kubectl'
  *  context is named differently). */
 const KUBECTL_CONTEXT = process.env.CUMORA_KUBECTL_CONTEXT
   ?? (env.NODE_ENV === 'production' ? '' : 'orbstack')
+// The upstream :dev fallback with IfNotPresent can reuse an old image without
+// this fork's bootstrap/settings contract. Deploy a built fork image and set
+// CUMORA_AGENT_COMPUTER_IMAGE to its immutable tag/digest; Compose does not build it.
 const IMAGE = process.env.CUMORA_AGENT_COMPUTER_IMAGE
   ?? 'quay.io/yetoneful/cumora-agent-computer:dev'
 /** TTL of the JWT minted at Pod-spawn time. Pods live up to
@@ -57,11 +60,11 @@ const TOKEN_TTL_SECONDS = Number(process.env.CUMORA_AGENT_TOKEN_TTL_SECONDS ?? 2
 /** K8s namespace pods land in. Default = current context's namespace. */
 const NS = process.env.CUMORA_AGENT_NAMESPACE ?? 'default'
 
-/** Rewrite a server-side URL for use inside agent pods. Pods run on the K8s
- *  network where compose service names and loopback don't resolve; they reach
- *  host services via host.docker.internal. The sub2api case swaps the
- *  compose-internal URL for its public counterpart first, so no port is
- *  hardcoded here — SUB2API_PUBLIC_URL is the pod-reachable form. */
+/** Rewrite host endpoints only for explicitly local Kubernetes deployments.
+ * Set CUMORA_POD_HOST_REWRITE=true for Compose with a local kubeconfig whose
+ * context is not named docker-desktop/orbstack; false disables rewriting.
+ * SUB2API_PUBLIC_URL must include the published host port (e.g. 8082, not
+ * Compose's internal 8080). In-cluster service DNS and sidecar loopback stay intact. */
 export function podUrl(raw: string): string {
   // An omitted optional endpoint (for example OPENAI_BASE_URL) is valid;
   // malformed non-empty values are not. Callers must not silently inject a
@@ -70,16 +73,22 @@ export function podUrl(raw: string): string {
   try {
     let target = raw
     const internal = env.SUB2API_INTERNAL_URL.replace(/\/+$/, '')
-    if (internal && target.startsWith(internal) && env.SUB2API_PUBLIC_URL) {
+    if (internal && (target === internal || target.startsWith(internal + '/') || target.startsWith(internal + '?') || target.startsWith(internal + '#')) && env.SUB2API_PUBLIC_URL) {
       target = env.SUB2API_PUBLIC_URL.replace(/\/+$/, '') + target.slice(internal.length)
     }
     const u = new URL(target)
-    if (['localhost', '127.0.0.1', '[::1]', 'db', 'redis'].includes(u.hostname)) u.hostname = 'host.docker.internal'
+    const local = process.env.CUMORA_POD_HOST_REWRITE === 'true'
+      || (process.env.CUMORA_POD_HOST_REWRITE !== 'false' && ['docker-desktop', 'orbstack'].includes(KUBECTL_CONTEXT))
+    if (local && u.hostname === 'sub2api') {
+      throw new Error('Compose sub2api requires SUB2API_PUBLIC_URL with a Pod-reachable hostname and published port (for example http://host.docker.internal:8082)')
+    }
+    if (local && ['localhost', '127.0.0.1', '[::1]', 'db', 'redis'].includes(u.hostname)) u.hostname = 'host.docker.internal'
     const out = u.toString()
     return target.endsWith('/') || !out.endsWith('/') ? out : out.slice(0, -1)
   } catch (cause) {
     const detail = cause instanceof Error ? cause.message : String(cause)
-    throw new Error('invalid pod URL ' + JSON.stringify(raw) + ': ' + detail)
+    // Never echo raw URLs: they may contain database passwords or API tokens.
+    throw new Error('invalid pod URL configuration: ' + (detail.startsWith('Compose sub2api requires') ? detail : 'expected a valid absolute URL'))
   }
 }
 /** Comma-separated list of imagePullSecrets to attach to the agent
@@ -449,13 +458,13 @@ ${indent(podUrl(env.REDIS_URL))}
 ${indent(env.NOVITA_API_KEY)}
     - name: NOVITA_BASE_URL
       value: |-
-${indent(env.NOVITA_BASE_URL)}
+${indent(podUrl(env.NOVITA_BASE_URL))}
     - name: ORCAROUTER_API_KEY
       value: |-
 ${indent(env.ORCAROUTER_API_KEY)}
     - name: ORCAROUTER_BASE_URL
       value: |-
-${indent(env.ORCAROUTER_BASE_URL)}
+${indent(podUrl(env.ORCAROUTER_BASE_URL))}
     - name: DATABASE_URL
       value: |-
 ${indent(podUrl(env.DATABASE_URL))}
@@ -633,7 +642,7 @@ export async function getClusterFuseUtilization(appCap = automationNumber('pod_a
       ratio: 1,
       cached: false,
       capacityKnown: false,
-      capacityError: detail || 'kubectl could not read cluster capacity',
+      capacityError: (detail || 'kubectl could not read cluster capacity') + '; check API connectivity and the server ServiceAccount RBAC: nodes get/list and pods get/list in CUMORA_AGENT_NAMESPACE',
     }
   }
   try {
@@ -653,7 +662,7 @@ export async function getClusterFuseUtilization(appCap = automationNumber('pod_a
       ratio: 1,
       cached: false,
       capacityKnown: false,
-      capacityError: 'no devic.es/fuse capacity was advertised by any node',
+      capacityError: 'no usable devic.es/fuse capacity advertised; install/configure the FUSE device plugin (server/k8s/generic-device-plugin.note), verify /dev/fuse on the worker nodes, then verify positive devic.es/fuse capacity with kubectl describe nodes; Docker Desktop Kubernetes does not install this plugin automatically',
     }
   }
   const cap = appCap > 0 ? Math.min(parsed.cap, appCap) : parsed.cap
@@ -679,15 +688,27 @@ const POD_ADMISSION_LOCK_KEY = 7_643_178_926_307n
 async function withPodAdmissionLease<T>(fn: () => Promise<T>): Promise<T> {
   const client = await pool.connect()
   let locked = false
+  let discard = true
   try {
-    await client.query('SELECT pg_advisory_lock($1::bigint)', [POD_ADMISSION_LOCK_KEY.toString()])
+    // Never wait in PostgreSQL while another replica spends up to 135s in
+    // kubectl apply. A busy lease returns capacity_denied for bounded wake retry.
+    const result = await client.query('SELECT pg_try_advisory_lock($1::bigint) AS locked', [POD_ADMISSION_LOCK_KEY.toString()])
+    discard = false
+    if (result.rows[0]?.locked !== true) throw new Error('pod admission lease busy; retry on the next wake')
     locked = true
     return await fn()
   } finally {
     if (locked) {
-      await client.query('SELECT pg_advisory_unlock($1::bigint)', [POD_ADMISSION_LOCK_KEY.toString()]).catch(() => { /* connection release unlocks it */ })
+      try {
+        const result = await client.query('SELECT pg_advisory_unlock($1::bigint) AS unlocked', [POD_ADMISSION_LOCK_KEY.toString()])
+        discard = result.rows[0]?.unlocked !== true
+      } catch {
+        discard = true
+      }
+      if (discard) console.warn('[orchestrator] admission lease unlock failed; destroying connection')
     }
-    client.release()
+    // Returning a session to the pool does NOT release its advisory locks.
+    client.release(discard)
   }
 }
 
@@ -897,6 +918,9 @@ export async function ensurePod(agentId: string, initialTriage?: InitialInboxTri
         })
       }
       return result
+    } catch {
+      console.warn(`[orchestrator] ${agentId} Pod preparation failed; check Pod URL/bootstrap configuration`)
+      return { created: false, ok: false, code: 'pod_apply_failed', reason: 'Pod preparation failed; check Pod URL/bootstrap configuration, including SUB2API_PUBLIC_URL for Compose and CUMORA_POD_HOST_REWRITE for local Kubernetes' }
     } finally {
       if (watchdogTimer) clearTimeout(watchdogTimer)
       inFlight.delete(agentId)
@@ -911,24 +935,38 @@ async function ensurePodImpl(agentId: string, signal: AbortSignal, initialTriage
   // This is the final authorization boundary for managed execution. Scheduler
   // lookups are advisory only: assignment/tier can change between a wake and
   // this call, and other callers may invoke ensurePod directly.
+  const cleanupDenied = async (denied: EnsurePodResult): Promise<EnsurePodResult> => {
+    // A lookup failure is not evidence of revoked placement; never delete for it.
+    if (denied.ok || denied.code !== 'placement_denied' || signal.aborted) return denied
+    const reap = await kubectlWithRetry(
+      ['delete', 'pods', '-l', `app=cumora-agent,cumora.agent=${dnsLabelValue(safeName(agentId).replace(/^agent-/, '') || 'unknown')}`, '--ignore-not-found=true', '--wait=false'],
+      { timeoutMs: 20_000, signal },
+    )
+    if (reap.code !== 0) {
+      console.warn(`[orchestrator] ${agentId} placement cleanup failed: ${(reap.err || reap.out).trim()}`)
+      return { created: false, ok: false, code: 'pod_reap_failed', reason: 'placement denied; managed Pod cleanup failed: ' + (reap.err || reap.out).trim() }
+    }
+    fuseUtilCache = null
+    return denied
+  }
   const initialPlacement = await verifyManagedPodPlacement(agentId)
   if (!initialPlacement.ok) {
-    return { created: false, ...initialPlacement }
+    return cleanupDenied({ created: false, ...initialPlacement })
   }
   const recheckPlacement = async (): Promise<EnsurePodResult | null> => {
     const current = await verifyManagedPodPlacement(agentId)
-    if (!current.ok) return { created: false, ...current }
+    if (!current.ok) return cleanupDenied({ created: false, ...current })
     if (
       current.companyId !== initialPlacement.companyId
       || current.computerId !== initialPlacement.computerId
       || current.runtimeAssignmentId !== initialPlacement.runtimeAssignmentId
     ) {
-      return {
+      return cleanupDenied({
         created: false,
         ok: false,
         code: 'placement_denied',
         reason: 'managed pod denied: agent placement changed during preparation',
-      }
+      })
     }
     return null
   }
@@ -1003,10 +1041,15 @@ async function ensurePodImpl(agentId: string, signal: AbortSignal, initialTriage
     }
     const denied = await recheckPlacement()
     if (denied) return denied
-    await kubectlWithRetry(
+    const reap = await kubectlWithRetry(
       ['delete', 'pod', podName(agentId), '--ignore-not-found=true', '--wait=true', '--timeout=30s'],
       { timeoutMs: 40_000, signal },
     )
+    if (reap.code !== 0) {
+      const reason = `pod reap failed (was ${h.phase}): ${(reap.err || reap.out).trim()}`
+      console.warn(`[orchestrator] ${agentId} ${reason}`)
+      return { created: false, ok: false, code: 'pod_reap_failed', reason }
+    }
   }
 
   const persona = await inprocClient.loadPersona(agentId).catch(() => null)
@@ -1090,6 +1133,7 @@ async function ensurePodImpl(agentId: string, signal: AbortSignal, initialTriage
     const threshold = Number(settings.pod_fuse_threshold)
     const fuse = await getClusterFuseUtilization(Number(settings.pod_admission_max))
     if (!fuse.capacityKnown) {
+      console.warn(`[orchestrator] ${agentId} FUSE admission denied: ${fuse.capacityError}`)
       return {
         podApply: null,
         denied: {
@@ -1115,7 +1159,11 @@ async function ensurePodImpl(agentId: string, signal: AbortSignal, initialTriage
       podApply: await kubectlWithRetry(['apply', '-f', '-'], { stdin: manifest, timeoutMs: 45_000, signal }),
       denied: null,
     }
-  })
+  }).catch(() => ({
+    podApply: null,
+    denied: { created: false as const, ok: false as const, code: 'capacity_denied' as const,
+      reason: 'Pod admission lease unavailable or busy; retry on the next wake; check database connectivity if persistent' },
+  }))
   if (admission.denied) return admission.denied
   const podApply = admission.podApply
   if (podApply.code !== 0) {

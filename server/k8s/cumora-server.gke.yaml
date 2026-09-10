@@ -22,7 +22,12 @@
 #     registry holds the cumora-server / cumora-agent-computer images)
 #
 # Apply:
-#   kubectl apply -f server/k8s/cumora-server.gke.yaml
+#   export CUMORA_NAMESPACE=default # set to the server ServiceAccount namespace
+#   # Create the namespace and required Secrets in that namespace first.
+#   envsubst '${CUMORA_NAMESPACE}' < server/k8s/cumora-server.gke.yaml | kubectl apply -f -
+# This is a template: render CUMORA_NAMESPACE before applying. Using kubectl -n
+# alone cannot rewrite the cluster-scoped binding's ServiceAccount subject.
+# FUSE device plugin is required; see server/k8s/generic-device-plugin.note.
 ---
 # ServiceAccount with Workload Identity annotation binding to the
 # GCP IAM service account that holds Cloud SQL Client (and any
@@ -30,6 +35,7 @@
 apiVersion: v1
 kind: ServiceAccount
 metadata:
+  namespace: ${CUMORA_NAMESPACE}
   name: cumora-server
   annotations:
     # REPLACE: project-id + service-account email
@@ -38,6 +44,7 @@ metadata:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
+  namespace: ${CUMORA_NAMESPACE}
   name: cumora-server-agent-pods
 rules:
 - apiGroups: [""]
@@ -77,7 +84,7 @@ metadata:
 subjects:
 - kind: ServiceAccount
   name: cumora-server
-  namespace: default
+  namespace: ${CUMORA_NAMESPACE}
 roleRef:
   kind: ClusterRole
   name: cumora-server-node-read
@@ -86,6 +93,7 @@ roleRef:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
+  namespace: ${CUMORA_NAMESPACE}
   name: cumora-server-agent-pods
 subjects:
 - kind: ServiceAccount
@@ -100,6 +108,7 @@ roleRef:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
+  namespace: ${CUMORA_NAMESPACE}
   name: cumora-server
   labels: { app: cumora-server }
 spec:
@@ -157,15 +166,14 @@ spec:
         - secretRef: { name: cumora }
         env:
         # Agent pods reach the server via cluster-internal DNS.
-        # If you deploy to a non-default namespace, change `default`
-        # to that namespace below.
+        # CUMORA_NAMESPACE also sets the server ServiceAccount binding.
         - name: AGENT_RUNTIME_SERVER_URL
-          value: "http://cumora-server.default.svc.cluster.local:5181/runtime"
+          value: "http://cumora-server.${CUMORA_NAMESPACE}.svc.cluster.local:5181/runtime"
         # Where agent-computer pods land. Recommended: a dedicated
         # namespace (`cumora-agents`) with its own RBAC scope. Make
         # sure the Role above is bound in THAT namespace too.
         - name: CUMORA_AGENT_NAMESPACE
-          value: "default"
+          value: "${CUMORA_NAMESPACE}"
         # Image for agent-computer pods. Must be pushed to a registry
         # reachable from the cluster (and pull-secret-able if private).
         - name: CUMORA_AGENT_COMPUTER_IMAGE
@@ -196,6 +204,7 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
+  namespace: ${CUMORA_NAMESPACE}
   name: cumora-server
   labels: { app: cumora-server }
 spec:
@@ -210,6 +219,7 @@ spec:
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
+  namespace: ${CUMORA_NAMESPACE}
   name: cumora-server
 spec:
   minAvailable: 1

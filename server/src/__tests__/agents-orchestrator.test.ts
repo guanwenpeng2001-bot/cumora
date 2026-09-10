@@ -431,7 +431,7 @@ test('podManifest: well-formed inputs produce a parseable manifest with the slug
     image: 'quay.io/img:tag',
     serverUrl: 'http://server/runtime',
     openaiKey: 'sk-abc',
-    openaiBaseUrl: 'https://sub2api/v1',
+    openaiBaseUrl: 'https://gateway.example/v1',
     idleMs: 600_000,
     noWorkMs: 90_000,
   })

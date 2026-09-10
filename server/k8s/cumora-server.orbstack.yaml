@@ -12,7 +12,12 @@
 #     --from-literal=OPENAI_API_KEY='sk-...' \
 #     --from-literal=AGENT_RUNTIME_SECRET="$(openssl rand -hex 32)"
 #
-#   kubectl apply -f server/k8s/cumora-server.orbstack.yaml
+#   export CUMORA_NAMESPACE=default # set to the server ServiceAccount namespace
+#   # Create the namespace and required Secrets in that namespace first.
+#   envsubst '${CUMORA_NAMESPACE}' < server/k8s/cumora-server.orbstack.yaml | kubectl apply -f -
+# This is a template: render CUMORA_NAMESPACE before applying. Using kubectl -n
+# alone cannot rewrite the cluster-scoped binding's ServiceAccount subject.
+# FUSE device plugin is required; see server/k8s/generic-device-plugin.note.
 #
 # OrbStack-isms baked in here:
 #   - PG/Redis URLs in the Secret use host.docker.internal
@@ -28,11 +33,13 @@
 apiVersion: v1
 kind: ServiceAccount
 metadata:
+  namespace: ${CUMORA_NAMESPACE}
   name: cumora-server
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
+  namespace: ${CUMORA_NAMESPACE}
   name: cumora-server-agent-pods
 rules:
 - apiGroups: [""]
@@ -60,7 +67,7 @@ metadata:
 subjects:
 - kind: ServiceAccount
   name: cumora-server
-  namespace: default
+  namespace: ${CUMORA_NAMESPACE}
 roleRef:
   kind: ClusterRole
   name: cumora-server-node-read
@@ -69,6 +76,7 @@ roleRef:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
+  namespace: ${CUMORA_NAMESPACE}
   name: cumora-server-agent-pods
 subjects:
 - kind: ServiceAccount
@@ -84,6 +92,7 @@ roleRef:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
+  namespace: ${CUMORA_NAMESPACE}
   name: cumora-server
   labels: { app: cumora-server }
 spec:
@@ -107,11 +116,11 @@ spec:
         # The agent-computer pod reaches the server via this URL.
         # When server runs IN the cluster, use the service DNS;
         # when server runs on the host, agents reach it via
-        # host.docker.internal (orchestrator's default).
+        # host.docker.internal (configure explicitly for host services).
         - name: AGENT_RUNTIME_SERVER_URL
-          value: "http://cumora-server.default.svc.cluster.local:5181/runtime"
+          value: "http://cumora-server.${CUMORA_NAMESPACE}.svc.cluster.local:5181/runtime"
         - name: CUMORA_AGENT_NAMESPACE
-          value: "default"
+          value: "${CUMORA_NAMESPACE}"
         - name: WORKSPACE_RUNTIME_CLEANUP_ENABLED
           value: "true"
         # In-cluster PG is also reachable via the service URL above
@@ -135,6 +144,7 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
+  namespace: ${CUMORA_NAMESPACE}
   name: cumora-server
   labels: { app: cumora-server }
 spec:

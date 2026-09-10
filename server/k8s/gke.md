@@ -218,9 +218,16 @@ After replacing `REPLACE-*` placeholders in
 # against the same DATABASE_URL before starting application replicas. The
 # production Deploy workflow creates and verifies this one-shot Job for you.
 npm run migrate
-kubectl apply -f server/k8s/cumora-server.gke.yaml
-kubectl rollout status deployment/cumora-server
+export CUMORA_NAMESPACE=default # or the namespace prepared for the server
+envsubst '${CUMORA_NAMESPACE}' < server/k8s/cumora-server.gke.yaml | kubectl apply -f -
+kubectl -n "$CUMORA_NAMESPACE" rollout status deployment/cumora-server
 ```
+
+The YAML is a namespace template. Render it with `envsubst` as above; `kubectl -n`
+alone does not change a ClusterRoleBinding subject. The namespace must already
+exist, with the `cumora` and `quay-pull` Secrets and Workload Identity binding
+prepared for that namespace. `CUMORA_NAMESPACE` sets the server ServiceAccount,
+its RBAC subject, all namespaced resources, the runtime URL and agent namespace.
 
 The application Pods only read `schema_migrations` and refuse to start outside
 their supported version range. They never execute DDL during startup.
@@ -253,8 +260,9 @@ kubectl logs agent-<id>
 ## What to keep in mind
 
 - **Cluster-internal DNS in the Deployment env** —
-  `AGENT_RUNTIME_SERVER_URL` uses `cumora-server.default.svc.cluster.local`.
-  Change `default` if you deploy to a different namespace.
+  `AGENT_RUNTIME_SERVER_URL` uses the rendered `CUMORA_NAMESPACE` in
+  `cumora-server.<namespace>.svc.cluster.local`. GKE URLs are not rewritten
+  to `host.docker.internal`; leave `CUMORA_POD_HOST_REWRITE` unset or false.
 - **Agent pod namespace** — `CUMORA_AGENT_NAMESPACE` env on the
   server container picks where agent pods land. For prod separate
   them into a dedicated namespace (e.g. `cumora-agents`) and

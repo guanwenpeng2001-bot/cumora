@@ -1,4 +1,5 @@
 import { test } from 'node:test'
+import { createRequire } from 'node:module'
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
@@ -34,4 +35,27 @@ test('production deploy migrates before one atomic Deployment mutation', async (
   assert.match(workflow, /kind:\s*"Job"/)
   assert.match(workflow, /Candidate database migration did not complete; deployment was not mutated/)
   assert.match(workflow, /\{ name: "migrate", "\$patch": "delete" \}/)
+})
+
+test('K8s templates render server namespace consistently for RBAC and agent URLs', async () => {
+  const { loadAll } = createRequire(import.meta.url)('js-yaml') as { loadAll: (yaml: string) => Array<Record<string, any>> }
+  for (const variant of ['gke', 'orbstack']) {
+    const template = await readRepo('server/k8s/cumora-server.' + variant + '.yaml')
+    for (const namespace of ['default', 'cumora-staging']) {
+      const rendered = template.replaceAll('$' + '{CUMORA_NAMESPACE}', namespace)
+      const docs = loadAll(rendered).filter(Boolean)
+      assert.equal(docs.length, variant === 'gke' ? 8 : 7)
+      for (const doc of docs) {
+        if (!doc.kind.startsWith('Cluster')) assert.equal(doc.metadata.namespace, namespace)
+      }
+      const binding = docs.find(doc => doc.kind === 'ClusterRoleBinding')!
+      const sa = docs.find(doc => doc.kind === 'ServiceAccount')!
+      assert.equal(binding.subjects[0].namespace, sa.metadata.namespace)
+      assert.equal(binding.subjects[0].name, sa.metadata.name)
+      const deployment = docs.find(doc => doc.kind === 'Deployment')!
+      const server = deployment.spec.template.spec.containers.find((c: { name: string }) => c.name === 'server')
+      assert.ok(server.env.some((e: { name: string; value: string }) => e.name === 'CUMORA_AGENT_NAMESPACE' && e.value === namespace))
+      assert.ok(server.env.some((e: { name: string; value: string }) => e.name === 'AGENT_RUNTIME_SERVER_URL' && e.value === 'http://cumora-server.' + namespace + '.svc.cluster.local:5181/runtime'))
+    }
+  }
 })

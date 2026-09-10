@@ -175,13 +175,12 @@ test('Pod wake and 30s probe respect a 120s defer boundary; deadline retries wit
   assert.equal(f.calls.length, 1)
   assert.deepEqual(f.pod.state.inboxDeferred.messageIds, ['old'])
   f.advance(30_000)
-  f.inbox([{ id: 'old' }, { id: 'new' }])
   await f.pod.drain('a', { trigger: 'message.new' })
   f.pod.startInboxProbe('a')
   const probe = f.timers.find(t => t.interval && t.ms === 30_000)!
   probe.fn()
   await flushDrain()
-  assert.equal(f.calls.length, 1, 'neither new messages nor probes bypass the deadline')
+  assert.equal(f.calls.length, 1, 'duplicate wakes and probes do not bypass the unchanged boundary')
   f.run(async () => {})
   f.advance(90_000)
   f.timers.find(t => !t.interval && !t.cleared)!.fn()
@@ -242,3 +241,22 @@ test('Pod retry timer is scheduled outside the completed turn settings context',
   const retry = f.timers.find(t => !t.interval && !t.cleared)!
   assert.equal(retry.context, undefined, 'timer must not pin the old turn revision')
 })
+
+for (const source of ['wake', 'probe']) {
+  test(`Pod new human message bypasses old defer through ${source}`, async () => {
+    const f = drainFixture()
+    await f.pod.drain('a')
+    f.advance(30_000)
+    f.inbox([{ id: 'old' }, { id: 'human-new' }])
+    f.run(async () => {})
+    if (source === 'wake') await f.pod.drain('a', { trigger: 'message.new' })
+    else {
+      f.pod.startInboxProbe('a')
+      f.timers.find(t => t.interval && t.ms === 30_000)!.fn()
+      await flushDrain()
+    }
+    assert.equal(f.calls.length, 2)
+    assert.equal(f.pod.state.inboxDeferred, null)
+    assert.ok(f.timers[0].cleared)
+  })
+}

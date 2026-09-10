@@ -275,7 +275,7 @@ test('manifest round-trips bootstrap and never transmits the server signing secr
   const exports: { podManifest?: (args: unknown) => string } = {}
   const names = ['podManifest', 'podUrl', 'yamlQuote', 'dnsLabelValue', 'safeName', 'podName']
   runInNewContext(transpile(functionsFrom('agents/runtime/orchestrator', names)), {
-    exports, URL, randomBytes, env: main.env.env, PULL_SECRETS: [], POD_SERVICE_ACCOUNT: '',
+    exports, URL, randomBytes, process: { env: {} }, KUBECTL_CONTEXT: '', env: main.env.env, PULL_SECRETS: [], POD_SERVICE_ACCOUNT: '',
     CHROME_PROFILE_ON_PVC: false, CHROME_PVC_SIZE: '500Mi',
     getBrainModel: main.settings.getBrainModel, getSupportModel: main.settings.getSupportModel,
     getCompactionModel: main.settings.getCompactionModel, agentReasoningEffort: () => 'low',
