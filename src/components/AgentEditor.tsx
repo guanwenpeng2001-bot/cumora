@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { api, getPairingServerOrigin, resolveAssetUrl, type AgentInput } from '@/api/client'
+import { api, http, getPairingServerOrigin, resolveAssetUrl, type AgentInput } from '@/api/client'
 import { FallbackChainEditor, CatalogStatus, EFFORT_OPTIONS, modelInteger } from '@/components/ModelFields'
 import { useModelCatalog, catalogOptions, catalogSource } from '@/stores/modelCatalog'
 import { Checkbox } from '@/components/Checkbox'
@@ -57,6 +57,9 @@ interface Props {
 export function AgentEditor({ agent, onClose, onSaved }: Props) {
   const t = useT()
   const editing = agent !== null
+  const canWrite = useAuth((s) => ['owner', 'admin'].includes(s.companies.find((c) => c.id === s.activeCompanyId)?.role ?? ''))
+  const [savedAgentId, setSavedAgentId] = useState<string | null>(null)
+  const [resourceRefresh, setResourceRefresh] = useState(0)
   const locale = useLocaleStore((s) => s.locale)
   const copy = locale === 'zh-CN' ? {
     loading: '正在加载绑定…', loadError: '读取失败；保存档案不会替换此区绑定。',
@@ -118,7 +121,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
   // enablement, create mode saves after creation.
   const [skillChoices, setSkillChoices] = useState<Array<{ id: string; name: string; description: string }>>([])
   const [skillChecked, setSkillChecked] = useState<Set<string>>(new Set())
-  const [connectorChoices, setConnectorChoices] = useState<Array<{ id: string; name: string; type: 'stdio' | 'http' }>>([])
+  const [connectorChoices, setConnectorChoices] = useState<Array<{ id: string; name: string; type: 'stdio' | 'http'; globallyEnabled: boolean }>>([])
   const [connectorChecked, setConnectorChecked] = useState<Set<string>>(new Set())
   const [skillStatus, setSkillStatus] = useState<BindingStatus>('loading')
   const [connectorStatus, setConnectorStatus] = useState<BindingStatus>('loading')
@@ -158,12 +161,12 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
     parentSignal.addEventListener('abort', abort)
     setConnectorStatus('loading')
     const load = editing && agent
-      ? api.getAgentMcpConnectors(agent.id, controller.signal).then((r) => r.items.map((x) => ({ id: x.connector.id, name: x.connector.name, type: x.connector.type, enabled: x.enabled })))
-      : api.getMcpConnectors(controller.signal).then((r) => r.items.filter((x) => x.enabled).map((x) => ({ id: x.id, name: x.name, type: x.type, enabled: false })))
+      ? api.getAgentMcpConnectors(agent.id, controller.signal).then((r) => r.items.map((x) => ({ id: x.connector.id, name: x.connector.name, type: x.connector.type, globallyEnabled: x.connector.enabled, enabled: x.enabled })))
+      : api.getMcpConnectors(controller.signal).then((r) => r.items.map((x) => ({ id: x.id, name: x.name, type: x.type, globallyEnabled: x.enabled, enabled: false })))
     void load.then((items) => {
       if (controller.signal.aborted || !isCurrent()) return
       const initial = new Set(items.filter((x) => x.enabled).map((x) => x.id))
-      setConnectorChoices(items.map(({ id, name, type }) => ({ id, name, type })))
+      setConnectorChoices(items.map(({ id, name, type, globallyEnabled }) => ({ id, name, type, globallyEnabled })))
       setConnectorInitial(initial)
       setConnectorChecked(new Set(initial))
       setConnectorStatus('ready')
@@ -263,7 +266,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
     setRepairCopied(false)
     setRepairErr(null)
     setRepairCode(null)
-    if (!selectedComputerOffline || !selectedComputer || !isCurrent() || save.current) return
+    if (!canWrite || !selectedComputerOffline || !selectedComputer || !isCurrent() || save.current) return
 
     let cancelled = false
     void api.repairComputer(selectedComputer.id)
@@ -272,7 +275,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
         if (!cancelled) setRepairErr(e instanceof Error ? e.message : String(e))
       })
     return () => { cancelled = true }
-  }, [selectedComputer?.id, selectedComputerOffline])
+  }, [selectedComputer?.id, selectedComputerOffline, canWrite])
   useEffect(() => {
     if (!repairCopied) return
     const t = window.setTimeout(() => setRepairCopied(false), 1600)
@@ -303,13 +306,13 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
 
   // Esc to close
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') { onClose(); if (savedAgentId) onSaved?.() } }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [onClose])
+  }, [onClose, onSaved, savedAgentId])
 
   const submit = async () => {
-    if (submitting.current || generatingAvatar || !isCurrent()) return
+    if (!canWrite || savedAgentId || submitting.current || generatingAvatar || !isCurrent()) return
     submitting.current = true
     setErr(null)
     setBusy(true)
@@ -371,25 +374,22 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
           } : undefined,
           expectedEngine: (!editing || assignmentChanged) && isByoaTarget ? pinned : undefined,
           engineError: t('agent.enginePinRejected', { engine: engineLabel(pinned ?? 'managed') }),
-          skills: bindingReplacement(skillStatus, skillInitial, skillChecked),
-          mcp: bindingReplacement(connectorStatus, connectorInitial, connectorChecked),
+          skills: canWrite ? bindingReplacement(skillStatus, skillInitial, skillChecked) : null,
+          mcp: canWrite ? bindingReplacement(connectorStatus, connectorInitial, connectorChecked) : null,
         })
       }
       const attempt = save.current
       const completed = await attempt.run(api, isCurrent, () => {
         setProgress({ ...attempt.stages })
+        setResourceRefresh((n) => n + 1)
         if (attempt.stages.skills === 'saved') setSkillInitial(new Set(attempt.snapshot.skills!))
         if (attempt.stages.mcp === 'saved') setConnectorInitial(new Set(attempt.snapshot.mcp!))
       }, requests.current.signal)
       if (!completed || !isCurrent()) return
-      save.current = null
-      onClose()
-      if (onSaved) {
-        onSaved()
-      } else {
-        void useParticipants.getState().refresh()
-        void useConversations.getState().reload()
-      }
+      setSavedAgentId(attempt.agentId!)
+      setResourceRefresh((n) => n + 1)
+      void useParticipants.getState().refresh()
+      void useConversations.getState().reload()
     } catch (e) {
       if (isCurrent()) setErr(e instanceof Error ? e.message : String(e))
     } finally {
@@ -398,10 +398,15 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
     }
   }
 
+  const close = () => {
+    onClose()
+    if (savedAgentId) onSaved?.()
+  }
+
   const initial = (name || agent?.id || '?').charAt(0).toUpperCase()
 
   const generateAvatar = async () => {
-    if (!editing || !agent || !isCurrent() || submitting.current || save.current || generatingAvatar) return
+    if (!canWrite || !editing || !agent || !isCurrent() || submitting.current || save.current || generatingAvatar) return
     setAvatarErr(null)
     setGeneratingAvatar(true)
     try {
@@ -423,7 +428,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
     <div
       className="fixed inset-0 z-50 grid place-items-center p-6"
       style={{ background: 'rgba(15, 30, 50, 0.55)', backdropFilter: 'blur(6px)' }}
-      onClick={onClose}
+      onClick={close}
     >
       <div
         className="bg-cloud rounded-[18px] shadow-pop w-full max-w-[560px] max-h-[90vh] flex flex-col overflow-hidden"
@@ -449,13 +454,13 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
           </div>
           <button
             type="button"
-            onClick={onClose}
+            onClick={close}
             className="w-8 h-8 rounded-full grid place-items-center text-ink-500 hover:bg-sky2-50 hover:text-ink-900 transition"
             aria-label={t('common.close')}
           >×</button>
         </div>
 
-        <fieldset disabled={busy || !!progress || contextChanged || generatingAvatar} className="px-6 py-5 space-y-4 overflow-y-auto flex-1 min-h-0">
+        <fieldset disabled={!canWrite || busy || !!progress || contextChanged || generatingAvatar} className="px-6 py-5 space-y-4 overflow-y-auto flex-1 min-h-0">
           <Field label={t('agent.nameLabel')} hint={t('agent.nameHint')}>
             <Input
               type="text"
@@ -632,8 +637,10 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
               {skillStatus === 'ready' && skillChoices.map((sk) => (
                 <Checkbox
                   key={sk.id}
+                  disabled={!canWrite}
                   checked={skillChecked.has(sk.id)}
                   onCheckedChange={(next) => {
+                    if (!canWrite) return
                     setSkillChecked((prev) => {
                       const copy = new Set(prev)
                       if (next) copy.add(sk.id)
@@ -656,14 +663,16 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
               {connectorStatus === 'error' && <button type="button" className="ml-2 underline" onClick={() => setConnectorReload((n) => n + 1)}>{copy.retryLoad}</button>}
             </div>
             <div className="text-[10.5px] text-ink-400 italic mb-1.5">
-              {isByoa ? t('agent.connectorsByoaNote') : t('agent.connectorsManagedNote')}
+              {locale === 'zh-CN' ? '勾选以绑定；取消勾选并保存会从此 Agent 解绑。全局启用/禁用请前往连接器设置。' : 'Check to bind; uncheck and save to unbind from this agent. Enable or disable globally in connector settings.'}
             </div>
             <div className="space-y-1">
               {connectorStatus === 'ready' && connectorChoices.map((c) => (
                 <Checkbox
                   key={c.id}
+                  disabled={!canWrite}
                   checked={connectorChecked.has(c.id)}
                   onCheckedChange={(next) => {
+                    if (!canWrite) return
                     setConnectorChecked((prev) => {
                       const copy = new Set(prev)
                       if (next) copy.add(c.id)
@@ -672,7 +681,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
                     })
                   }}
                   label={c.name}
-                  description={c.type}
+                  description={c.type + (c.globallyEnabled ? '' : (locale === 'zh-CN' ? ' · 已全局禁用；绑定仍保留' : ' · Globally disabled; binding retained'))}
                 />
               ))}
             </div>
@@ -729,7 +738,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
                 <div className="mt-1.5 text-[11.5px] text-ink-400">{t('agent.engineHint')}</div>
               </div>
             )}
-            {selectedComputerOffline && (
+            {canWrite && selectedComputerOffline && (
               <div
                 className="mt-3 rounded-[12px] p-3"
                 style={{ background: 'var(--sky-50)', border: '1px solid var(--sky-100)' }}
@@ -894,11 +903,13 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
 
         </fieldset>
 
+        {!contextChanged && <ResourceApplication agentId={savedAgentId ?? save.current?.agentId ?? agent?.id ?? null} refresh={resourceRefresh} saving={busy} />}
+        {!canWrite && <div role="status" className="px-6 py-2 text-[12px]">{locale === 'zh-CN' ? '只读；修改 Agent 和绑定需要公司 owner/admin 权限。' : 'Read only. Editing agents and bindings requires company owner/admin permission.'}</div>}
         {(progress || err || contextChanged) && (
           <div className="px-6 py-3 text-[12px] border-t border-ink-100" aria-live="polite">
             {contextChanged ? <div role="alert">{copy.contextChanged}</div> : <>
               {progress && <>
-                <div>{copy.frozen}</div>
+                <div>{savedAgentId ? (locale === 'zh-CN' ? '已保存；运行应用状态见上方。' : 'Saved. See runtime application status above.') : copy.frozen}</div>
                 {save.current?.agentId && !editing && <div>{copy.savedId}: {save.current.agentId}</div>}
                 <ul>{(['profile', 'host', 'skills', 'mcp'] as const).map((stage) => (
                   <li key={stage}>{copy[stage]}: {copy[progress[stage]]}</li>
@@ -912,12 +923,12 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
         <div className="px-6 py-4 border-t border-ink-100 flex items-center gap-2 bg-paper shrink-0">
           <button
             type="button"
-            onClick={onClose}
+            onClick={close}
             className="px-4 py-2 rounded-[9px] text-[12.5px] font-semibold text-ink-700 bg-cloud hover:bg-sky2-50 transition"
             style={{ border: '1px solid var(--ink-100)' }}
-          >{t('agent.cancelBtn')}</button>
+          >{savedAgentId ? t('common.close') : t('agent.cancelBtn')}</button>
           <div className="flex-1" />
-          <button
+          {canWrite && !savedAgentId && <button
             type="button"
             onClick={submit}
             disabled={busy || generatingAvatar || contextChanged || !name.trim() || !systemPrompt.trim()}
@@ -928,7 +939,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
             }}
           >
             {busy ? t('agent.saving') : progress ? copy.retry : (editing ? t('agent.saveChanges') : t('agent.createAgent'))}
-          </button>
+          </button>}
         </div>
       </div>
 
@@ -971,6 +982,62 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
       `}</style>
     </div>
   )
+}
+
+interface ResourceApplicationState {
+  saved: true
+  version: string
+  appliedVersion: string | null
+  status: 'pending' | 'applied' | 'failed'
+  error?: string
+}
+
+function ResourceApplication({ agentId, refresh, saving }: { agentId: string | null; refresh: number; saving: boolean }) {
+  const zh = useLocaleStore((s) => s.locale === 'zh-CN')
+  const epoch = useAuth((s) => s.contextEpoch)
+  const [state, setState] = useState<ResourceApplicationState | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [reload, setReload] = useState(0)
+  useEffect(() => {
+    setState(null)
+    setError(null)
+    if (!agentId || saving) return
+    const controller = new AbortController()
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const load = async () => {
+      try {
+        const r = await http<ResourceApplicationState>(`/agents/${encodeURIComponent(agentId)}/resources/status`, { signal: controller.signal })
+        if (controller.signal.aborted || useAuth.getState().contextEpoch !== epoch) return
+        if (r.saved !== true || typeof r.version !== 'string' || !['pending', 'applied', 'failed'].includes(r.status)
+            || (r.status === 'applied' && r.appliedVersion !== r.version)) throw new Error(zh ? '资源状态响应无效' : 'Invalid resource status response')
+        setState(r)
+        setError(null)
+      } catch (e) {
+        if (controller.signal.aborted || useAuth.getState().contextEpoch !== epoch) return
+        setState(null)
+        setError(e instanceof Error ? e.message : String(e))
+      }
+      if (!controller.signal.aborted && useAuth.getState().contextEpoch === epoch) timer = setTimeout(() => void load(), 5000)
+    }
+    void load()
+    return () => { controller.abort(); clearTimeout(timer) }
+  }, [agentId, refresh, saving, reload, epoch, zh])
+  if (!agentId) return null
+  const label = state?.status === 'applied' ? (zh ? '已应用' : 'Applied')
+    : state?.status === 'failed' ? (zh ? '应用失败' : 'Application failed') : (zh ? '待应用' : 'Pending application')
+  return <div className="px-6 py-3 border-t border-ink-100 text-[12px]" aria-live="polite">
+    <div className="font-semibold">{zh ? '技能 / MCP 资源应用状态' : 'Skills / MCP resource application'}</div>
+    {saving ? <div>{zh ? '正在保存，应用状态将在保存后重新读取。' : 'Saving; application status will refresh after saving.'}</div>
+      : error ? <div role="alert" className="text-coral-deep">{zh ? '无法读取应用状态：' : 'Application status unavailable: '}{error}</div>
+      : state ? <>
+        <div>{zh ? '已保存' : 'Saved'} · {label}</div>
+        <div className="break-all text-[10.5px] text-ink-400">{zh ? '目标版本：' : 'Desired version: '}{state.version}</div>
+        {state.appliedVersion && <div className="break-all text-[10.5px] text-ink-400">{zh ? '已应用版本：' : 'Applied version: '}{state.appliedVersion}</div>}
+        {state.status === 'failed' && <div role="alert" className="text-coral-deep">{state.error ?? (zh ? '运行端未能应用资源' : 'The runtime could not apply resources')}</div>}
+      </> : <div>{zh ? '正在读取应用状态…' : 'Loading application status…'}</div>}
+    <div className="text-ink-500">{zh ? '保存后在下一安全 turn 边界应用，不中断在途任务。BYOA 通常约 60 秒发现资源变更；旧运行端未确认时保持待应用。' : 'Saved changes apply at the next safe turn boundary without interrupting active work. BYOA usually discovers changes in about 60 seconds; unacknowledged changes remain pending on older runtimes.'}</div>
+    <button type="button" disabled={saving} className="underline mt-1" onClick={() => setReload((n) => n + 1)}>{zh ? '刷新应用状态' : 'Refresh application status'}</button>
+  </div>
 }
 
 function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {

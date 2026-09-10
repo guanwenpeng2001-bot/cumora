@@ -1,12 +1,12 @@
 /**
  * Settings-page "Connectors" tab — the company MCP connector registry.
  * List / create / edit / delete / enable toggle. stdio = command+args+env,
- * http = url+headers. Phase 5 wires these into BYOA engines via the daemon;
- * managed agents get MCP in phase 6 (noted in the UI).
+ * http = url+headers. Bound agents apply changes at the next safe turn boundary.
  */
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, type ApiMcpConnector } from '@/api/client'
-import { useT } from '@/lib/i18n'
+import { useAuth } from '@/stores/auth'
+import { useT, useLocaleStore } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
 
 interface FormState {
@@ -25,15 +25,32 @@ const EMPTY_FORM: FormState = {
   id: null, name: '', type: 'stdio', command: '', args: '', env: '', url: '', headers: '', enabled: true,
 }
 
-/** KEY=VALUE per line → record. Blank/garbage lines are skipped. */
-function parseKvLines(text: string): Record<string, string> {
-  const out: Record<string, string> = {}
-  for (const line of text.split('\n')) {
+function parseKvLines(text: string, kind: 'env' | 'headers') {
+  const values: Record<string, string> = Object.create(null)
+  const errors: Array<{ line: number; reason: 'format' | 'key' | 'duplicate' | 'value' }> = []
+  const seen = new Set<string>()
+  text.split('\n').forEach((raw, index) => {
+    const line = raw.endsWith('\r') ? raw.slice(0, -1) : raw
+    if (!line.trim()) return
     const i = line.indexOf('=')
-    if (i <= 0) continue
-    out[line.slice(0, i).trim()] = line.slice(i + 1).trim()
-  }
-  return out
+    if (i <= 0) { errors.push({ line: index + 1, reason: 'format' }); return }
+    const key = line.slice(0, i).trim()
+    const value = line.slice(i + 1)
+    const validKey = kind === 'env' ? /^[A-Za-z_][A-Za-z0-9_]*$/.test(key) : /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(key)
+    const identity = kind === 'headers' ? key.toLowerCase() : key
+    if (!validKey) errors.push({ line: index + 1, reason: 'key' })
+    else if (seen.has(identity)) errors.push({ line: index + 1, reason: 'duplicate' })
+    else if ((kind === 'headers' ? /[\x00-\x08\x0a-\x1f\x7f]/ : /[\x00\r]/).test(value)) errors.push({ line: index + 1, reason: 'value' })
+    else values[key] = value
+    seen.add(identity)
+  })
+  return { values, errors }
+}
+function validConnectorForm(form: FormState): boolean {
+  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(form.name.trim()) || form.name.includes('__')) return false
+  if (form.type === 'stdio') return !!form.command.trim() && !form.command.includes('\x00') && !form.args.includes('\x00')
+  try { const url = new URL(form.url.trim()); return ['http:', 'https:'].includes(url.protocol) && !!url.hostname }
+  catch { return false }
 }
 function kvLines(rec: Record<string, string>): string {
   return Object.entries(rec).map(([k, v]) => `${k}=${v}`).join('\n')
@@ -44,49 +61,88 @@ const inputStyle = { border: '1px solid var(--ink-100)' }
 
 export function ConnectorsTab() {
   const t = useT()
+  const zh = useLocaleStore((s) => s.locale === 'zh-CN')
+  const canWrite = useAuth((s) => ['owner', 'admin'].includes(s.companies.find((c) => c.id === s.activeCompanyId)?.role ?? ''))
+  const epoch = useAuth((s) => s.contextEpoch)
   const [items, setItems] = useState<ApiMcpConnector[] | null>(null)
   const [form, setForm] = useState<FormState | null>(null)
-  const [busy, setBusy] = useState<string | null>(null)
+  const [busy, setBusy] = useState<Set<string>>(new Set())
+  const active = useRef(new Set<string>())
   const [error, setError] = useState<string | null>(null)
-
-  const load = useCallback(() => {
-    void api.getMcpConnectors().then((r) => setItems(r.items)).catch((e) => setError(e instanceof Error ? e.message : String(e)))
-  }, [])
-  useEffect(load, [load])
-
-  const openEdit = (c: ApiMcpConnector) => setForm({
-    id: c.id, name: c.name, type: c.type,
-    command: c.command ?? '', args: c.args.join('\n'), env: kvLines(c.env),
-    url: c.url ?? '', headers: kvLines(c.headers), enabled: c.enabled,
-  })
-
-  const save = () => {
-    if (!form) return
-    setBusy('save')
-    setError(null)
-    const payload = {
-      name: form.name.trim(), type: form.type,
-      command: form.type === 'stdio' ? form.command.trim() : null,
-      args: form.type === 'stdio' ? form.args.split('\n').map((s) => s.trim()).filter(Boolean) : [],
-      env: form.type === 'stdio' ? parseKvLines(form.env) : {},
-      url: form.type === 'http' ? form.url.trim() : null,
-      headers: form.type === 'http' ? parseKvLines(form.headers) : {},
-      enabled: form.enabled,
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [notice, setNotice] = useState<string | null>(null)
+  const loadSequence = useRef(0)
+  const current = () => useAuth.getState().contextEpoch === epoch
+  const load = useCallback(async () => {
+    const sequence = ++loadSequence.current
+    setLoadError(null)
+    try {
+      const r = await api.getMcpConnectors()
+      if (useAuth.getState().contextEpoch === epoch && sequence === loadSequence.current) setItems(r.items)
+    } catch (e) {
+      if (current() && sequence === loadSequence.current) setLoadError(e instanceof Error ? e.message : String(e))
     }
-    void (form.id ? api.updateMcpConnector(form.id, payload) : api.createMcpConnector(payload))
-      .then(() => { setForm(null); load() })
-      .catch((e) => setError(e instanceof Error ? e.message : String(e)))
-      .finally(() => setBusy(null))
+  }, [epoch])
+  useEffect(() => {
+    setItems(null); setForm(null); setError(null); setNotice(null); setBusy(new Set()); active.current.clear()
+    void load()
+  }, [load, canWrite])
+
+  const run = async (key: string, action: () => Promise<unknown>) => {
+    if (!canWrite || !current() || active.current.has(key)) return
+    active.current.add(key)
+    setBusy((prev) => new Set(prev).add(key))
+    setError(null)
+    try {
+      await action()
+      if (!current()) return
+      setNotice(zh ? '已保存；绑定此连接器的 Agent 将在下一安全 turn 边界应用。请在 Agent 编辑器查看应用状态。' : 'Saved. Bound agents apply changes at the next safe turn boundary. Check application status in the agent editor.')
+      await load()
+    } catch (e) { if (current()) setError(e instanceof Error ? e.message : String(e)) }
+    finally {
+      if (current()) {
+        active.current.delete(key)
+        setBusy((prev) => { const next = new Set(prev); next.delete(key); return next })
+      }
+    }
   }
+  const openEdit = (c: ApiMcpConnector) => {
+    if (!canWrite || active.current.has(c.id)) return
+    setForm({ id: c.id, name: c.name, type: c.type,
+      command: c.command ?? '', args: c.args.join('\n'), env: kvLines(c.env),
+      url: c.url ?? '', headers: kvLines(c.headers), enabled: c.enabled })
+  }
+  const kv = parseKvLines(form?.type === 'http' ? form.headers : form?.env ?? '', form?.type === 'http' ? 'headers' : 'env')
+  const valid = !!form && validConnectorForm(form) && kv.errors.length === 0
+  const save = () => {
+    if (!form || !valid || !canWrite) return
+    const draft = form
+    void run(draft.id ?? 'save', async () => {
+      const payload = {
+        name: draft.name.trim(), type: draft.type,
+        command: draft.type === 'stdio' ? draft.command.trim() : null,
+        args: draft.type === 'stdio' ? draft.args.split('\n').map((s) => s.trim()).filter(Boolean) : [],
+        env: draft.type === 'stdio' ? kv.values : {},
+        url: draft.type === 'http' ? draft.url.trim() : null,
+        headers: draft.type === 'http' ? kv.values : {}, enabled: draft.enabled,
+      }
+      await (draft.id ? api.updateMcpConnector(draft.id, payload) : api.createMcpConnector(payload))
+      if (current()) setForm(null)
+    })
+  }
+  const formBusy = !!form && busy.has(form.id ?? 'save')
 
   return (
     <div className="space-y-6">
-      <div className="text-[11.5px] text-ink-500 italic max-w-2xl">{t('me.mcp.intro')}</div>
+      <div className="text-[11.5px] text-ink-500 italic max-w-2xl">{zh ? '公司 MCP 连接器。全局禁用影响所有绑定的 Agent；从某个 Agent 解绑请使用 Agent 编辑器。' : 'Company MCP connectors. Disabling globally affects all bound agents; use the agent editor to unbind from one agent.'}</div>
+      {!canWrite && <div className="text-[11.5px] text-ink-500">{zh ? '只读摘要；修改需要公司 owner/admin 权限。' : 'Read-only summary. Changes require company owner/admin permission.'}</div>}
+      {notice && <div role="status" className="text-[11.5px] text-skype-deep">{notice}</div>}
       {error && <div className="text-[11.5px] text-coral-deep">{error}</div>}
 
       <div className="bg-cloud rounded-[14px] divide-y divide-ink-100" style={{ border: '1px solid var(--ink-100)' }}>
-        {items === null && <div className="p-4 text-[12px] text-ink-400 italic">{t('common.loading')}</div>}
-        {items?.length === 0 && <div className="p-4 text-[12px] text-ink-400 italic">{t('me.mcp.empty')}</div>}
+        {loadError && <div role="alert" className="p-4 text-[12px] text-coral-deep">{loadError} <button type="button" className="underline" onClick={() => void load()}>{zh ? '重试' : 'Retry'}</button></div>}
+        {!loadError && items === null && <div className="p-4 text-[12px] text-ink-400 italic">{t('common.loading')}</div>}
+        {!loadError && items?.length === 0 && <div className="p-4 text-[12px] text-ink-400 italic">{t('me.mcp.empty')}</div>}
         {items?.map((c) => (
           <div key={c.id} className="flex items-center gap-3 p-4">
             <div className="flex-1 min-w-0">
@@ -98,42 +154,35 @@ export function ConnectorsTab() {
                 {c.type === 'stdio' ? [c.command, ...c.args].join(' ') : c.url}
               </div>
             </div>
-            <button type="button" onClick={() => {
-              setBusy(`toggle-${c.id}`)
-              void api.updateMcpConnector(c.id, { ...c, enabled: !c.enabled })
-                .then(load).catch((e) => setError(e instanceof Error ? e.message : String(e)))
-                .finally(() => setBusy(null))
-            }}
+            <span className="text-[11px] text-ink-500">{c.enabled ? (zh ? '全局启用' : 'Globally enabled') : (zh ? '全局禁用' : 'Globally disabled')}</span>
+            {canWrite && <><button type="button" disabled={busy.has(c.id) || form?.id === c.id} aria-busy={busy.has(c.id)}
+              aria-label={c.enabled ? (zh ? '全局禁用' : 'Disable globally') : (zh ? '全局启用' : 'Enable globally')}
+              onClick={() => void run(c.id, () => api.updateMcpConnector(c.id, { ...c, enabled: !c.enabled }))}
               className={cn('w-9 h-5 rounded-full relative shrink-0 transition-colors', c.enabled ? 'bg-skype' : 'bg-ink-200')}
-              title={c.enabled ? t('me.mcp.disable') : t('me.mcp.enable')}>
+              title={c.enabled ? (zh ? '全局禁用' : 'Disable globally') : (zh ? '全局启用' : 'Enable globally')}>
               <span className={cn('absolute w-4 h-4 bg-white rounded-full top-0.5 transition-all', c.enabled ? 'left-[18px]' : 'left-0.5')}
                 style={{ boxShadow: '0 1px 3px rgba(0,0,0,0.2)' }} />
             </button>
-            <button type="button" onClick={() => openEdit(c)}
+            <button type="button" disabled={formBusy || busy.has(c.id)} onClick={() => openEdit(c)}
               className="h-6 px-2.5 rounded-[6px] text-[11px] font-semibold text-ink-500 hover:bg-sky2-50 hover:text-skype-deep transition shrink-0">
               {t('me.mcp.edit')}
             </button>
-            <button type="button" disabled={busy === `del-${c.id}`}
-              onClick={() => {
-                setBusy(`del-${c.id}`)
-                void api.deleteMcpConnector(c.id).then(load)
-                  .catch((e) => setError(e instanceof Error ? e.message : String(e)))
-                  .finally(() => setBusy(null))
-              }}
+            <button type="button" disabled={busy.has(c.id) || form?.id === c.id}
+              onClick={() => void run(c.id, () => api.deleteMcpConnector(c.id))}
               className="w-6 h-6 rounded-md grid place-items-center text-ink-400 hover:bg-coral-soft hover:text-coral-deep transition shrink-0"
-              aria-label={t('me.mcp.delete')}>×</button>
+              aria-label={t('me.mcp.delete')}>×</button></>}
           </div>
         ))}
       </div>
 
-      {form === null ? (
+      {canWrite && (form === null ? (
         <button type="button" onClick={() => setForm(EMPTY_FORM)}
           className="h-8 px-4 rounded-full text-[12.5px] font-semibold text-white"
           style={{ background: 'var(--skype)', boxShadow: '0 4px 12px -3px rgba(0, 168, 240, 0.5)' }}>
           {t('me.mcp.add')}
         </button>
       ) : (
-        <div className="bg-cloud rounded-[14px] p-4 space-y-3" style={{ border: '1px solid var(--ink-100)' }}>
+        <fieldset disabled={formBusy} className="bg-cloud rounded-[14px] p-4 space-y-3" style={{ border: '1px solid var(--ink-100)' }}>
           <div className="font-semibold text-[13px] text-ink-900">
             {form.id ? t('me.mcp.editTitle') : t('me.mcp.addTitle')}
           </div>
@@ -173,19 +222,24 @@ export function ConnectorsTab() {
               </>
             )}
           </div>
+          {kv.errors.map((e) => <div key={e.line} role="alert" className="text-[11px] text-coral-deep">
+            {form.type === 'stdio' ? 'env' : 'header'} {zh ? '第' : 'line '}{e.line}{zh ? '行：' : ': '}
+            {({ format: zh ? '请使用 KEY=VALUE 格式' : 'Use KEY=VALUE', key: zh ? '名称非法' : 'Invalid key', duplicate: zh ? '名称重复' : 'Duplicate key', value: zh ? '值包含非法控制字符' : 'Invalid control character in value' })[e.reason]}
+          </div>)}
+          {!validConnectorForm(form) && <div role="alert" className="text-[11px] text-coral-deep">{zh ? '名称须为 1–64 个小写字母、数字、_ 或 -，以字母或数字开头且不含 __；stdio 需有效命令，HTTP 需有效 http(s) URL。' : 'Name: 1–64 lowercase letters, digits, _ or -, starting with a letter or digit, without __. stdio needs a valid command; HTTP needs a valid http(s) URL.'}</div>}
           <div className="flex items-center gap-2.5 pt-1">
-            <button type="button" onClick={save} disabled={busy === 'save' || !form.name.trim()}
+            <button type="button" onClick={save} disabled={formBusy || !valid}
               className="h-8 px-4 rounded-full text-[12.5px] font-semibold text-white disabled:cursor-not-allowed"
               style={{ background: form.name.trim() ? 'var(--skype)' : 'var(--ink-200)' }}>
-              {busy === 'save' ? t('me.mcp.saving') : t('me.mcp.save')}
+              {formBusy ? t('me.mcp.saving') : t('me.mcp.save')}
             </button>
             <button type="button" onClick={() => setForm(null)}
               className="h-8 px-3 rounded-full text-[12px] font-semibold text-ink-500 hover:bg-sky2-50 transition">
               {t('me.mcp.cancel')}
             </button>
           </div>
-        </div>
-      )}
+        </fieldset>
+      ))}
     </div>
   )
 }
