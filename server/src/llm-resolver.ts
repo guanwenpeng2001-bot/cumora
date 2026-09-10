@@ -47,7 +47,7 @@ export async function resolveRoleCall(company: string | null, domain: RoleCallPl
   if (domain === 'byoa') return freeze({ ...plan, diagnostics: ['byoa-engine-managed'] })
   if (!LLM_ROLES.includes(role)) return freeze({ ...plan, diagnostics: ['invalid-role'] })
   const config = parseLlmConfig(snapshot.settings.llm_config ?? '')
-  const selected = config.roles.find(r => r.role === role && r.purpose === purpose) ?? config.roles.find(r => r.role === role && r.purpose === undefined)
+  const selected = config.roles.find(r => r.role === role && role !== 'embed' && r.purpose === purpose) ?? config.roles.find(r => r.role === role && r.purpose === undefined)
   const mc = role === 'brain' ? parseAgentModelConfig(agent?.modelConfig ?? agent?.model_config) : null
   const inherited = snapshot.settings[`${role}_model`]?.trim() ?? ''
   const primary = role === 'brain' && agent?.model?.trim() ? agent.model.trim() : selected?.models[0] ?? inherited
@@ -55,7 +55,7 @@ export async function resolveRoleCall(company: string | null, domain: RoleCallPl
   const models = primary ? [...new Set([primary, ...(role === 'embed' ? [] : fallbacks)].map(m => m.trim()).filter(Boolean))] : []
   if (!primary) diagnostics.push(`missing-primary:${role}`)
   const context = company && sub2apiRoutingConfigured() ? await resolveTenantLlmContext(company) : null
-  const discovery = context && SUB2API_PLATFORMS.some(p => context.keys[p]) ? await tenantModelSnapshot(context) : null
+  const discovery = role !== 'embed' && context && SUB2API_PLATFORMS.some(p => context.keys[p]) ? await tenantModelSnapshot(context) : null
   if (context && discovery && context.authorizationVersion !== discovery.authorizationVersion) {
     return resolveRoleCall(company, domain, role, purpose, agent, snapshot)
   }
@@ -82,8 +82,8 @@ export async function resolveRoleCall(company: string | null, domain: RoleCallPl
     const prefix = model.startsWith('novita/') ? 'novita' : model.startsWith('orcarouter/') ? 'orcarouter' : undefined
     const slot: DirectLlmSlot = explicit?.env ?? prefix ?? (['image', 'audio', 'embed'].includes(role) ? role as DirectLlmSlot : 'text')
     const direct = resolveDirectLlmEnv(slot)
-    const kind = explicit?.kind ?? (prefix && direct.configured ? 'direct' : available.length ? 'gateway' : 'direct')
-    const platform = kind === 'gateway' ? explicit?.platform ?? pickPlatformForModel(modelsByPlatform, model, available) : undefined
+    const kind = explicit?.kind ?? (role === 'embed' ? direct.configured || !sub2apiRoutingConfigured() ? 'direct' : 'gateway' : prefix && direct.configured ? 'direct' : available.length ? 'gateway' : 'direct')
+    const platform = kind === 'gateway' ? explicit?.platform ?? (role === 'embed' ? 'openai' : pickPlatformForModel(modelsByPlatform, model, available)) : undefined
     const protocol = metadata?.protocol ?? explicit?.protocol ?? (kind === 'direct' ? direct.protocol as LlmProtocol : role === 'image' ? 'images' : role === 'audio' ? 'chat' : role === 'embed' ? 'embeddings' : 'responses')
     const effortKey = role === 'brain' ? 'agent_reasoning_effort' : 'support_reasoning_effort'
     const rawEffort = snapshot.settings[effortKey]?.trim().toLowerCase() ?? 'none'

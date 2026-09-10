@@ -142,15 +142,14 @@ export function attachFsEndpoints(
     if (p.startsWith('memory/')) {
       void (async () => {
         try {
-          const { embedText } = await import('../embeddings.js')
-          const vec = await embedText(text)
-          if (vec) {
-            await pool.query(
+          const { embedAndStore } = await import('../embeddings.js')
+          await embedAndStore(text, { companyId: c.companyId, agentId: c.sub, purpose: 'memory.write' }, async (client, vec) => {
+            await client.query(
               `UPDATE agent_workspace SET embedding = $1::vector
-                WHERE agent_id = $2 AND path = $3`,
-              [vec, c.sub, p],
+                WHERE agent_id = $2 AND path = $3 AND body = $4`,
+              [vec, c.sub, p, text],
             )
-          }
+          })
         } catch (err) {
           console.warn('[runtime/fs] async embed failed', err instanceof Error ? err.message : String(err))
         }

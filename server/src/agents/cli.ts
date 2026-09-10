@@ -4115,15 +4115,15 @@ async function cmdMemory(parsed: ParsedArgs): Promise<CliResult> {
     // body + vector in one shot. `embedText` returns null on failure
     // (rate limit, network blip, etc.) — we still write the row so the
     // memory isn't lost; the next background backfill will fill it in.
-    const { embedText } = await import('./embeddings.js')
-    const embedding = await embedText(body)
-    if (embedding) {
-      await pool.query(
+    const { embedAndStore } = await import('./embeddings.js')
+    const stored = await embedAndStore(body, { companyId: tenant, agentId: me, purpose: 'memory.write' }, async (client, embedding) => {
+      await client.query(
         `INSERT INTO agent_workspace (agent_id, path, body, meta, embedding, company_id, updated_at)
          VALUES ($1, $2, $3, $4::jsonb, $5::vector, $6, NOW())`,
         [me, path, body, JSON.stringify(meta), embedding, tenant],
       )
-    } else {
+    })
+    if (!stored) {
       await pool.query(
         `INSERT INTO agent_workspace (agent_id, path, body, meta, company_id, updated_at)
          VALUES ($1, $2, $3, $4::jsonb, $5, NOW())`,

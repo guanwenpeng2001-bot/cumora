@@ -13,24 +13,22 @@
  * recency-only retrieval. That way a transient OpenAI outage doesn't
  * break the entire wake cycle.
  */
-import OpenAI from 'openai'
-import { resolveDirectLlmEnv } from '../env.js'
+import { resolveRoleCall } from '../llm-resolver.js'
+import { getLlmCandidateClient } from '../llm.js'
 import { pool } from '../db/pool.js'
+import type { PoolClient } from 'pg'
+import { getServerSettingsSnapshot, writeInEmbeddingSpace, type ServerSettingsSnapshot } from '../settings.js'
 
-import { getEmbedModel } from '../settings.js'
 const EMBED_DIM = 1536
 /** OpenAI accepts up to ~8K tokens per input; we cap at 8K characters
  *  (~2K tokens) which is plenty for a single memory entry or a few
  *  recent inbox messages. */
 const MAX_INPUT_CHARS = 8000
 
-let client: OpenAI | null = null
-function embeddingClient(): OpenAI {
-  if (client) return client
-  const direct = resolveDirectLlmEnv('embed')
-  if (!direct.configured) throw new Error('Direct embedding LLM is not configured')
-  client = new OpenAI({ apiKey: direct.apiKey, baseURL: direct.baseURL, timeout: 10_000, maxRetries: 1 })
-  return client
+export interface EmbeddingContext {
+  companyId?: string | null
+  agentId?: string
+  purpose?: string
 }
 
 /** Test-only override. When set, every {@link embedText} call returns
@@ -46,24 +44,36 @@ export function __setEmbedTextOverrideForTesting(fn: typeof testEmbedOverride): 
 
 /** Embed a string. Returns a Postgres-pgvector literal string ready
  *  to bind as `$N::vector` in INSERT/UPDATE, or null if it failed. */
-export async function embedText(text: string): Promise<string | null> {
+export async function embedText(text: string, context: EmbeddingContext = {}, captured?: ServerSettingsSnapshot): Promise<string | null> {
   const trimmed = (text ?? '').trim()
   if (!trimmed) return null
   if (testEmbedOverride) return testEmbedOverride(trimmed)
   try {
-    const resp = await embeddingClient().embeddings.create({
-      model: getEmbedModel() || 'text-embedding-3-small',
+    const plan = await resolveRoleCall(context.companyId ?? null, 'server', 'embed', context.purpose ?? 'memory', { id: context.agentId }, captured)
+    const candidate = plan.candidates[0]
+    if (!candidate?.available || candidate.protocol !== 'embeddings') return null
+    const client = await getLlmCandidateClient(plan, candidate)
+    const resp = await client.embeddings.create({
+      model: candidate.requestModel,
       dimensions: EMBED_DIM,
       input: trimmed.length > MAX_INPUT_CHARS ? trimmed.slice(0, MAX_INPUT_CHARS) : trimmed,
-    })
+    }, { timeout: 10_000, maxRetries: 0 })
     const vec = resp.data[0]?.embedding
-    if (!Array.isArray(vec) || vec.length !== EMBED_DIM) return null
+    if (!Array.isArray(vec) || vec.length !== EMBED_DIM || !vec.every(n => typeof n === 'number' && Number.isFinite(n))) return null
     // pgvector accepts the text form `[0.1,0.2,…]` and casts via ::vector.
     return `[${vec.join(',')}]`
   } catch (e) {
     console.warn('[embed] failed', e instanceof Error ? e.message : String(e))
     return null
   }
+}
+
+/** Validate the captured space under the settings lock before persisting a vector. */
+export async function embedAndStore(text: string, context: EmbeddingContext, store: (client: PoolClient, vector: string) => Promise<void>): Promise<boolean> {
+  const captured = getServerSettingsSnapshot()
+  const vector = await embedText(text, context, captured)
+  if (!vector) return false
+  return writeInEmbeddingSpace(captured, client => store(client, vector))
 }
 
 /** Whether pgvector is actually installed in this database. Cached so
@@ -94,8 +104,8 @@ export async function backfillMemoryEmbeddings(opts: { batchSize?: number; delay
   let afterAgentId: string | null = null
   let afterPath: string | null = null
   while (true) {
-    const result: { rows: Array<{ agent_id: string; path: string; body: string }> } = await pool.query(
-      `SELECT agent_id, path, body
+    const result: { rows: Array<{ agent_id: string; company_id: string | null; path: string; body: string }> } = await pool.query(
+      `SELECT agent_id, COALESCE(company_id, (SELECT p.company_id FROM participants p WHERE p.id = agent_id AND p.kind = 'agent' AND p.departed_at IS NULL LIMIT 1)) AS company_id, path, body
          FROM agent_workspace
         WHERE path LIKE 'memory/%' AND embedding IS NULL AND body <> ''
           AND ($2::text IS NULL OR (agent_id, path) > ($2::text, $3::text))
@@ -103,22 +113,20 @@ export async function backfillMemoryEmbeddings(opts: { batchSize?: number; delay
         LIMIT $1`,
       [batchSize, afterAgentId, afterPath],
     )
-    const rows: Array<{ agent_id: string; path: string; body: string }> = result.rows
+    const rows: Array<{ agent_id: string; company_id: string | null; path: string; body: string }> = result.rows
     if (rows.length === 0) break
     for (const r of rows) {
       try {
-        const vec = await embedText(r.body)
-        if (!vec) {
-          failed++
-          continue
-        }
         try {
-          await pool.query(
-            `UPDATE agent_workspace SET embedding = $1::vector
-              WHERE agent_id = $2 AND path = $3`,
-            [vec, r.agent_id, r.path],
-          )
-          processed++
+          const stored = await embedAndStore(r.body, { companyId: r.company_id, agentId: r.agent_id, purpose: 'memory.backfill' }, async (client, vec) => {
+            await client.query(
+              `UPDATE agent_workspace SET embedding = $1::vector
+                WHERE agent_id = $2 AND path = $3 AND embedding IS NULL AND body = $4`,
+              [vec, r.agent_id, r.path, r.body],
+            )
+          })
+          if (stored) processed++
+          else failed++
         } catch (e) {
           failed++
           console.warn('[embed:backfill] UPDATE failed for', r.path, e instanceof Error ? e.message : String(e))

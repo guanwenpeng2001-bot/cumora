@@ -248,6 +248,26 @@ export async function writeServerSettings(entries: Record<string, string | null>
   }
   const rows = Object.entries(entries)
   return commitSettings(async (client) => {
+    if (rows.some(([key]) => ['embed_model', 'llm_config', 'sub2api_group_config'].includes(key))) {
+      const current = await client.query<{ key: string; value: string }>('SELECT key, value FROM server_settings')
+      const before = makeSnapshot(current.rows).settings
+      const after = { ...before }
+      for (const [key, value] of rows) after[key] = value ?? SETTING_DEFS.find(d => d.key === key)!.envValue()
+      if (embeddingSpace(before) !== embeddingSpace(after)) {
+        const column = await client.query<{ exists: boolean }>(
+          `SELECT EXISTS (SELECT 1 FROM information_schema.columns
+            WHERE table_schema = current_schema() AND table_name = 'agent_workspace' AND column_name = 'embedding') AS exists`,
+        )
+        if (column.rows[0]?.exists) {
+          const vectors = await client.query<{ exists: boolean }>(
+            'SELECT EXISTS (SELECT 1 FROM agent_workspace WHERE embedding IS NOT NULL) AS exists',
+          )
+          if (vectors.rows[0]?.exists) throw new InvalidServerSettingError(
+            'embedding_space_locked: existing vectors require the same embedding model and route (1536 dimensions); a dedicated migration is required',
+          )
+        }
+      }
+    }
     for (const [key, value] of rows) {
       await client.query('DELETE FROM server_settings WHERE key = $1', [value === null ? key : INHERIT_PREFIX + key])
       await client.query(
@@ -256,6 +276,43 @@ export async function writeServerSettings(entries: Record<string, string | null>
         [value === null ? INHERIT_PREFIX + key : key, value ?? 'true'],
       )
     }
+  })
+}
+
+export async function writeInEmbeddingSpace(expected: ServerSettingsSnapshot, write: (client: PoolClient) => Promise<void>): Promise<boolean> {
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    await client.query('LOCK TABLE server_settings IN SHARE MODE')
+    const { rows } = await client.query<{ key: string; value: string }>('SELECT key, value FROM server_settings')
+    if (embeddingSpace(expected.settings) !== embeddingSpace(makeSnapshot(rows).settings)) {
+      await client.query('ROLLBACK')
+      console.warn('[embed] embedding_space_changed: discarding stale vector')
+      return false
+    }
+    await write(client)
+    await client.query('COMMIT')
+    return true
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw e
+  } finally {
+    client.release()
+  }
+}
+
+function embeddingSpace(settings: Readonly<Record<string, string>>): string {
+  const config = parseLlmConfig(settings.llm_config ?? '')
+  const model = config.roles.find(r => r.role === 'embed' && r.purpose === undefined)?.models[0]
+    ?? settings.embed_model.trim()
+  const metadata = config.models.find(m => m.model === model)
+  const route = config.routes.find(r => r.id === metadata?.route)
+  return JSON.stringify({
+    model, legacyModel: settings.embed_model.trim(), dimensions: 1536,
+    route: route ? [route.kind, route.platform ?? null, route.env ?? null, route.protocol ?? null] : null,
+    protocol: metadata?.protocol ?? null,
+    groups: route?.kind === 'direct' ? null : ['free', 'pro', 'max'].map(tier =>
+      parseGroupConfig(settings.sub2api_group_config ?? '')[tier as 'free' | 'pro' | 'max']?.[route?.platform ?? 'openai'] ?? null),
   })
 }
 
@@ -324,7 +381,7 @@ export function parseLlmConfig(raw: string, strict = false): LlmConfig {
       check(LLM_ROLES.includes(r.role) && (r.purpose === undefined || nonempty(r.purpose)))
       const id = JSON.stringify([r.role, r.purpose]); check(!roles.has(id)); roles.add(id)
       check(Array.isArray(r.models) && r.models.length > 0 && r.models.every(nonempty))
-      check(r.role !== 'embed' || r.models.length === 1)
+      check(r.role !== 'embed' || (r.models.length === 1 && r.purpose === undefined))
     }
     return config
   } catch {

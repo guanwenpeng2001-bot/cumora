@@ -125,6 +125,11 @@ function toMemoryRow(r: MemoryQueryRow): MemoryRow {
 }
 
 export class InProcRuntimeClient implements AgentRuntimeClient {
+  async applyPendingResources(agentId: string, version?: string): Promise<import('./client.js').ResourceApplicationResult> {
+    const { applyPendingAgentResources } = await import('../../skill-library.js')
+    return applyPendingAgentResources(agentId, version)
+  }
+
   /** Persona row (delegates to the cached personas.ts helper).
    *  Returns null when the id isn't an active agent. */
   async loadPersona(agentId: string): Promise<PersonaRow | null> {
@@ -273,8 +278,23 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
     const scopePred = memoryScopeSql('meta', 'path', '$SCOPE')
 
     const { hasPgVector, embedText } = await import('../embeddings.js')
+    const { getServerSettingsSnapshot, writeInEmbeddingSpace } = await import('../../settings.js')
+    const captured = getServerSettingsSnapshot()
     const useSemantic = queryText.trim().length > 0 && (await hasPgVector())
-    const queryVec = useSemantic ? await embedText(queryText) : null
+    let queryVec: string | null = null
+    if (useSemantic) {
+      try {
+        const { rows } = await pool.query<{ company_id: string | null }>(
+          "SELECT company_id FROM participants WHERE id = $1 AND kind = 'agent' AND departed_at IS NULL LIMIT 1",
+          [agentId],
+        )
+        if (rows[0]?.company_id) queryVec = await embedText(queryText, {
+          companyId: rows[0].company_id, agentId, purpose: 'memory.retrieve',
+        }, captured)
+      } catch (e) {
+        console.warn('[memory] embedding context unavailable', e instanceof Error ? e.message : String(e))
+      }
+    }
 
     const toVisible = (rows: MemoryQueryRow[]): MemoryRow[] =>
       rows.filter((r) => memoryVisibleInScope(
@@ -283,7 +303,7 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
         readScope,
       )).map(toMemoryRow)
 
-    if (!queryVec) {
+    const loadRecent = async (): Promise<MemoryRow[]> => {
       const { rows } = await pool.query<MemoryQueryRow>(
         `SELECT path, body, meta, updated_at
            FROM agent_workspace
@@ -295,13 +315,16 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
       )
       return toVisible(rows)
     }
+    if (!queryVec) return loadRecent()
 
     // Hybrid retrieval: three CTEs unioned, ROW_NUMBER dedupes by path
     // keeping the lowest-rank source (pinned > semantic > recent). Final
     // ORDER preserves that rank so the prompt reads natural: identity-
     // defining stuff first, then "what's relevant now", then recency.
-    const { rows } = await pool.query<MemoryQueryRow & { source_rank: number }>(
-      `WITH
+    let semanticRows: MemoryQueryRow[] = []
+    const sameSpace = await writeInEmbeddingSpace(captured, async (client) => {
+      const { rows } = await client.query<MemoryQueryRow & { source_rank: number }>(
+        `WITH
          pinned AS (
            SELECT path, body, meta, updated_at, 0 AS source_rank
              FROM agent_workspace
@@ -342,9 +365,11 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
         WHERE rn = 1
         ORDER BY source_rank ASC, updated_at DESC
         LIMIT $5`,
-      [agentId, queryVec, semanticLimit, recentLimit, totalLimit, projectIds],
-    )
-    return toVisible(rows)
+        [agentId, queryVec, semanticLimit, recentLimit, totalLimit, projectIds],
+      )
+      semanticRows = rows
+    })
+    return sameSpace ? toVisible(semanticRows) : loadRecent()
   }
 
   // ─── reads (cont.) ────────────────────────────────────────────────
