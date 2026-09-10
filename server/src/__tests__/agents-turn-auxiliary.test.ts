@@ -32,7 +32,7 @@ function fixture(behavior: (request: any, signal?: AbortSignal) => AsyncIterable
     parseLlmConfig: JSON.parse, readLlmModelTarget: (model: string) => ({ requestModel: model }), LLM_ROLES: ['brain', 'support', 'compaction'] }
   const resolver = compile(read('../llm-resolver.ts'), {
     './settings.js': settings, './env.js': { resolveDirectLlmEnv: () => ({ configured: true, protocol }) },
-    './tenant-llm-context.js': {}, './sub2api.js': { sub2apiRoutingConfigured: () => false, sub2apiConfigured: () => false },
+    './tenant-llm-context.js': {}, './sub2api.js': { sub2apiRoutingConfigured: () => false, sub2apiConfigured: () => false, dashscopeMediaRole: () => null, supportsDashscopeChatAudio: () => false },
     './agents/model-config.js': { REASONING_EFFORTS: new Set(['none']), parseAgentModelConfig: () => null },
   })
   const fallback = compile(read('../agents/fallback.ts'), { '../settings.js': {} })

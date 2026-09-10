@@ -1,7 +1,7 @@
 import { getServerSettingsSnapshot, parseLlmConfig, readLlmModelTarget, LLM_ROLES, type LlmRole, type LlmProtocol, type ServerSettingsSnapshot } from './settings.js'
 import { resolveDirectLlmEnv, type DirectLlmSlot } from './env.js'
 import { resolveTenantLlmContext, tenantRoutingSnapshot, waitForLlmResolution } from './tenant-llm-context.js'
-import { sub2apiRoutingConfigured, sub2apiConfigured, pickPlatformForModel, supportsGatewayImages, SUB2API_PLATFORMS, type Platform } from './sub2api.js'
+import { sub2apiRoutingConfigured, sub2apiConfigured, pickPlatformForModel, supportsGatewayImages, dashscopeMediaRole, supportsDashscopeChatAudio, SUB2API_PLATFORMS, type Platform } from './sub2api.js'
 import { parseAgentModelConfig, REASONING_EFFORTS } from './agents/model-config.js'
 
 export interface RoleCallAgent { id?: string; model?: string | null; modelConfig?: unknown; model_config?: unknown }
@@ -86,11 +86,13 @@ export async function resolveRoleCall(company: string | null, domain: RoleCallPl
     const { metadata, route: explicit } = translated
     const slot: DirectLlmSlot = explicit?.env ?? (['image', 'audio', 'embed'].includes(role) ? role as DirectLlmSlot : 'text')
     const direct = resolveDirectLlmEnv(slot)
-    const dashscope = role === 'image' && /^(qwen-image|wanx|wan[0-9])/i.test(translated.requestModel)
-    const kind = explicit?.kind ?? (dashscope && direct.protocol === 'dashscope-image' ? 'direct' : role === 'embed' ? direct.configured || !sub2apiRoutingConfigured() ? 'direct' : 'gateway' : available.length ? 'gateway' : 'direct')
+    const dashscope = dashscopeMediaRole(translated.requestModel) === role
+    const kind = explicit?.kind ?? (dashscope ? 'direct' : role === 'embed' ? direct.configured || !sub2apiRoutingConfigured() ? 'direct' : 'gateway' : available.length ? 'gateway' : 'direct')
     const platform = kind === 'gateway' ? explicit?.platform ?? (role === 'embed' ? 'openai' : pickPlatformForModel(modelsByPlatform, model, available)) : undefined
     const protocol = translated.protocol ?? explicit?.protocol ?? (kind === 'direct' ? direct.protocol as LlmProtocol : role === 'image' ? 'images' : role === 'audio' ? 'chat' : role === 'embed' ? 'embeddings' : 'responses')
     const gatewaySupported = role !== 'image' || kind !== 'gateway' || protocol === 'images' && supportsGatewayImages(translated.requestModel)
+    // Native ASR families must not be sent to the incompatible Chat endpoint.
+    const audioSupported = role !== 'audio' || !dashscope || supportsDashscopeChatAudio(translated.requestModel)
     const effortKey = role === 'brain' ? 'agent_reasoning_effort' : 'support_reasoning_effort'
     const rawEffort = snapshot.settings[effortKey]?.trim().toLowerCase() ?? 'none'
     const effort = mc?.effort ?? metadata?.effort ?? (REASONING_EFFORTS.has(rawEffort) ? rawEffort : 'none')
@@ -105,7 +107,7 @@ export async function resolveRoleCall(company: string | null, domain: RoleCallPl
         env: kind === 'direct' ? slot : undefined,
         endpointSource: kind === 'gateway' ? 'sub2api-env' : direct.endpointSource,
         credentialSource: kind === 'gateway' ? 'owner-key-map' : direct.keySource },
-      protocol, available: compatible && gatewaySupported && (kind === 'gateway' ? Boolean(context?.baseURL && platform && context.keys[platform]) : direct.configured),
+      protocol, available: compatible && gatewaySupported && audioSupported && (kind === 'gateway' ? Boolean(context?.baseURL && platform && context.keys[platform]) : direct.configured),
       source: target ? 'llm_config:env_after_chain' : role === 'brain' && ((model === primary && agent?.model?.trim()) || (model !== primary && mc?.fallbackModels)) ? 'agent' : selected ? `${snapshot.sources.llm_config}:llm_config` : `${snapshot.sources[sourceKey] ?? 'env'}:${sourceKey}`,
       parameterSources: { effort: mc?.thinking !== undefined || mc?.effort !== undefined ? 'agent' : metadata?.thinking !== undefined || metadata?.effort !== undefined ? 'llm_config' : effortKey,
         maxOutputTokens: mc?.maxOutputTokens !== undefined ? 'agent:model-cap' : metadata?.maxOutputTokens !== undefined ? 'llm_config' : role === 'brain' ? 'agent_max_output_tokens' : 'caller-budget',
@@ -114,7 +116,7 @@ export async function resolveRoleCall(company: string | null, domain: RoleCallPl
         maxOutputTokens: max === undefined ? undefined : Math.min(max, metadata?.maxOutputTokens ?? max, contextWindow ?? max), contextWindow,
         reasoningHeadroom: role === 'brain' ? undefined : readInteger('support_reasoning_headroom', 0, 0) } : {},
       capabilities: { tools: metadata?.tools, vision: metadata?.vision },
-      diagnostic: !gatewaySupported ? 'gateway-image-model-unsupported' : !compatible ? 'incompatible-capability' : kind === 'direct' && !direct.configured ? 'direct-unconfigured' : kind === 'gateway' && !context?.keys[platform!] ? 'gateway-unprovisioned' : undefined,
+      diagnostic: !gatewaySupported ? 'gateway-image-model-unsupported' : !audioSupported ? 'dashscope-audio-requires-native-protocol' : !compatible ? 'incompatible-capability' : kind === 'direct' && !direct.configured ? 'direct-unconfigured' : kind === 'gateway' && !context?.keys[platform!] ? 'gateway-unprovisioned' : undefined,
     }
   })
   const seen = new Set<string>()

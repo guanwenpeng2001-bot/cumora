@@ -510,6 +510,20 @@ export function supportsGatewayImages(model: string): boolean {
   return id.startsWith('gpt-image-') || id === 'grok-imagine' || id === 'grok-imagine-edit' || id.startsWith('grok-imagine-image')
 }
 
+/** Provider ownership is distinct from sub2api's four provisioned platform pools.
+ * DashScope currently shares the OpenAI pool; media needs its own direct adapter. */
+export function dashscopeMediaRole(model: string): 'audio' | 'image' | null {
+  const id = model.trim()
+  if (/^(qwen3-asr|qwen-audio-3\.0-asr|fun-asr|paraformer)(?:$|[-.])/i.test(id)) return 'audio'
+  if (/^(qwen-image|wanx|z-image)(?:$|[-.\d])|^wan\d+(?:\.\d+)?-image(?:$|-)/i.test(id)) return 'image'
+  return null
+}
+
+/** Fun-ASR/Paraformer and realtime Qwen ASR use native HTTP/WebSocket APIs. */
+export function supportsDashscopeChatAudio(model: string): boolean {
+  return /^qwen3-asr-flash(?:-\d{4}-\d{2}-\d{2})?$/i.test(model.trim())
+}
+
 export const MODEL_PLATFORM_PRIORITY: readonly Platform[] = ['kimi', 'deepseek', 'grok', 'openai']
 
 /** Prefer the native DeepSeek pool even while discovery is cold or stale.

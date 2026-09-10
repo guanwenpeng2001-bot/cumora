@@ -26,7 +26,7 @@ function fixture(statuses: (number | Error)[] = [], gateway = false, content: un
     './tenant-llm-context.js': { resolveTenantLlmContext: async (company: string) => { tenants.push(company); return { keys: { openai: 'owner-key' }, baseURL: 'https://gateway.invalid', authorizationVersion: 'owner-v1' } },
       waitForLlmResolution: (promise: Promise<unknown>) => promise,
       tenantRoutingSnapshot: async () => ({ authorizationVersion: 'owner-v1', platforms: { openai: { ok: true, models: ['asr-primary', 'asr-backup'] } } }) },
-    './sub2api.js': { sub2apiRoutingConfigured: () => gateway, sub2apiConfigured: () => gateway, SUB2API_PLATFORMS: ['openai'], pickPlatformForModel: () => 'openai' },
+    './sub2api.js': { sub2apiRoutingConfigured: () => gateway, sub2apiConfigured: () => gateway, SUB2API_PLATFORMS: ['openai'], pickPlatformForModel: () => 'openai', dashscopeMediaRole: () => null, supportsDashscopeChatAudio: () => true },
     './agents/model-config.js': { REASONING_EFFORTS: new Set(['none']) },
   })
   const fallback = compile(read('../agents/fallback.ts'), { '../settings.js': {} })

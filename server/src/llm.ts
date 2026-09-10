@@ -505,7 +505,7 @@ export async function transcribeAudio(audioBase64: unknown, format: unknown = 'w
       return async () => {
         try {
           const body = await client.post<{ model?: unknown; usage?: unknown; choices?: { message?: { content?: unknown } }[] }>('/chat/completions', {
-            body: { model: candidate.requestModel, messages: [{ role: 'user', content: [
+            body: { model: candidate.requestModel, stream: false, messages: [{ role: 'user', content: [
               { type: 'input_audio', input_audio: { data: `data:${clip.mime};base64,${clip.audio}` } },
             ] }] }, maxRetries: 0, signal, timeout: remaining,
           })
