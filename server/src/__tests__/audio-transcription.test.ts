@@ -18,7 +18,7 @@ function fixture(statuses: (number | Error)[] = [], gateway = false, content: un
   const records: any[] = [], requests: any[] = [], logs: any[] = [], tenants: string[] = []
   const settings = { getServerSettingsSnapshot: () => ({ revision: '20', settings: { audio_model: 'asr-primary', audio_fallback_models: 'asr-backup', llm_config: '' }, sources: {} }),
     parseLlmConfig: () => ({ roles: [], models: [], routes: [] }), LLM_ROLES: ['audio'],
-    readLlmModelTarget: (model) => ({ requestModel: model, route: undefined, protocol: undefined, metadata: undefined }) }
+    readLlmModelTarget: (model: string) => ({ requestModel: model, route: undefined, protocol: undefined, metadata: undefined }) }
   const resolver = compile(read('../llm-resolver.ts'), {
     './settings.js': settings, './env.js': { resolveDirectLlmEnv: () => ({ configured: !gateway, protocol: 'chat' }) },
     './tenant-llm-context.js': { resolveTenantLlmContext: async (company: string) => { tenants.push(company); return { keys: { openai: 'owner-key' }, baseURL: 'https://gateway.invalid', authorizationVersion: 'owner-v1' } },
