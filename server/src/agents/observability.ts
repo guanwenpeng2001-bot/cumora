@@ -188,25 +188,39 @@ async function finishAgentRunRow(
        )`
     : ''
   const result = await db.query(
-    `UPDATE agent_runs
+    `WITH cloud_attempts AS (
+       SELECT l.* FROM llm_calls l
+       JOIN agent_runs ar ON ar.id = l.run_id
+         AND ar.agent_id = l.agent_id AND ar.company_id IS NOT DISTINCT FROM l.company_id
+       WHERE l.run_id = $1 AND l.source = 'cloud' AND l.purpose = 'agent-turn'
+     ), cloud_totals AS (
+       SELECT COUNT(*) AS attempts, SUM(cost_usd) AS cost_usd,
+              BOOL_OR(cost_estimated OR NOT measured) AS cost_estimated,
+              SUM(input_tokens) AS input_tokens, SUM(cached_input_tokens) AS cached_input_tokens,
+              SUM(cache_creation_tokens) AS cache_creation_tokens, SUM(output_tokens) AS output_tokens,
+              (SELECT model FROM cloud_attempts ORDER BY (status = 'ok') DESC, created_at DESC, id DESC LIMIT 1) AS model
+       FROM cloud_attempts
+     )
+     UPDATE agent_runs
         SET status = $2,
             stage = $2,
             summary = $3,
             error = $4,
             tool_call_count = $5,
             token_count = $6,
-            input_tokens          = COALESCE($7, input_tokens),
-            cached_input_tokens   = COALESCE($8, cached_input_tokens),
-            cache_creation_tokens = COALESCE($9, cache_creation_tokens),
-            output_tokens         = COALESCE($10, output_tokens),
-            cost_usd              = COALESCE($11, cost_usd),
-            cost_estimated        = COALESCE($12, cost_estimated),
-            model                 = COALESCE($13, model),
+            input_tokens          = CASE WHEN ct.attempts > 0 THEN ct.input_tokens ELSE COALESCE($7, agent_runs.input_tokens) END,
+            cached_input_tokens   = CASE WHEN ct.attempts > 0 THEN ct.cached_input_tokens ELSE COALESCE($8, agent_runs.cached_input_tokens) END,
+            cache_creation_tokens = CASE WHEN ct.attempts > 0 THEN ct.cache_creation_tokens ELSE COALESCE($9, agent_runs.cache_creation_tokens) END,
+            output_tokens         = CASE WHEN ct.attempts > 0 THEN ct.output_tokens ELSE COALESCE($10, agent_runs.output_tokens) END,
+            cost_usd              = CASE WHEN ct.attempts > 0 THEN ct.cost_usd ELSE COALESCE($11, agent_runs.cost_usd) END,
+            cost_estimated        = CASE WHEN ct.attempts > 0 THEN ct.cost_estimated ELSE COALESCE($12, agent_runs.cost_estimated) END,
+            model                 = CASE WHEN ct.attempts > 0 THEN ct.model ELSE COALESCE($13, agent_runs.model) END,
             updated_at = NOW(),
             finished_at = NOW()
-      WHERE id = $1
+      FROM cloud_totals ct
+      WHERE agent_runs.id = $1
         ${ownerPredicate}
-      RETURNING id`,
+      RETURNING agent_runs.id`,
     [
       args.runId,
       args.status,

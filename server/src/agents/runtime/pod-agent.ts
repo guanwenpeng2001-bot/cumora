@@ -11,7 +11,7 @@
  *   5. If the idle timer fires (no wakes for CUMORA_AGENT_IDLE_MS):
  *      set status='resting', close the stream, exit 0. K8s deletes
  *      the Pod. PVC stays.
- *   6. SIGTERM (k8s draining the node): finish current turn, exit 0.
+ *   6. SIGTERM (k8s draining the node): cancel current request, finish cleanup, exit 0.
  *
  * Per-agent serialization is intrinsic — one process, awaits each
  * turn before the next.
@@ -60,6 +60,8 @@ const state: RunnerState = {
   firstWakeReceived: false,
 }
 
+let activeTurnController: AbortController | null = null
+
 let pendingTurnOptions: AgentTurnOptions | null = null
 let inboxProbeTimer: NodeJS.Timeout | null = null
 let inboxProbeInFlight = false
@@ -69,6 +71,7 @@ function mergeTurnOptions(next: AgentTurnOptions | null): void {
 }
 
 async function drain(agentId: string, options: AgentTurnOptions | null = null): Promise<void> {
+  if (state.shuttingDown) return
   mergeTurnOptions(options)
   state.lastActivityAt = Date.now()
   if (state.busy) { state.pendingRerun = true; return }
@@ -80,12 +83,14 @@ async function drain(agentId: string, options: AgentTurnOptions | null = null): 
       pendingTurnOptions = null
       const started = Date.now()
       try {
-        await runAgentTurn(agentId, turnOptions)
+        activeTurnController = new AbortController()
+        await runAgentTurn(agentId, { ...turnOptions, signal: activeTurnController.signal })
         console.log(`[pod-agent] turn ok · ${Date.now() - started}ms`)
       } catch (err) {
         console.error(`[pod-agent] turn failed (${Date.now() - started}ms):`,
           err instanceof Error ? err.message : String(err))
       }
+      activeTurnController = null
       state.lastActivityAt = Date.now()
     } while (state.pendingRerun && !state.shuttingDown)
   } finally {
@@ -260,6 +265,7 @@ async function gracefulExit(reason: string, finalStatus: 'resting' | null): Prom
     await new Promise<void>(() => { /* never resolve */ })
   }
   state.shuttingDown = true
+  activeTurnController?.abort(new DOMException(`Pod stopping: ${reason}`, 'AbortError'))
   stopInboxProbe()
   console.log('[pod-agent] shutting down: ' + reason)
   // Wait for in-flight turn to finish, capped at 60s.

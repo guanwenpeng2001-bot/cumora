@@ -332,8 +332,8 @@ export interface AgentRuntimeClient {
     data?: Record<string, unknown>
     stage?: string
   }): Promise<void>
-  /** Close out the run with final status + totals. `model` + `usage` (optional)
-   *  let the server store a cache-aware effective cost for the turn. */
+  /** Close out the run. Server-recorded cloud attempts supply model and cost
+   *  totals; optional model/usage remain the legacy or BYOA projection. */
   finishRun(args: {
     runId: string
     status: 'running' | 'completed' | 'failed' | 'skipped'

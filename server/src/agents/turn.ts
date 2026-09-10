@@ -19,9 +19,8 @@
  */
 import type { ResponseInputItem, ResponseStreamEvent } from 'openai/resources/responses/responses'
 import { env } from '../env.js'
-import { agentReasoningEffort, agentMaxOutputTokens, supportReasoningOptions, supportReasoningHeadroom, reasoningOptions } from './reasoning.js'
-import { agentTurnChain, type AgentModelConfig } from './model-config.js'
-import { resolvedChain, runWithFallbackResult } from './fallback.js'
+import { supportReasoningOptions, supportReasoningHeadroom, reasoningOptions } from './reasoning.js'
+import { type AgentModelConfig } from './model-config.js'
 import { getBrainModel, getCompactionModel } from '../settings.js'
 import { redis } from '../redis.js'
 import { readLocalMessageAttachment } from '../local-attachment-files.js'
@@ -46,7 +45,6 @@ import { runtime } from './runtime/select.js'
 import type { AgentRuntimeClient } from './runtime/client.js'
 import { BUSY_STATUS_HEARTBEAT_MS } from '../status.js'
 import { errorText, type AgentRunStatus } from './observability.js'
-import { getLlmClient } from '../llm.js'
 import { enforceModelPolicy, realTaskModel, supportModel } from './model-policy.js'
 import { materializeImage } from './image-fetcher.js'
 import {
@@ -56,8 +54,8 @@ import {
   type ResponseStreamState,
 } from './turn-stream.js'
 import { compactHistoryWithSummary, estimateHistoryTokens, estimateTokens } from './turn-compaction.js'
-import { usageFromOpenAI, addUsage, EMPTY_USAGE, type TokenUsage } from './cost.js'
-import { recordLlmCall, classifyLlmCallError, readStreamUsage, readStreamReasoningTokens } from './llm-ledger.js'
+import { addUsage, EMPTY_USAGE, type TokenUsage } from './cost.js'
+import { recordLlmCall, readStreamUsage, readStreamReasoningTokens } from './llm-ledger.js'
 import { resolveDeclaredAutoRelayTarget } from './auto-relay.js'
 import {
   canDrainSteer,
@@ -127,6 +125,7 @@ import {
 import { mentionedAgentIds } from './scheduler.js'
 
 export interface AgentTurnOptions {
+  signal?: AbortSignal
   /** Why this turn was started. Message-driven turns remain the default. */
   trigger?: 'message.new' | 'idle' | 'manual' | 'background_scan' | 'poll.updated'
   /** Short scheduler note rendered only for idle synthetic wakes. */
@@ -340,8 +339,6 @@ function isModelProviderConnectionError(err: unknown): boolean {
   return isModelProviderConnectionText(errorText(err).toLowerCase())
 }
 
-const MODEL_PROVIDER_CONNECTION_RETRY_LIMIT = 2
-const MODEL_PROVIDER_CONNECTION_RETRY_BASE_MS = 500
 
 /** Big-brain reasoning effort for the agent's main turn (CUMORA_REASONING_EFFORT).
  *  Default 'low' — chat-first product, replies should feel instant. Raise to
@@ -359,11 +356,6 @@ const MODEL_PROVIDER_CONNECTION_RETRY_BASE_MS = 500
  *  Excess attempts still record an observability event so the underlying
  *  failure cause is preserved in the audit trail. */
 const FAILURE_NOTICE_HOURLY_CAP = 3
-
-function modelProviderConnectionRetryDelayMs(retryCount: number): number {
-  const backoff = MODEL_PROVIDER_CONNECTION_RETRY_BASE_MS * (2 ** Math.max(0, retryCount - 1))
-  return backoff + Math.floor(Math.random() * 250)
-}
 
 function agentTurnFailureNoticeReason(summary: string, err?: string | null): string {
   const text = `${summary}\n${err ?? ''}`.toLowerCase()
@@ -1204,6 +1196,79 @@ function verifierSideEffects(effects: CliSideEffect[]): string {
   return JSON.stringify(effects.slice(-20), null, 2)
 }
 
+async function executeAuxiliaryStream<T>(args: {
+  purpose: 'completion-verify' | 'compaction' | 'steer-summary'
+  companyId: string | null
+  agentId: string
+  instructions: string
+  input: ResponseInputItem[]
+  outputTokens: number
+  signal?: AbortSignal
+  extras?: Record<string, unknown>
+  parse: (text: string) => T
+}): Promise<T> {
+  const { resolveRoleCall } = await import('../llm-resolver.js')
+  const { executeLlmPlan } = await import('../llm-execution.js')
+  const { getLlmCandidateClient } = await import('../llm.js')
+  const { measuredUsage } = await import('./cost.js')
+  const plan = await resolveRoleCall(args.companyId, args.companyId ? 'managed' : 'server',
+    'compaction', args.purpose, { id: args.agentId })
+  return executeLlmPlan({
+    plan, context: { role: 'compaction', purpose: args.purpose, companyId: args.companyId,
+      agentId: args.agentId, extras: args.extras }, signal: args.signal,
+    prepare: async (candidate, state) => {
+      if (!['responses', 'chat'].includes(candidate.protocol)) throw new Error('Non-text auxiliary LLM protocol')
+      const client = await getLlmCandidateClient(plan, candidate)
+      const shim = candidate.route.kind === 'direct' && ['novita', 'orcarouter'].includes(candidate.route.env ?? '')
+      const useChat = candidate.protocol === 'chat' && !shim
+      const model = shim ? `${candidate.route.env}/${candidate.requestModel}` : candidate.requestModel
+      const maxTokens = Math.min(args.outputTokens + (candidate.parameters.reasoningHeadroom ?? 0),
+        candidate.parameters.maxOutputTokens ?? Infinity)
+      const effort = candidate.parameters.effort
+      state.protocol = useChat ? 'chat' : candidate.protocol
+      state.usageProtocol = useChat ? 'chat' : 'responses'
+      return async () => {
+        const stream = useChat
+          ? await client.chat.completions.create({
+            model, stream: true, stream_options: { include_usage: true },
+            messages: [{ role: 'system', content: args.instructions }, ...args.input.map(item => {
+              const message = item as { role: 'user'; content: Array<{ text: string }> }
+              return { role: message.role, content: message.content.map(part => part.text).join('\n') }
+            })], max_completion_tokens: maxTokens, ...(effort ? { reasoning_effort: effort } : {}),
+          } as Parameters<typeof client.chat.completions.create>[0], { signal: args.signal })
+          : await client.responses.create({
+            model, instructions: args.instructions, input: args.input, stream: true,
+            max_output_tokens: maxTokens, ...(effort ? { reasoning: { effort } } : {}),
+          } as Parameters<typeof client.responses.create>[0], { signal: args.signal })
+        let collected = ''
+        for await (const event of stream as unknown as AsyncIterable<Record<string, any>>) {
+          if (args.signal?.aborted) throw args.signal.reason ?? new Error('auxiliary stream aborted')
+          const response = useChat ? event : event.response
+          if (typeof response?.model === 'string') state.actualModel = response.model
+          if (response?.usage) {
+            state.rawUsage = response.usage
+            state.usage = measuredUsage(response.usage, useChat ? 'chat' : 'responses')
+            state.reasoningTokens = response.usage[useChat ? 'completion_tokens_details' : 'output_tokens_details']?.reasoning_tokens
+          }
+          if (event.type === 'error' || event.type === 'response.failed' || event.type === 'response.incomplete') {
+            const error = response?.error ?? event.error ?? event
+            throw Object.assign(new Error(error.message ?? 'Auxiliary response did not complete'),
+              { status: error.status ?? event.status, code: error.code })
+          }
+          if (useChat) collected += event.choices?.[0]?.delta?.content ?? ''
+          else if (event.type === 'response.output_text.delta') collected += event.delta
+          else if (event.type === 'response.output_text.done') collected = event.text || collected
+        }
+        if (args.signal?.aborted) throw args.signal.reason ?? new Error('auxiliary stream aborted')
+        const result = args.parse(collected)
+        // These private streams publish only the fully parsed result, never partial text.
+        state.committed = true
+        return result
+      }
+    },
+  })
+}
+
 async function verifyTerminalCompletion(args: {
   persona: { name: string; model: string | null }
   tenant: string | null
@@ -1212,9 +1277,6 @@ async function verifyTerminalCompletion(args: {
   turnStatus: TurnStatusOutput
   sideEffects: CliSideEffect[]
 }): Promise<CompletionVerification> {
-  const client = await getLlmClient(args.tenant)
-  // Completion verification is auxiliary judgment, not a real task — small model.
-  const model = enforceModelPolicy(getCompactionModel() || supportModel(), 'completion-verify')
   const instructions = `You are Cumora's turn-completion verifier. Decide whether agent "${args.persona.name}" may safely end this turn.
 
 Use semantic judgment, not keyword rules. Read the actual conversation and the actual side effects. A reaction can be a valid lightweight response only when the human did not ask for a deliverable, answer, artifact, image, file, external action, or status report that remains missing. If the human asked for work and the side effects only acknowledge it, completion is false.
@@ -1225,25 +1287,10 @@ Reply ONLY as JSON: {"complete":boolean,"reason":"short factual reason","next_st
   const VERIFIER_TIMEOUT_MS = 10_000
   const ctrl = new AbortController()
   const timer = setTimeout(() => ctrl.abort(new Error('completion verifier timed out')), VERIFIER_TIMEOUT_MS)
-  // Stream-local ledger state. We record EXACTLY ONCE at the natural end of
-  // the stream (success path) or in the catch (failure path) — never twice.
-  const t0 = Date.now()
-  let usage: TokenUsage | null = null
-  let reasoning = 0
-  let recorded = false
-  const record = (status: 'ok' | 'rate_limited' | 'timeout' | 'failed', error?: string) => {
-    if (recorded) return
-    recorded = true
-    void recordLlmCall({
-      purpose: 'completion-verify', companyId: args.tenant, agentId: args.agentId,
-      model, usage, reasoningTokens: reasoning,
-      latencyMs: Date.now() - t0, status, error,
-    })
-  }
   try {
-    const stream = await client.responses.create({
-      model,
-      instructions,
+    const result = await executeAuxiliaryStream({
+      purpose: 'completion-verify', companyId: args.tenant, agentId: args.agentId,
+      instructions, outputTokens: 500, signal: ctrl.signal,
       input: [
         {
           role: 'user',
@@ -1266,29 +1313,14 @@ Reply ONLY as JSON: {"complete":boolean,"reason":"short factual reason","next_st
           ],
         },
       ],
-      stream: true,
-      max_output_tokens: 500 + supportReasoningHeadroom(),
-      ...supportReasoningOptions(),
-      signal: ctrl.signal,
-    } as unknown as Parameters<typeof client.responses.create>[0])
-
-    let collected = ''
-    for await (const ev of stream as AsyncIterable<ResponseStreamEvent>) {
-      if (ctrl.signal.aborted) throw new Error('completion verifier aborted')
-      const u = readStreamUsage(ev as unknown as { type?: string } & Record<string, unknown>)
-      if (u) { usage = u; reasoning = readStreamReasoningTokens(ev as unknown as { type?: string } & Record<string, unknown>) }
-      if (ev.type === 'response.output_text.delta') {
-        collected += (ev as unknown as { delta: string }).delta
-      } else if (ev.type === 'response.output_text.done') {
-        collected = (ev as unknown as { text: string }).text || collected
-      }
-    }
-    const verdict = parseCompletionVerification(collected)
-    if (!verdict) throw new Error(`completion verifier returned invalid JSON: ${collected.slice(0, 500)}`)
-    record('ok')
-    return verdict
+      parse: (collected) => {
+        const verdict = parseCompletionVerification(collected)
+        if (!verdict) throw new Error(`completion verifier returned invalid JSON: ${collected.slice(0, 500)}`)
+        return verdict
+      },
+    })
+    return result
   } catch (err) {
-    record(classifyLlmCallError(err), err instanceof Error ? err.message : String(err))
     throw err
   } finally {
     clearTimeout(timer)
@@ -1341,8 +1373,7 @@ function formatItemsForSummary(items: ResponseInputItem[]): string {
  *  portion of history. One round-trip; result is spliced into history
  *  as a synthetic message that replaces the dropped items.
  *
- *  Same client as the turn-loop's main LLM call (per-tenant via
- *  getLlmClient → sub2api), same model. The prompt explicitly asks
+ *  Uses the tenant's compaction plan. The prompt explicitly asks
  *  for an "actionable continuation note" rather than narrative prose
  *  so the agent reading it can immediately resume. */
 async function summarizeHistoryItems(
@@ -1353,13 +1384,6 @@ async function summarizeHistoryItems(
 ): Promise<string> {
   const flattened = formatItemsForSummary(itemsToDrop)
   if (flattened.length === 0) return '(no earlier work to summarize)'
-  const client = await getLlmClient(tenant)
-  // Prefer OPENAI_COMPACTION_MODEL when configured — auto-compaction is
-  // a one-shot summarization pass and lets the operator route it to a
-  // cheaper model without affecting the agent's main reasoning quality.
-  // Falls back to the agent's own model so unset == "current behavior".
-  // Summarizing earlier tool work is auxiliary, not a real task — small model.
-  const model = enforceModelPolicy(getCompactionModel() || supportModel(), 'compaction')
   const instructions = `You are summarizing earlier tool work that agent "${persona.name}" did during a single turn, so the agent can continue without seeing the raw history. Write a concise, factual "what I've done so far" note (≤ 800 words) that includes:
 
 - Which tools were called, and what each returned (paths, IDs, key strings, error messages — keep the SPECIFIC data, not the generalities)
@@ -1367,32 +1391,10 @@ async function summarizeHistoryItems(
 - Anything the agent should remember to do NEXT
 
 Skip narrative framing. No headings, no bullet symbols unless they aid clarity. Plain paragraphs. Treat the output as a private memo to your future self.`
-  const t0 = Date.now()
-  let usage: TokenUsage | null = null
-  let reasoning = 0
-  let recorded = false
-  // Pre-compaction size as a local estimate — the operator can compare this
-  // against output_tokens to see "the summarizer ate 50K tokens of context
-  // and produced 800 tokens of memo, that's a 60× compression on this turn".
-  // estimateTokens is the same heuristic the 75%-budget guard uses, so the
-  // number here is consistent with what triggered the compaction in the
-  // first place.
-  const inputCharsBefore = flattened.length
-  const inputTokensBefore = estimateTokens(flattened)
-  const record = (status: 'ok' | 'rate_limited' | 'timeout' | 'failed', error?: string) => {
-    if (recorded) return
-    recorded = true
-    void recordLlmCall({
-      purpose: 'compaction', companyId: tenant, agentId,
-      model, usage, reasoningTokens: reasoning,
-      latencyMs: Date.now() - t0, status, error,
-      extras: { itemsDropped: itemsToDrop.length, inputCharsBefore, inputTokensBefore },
-    })
-  }
   try {
-    const stream = await client.responses.create({
-      model,
-      instructions,
+    const result = await executeAuxiliaryStream({
+      purpose: 'compaction', companyId: tenant, agentId, extras: { itemsDropped: itemsToDrop.length, inputCharsBefore: flattened.length, inputTokensBefore: estimateTokens(flattened) },
+      instructions, outputTokens: 1500,
       input: [
         {
           role: 'user',
@@ -1401,27 +1403,14 @@ Skip narrative framing. No headings, no bullet symbols unless they aid clarity. 
           ],
         },
       ],
-      stream: true,
-      max_output_tokens: 1500 + supportReasoningHeadroom(),
-      ...supportReasoningOptions(),
-    } as unknown as Parameters<typeof client.responses.create>[0])
-
-    let collected = ''
-    for await (const ev of stream as AsyncIterable<ResponseStreamEvent>) {
-      const u = readStreamUsage(ev as unknown as { type?: string } & Record<string, unknown>)
-      if (u) { usage = u; reasoning = readStreamReasoningTokens(ev as unknown as { type?: string } & Record<string, unknown>) }
-      if (ev.type === 'response.output_text.delta') {
-        collected += (ev as unknown as { delta: string }).delta
-      } else if (ev.type === 'response.output_text.done') {
-        collected = (ev as unknown as { text: string }).text || collected
-      }
-    }
-    const text = collected.trim()
-    if (!text) throw new Error('empty summary from LLM')
-    record('ok')
-    return text
+      parse: (collected) => {
+        const text = collected.trim()
+        if (!text) throw new Error('empty summary from LLM')
+        return text
+      },
+    })
+    return result
   } catch (err) {
-    record(classifyLlmCallError(err), err instanceof Error ? err.message : String(err))
     console.warn(`[turn] ${agentId} summarizeHistoryItems failed:`, err instanceof Error ? err.message : err)
     throw err
   }
@@ -1499,8 +1488,7 @@ function renderSteerBatchTruncated(
 }
 
 /** Summarize a larger steer batch through the cheap-model summarizer.
- *  Mirrors the auto-compaction summarizer (uses
- *  OPENAI_COMPACTION_MODEL when set; falls back to persona.model).
+ *  Uses the compaction role with its own steer-summary purpose.
  *  On any failure, callers fall back to the TRUNCATED-verbatim render
  *  — NOT a full verbatim of the batch (which would be the exact
  *  context blow-up summarizing exists to prevent). */
@@ -1512,9 +1500,6 @@ async function summarizeSteerBatch(
   draftAssistantText?: string | null,
 ): Promise<string> {
   const flattened = batch.map((s) => `@${s.authorName} in ${s.conversationId}:\n${s.body}`).join('\n\n---\n\n')
-  const client = await getLlmClient(tenant)
-  // Digesting a mid-turn steer batch is auxiliary, not a real task — small model.
-  const model = enforceModelPolicy(getCompactionModel() || supportModel(), 'steer-summary')
   const draft = (draftAssistantText ?? '').trim()
   const draftBlock = draft
     ? `\n\nThe agent was ABOUT TO SEND this reply when the new messages arrived:\n---\n${draft}\n---\nFlag explicitly if any new message changes the answer they were about to give.`
@@ -1534,24 +1519,10 @@ Treat the output as a private memo that will be appended to the agent's input. E
   const SUMMARIZER_TIMEOUT_MS = 10_000
   const ctrl = new AbortController()
   const timer = setTimeout(() => ctrl.abort(new Error('steer summarizer timed out')), SUMMARIZER_TIMEOUT_MS)
-  const t0 = Date.now()
-  let usage: TokenUsage | null = null
-  let reasoning = 0
-  let recorded = false
-  const record = (status: 'ok' | 'rate_limited' | 'timeout' | 'failed', error?: string) => {
-    if (recorded) return
-    recorded = true
-    void recordLlmCall({
-      purpose: 'steer-summary', companyId: tenant, agentId,
-      model, usage, reasoningTokens: reasoning,
-      latencyMs: Date.now() - t0, status, error,
-      extras: { batchSize: batch.length, hadDraft: !!draft },
-    })
-  }
   try {
-    const stream = await client.responses.create({
-      model,
-      instructions,
+    const result = await executeAuxiliaryStream({
+      purpose: 'steer-summary', companyId: tenant, agentId, extras: { batchSize: batch.length, hadDraft: !!draft },
+      instructions, outputTokens: 600, signal: ctrl.signal,
       input: [
         {
           role: 'user',
@@ -1560,35 +1531,114 @@ Treat the output as a private memo that will be appended to the agent's input. E
           ],
         },
       ],
-      stream: true,
-      max_output_tokens: 600 + supportReasoningHeadroom(),
-      ...supportReasoningOptions(),
-      signal: ctrl.signal,
-    } as unknown as Parameters<typeof client.responses.create>[0])
-
-    let collected = ''
-    for await (const ev of stream as AsyncIterable<ResponseStreamEvent>) {
-      if (ctrl.signal.aborted) throw new Error('steer summarizer aborted')
-      const u = readStreamUsage(ev as unknown as { type?: string } & Record<string, unknown>)
-      if (u) { usage = u; reasoning = readStreamReasoningTokens(ev as unknown as { type?: string } & Record<string, unknown>) }
-      if (ev.type === 'response.output_text.delta') {
-        collected += (ev as unknown as { delta: string }).delta
-      } else if (ev.type === 'response.output_text.done') {
-        collected = (ev as unknown as { text: string }).text || collected
-      }
-    }
-    const text = collected.trim()
-    if (!text) throw new Error('empty summary from LLM')
-    record('ok')
+      parse: (collected) => {
+        const text = collected.trim()
+        if (!text) throw new Error('empty summary from LLM')
+        return text
+      },
+    })
+    const text = result
     const header = draft
       ? `[Mid-turn update — summary of ${batch.length} new messages; you were about to send a reply, see if it still applies]`
       : `[Mid-turn update — summary of ${batch.length} new messages]`
     return `${header}\n\n${text}`
   } catch (err) {
-    record(classifyLlmCallError(err), err instanceof Error ? err.message : String(err))
     console.warn(`[turn] ${agentId} summarizeSteerBatch failed; falling back to TRUNCATED verbatim:`,
       err instanceof Error ? err.message : err)
     return renderSteerBatchTruncated(batch, draftAssistantText)
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+export async function executeAgentTurnHop(args: {
+  plan: import('../llm-resolver.js').RoleCallPlan
+  context: import('./llm-ledger.js').LlmCallContext
+  input: ResponseInputItem[]
+  instructions: string
+  tools: unknown[]
+  signal?: AbortSignal
+  wallTimeoutMs?: number
+  idleTimeoutMs?: number
+  requestEvent?: (data: Record<string, unknown>) => Promise<void>
+  record?: (record: import('./llm-ledger.js').LlmCallRecord) => Promise<void>
+}): Promise<{ state: ResponseStreamState; input: ResponseInputItem[] }> {
+  const { executeLlmPlan, responsesToChat } = await import('../llm-execution.js')
+  const { getLlmCandidateClient } = await import('../llm.js')
+  const { compactHistory } = await import('./turn-compaction.js')
+  const { measuredUsage } = await import('./cost.js')
+  const { chatResponseStream } = await import('../novita.js')
+  const controller = new AbortController()
+  const signal = args.signal ? AbortSignal.any([args.signal, controller.signal]) : controller.signal
+  const timer = setTimeout(() => controller.abort(new DOMException('Model hop wall timeout', 'TimeoutError')),
+    args.wallTimeoutMs ?? 6 * 60_000)
+  let stripImages = false
+  try {
+    return await executeLlmPlan({
+      plan: args.plan, context: args.context, signal, sdkMaxRetries: 0, record: args.record,
+      retry: { maxRetries: 1, shouldRetry: error => {
+        if (stripImages || !isImageFetchFailure(error)) return false
+        stripImages = true
+        return true
+      } },
+      prepare: async (candidate, attempt) => {
+        signal.throwIfAborted()
+        if (!['responses', 'chat'].includes(candidate.protocol)) throw new Error('Non-text turn protocol')
+        if (candidate.capabilities.tools === false && args.tools.length) throw new Error('Turn candidate does not support tools')
+        let input = structuredClone(args.input)
+        if (stripImages || candidate.capabilities.vision === false) input = stripImageInputs(input)
+        const overhead = estimateTokens(args.instructions) + estimateTokens(JSON.stringify(args.tools))
+        const window = candidate.parameters.contextWindow ?? contextWindowFor(candidate.model)
+        const output = Math.min(candidate.parameters.maxOutputTokens ?? 4000, window - overhead - 1)
+        const inputBudget = Math.min(hardLimitFor(candidate.model, window), window - overhead - output)
+        if (output < 1 || inputBudget < 1) throw new Error('Turn candidate context budget exhausted')
+        if (estimateHistoryTokens(input) > inputBudget) input = compactHistory(input, n => n > inputBudget).newHistory
+        if (estimateHistoryTokens(input) > inputBudget) throw new Error('Turn candidate input exceeds context budget')
+        const shim = candidate.route.kind === 'direct' && ['novita', 'orcarouter'].includes(candidate.route.env ?? '')
+        const useChat = candidate.protocol === 'chat' && !shim
+        const model = shim ? `${candidate.route.env}/${candidate.requestModel}` : candidate.requestModel
+        const body = { model, input, instructions: args.instructions, tools: args.tools,
+          tool_choice: 'auto', stream: true, max_output_tokens: output,
+          ...(candidate.parameters.effort ? { reasoning: { effort: candidate.parameters.effort } } : {}) }
+        const client = await getLlmCandidateClient(args.plan, candidate)
+        const state = newResponseStreamState()
+        const requestController = new AbortController()
+        const requestSignal = AbortSignal.any([signal, requestController.signal])
+        attempt.protocol = candidate.protocol
+        attempt.usageProtocol = 'responses'
+        await args.requestEvent?.({ model: candidate.model, requestedModel: args.plan.candidates[0]?.model,
+          requestModel: candidate.requestModel, actualModel: null, route: candidate.route.id,
+          inputItems: input.length, maxOutputTokens: output, contextWindow: window, imageStripRetryUsed: stripImages })
+        return async () => {
+          signal.throwIfAborted()
+          const stream = useChat
+            ? chatResponseStream(client, { ...responsesToChat(body), stream_options: { include_usage: true } }, requestSignal)
+            : await client.responses.create(body as Parameters<typeof client.responses.create>[0], { signal: requestSignal, maxRetries: 0 })
+          try {
+            await consumeResponseStream(stream as AsyncIterable<ResponseStreamEvent>, event => {
+              try { applyResponseStreamEvent(state, event, { traceItem: traceResponseOutputItem }) }
+              finally {
+                attempt.actualModel = state.actualModel ?? null
+                attempt.rawUsage = state.responseUsage
+                attempt.usage = measuredUsage(state.responseUsage, 'responses')
+                const reasoning = (state.responseUsage as { output_tokens_details?: { reasoning_tokens?: number } } | null)?.output_tokens_details?.reasoning_tokens
+                if (typeof reasoning === 'number' && Number.isSafeInteger(reasoning) && reasoning >= 0) attempt.reasoningTokens = reasoning
+                if (Array.from(state.responseTextByPart.values()).some(text => text.length > 0)
+                  || Object.keys(state.pendingTools).length > 0 || state.responseOutput.length > 0) attempt.committed = true
+              }
+            }, { signal: requestSignal, idleTimeoutMs: args.idleTimeoutMs, abortRequest: reason => requestController.abort(reason) })
+            signal.throwIfAborted()
+            if (!state.completed) throw Object.assign(new Error('Response stream ended before completion'), { code: 'ECONNRESET' })
+            state.actualModel ??= candidate.model
+            return { state, input }
+          } finally {
+            requestController.abort()
+            const streamController = (stream as unknown as { controller?: AbortController }).controller
+            streamController?.abort()
+          }
+        }
+      },
+    })
   } finally {
     clearTimeout(timer)
   }
@@ -1601,9 +1651,6 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
   // Per-agent model settings (participants.model_config). Absent fields
   // inherit the global brain role (server_settings → env).
   const agentMc: AgentModelConfig | null = persona.modelConfig ?? null
-  const turnEffort = agentMc?.effort ?? agentReasoningEffort()
-  const turnMaxOutputTokens = agentMc?.maxOutputTokens ?? agentMaxOutputTokens()
-  const turnThinking = agentMc?.thinking ?? true
   const turnContextWindow = agentMc?.contextWindow
 
   const inbox = await loadInbox(agentId)
@@ -1680,6 +1727,8 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
   // Cache-aware usage SUMMED across every model hop of this turn (totalTokensThisTurn
   // tracks only the last hop, for the budget guard; this is for the cost ledger).
   let turnUsage: TokenUsage = { ...EMPTY_USAGE }
+  let lastSuccessfulModel: string | null = null
+  let lastAttemptModel: string | null = null
   let missingUsageHopCount = 0
   let toolCallCount = 0
   // Plain assistant text emitted by the model is only a draft; Cumora users
@@ -2051,6 +2100,8 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
         : (options.idleReason ?? 'idle heartbeat')
     const gate = await gateSyntheticWake({
       companyId: runCompanyId,
+      agentId,
+      runId,
       personaName: persona.name,
       kind: options.trigger as 'idle' | 'background_scan' | 'poll.updated',
       brief,
@@ -2510,6 +2561,7 @@ Mechanics:
   }
 
   for (let hop = 0; hop < MAX_HOPS; hop++) {
+    options.signal?.throwIfAborted()
     // Auto-compaction: when the previous hop's reported usage crosses the
     // soft threshold, reshape `history` BEFORE sending it. compactHistory()
     // first truncates oversized function_call_output payloads in place,
@@ -2613,220 +2665,55 @@ Mechanics:
     // response item shape so the wire format matches what /v1/responses
     // wants back. Reasoning / text items are intentionally NOT collected.
     const assistantOutputItems: ResponseInputItem[] = []
-    // Retry budget for provider failures. Image fetch failures retry once
-    // without pixels; provider transport failures retry briefly before the
-    // turn is allowed to fail and post a user-visible notice.
-    let inputForAttempt: ResponseInputItem[] = nextInput
-    let imageStripRetryUsed = false
-    let modelConnectionRetryCount = 0
-    const maybeRetryModelProviderConnection = async (err: unknown, phase: 'create' | 'stream'): Promise<boolean> => {
-      if (isQuotaExhaustedError(err)) return false
-      if (!isModelProviderConnectionError(err)) return false
-      if (modelConnectionRetryCount >= MODEL_PROVIDER_CONNECTION_RETRY_LIMIT) return false
-
-      modelConnectionRetryCount += 1
-      const delayMs = modelProviderConnectionRetryDelayMs(modelConnectionRetryCount)
-      await runtime.recordEvent({
-        runId, agentId, companyId: runCompanyId,
-        kind: 'model.retry_provider_connection',
-        level: 'warn',
-        title: 'Model provider connection failed; retrying request',
-        data: {
-          hop: hop + 1,
-          phase,
-          retry: modelConnectionRetryCount,
-          maxRetries: MODEL_PROVIDER_CONNECTION_RETRY_LIMIT,
-          delayMs,
-          error: errorText(err),
-        },
-        stage: 'model_retry_provider_connection',
-      }).catch(() => { /* observability best-effort */ })
-      await new Promise<void>((resolve) => setTimeout(resolve, delayMs))
-      return true
-    }
-
+    const { resolveRoleCall } = await import('../llm-resolver.js')
+    const plan = await resolveRoleCall(runCompanyId, 'managed', 'brain', 'agent-turn', {
+      id: agentId, model: persona.model ? enforceModelPolicy(realTaskModel(persona.model), 'agent-turn') : undefined,
+      modelConfig: agentMc,
+    })
     try {
-      // Inner retry loop. attempt=0 sends full multimodal input; attempt=1
-      // (only entered if image fetch fails) re-sends without images.
-      for (let attempt = 0; ; attempt++) {
-      if (attempt > 0) {
-        // Reset per-attempt state so a partial response from attempt 0 doesn't
-        // contaminate observability / tool-call accounting on the retry.
-        streamState = newResponseStreamState()
-        assistantOutputItems.length = 0
-      }
-      const retryKind = attempt === 0 ? null : imageStripRetryUsed ? 'images stripped' : 'provider connection'
-      await runtime.recordEvent({
-        runId, agentId, companyId: runCompanyId,
-        kind: 'model.request',
-        title: retryKind === null
-          ? `Model hop ${hop + 1} started`
-          : `Model hop ${hop + 1} retry (${retryKind})`,
-        data: {
-          hop: hop + 1,
-          attempt: attempt + 1,
-          model: persona.model ?? getBrainModel(),
-          inputItems: inputForAttempt.length,
-          historyItems: history.length,
-          instructions: traceText(instructions),
-          input: traceInput(inputForAttempt),
-          tools: traceToolDefinitions(mcpToolDefs),
-          request: {
-            toolChoice: 'auto',
-            reasoning: turnThinking && turnEffort !== 'none' ? { effort: turnEffort } : null,
-            maxOutputTokens: turnMaxOutputTokens,
-          },
+      const result = await executeAgentTurnHop({
+        plan, context: { purpose: 'agent-turn', role: 'brain', companyId: runCompanyId, agentId, runId,
+          extras: { hop: hop + 1 } },
+        input: nextInput, instructions,
+        tools: mcpToolDefs.length > 0 ? [...TOOL_DEFS_RESPONSES, ...mcpToolDefs] : TOOL_DEFS_RESPONSES,
+        signal: options.signal,
+        requestEvent: async data => { await runtime.recordEvent({
+          runId, agentId, companyId: runCompanyId, kind: 'model.request',
+          title: `Model hop ${hop + 1} started`,
+          data: { ...data, hop: hop + 1, lastSuccessfulModel }, stage: `model_hop_${hop + 1}`,
+        }) },
+        record: async record => {
+          lastAttemptModel = record.model
+          if (record.usage) turnUsage = addUsage(turnUsage, record.usage)
+          await recordLlmCall(record)
         },
-        stage: retryKind === null
-          ? `model_hop_${hop + 1}`
-          : imageStripRetryUsed
-            ? `model_hop_${hop + 1}_no_images`
-            : `model_hop_${hop + 1}_retry`,
       })
-      const hopModel = enforceModelPolicy(realTaskModel(persona.model), 'agent-turn')
-      const hopChain = agentTurnChain(hopModel, agentMc, resolvedChain('brain'))
-      // An explicit turn chain owns fallback selection. Ask the client factory
-      // for provider routing only, otherwise the role wrapper would retry the
-      // same chain inside this one and amplify every failure.
-      const client = await getLlmClient(runCompanyId, { skipModelFallback: Boolean(hopChain) })
-      // Per-hop ledger state. Each model hop is a separately-billed call (the
-      // existing addUsage() sums them for the turn total), so each gets its
-      // own llm_calls row with purpose='agent-turn'. This makes "which hop
-      // burned the most tokens" queryable AND gives a clean cross-purpose
-      // breakdown for the same turn (agent-turn rows + the verify/compaction
-      // rows already recorded above).
-      let effectiveHopModel = hopModel
-      const hopT0 = Date.now()
-      let hopRecorded = false
-      const recordHop = (status: 'ok' | 'rate_limited' | 'timeout' | 'failed', usage: TokenUsage | null, error?: string) => {
-        if (hopRecorded) return
-        hopRecorded = true
-        void recordLlmCall({
-          purpose: 'agent-turn', companyId: runCompanyId, agentId, runId,
-          model: effectiveHopModel, usage,
-          latencyMs: Date.now() - hopT0, status, error,
-          extras: { hop: hop + 1, imageStripRetryUsed, retryKind },
-        })
-      }
-      let stream
-      try {
-        const createArgs = {
-          // THE real task: the agent's main turn responding to a conversation.
-          // The one sanctioned big-model call site (per-agent override wins).
-          model: hopModel,
-          instructions,
-          input: inputForAttempt,
-          tools: mcpToolDefs.length > 0 ? [...TOOL_DEFS_RESPONSES, ...mcpToolDefs] : TOOL_DEFS_RESPONSES,
-          tool_choice: 'auto' as const,
-          // thinking=false omits the reasoning field entirely (provider
-          // default); effort/maxOutputTokens inherit from the global brain
-          // role unless model_config pins them.
-          ...(turnThinking ? reasoningOptions(turnEffort) : {}),
-          max_output_tokens: turnMaxOutputTokens,
-          // No `previous_response_id` — sub2api's OAuth /v1/responses path
-          // rejects it (see history block above). The full transcript is
-          // re-sent via `inputForAttempt` instead.
-          stream: true as const,
-        }
-        if (hopChain) {
-          const fallbackResult = await runWithFallbackResult(hopChain, (m) => client.responses.create({ ...createArgs, model: m }))
-          effectiveHopModel = fallbackResult.model
-          stream = fallbackResult.value
-        } else {
-          stream = await client.responses.create(createArgs)
-        }
-      } catch (err) {
-        // Record the failed attempt: no usage (the SDK error preceded any
-        // stream events), classified by error shape. Even retried attempts
-        // are real sub2api calls so they get their own row.
-        recordHop(classifyLlmCallError(err), null, err instanceof Error ? err.message : String(err))
-        // The "image_url unreachable" rejection lands here (before we ever
-        // start streaming). HEAD-probing in the prompt builder catches most
-        // bad URLs, but some CDNs 200 on HEAD and 4xx on GET — this is the
-        // safety net that keeps a turn alive when probing was insufficient.
-        if (!imageStripRetryUsed && isImageFetchFailure(err)) {
-          imageStripRetryUsed = true
-          inputForAttempt = stripImageInputs(nextInput)
-          await runtime.recordEvent({
-            runId, agentId, companyId: runCompanyId,
-            kind: 'model.retry_no_images',
-            level: 'warn',
-            title: 'OpenAI could not fetch an image_url; retrying with images stripped',
-            data: { hop: hop + 1, error: errorText(err) },
-            stage: 'model_retry_no_images',
-          }).catch(() => { /* observability best-effort */ })
-          continue
-        }
-        if (await maybeRetryModelProviderConnection(err, 'create')) continue
-        throw err
-      }
-
-      try {
-        await consumeResponseStream(
-          stream as AsyncIterable<ResponseStreamEvent>,
-          (event) => applyResponseStreamEvent(streamState, event, { traceItem: traceResponseOutputItem }),
-        )
-      } catch (err) {
-        // Stream itself blew up mid-flight. Record with whatever partial usage
-        // streamState managed to capture before the failure (often null on a
-        // connection drop pre-usage).
-        recordHop(
-          classifyLlmCallError(err),
-          streamState.responseUsage ? usageFromOpenAI(streamState.responseUsage) : null,
-          err instanceof Error ? err.message : String(err),
-        )
-        if (await maybeRetryModelProviderConnection(err, 'stream')) continue
-        throw err
-      }
-      // Surface the hop's token count to the per-turn 75%-budget guard.
+      streamState = result.state
+      history = result.input
+      lastSuccessfulModel = streamState.actualModel ?? null
       if (streamState.responseUsage) {
         totalTokensThisTurn = streamState.totalTokens
-        // Accumulate the cache-aware breakdown — each hop is a separately-billed
-        // call, so the turn's true cost is the SUM (not the last hop alone).
-        const hopUsage = usageFromOpenAI(streamState.responseUsage)
-        turnUsage = addUsage(turnUsage, hopUsage)
         missingUsageHopCount = 0
-        recordHop('ok', hopUsage)
       } else {
-        missingUsageHopCount += 1
+        missingUsageHopCount++
         totalTokensThisTurn = estimateHistoryTokens(history)
         await runtime.recordEvent({
-          runId, agentId, companyId: runCompanyId,
-          kind: 'turn.usage_missing',
-          level: 'warn',
+          runId, agentId, companyId: runCompanyId, kind: 'turn.usage_missing', level: 'warn',
           title: 'Model response completed without usage; using local history token estimate',
-          data: {
-            hop: hop + 1,
-            missingUsageHopCount,
-            estimatedHistoryTokens: totalTokensThisTurn,
-            historyItems: history.length,
-          },
-          stage: 'usage_missing',
+          data: { hop: hop + 1, missingUsageHopCount, estimatedHistoryTokens: totalTokensThisTurn }, stage: 'usage_missing',
         }).catch(() => { /* observability best-effort */ })
-        // Provider didn't surface usage on this hop. We still know the call
-        // landed — record the row with usage=null (measured=false, cost=0)
-        // so the spend rollup at least counts the call, with cost flagged
-        // as unmeasured. Better than dropping it silently.
-        recordHop('ok', null)
-      }
-      // Stream consumed successfully on this attempt — leave the inner
-      // strip-and-retry loop. (We never break-via-fallthrough on attempt 0
-      // because the only way to reach here is a fully-streamed response.)
-      break
       }
     } catch (err) {
-      console.error(`[turn] ${agentId} OpenAI error`, err)
       await runtime.recordEvent({
-        runId, agentId, companyId: runCompanyId,
-        kind: 'model.error',
-        level: 'error',
-        title: 'OpenAI response stream failed',
-        data: { hop: hop + 1, error: errorText(err) },
-        stage: 'model_error',
+        runId, agentId, companyId: runCompanyId, kind: 'model.error', level: 'error',
+        title: 'Model response stream failed',
+        data: { hop: hop + 1, requestedModel: plan.candidates[0]?.model,
+          actualModel: lastAttemptModel, lastSuccessfulModel, error: errorText(err) }, stage: 'model_error',
       })
       throw err
     }
 
+    options.signal?.throwIfAborted()
     const toolCalls = Object.values(streamState.pendingTools)
     // Rebuild assistantOutputItems from pendingTools — same source of truth
     // as `outs` below — so every function_call_output we emit has a matching
@@ -2850,7 +2737,10 @@ Mechanics:
       title: toolCalls.length > 0 ? `Model requested ${toolCalls.length} tool call${toolCalls.length === 1 ? '' : 's'}` : 'Model completed with no tool calls',
       data: {
         hop: hop + 1,
-        model: persona.model ?? getBrainModel(),
+        model: streamState.actualModel,
+        requestedModel: plan.candidates[0]?.model,
+        actualModel: streamState.actualModel,
+        lastSuccessfulModel,
         responseId: streamState.responseId,
         status: streamState.responseStatus,
         outputText: traceText(Array.from(streamState.responseTextByPart.values()).join('\n')),
@@ -3671,7 +3561,7 @@ Mechanics:
       error: finalError,
       toolCallCount,
       tokenCount: totalTokensThisTurn,
-      model: persona.model ?? getBrainModel(),
+      model: lastSuccessfulModel ?? lastAttemptModel,
       usage: turnUsage,
     }).catch((err) => console.error(`[turn] ${agentId} failed to finish observability run`, err))
   }

@@ -293,6 +293,7 @@ async function createNonStreaming(args: ResponsesCreateArgs, opts?: RequestOpts)
       : []
   return {
     id: completion.id,
+    model: completion.model,
     output_text: outputText,
     output,
     usage: toResponseUsage(completion.usage),
@@ -312,9 +313,11 @@ async function createNonStreaming(args: ResponsesCreateArgs, opts?: RequestOpts)
 async function* createStreaming(
   args: ResponsesCreateArgs,
   opts?: RequestOpts,
+  client = novitaClient(),
+  chatBody?: Record<string, unknown>,
 ): AsyncGenerator<ResponseStreamEvent> {
-  const body = buildChatBody(args, true)
-  const stream = await novitaClient().chat.completions.create(
+  const body = chatBody ?? buildChatBody(args, true)
+  const stream = await client.chat.completions.create(
     body as unknown as Parameters<OpenAI['chat']['completions']['create']>[0] & { stream: true },
     toRequestOptions(args, opts),
   )
@@ -333,10 +336,18 @@ async function* createStreaming(
   // on the first delta for that index).
   const toolCallsByIndex = new Map<number, { id: string; name: string; arguments: string }>()
   let usage: unknown = null
+  let actualModel: string | undefined
+  let finished = false
   let seq = 1
 
   for await (const chunk of stream as AsyncIterable<ChatCompletionChunk>) {
+    if (chunk.model) actualModel = chunk.model
+    if (chunk.choices?.[0]?.finish_reason) finished = true
     if (chunk.usage) usage = chunk.usage
+    if (chunk.model || chunk.usage) yield {
+      type: 'response.in_progress', sequence_number: seq++,
+      response: { id: responseId, model: actualModel, usage: toResponseUsage(usage), status: 'in_progress' },
+    } as unknown as ResponseStreamEvent
     const delta = chunk.choices?.[0]?.delta
     if (!delta) continue
     if (delta.content) {
@@ -381,6 +392,7 @@ async function* createStreaming(
     }
   }
 
+  if (!finished) throw Object.assign(new Error('Chat response stream ended before finish_reason'), { code: 'ECONNRESET' })
   for (const [idx, entry] of toolCallsByIndex) {
     yield {
       type: 'response.function_call_arguments.done',
@@ -411,6 +423,7 @@ async function* createStreaming(
     sequence_number: seq++,
     response: {
       id: responseId,
+      model: actualModel,
       status: 'completed',
       output,
       usage: toResponseUsage(usage),
@@ -425,8 +438,7 @@ async function* createStreaming(
  *  satisfies every real usage without depending on the SDK's internal
  *  `Stream` class. `controller.abort()` is wired so `turn-stream.ts`'s
  *  idle/wall timeout abort path (`abortStream`) has something to call. */
-function wrapAsyncIterable(gen: AsyncGenerator<ResponseStreamEvent>): AsyncIterable<ResponseStreamEvent> & { controller: AbortController } {
-  const controller = new AbortController()
+function wrapAsyncIterable(gen: AsyncGenerator<ResponseStreamEvent>, controller: AbortController): AsyncIterable<ResponseStreamEvent> & { controller: AbortController } {
   return {
     controller,
     [Symbol.asyncIterator]() {
@@ -442,8 +454,19 @@ function wrapAsyncIterable(gen: AsyncGenerator<ResponseStreamEvent>): AsyncItera
 export const novitaResponsesShim = {
   create(args: ResponsesCreateArgs, opts?: RequestOpts): unknown {
     if (args.stream) {
-      return Promise.resolve(wrapAsyncIterable(createStreaming(args, opts)))
+      const controller = new AbortController()
+      const parent = opts?.signal ?? args.signal
+      const signal = parent ? AbortSignal.any([parent, controller.signal]) : controller.signal
+      return Promise.resolve(wrapAsyncIterable(createStreaming(args, { ...opts, signal }), controller))
     }
     return createNonStreaming(args, opts)
   },
+}
+
+/** Reuse the Chat event translator for explicit Chat routes. */
+export function chatResponseStream(client: OpenAI, body: Record<string, unknown>, signal: AbortSignal): AsyncIterable<ResponseStreamEvent> {
+  const controller = new AbortController()
+  return wrapAsyncIterable(createStreaming({ model: String(body.model) }, {
+    signal: AbortSignal.any([signal, controller.signal]), maxRetries: 0,
+  }, client, body), controller)
 }

@@ -17,6 +17,7 @@ export const RESPONSE_STREAM_IDLE_TIMEOUT_MS = 4 * 60_000
 export const RESPONSE_STREAM_WALL_TIMEOUT_MS = 6 * 60_000
 
 export class ResponseStreamTimeoutError extends Error {
+  readonly code = 'ETIMEDOUT'
   constructor(
     readonly kind: 'idle' | 'wall',
     readonly timeoutMs: number,
@@ -35,6 +36,8 @@ export interface PendingToolCall {
 export interface ResponseStreamState {
   pendingTools: Record<string, PendingToolCall>
   responseTextByPart: Map<string, string>
+  actualModel?: string
+  completed?: boolean
   responseId?: string
   responseStatus?: string
   /** Traced (truncation-safe) representation of `response.completed.output`,
@@ -68,6 +71,8 @@ export interface ApplyStreamEventOptions {
 }
 
 export interface ConsumeStreamOptions {
+  signal?: AbortSignal
+  abortRequest?: (reason: unknown) => void
   /** Maximum silence between stream events. Once the HTTP stream has been
    *  established, the OpenAI SDK request timeout no longer protects every
    *  `for await` read; this bounds the no-progress case explicitly. */
@@ -93,17 +98,25 @@ async function nextWithTimeout<T>(
   next: Promise<IteratorResult<T>>,
   timeoutMs: number,
   kind: 'idle' | 'wall',
+  signal?: AbortSignal,
 ): Promise<IteratorResult<T>> {
   let timer: ReturnType<typeof setTimeout> | null = null
+  let onAbort: (() => void) | undefined
   try {
     return await Promise.race([
       next,
+      new Promise<never>((_, reject) => {
+        onAbort = () => reject(signal?.reason ?? new DOMException('Aborted', 'AbortError'))
+        if (signal?.aborted) onAbort()
+        else signal?.addEventListener('abort', onAbort, { once: true })
+      }),
       new Promise<IteratorResult<T>>((_, reject) => {
         timer = setTimeout(() => reject(new ResponseStreamTimeoutError(kind, timeoutMs)), timeoutMs)
       }),
     ])
   } finally {
     if (timer) clearTimeout(timer)
+    if (onAbort) signal?.removeEventListener('abort', onAbort)
   }
 }
 
@@ -118,18 +131,25 @@ export async function consumeResponseStream(
   const iterator = stream[Symbol.asyncIterator]()
 
   while (true) {
+    if (opts.signal?.aborted) {
+      abortStream(stream)
+      opts.signal.throwIfAborted()
+    }
     const remainingWallMs = deadline - Date.now()
     if (remainingWallMs <= 0) {
       abortStream(stream)
-      throw new ResponseStreamTimeoutError('wall', wallTimeoutMs)
+      const error = new ResponseStreamTimeoutError('wall', wallTimeoutMs)
+      opts.abortRequest?.(error)
+      throw error
     }
     const waitMs = Math.min(idleTimeoutMs, remainingWallMs)
     const timeoutKind = waitMs === remainingWallMs ? 'wall' : 'idle'
     let result: IteratorResult<ResponseStreamEvent>
     try {
-      result = await nextWithTimeout(iterator.next(), waitMs, timeoutKind)
+      result = await nextWithTimeout(iterator.next(), waitMs, timeoutKind, opts.signal)
     } catch (err) {
-      if (err instanceof ResponseStreamTimeoutError) abortStream(stream)
+      abortStream(stream)
+      if (err instanceof ResponseStreamTimeoutError) opts.abortRequest?.(err)
       throw err
     }
     if (result.done) return
@@ -157,6 +177,13 @@ export function applyResponseStreamEvent(
   event: ResponseStreamEvent,
   opts: ApplyStreamEventOptions = {},
 ): void {
+  if ('response' in event) {
+    if (event.response.model) state.actualModel = event.response.model
+    if (event.response.usage) {
+      state.responseUsage = event.response.usage
+      state.totalTokens = (event.response.usage.input_tokens ?? 0) + (event.response.usage.output_tokens ?? 0)
+    }
+  }
   switch (event.type) {
     case 'response.created':
       state.responseId = event.response.id
@@ -192,6 +219,7 @@ export function applyResponseStreamEvent(
       }
       break
     case 'response.completed':
+      state.completed = true
       state.responseStatus = event.response.status
       state.responseOutput = (event.response.output ?? []).map((item) =>
         opts.traceItem ? opts.traceItem(item) : item,
@@ -211,6 +239,16 @@ export function applyResponseStreamEvent(
                             (event.response.usage.output_tokens ?? 0)
       }
       break
+    case 'response.failed':
+    case 'response.incomplete': {
+      const code = event.response.error?.code
+      const status = code === 'server_error' ? 500 : code === 'rate_limit_exceeded' ? 429 : undefined
+      throw Object.assign(new Error(`Response ${event.type}: ${JSON.stringify(event.response.error ?? event.response.incomplete_details)}`), { status })
+    }
+    case 'error':
+      throw Object.assign(new Error(event.message), {
+        status: event.code === 'server_error' ? 500 : event.code === 'rate_limit_exceeded' ? 429 : undefined,
+      })
     default:
       break
   }

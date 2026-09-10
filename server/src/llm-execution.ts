@@ -27,6 +27,7 @@ export interface LlmExecutionOptions<T> {
   prepare: (candidate: RoleCallCandidate, state: LlmAttemptState) => Promise<() => Promise<T>>
   /** Streaming consumers must finish here and mark the first committed output. */
   consume?: (value: T, state: LlmAttemptState) => Promise<T>
+  retry?: { maxRetries: number; shouldRetry: (error: unknown, candidate: RoleCallCandidate) => boolean }
   record?: (record: LlmCallRecord) => Promise<void>
   log?: (event: Record<string, unknown>) => void
 }
@@ -38,6 +39,8 @@ export async function executeLlmPlan<T>(options: LlmExecutionOptions<T>): Promis
   if (!plan.candidates.length) throw new Error('LLM candidate chain is empty')
   const logicalCallId = options.logicalCallId ?? randomUUID()
   const checkAbort = () => { if (signal?.aborted) throw signal.reason ?? new DOMException('Aborted', 'AbortError') }
+  let retryCount = 0
+  let attempt = 0
   for (let index = 0; index < plan.candidates.length; index++) {
     checkAbort()
     const candidate = plan.candidates[index]!
@@ -52,24 +55,28 @@ export async function executeLlmPlan<T>(options: LlmExecutionOptions<T>): Promis
     try {
       value = await send()
       if (options.consume) value = await options.consume(value, state)
+      checkAbort()
     } catch (err) {
       failed = true
       error = err
     }
     const cancelled = signal?.aborted || isLlmCancellation(error)
     const reason = failed && !cancelled ? fallbackReason(error) : null
-    const next = failed && reason && !state.committed && !cancelled ? plan.candidates[index + 1] : undefined
+    const retry = failed && !state.committed && !cancelled && options.retry
+      && retryCount < Math.min(options.retry.maxRetries, 1)
+      && options.retry.shouldRetry(error, candidate)
+    const next = retry ? candidate : failed && reason && !state.committed && !cancelled ? plan.candidates[index + 1] : undefined
     const status = failed ? classifyLlmCallError(error) : 'ok'
     const extras = {
-      ...context.extras, logicalCallId, attempt: index + 1,
+      ...context.extras, logicalCallId, attempt: ++attempt,
       role: plan.role, purpose: plan.purpose, requestedModel: candidate.model,
       requestModel: candidate.requestModel, actualModel: state.actualModel,
       route: candidate.route.id, routeKind: candidate.route.kind, platform: candidate.route.platform ?? null,
       protocol: state.protocol ?? candidate.protocol, plannedProtocol: candidate.protocol, usageProtocol: state.usageProtocol ?? null, revision: plan.revision, authorizationVersion: plan.authorizationVersion ?? null,
       status, httpStatus: (error as { status?: number } | null)?.status ?? null,
       failureReason: cancelled ? 'cancelled' : reason ?? (failed ? 'non-fallbackable-error' : null),
-      nextCandidate: next?.model ?? null, nextCandidateReason: next ? reason : null,
-      stopReason: !failed ? 'completed' : cancelled ? 'cancelled' : state.committed ? 'output-committed' : !reason ? 'non-fallbackable-error' : next ? 'advance' : 'exhausted',
+      nextCandidate: next?.model ?? null, nextCandidateReason: retry ? 'retry-without-images' : next ? reason : null,
+      stopReason: !failed ? 'completed' : cancelled ? 'cancelled' : state.committed ? 'output-committed' : next ? 'advance' : !reason ? 'non-fallbackable-error' : 'exhausted',
       usage: state.usage, rawUsage: state.rawUsage, measurement: state.usage ? 'measured' : 'unknown',
       sdkMaxRetries: options.sdkMaxRetries ?? null, sdkRetryPolicy: options.sdkMaxRetries === undefined ? 'client-default' : 'request-override', sdkRetriesIndividuallyObservable: false,
     }
@@ -82,6 +89,7 @@ export async function executeLlmPlan<T>(options: LlmExecutionOptions<T>): Promis
     log(extras)
     if (!failed) return value as T
     if (!next) throw error
+    if (retry) { retryCount++; index-- }
   }
   throw new Error('LLM candidate chain is empty')
 }
@@ -114,7 +122,7 @@ async function textPlan(ctx: LlmCallContext, model?: string): Promise<RoleCallPl
     { ...ctx.agent, id: ctx.agentId ?? ctx.agent?.id }, captured)
 }
 
-function responsesToChat(args: TextArgs): TextArgs {
+export function responsesToChat(args: TextArgs): TextArgs {
   if (args.previous_response_id || args.conversation) throw new Error('Stateful Responses input cannot move to a Chat route')
   const messages: Record<string, unknown>[] = []
   if (args.instructions) messages.push({ role: 'system', content: args.instructions })
