@@ -17,7 +17,7 @@ import { parseAgentModelConfig, validateAgentModelConfig, InvalidAgentModelConfi
 import { publicBodyParserError } from '../body-parser-errors.js'
 import { startConvene } from '../agents/convene.js'
 import { ensureDirectConversation } from '../agents/private_chat.js'
-import { transcribeAudio } from '../llm.js'
+import { transcribeAudio, AudioInputError } from '../llm.js'
 import { LLM_ROLES, type LlmRole, getServerSettingsSnapshot, writeServerSettings, validateServerSettings, InvalidServerSettingError } from '../settings.js'
 import { availableModels, invalidateModelCatalog } from '../models-catalog.js'
 import { TenantLlmAccessError, resolveTenantLlmContext } from '../tenant-llm-context.js'
@@ -672,24 +672,19 @@ api.post('/uploads/refresh-url', safe(async (req, res) => {
   res.json({ key, url: await storage.publicUrl(key) })
 }))
 
-const MAX_AUDIO_BYTES = 10 * 1024 * 1024  // 10 MB of decoded audio
-
 /** Voice-input transcription. The composer records a short MediaRecorder
  *  clip and POSTs it as `{ audio: base64, format }`; we forward it to the
  *  ASR model (see server/src/llm.ts transcribeAudio) and return the plain
  *  text so the user can edit before sending. */
 api.post('/audio/transcription', requireAuthBeforeLargeBody, audioJsonParser, safe(async (req, res) => {
-  requireAuth(req)
-  const audio = String(req.body?.audio ?? '')
-  const format = String(req.body?.format ?? 'webm').trim().toLowerCase()
-  if (!audio) throw new HttpError(400, 'audio is required')
-  if (!/^[a-z0-9-]+$/.test(format)) throw new HttpError(400, 'invalid format')
-  // base64 carries 3 bytes per 4 chars — check the encoded length instead of
-  // decoding 13MB just to count it.
-  if (audio.length > Math.ceil(MAX_AUDIO_BYTES / 3) * 4) {
-    throw new HttpError(413, `audio too large (max ${MAX_AUDIO_BYTES} bytes decoded)`)
+  const { companyId } = await requireCompany(req)
+  let text: string
+  try {
+    text = await transcribeAudio(req.body?.audio, req.body?.format, companyId)
+  } catch (error) {
+    if (error instanceof AudioInputError) throw new HttpError(error.status, error.message)
+    throw error
   }
-  const text = await transcribeAudio(audio, format)
   res.json({ text })
 }))
 

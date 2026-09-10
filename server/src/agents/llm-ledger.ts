@@ -74,6 +74,7 @@ export type LlmCallPurpose =
   // Keep them separate so the rollup can distinguish these different actions.
   | 'avatar-image'
   | 'agent-image'
+  | 'audio-transcription'
 
 export type LlmCallStatus = 'ok' | 'rate_limited' | 'timeout' | 'failed'
 export type LlmCallSource = 'cloud' | 'byoa-claude' | 'byoa-codex' | 'byoa-grok' | 'byoa-cursor' | 'byoa-opencode' | 'byoa-pi' | 'byoa-gemini' | 'byoa-qwen' | 'byoa-antigravity'

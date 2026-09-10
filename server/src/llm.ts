@@ -44,7 +44,7 @@ import { env, resolveDirectLlmEnv } from './env.js'
 export { resolveRoleCall } from './llm-resolver.js'
 import type { RoleCallPlan, RoleCallCandidate } from './llm-resolver.js'
 import { isNovitaModel, novitaResponsesShim } from './novita.js'
-import { resolvedChain, isFallbackableError } from './agents/fallback.js'
+import { fallbackReason, isLlmCancellation } from './agents/fallback.js'
 import { isOrcaRouterModel, orcarouterResponsesCreate } from './orcarouter.js'
 import { sub2apiRoutingConfigured, pickPlatformForModel, SUB2API_PLATFORMS, type Platform, type ApiKeyMap } from './sub2api.js'
 
@@ -505,47 +505,76 @@ export async function executeImage<T>(context: import('./agents/llm-ledger.js').
   })
 }
 
-/** Transcribe an audio clip via DashScope's OpenAI-compatible chat
- *  endpoint — the qwen3-asr models accept an `input_audio` content part
- *  carrying a base64 data URL.
- *
- *  Chain comes from runtime settings (server_settings audio_model +
- *  audio_fallback_models, env fallback); only fallbackable errors
- *  (402/429/5xx/network) advance — 400/401 surface immediately.
- *  Key comes from OPENAI_AUDIO_API_KEY, falling back to
- *  OPENAI_IMAGE_API_KEY (same Bailian key on this deployment). */
-export async function transcribeAudio(audioBase64: string, format: string): Promise<string> {
-  const { apiKey, baseURL: base, configured } = resolveDirectLlmEnv('audio')
-  if (!configured) throw new Error('Direct audio LLM is not configured')
-  const chain = resolvedChain('audio')
-  if (chain.length === 0) throw new Error('audio_model is not set (OPENAI_AUDIO_MODEL)')
-  let lastErr: unknown = null
-  for (const model of chain) {
-    try {
-      const resp = await fetch(`${base}/chat/completions`, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model,
-          messages: [{
-            role: 'user',
-            content: [{ type: 'input_audio', input_audio: { data: `data:audio/${format};base64,${audioBase64}` } }],
-          }],
-        }),
-        signal: AbortSignal.timeout(120_000),
-      })
-      // Carry the status so isFallbackableError can tell 401/400 (fatal)
-      // from 429/5xx (advance the chain).
-      if (!resp.ok) throw Object.assign(new Error(`asr request failed: ${resp.status} ${(await resp.text()).slice(0, 300)}`), { status: resp.status })
-      const body = (await resp.json()) as { choices?: { message?: { content?: string } }[] }
-      const text = body.choices?.[0]?.message?.content?.trim()
-      if (!text) throw new Error(`asr returned no text: ${JSON.stringify(body).slice(0, 300)}`)
-      return text
-    } catch (e) {
-      lastErr = e
-      if (!isFallbackableError(e)) throw e
-      console.warn(`[asr] ${model} failed, trying next:`, e instanceof Error ? e.message.slice(0, 200) : e)
-    }
-  }
-  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr))
+export const MAX_AUDIO_BYTES = 10 * 1024 * 1024
+
+export class AudioInputError extends Error {
+  constructor(message: string, readonly status = 400) { super(message) }
+}
+
+/** Validate the JSON clip before resolving routes or creating an upstream attempt. */
+export function validateAudioInput(audio: unknown, format: unknown = 'webm'): { audio: string; mime: string } {
+  const mimes: Record<string, string> = { webm: 'audio/webm', ogg: 'audio/ogg', wav: 'audio/wav',
+    mp3: 'audio/mpeg', mp4: 'audio/mp4', m4a: 'audio/mp4', flac: 'audio/flac', aac: 'audio/aac' }
+  if (typeof format !== 'string' || !Object.hasOwn(mimes, format.trim().toLowerCase())) throw new AudioInputError('invalid audio format')
+  const normalized = format.trim().toLowerCase()
+  if (typeof audio !== 'string' || !audio.length) throw new AudioInputError('audio is required')
+  if (audio.length > Math.ceil(MAX_AUDIO_BYTES / 3) * 4) throw new AudioInputError('audio too large', 413)
+  if (audio.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(audio)) throw new AudioInputError('invalid audio base64')
+  const bytes = Buffer.from(audio, 'base64')
+  if (!bytes.length || bytes.toString('base64') !== audio) throw new AudioInputError('invalid audio base64')
+  if (bytes.length > MAX_AUDIO_BYTES) throw new AudioInputError('audio too large', 413)
+  const starts = (value: string) => bytes.subarray(0, value.length).toString('latin1') === value
+  const matches = normalized === 'webm' ? bytes.length > 4 && bytes.readUInt32BE(0) === 0x1a45dfa3
+    : normalized === 'ogg' ? bytes.length > 27 && starts('OggS')
+    : normalized === 'wav' ? bytes.length > 44 && starts('RIFF') && bytes.subarray(8, 12).toString() === 'WAVE'
+    : normalized === 'mp3' ? bytes.length > 10 && (starts('ID3') || (bytes[0] === 0xff && (bytes[1]! & 0xe6) === 0xe2))
+    : normalized === 'mp4' || normalized === 'm4a' ? bytes.length > 16 && bytes.subarray(4, 8).toString() === 'ftyp'
+    : normalized === 'flac' ? bytes.length > 42 && starts('fLaC')
+    : bytes.length > 7 && bytes[0] === 0xff && (bytes[1]! & 0xf6) === 0xf0
+  if (!matches) throw new AudioInputError('audio content does not match format/MIME')
+  return { audio, mime: mimes[normalized]! }
+}
+
+/** Chat input_audio retains the existing data-URL protocol on gateway and env routes. */
+export async function transcribeAudio(audioBase64: unknown, format: unknown = 'webm', companyId: string | null = null): Promise<string> {
+  const clip = validateAudioInput(audioBase64, format)
+  const { resolveRoleCall } = await import('./llm-resolver.js')
+  const { executeLlmPlan } = await import('./llm-execution.js')
+  const { measuredUsage } = await import('./agents/cost.js')
+  const context = { companyId, purpose: 'audio-transcription' as const, role: 'audio' as const }
+  const plan = await resolveRoleCall(companyId, companyId ? 'managed' : 'server', 'audio', context.purpose)
+  return executeLlmPlan({ plan, context, sdkMaxRetries: 0,
+    prepare: async (candidate, state) => {
+      if (candidate.protocol !== 'chat') throw new Error('Non-audio LLM protocol')
+      const client = await getLlmCandidateClient(plan, candidate)
+      return async () => {
+        try {
+          const body = await client.post<{ model?: unknown; usage?: unknown; choices?: { message?: { content?: unknown } }[] }>('/chat/completions', {
+            body: { model: candidate.requestModel, messages: [{ role: 'user', content: [
+              { type: 'input_audio', input_audio: { data: `data:${clip.mime};base64,${clip.audio}` } },
+            ] }] }, maxRetries: 0, timeout: 120_000,
+          })
+          state.usage = measuredUsage(body?.usage, 'chat')
+          state.usageProtocol = 'chat'
+          state.actualModel = typeof body?.model === 'string' ? body.model : null
+          const content = body?.choices?.[0]?.message?.content
+          if (typeof content !== 'string' || !content.trim()) throw new Error('ASR returned invalid transcription')
+          return content.trim()
+        } catch (error) {
+          // Provider errors can echo the request or transcript; retain only routing diagnostics.
+          const reason = fallbackReason(error)
+          const status = (error as { status?: unknown } | null)?.status
+          const safe = new Error('ASR request failed')
+          if (typeof status === 'number' && Number.isInteger(status) && status >= 100 && status <= 599) Object.assign(safe, { status })
+          if (isLlmCancellation(error)) safe.name = 'AbortError'
+          else if (reason?.startsWith('transport:')) {
+            const transport = reason.slice('transport:'.length)
+            if (['APIConnectionError', 'APIConnectionTimeoutError', 'TimeoutError'].includes(transport)) safe.name = transport
+            else Object.assign(safe, { code: transport })
+          }
+          throw safe
+        }
+      }
+    },
+  })
 }
