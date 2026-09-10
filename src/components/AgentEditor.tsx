@@ -960,21 +960,25 @@ function ResourceApplication({ agentId, refresh, saving }: { agentId: string | n
   if (!agentId) return null
   const label = state?.status === 'applied' ? (translate(zh ? 'zh-CN' : 'en', 'settings.applied'))
     : state?.status === 'failed' ? (translate(zh ? 'zh-CN' : 'en', 'settings.applicationFailed')) : (translate(zh ? 'zh-CN' : 'en', 'settings.pendingApplication'))
-  return <div className="px-6 py-3 border-t border-ink-100 text-[12px] leading-relaxed shrink-0 min-w-0 max-h-[30vh] overflow-y-auto break-words space-y-1.5" aria-live="polite">
+  // Keep every status/detail in its own intrinsic-height row, including when
+  // the panel reaches its scroll limit. Do not compress rows to fit that limit.
+  return <div
+    className="px-6 py-3 border-t border-ink-100 text-[12px] shrink-0 min-w-0 max-h-[30vh] overflow-y-auto break-words"
+    style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr)', gridAutoRows: 'max-content', rowGap: 6, lineHeight: 1.625 }}
+    aria-live="polite"
+  >
     <div className="font-semibold">{translate(zh ? 'zh-CN' : 'en', 'settings.skillsMcpResourceApplication')}</div>
     {saving ? <div>{translate(zh ? 'zh-CN' : 'en', 'settings.savingApplicationStatusWillRefreshAfterSaving')}</div>
       : error ? <div role="alert" className="text-coral-deep">{translate(zh ? 'zh-CN' : 'en', 'settings.applicationStatusUnavailable')}{error}</div>
       : state ? <>
-        <div className="flex flex-wrap gap-x-3 gap-y-1">
-          <span>{translate(zh ? 'zh-CN' : 'en', 'settings.saved')}</span>
-          <span>{label}</span>
-        </div>
+        <div>{translate(zh ? 'zh-CN' : 'en', 'settings.saved')}</div>
+        <div>{label}</div>
         <div className="break-all text-[10.5px] text-ink-400">{translate(zh ? 'zh-CN' : 'en', 'settings.desiredVersion')}<span className="font-mono whitespace-nowrap" title={state.version}>{state.version.length > 8 ? state.version.slice(0, 8) + '…' : state.version}</span></div>
         {state.appliedVersion && <div className="break-all text-[10.5px] text-ink-400">{translate(zh ? 'zh-CN' : 'en', 'settings.appliedVersion')}<span className="font-mono whitespace-nowrap" title={state.appliedVersion}>{state.appliedVersion.length > 8 ? state.appliedVersion.slice(0, 8) + '…' : state.appliedVersion}</span></div>}
         {state.status === 'failed' && <div role="alert" className="text-coral-deep">{state.error ?? (translate(zh ? 'zh-CN' : 'en', 'settings.theRuntimeCouldNotApplyResources'))}</div>}
       </> : <div>{translate(zh ? 'zh-CN' : 'en', 'settings.loadingApplicationStatus')}</div>}
     <div className="text-ink-500">{translate(zh ? 'zh-CN' : 'en', 'settings.savedChangesApplyAtTheNextSafeTurnBoundary')}</div>
-    <button type="button" disabled={saving} className="underline mt-1" onClick={() => setReload((n) => n + 1)}>{translate(zh ? 'zh-CN' : 'en', 'settings.refreshApplicationStatus')}</button>
+    <button type="button" disabled={saving} className="underline mt-1 justify-self-start text-left" onClick={() => setReload((n) => n + 1)}>{translate(zh ? 'zh-CN' : 'en', 'settings.refreshApplicationStatus')}</button>
   </div>
 }
 
