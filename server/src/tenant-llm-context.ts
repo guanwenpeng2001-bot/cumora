@@ -1,3 +1,4 @@
+import { getManagedPodSettings } from './managed-pod-settings.js'
 import { pool } from './db/pool.js'
 import { parseApiKeyMap, listKeyModelsWithStatus, SUB2API_PLATFORMS, sub2apiOpenAIBaseURL, sub2apiRoutingConfigured, type ApiKeyMap, type Platform, type KeyModelsResult } from './sub2api.js'
 
@@ -43,9 +44,16 @@ export function invalidateTenantModelSnapshot(companyId?: string): void {
   refreshes.delete(companyId)
 }
 
-/** Read the committed owner row on every resolution, including in agent Pods.
+/** Main-service requests read the committed owner; Pods read their refreshed identity snapshot.
  * xmin changes even for same-key tier updates; no credentials enter public DTOs. */
 export async function resolveTenantLlmContext(companyId: string, userId?: string): Promise<TenantLlmContext> {
+  const managed = getManagedPodSettings()
+  if (managed) {
+    if (managed.gateway.companyId !== companyId || userId !== undefined) {
+      throw new TenantLlmAccessError('Managed Pod identity does not authorize this request')
+    }
+    return managed.gateway
+  }
   const generation = generations.get(companyId) ?? 0
   generations.set(companyId, generation)
   const { rows } = await pool.query<{ owner_user_id: string; sub2api_api_key: string | null; authorization_version: string }>(

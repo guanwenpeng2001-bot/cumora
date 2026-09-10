@@ -15,14 +15,17 @@
  * switching embedding models changes the vector space, so a silent
  * fallback would corrupt semantic memory recall (see fallback.ts).
  */
-import type { PoolClient } from 'pg'
+import type { PoolClient, QueryConfig } from 'pg'
 import { pool } from './db/pool.js'
-import { env } from './env.js'
+import { env, resolveDirectLlmEnv } from './env.js'
+import { parseApiKeyMap, sub2apiOpenAIBaseURL } from './sub2api.js'
+import { DIRECT_LLM_SLOTS, getManagedPodSettings, installManagedPodSettings, type ManagedPodSettings } from './managed-pod-settings.js'
 
 export interface SettingDef {
   key: string
   type: 'model' | 'list' | 'string' | 'integer' | 'reasoning' | 'json'
   required?: boolean
+  pod?: boolean
   /** Env fallback when the DB has no row. */
   envValue: () => string
 }
@@ -30,23 +33,23 @@ export interface SettingDef {
 /** The full key inventory. Values are always stored as strings; list-typed
  *  keys are comma-separated. */
 export const SETTING_DEFS: readonly SettingDef[] = [
-  { key: 'llm_config', type: 'json', envValue: () => '' },
+  { key: 'llm_config', pod: true, type: 'json', envValue: () => '' },
   { key: 'sub2api_group_config', type: 'json', envValue: () => '' },
-  { key: 'brain_model', type: 'model', required: true, envValue: () => env.OPENAI_MODEL ?? '' },
-  { key: 'brain_fallback_models', type: 'list', envValue: () => '' },
-  { key: 'support_model', type: 'model', required: true, envValue: () => env.OPENAI_MODEL_SUPPORT ?? '' },
-  { key: 'support_fallback_models', type: 'list', envValue: () => '' },
-  { key: 'compaction_model', type: 'model', required: true, envValue: () => env.OPENAI_COMPACTION_MODEL ?? '' },
-  { key: 'compaction_fallback_models', type: 'list', envValue: () => '' },
-  { key: 'image_model', type: 'model', required: true, envValue: () => env.OPENAI_IMAGE_MODEL ?? '' },
-  { key: 'image_fallback_models', type: 'list', envValue: () => process.env.OPENAI_IMAGE_FALLBACK_MODELS ?? '' },
-  { key: 'audio_model', type: 'model', required: true, envValue: () => process.env.OPENAI_AUDIO_MODEL ?? '' },
-  { key: 'audio_fallback_models', type: 'list', envValue: () => process.env.OPENAI_AUDIO_FALLBACK_MODELS ?? '' },
-  { key: 'embed_model', type: 'model', required: true, envValue: () => process.env.OPENAI_EMBED_MODEL || 'text-embedding-3-small' },
-  { key: 'agent_reasoning_effort', type: 'reasoning', envValue: () => process.env.CUMORA_REASONING_EFFORT ?? 'low' },
-  { key: 'agent_max_output_tokens', type: 'integer', envValue: () => process.env.CUMORA_AGENT_MAX_OUTPUT_TOKENS ?? '4000' },
-  { key: 'support_reasoning_effort', type: 'reasoning', envValue: () => process.env.CUMORA_SUPPORT_REASONING_EFFORT ?? 'low' },
-  { key: 'support_reasoning_headroom', type: 'integer', envValue: () => process.env.CUMORA_SUPPORT_REASONING_HEADROOM ?? '0' },
+  { key: 'brain_model', pod: true, type: 'model', required: true, envValue: () => env.OPENAI_MODEL ?? '' },
+  { key: 'brain_fallback_models', pod: true, type: 'list', envValue: () => '' },
+  { key: 'support_model', pod: true, type: 'model', required: true, envValue: () => env.OPENAI_MODEL_SUPPORT ?? '' },
+  { key: 'support_fallback_models', pod: true, type: 'list', envValue: () => '' },
+  { key: 'compaction_model', pod: true, type: 'model', required: true, envValue: () => env.OPENAI_COMPACTION_MODEL ?? '' },
+  { key: 'compaction_fallback_models', pod: true, type: 'list', envValue: () => '' },
+  { key: 'image_model', pod: true, type: 'model', required: true, envValue: () => env.OPENAI_IMAGE_MODEL ?? '' },
+  { key: 'image_fallback_models', pod: true, type: 'list', envValue: () => process.env.OPENAI_IMAGE_FALLBACK_MODELS ?? '' },
+  { key: 'audio_model', pod: true, type: 'model', required: true, envValue: () => process.env.OPENAI_AUDIO_MODEL ?? '' },
+  { key: 'audio_fallback_models', pod: true, type: 'list', envValue: () => process.env.OPENAI_AUDIO_FALLBACK_MODELS ?? '' },
+  { key: 'embed_model', pod: true, type: 'model', required: true, envValue: () => process.env.OPENAI_EMBED_MODEL || 'text-embedding-3-small' },
+  { key: 'agent_reasoning_effort', pod: true, type: 'reasoning', envValue: () => process.env.CUMORA_REASONING_EFFORT ?? 'low' },
+  { key: 'agent_max_output_tokens', pod: true, type: 'integer', envValue: () => process.env.CUMORA_AGENT_MAX_OUTPUT_TOKENS ?? '4000' },
+  { key: 'support_reasoning_effort', pod: true, type: 'reasoning', envValue: () => process.env.CUMORA_SUPPORT_REASONING_EFFORT ?? 'low' },
+  { key: 'support_reasoning_headroom', pod: true, type: 'integer', envValue: () => process.env.CUMORA_SUPPORT_REASONING_HEADROOM ?? '0' },
   // Not a model — the skills tab's local hub directory.
   { key: 'local_skillhub_path', type: 'string', envValue: () => process.env.LOCAL_SKILLHUB_PATH ?? '' },
 ]
@@ -69,6 +72,7 @@ export interface ServerSettingsSnapshot {
   settings: Readonly<Record<string, string>>
   sources: Readonly<Record<string, 'db' | 'env'>>
   diagnostics?: readonly string[]
+  source?: 'db' | 'env' | 'bootstrap'
 }
 
 let snapshot: ServerSettingsSnapshot | null = null
@@ -78,7 +82,7 @@ let refreshing: Promise<void> | null = null
 let generation = 0
 let writing: Promise<unknown> = Promise.resolve()
 
-function makeSnapshot(rows: { key: string; value: string }[]): ServerSettingsSnapshot {
+function makeSnapshot(rows: { key: string; value: string }[], defaults?: Readonly<Record<string, string>>): ServerSettingsSnapshot {
   const values = new Map(rows.map((r) => [r.key, r.value]))
   const revision = values.get(REVISION_KEY) ?? '0'
   if (!/^\d+$/.test(revision)) throw new Error('invalid settings revision')
@@ -86,17 +90,18 @@ function makeSnapshot(rows: { key: string; value: string }[]): ServerSettingsSna
   const settings: Record<string, string> = {}
   const sources: Record<string, 'db' | 'env'> = {}
   for (const def of SETTING_DEFS) {
-    settings[def.key] = values.get(def.key) ?? def.envValue()
+    const fallback = defaults ? defaults[def.key] ?? '' : def.envValue()
+    settings[def.key] = values.get(def.key) ?? fallback
     sources[def.key] = values.has(def.key) ? 'db' : 'env'
     try { validateServerSettings({ [def.key]: settings[def.key] }) } catch {
       diagnostics.push(`invalid-setting:${def.key}`)
       console.warn('[settings] invalid value; using env/default', def.key)
-      settings[def.key] = def.envValue()
+      settings[def.key] = fallback
       sources[def.key] = 'env'
       try { validateServerSettings({ [def.key]: settings[def.key] }) } catch { settings[def.key] = '' }
     }
   }
-  return Object.freeze({ revision, settings: Object.freeze(settings), sources: Object.freeze(sources), diagnostics: Object.freeze(diagnostics) })
+  return Object.freeze({ revision, source: 'db', settings: Object.freeze(settings), sources: Object.freeze(sources), diagnostics: Object.freeze(diagnostics) })
 }
 
 function installSnapshot(next: ServerSettingsSnapshot): void {
@@ -106,8 +111,88 @@ function installSnapshot(next: ServerSettingsSnapshot): void {
   lastRefreshFailureAt = 0
 }
 
+function podPolicy(policy: ServerSettingsSnapshot): ServerSettingsSnapshot {
+  const allowed = SETTING_DEFS.filter(def => def.pod)
+  return Object.freeze({
+    revision: policy.revision, source: policy.source,
+    settings: Object.freeze(Object.fromEntries(allowed.map(def => [def.key, policy.settings[def.key]]))),
+    sources: Object.freeze(Object.fromEntries(allowed.map(def => [def.key, policy.sources[def.key]]))),
+    diagnostics: policy.diagnostics,
+  })
+}
+
+async function readManagedPodSettings(base: ManagedPodSettings): Promise<ManagedPodSettings> {
+  // One statement gives policy and owner identity the same MVCC snapshot.
+  const { rows } = await pool.query<{
+    settings: { key: string; value: string }[]
+    owner_user_id: string; sub2api_api_key: string | null; authorization_version: string
+  }>({
+    text: `SELECT c.owner_user_id, u.sub2api_api_key, u.xmin::text AS authorization_version,
+             COALESCE((SELECT jsonb_agg(jsonb_build_object('key', s.key, 'value', s.value))
+               FROM server_settings s WHERE s.key = ANY($3::text[])), '[]'::jsonb) AS settings
+           FROM participants p JOIN companies c ON c.id = p.company_id
+           JOIN users u ON u.id = c.owner_user_id
+          WHERE p.id = $1 AND c.id = $2`,
+    values: [base.agentId, base.gateway.companyId, [...SETTING_DEFS.filter(def => def.pod).map(def => def.key), REVISION_KEY]],
+    query_timeout: 5_000,
+  } as QueryConfig & { query_timeout: number })
+  const row = rows[0]
+  if (!row) throw new Error('Managed Pod owner identity unavailable')
+  return {
+    ...base, source: 'db', policy: podPolicy(makeSnapshot(row.settings, base.defaults)),
+    gateway: {
+      companyId: base.gateway.companyId, ownerId: row.owner_user_id, generation: 0,
+      authorizationVersion: `${row.owner_user_id}:${row.authorization_version}:0:${base.gateway.baseURL}`,
+      keys: parseApiKeyMap(row.sub2api_api_key), baseURL: base.gateway.baseURL,
+    },
+  }
+}
+
+/** Called only by the main service; runtime-only credentials stay outside public settings. */
+export async function createManagedPodBootstrap(agentId: string, companyId: string, mapURL: (url: string) => string): Promise<ManagedPodSettings> {
+  const base: ManagedPodSettings = {
+    version: 1, agentId, source: 'bootstrap', policy: podPolicy(getServerSettingsSnapshot()),
+    defaults: Object.fromEntries(SETTING_DEFS.filter(def => def.pod).map(def => [def.key, def.envValue()])),
+    gateway: { companyId, ownerId: '', authorizationVersion: '', generation: 0, keys: {}, baseURL: mapURL(sub2apiOpenAIBaseURL()) },
+    direct: Object.fromEntries(DIRECT_LLM_SLOTS.map(slot => {
+      const direct = resolveDirectLlmEnv(slot)
+      return [slot, { ...direct, baseURL: mapURL(direct.baseURL) }]
+    })) as ManagedPodSettings['direct'],
+  }
+  // A failed owner read must not be mistaken for an unprovisioned owner.
+  const next = await readManagedPodSettings(base)
+  return { ...next, source: 'bootstrap', policy: { ...next.policy, source: 'bootstrap' } }
+}
+
+function installPodBootstrap(): ManagedPodSettings | null {
+  const managed = getManagedPodSettings()
+  if (managed && !snapshot) {
+    for (const def of SETTING_DEFS.filter(def => def.pod)) {
+      if (typeof managed.policy.settings[def.key] !== 'string' || typeof managed.defaults[def.key] !== 'string'
+        || !['db', 'env'].includes(managed.policy.sources[def.key])) throw new Error('Incomplete managed Pod policy')
+    }
+    installSnapshot(Object.freeze({ ...managed.policy, source: managed.source }))
+  }
+  return managed
+}
+
+/** Install bootstrap before the first turn, then wait at most five seconds. */
+export async function initializeManagedPodSettings(waitMs = 5_000): Promise<void> {
+  installPodBootstrap()
+  if (!snapshot) installSnapshot(Object.freeze({ ...makeSnapshot([]), source: 'env' }))
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    await Promise.race([loadServerSettings(), new Promise<void>(resolve => { timer = setTimeout(resolve, waitMs) })])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+  startServerSettingsRefresher()
+  console.log(`[settings] Pod ready source=${snapshot!.source} revision=${snapshot!.revision}`)
+}
+
 /** Forced refreshes wait for older queries, then perform their own read. */
 export async function refreshServerSettings(force = false): Promise<void> {
+  const managed = installPodBootstrap()
   if (refreshing) {
     if (!force) return refreshing
     await refreshing
@@ -118,12 +203,20 @@ export async function refreshServerSettings(force = false): Promise<void> {
   const startedGeneration = generation
   refreshing = (async () => {
     try {
-      const { rows } = await pool.query<{ key: string; value: string }>('SELECT key, value FROM server_settings')
-      const next = makeSnapshot(rows)
-      if (startedGeneration === generation) installSnapshot(next)
+      if (managed) {
+        const next = await readManagedPodSettings(managed)
+        if (startedGeneration === generation && (!snapshot || BigInt(next.policy.revision) >= BigInt(snapshot.revision))) {
+          installManagedPodSettings(next)
+          installSnapshot(next.policy)
+        }
+      } else {
+        const { rows } = await pool.query<{ key: string; value: string }>('SELECT key, value FROM server_settings')
+        const next = makeSnapshot(rows)
+        if (startedGeneration === generation) installSnapshot(next)
+      }
     } catch (e) {
       if (startedGeneration === generation) lastRefreshFailureAt = Date.now()
-      console.warn('[settings] refresh failed; serving previous/env values', e instanceof Error ? e.message : e)
+      console.warn(`[settings] refresh failed; retaining source=${snapshot?.source ?? 'env'} revision=${snapshot?.revision ?? '0'}`)
     } finally {
       refreshing = null
     }
@@ -132,8 +225,9 @@ export async function refreshServerSettings(force = false): Promise<void> {
 }
 
 export function getServerSettingsSnapshot(): ServerSettingsSnapshot {
+  installPodBootstrap()
   if (!snapshot || Date.now() - snapshotAt >= REFRESH_MS) void refreshServerSettings()
-  return snapshot ?? makeSnapshot([])
+  return snapshot ?? Object.freeze({ ...makeSnapshot([]), source: 'env' })
 }
 
 /** Sync read from one complete, immutable snapshot. */
@@ -149,6 +243,7 @@ export function getServerSettingList(key: string): string[] {
 /** First-boot seed: copy env values into the table, never overwriting
  *  existing rows (operator edits win over later .env changes). */
 export async function seedServerSettingsFromEnv(): Promise<void> {
+  if (process.env.CUMORA_AGENT_ID || getManagedPodSettings()) throw new Error('Managed Pods cannot seed server settings')
   await commitSettings(async (client) => {
     await client.query(
       `INSERT INTO server_settings (key, value)
@@ -171,8 +266,10 @@ export async function loadServerSettings(): Promise<void> {
 
 /** Periodic refresh so multi-process deployments (server + pods) converge
  *  without a restart. Unref'd — never keeps a process alive. */
+let refreshTimer: ReturnType<typeof setInterval> | undefined
 export function startServerSettingsRefresher(): void {
-  setInterval(() => void refreshServerSettings(true), REFRESH_MS).unref()
+  refreshTimer ??= setInterval(() => void refreshServerSettings(), REFRESH_MS)
+  refreshTimer.unref()
 }
 
 // ── role model getters (sync; snapshot + env fallback) ──────────────────
@@ -210,6 +307,7 @@ export function validateServerSettings(entries: Record<string, unknown>): assert
 }
 
 function commitSettings(mutate: (client: PoolClient) => Promise<void>): Promise<ServerSettingsSnapshot> {
+  if (process.env.CUMORA_AGENT_ID || getManagedPodSettings()) return Promise.reject(new Error('Managed Pod settings are read-only'))
   const pending = writing.then(async () => {
     const client = await pool.connect()
     try {

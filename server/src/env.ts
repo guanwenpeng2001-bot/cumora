@@ -6,6 +6,7 @@
  *  environment win over those in `.env` (dotenv default), so deployment
  *  doesn't need a file. */
 import 'dotenv/config'
+import { getManagedPodSettings } from './managed-pod-settings.js'
 
 function required(name: string, fallback?: string): string {
   const v = process.env[name] ?? fallback
@@ -28,13 +29,14 @@ const DEFAULT_SUPPORT_MODEL = process.env.OPENAI_MODEL_SUPPORT ?? 'gpt-5.4-mini'
 // dev machine; a production deploy left on it lets anyone who read the
 // (open-source) code forge runtime tokens, so boot refuses it below.
 const DEV_AGENT_RUNTIME_SECRET = 'dev-agent-runtime-secret-do-not-use-in-prod'
+let sub2apiInternalURL = (process.env.SUB2API_INTERNAL_URL ?? '').replace(/\/+$/, '')
 
 export const env = {
   PORT: Number(process.env.PORT ?? 5181),
   NODE_ENV: process.env.NODE_ENV ?? 'development',
   DATABASE_URL: required('DATABASE_URL', `postgres://${process.env.USER ?? 'postgres'}@localhost:5432/cumora`),
   REDIS_URL: required('REDIS_URL', 'redis://localhost:6379'),
-  OPENAI_API_KEY: process.env.OPENAI_API_KEY ?? '',
+  get OPENAI_API_KEY(): string { return getManagedPodSettings()?.direct.text.apiKey ?? (process.env.OPENAI_API_KEY ?? '') },
   /**
    * "Brain" model — the agent's main reasoning loop and convene speech.
    * Default model used when an agent's `participants.model` is NULL.
@@ -64,21 +66,21 @@ export const env = {
    * legacy/sub2api client instead, so an unconfigured deployment doesn't
    * break the run; the model just won't resolve to Novita as intended.
    */
-  NOVITA_API_KEY: process.env.NOVITA_API_KEY ?? '',
+  get NOVITA_API_KEY(): string { return getManagedPodSettings()?.direct.novita.apiKey ?? (process.env.NOVITA_API_KEY ?? '') },
   /** Novita's OpenAI-compatible Chat Completions base. Override for a
    *  self-hosted proxy or a pinned API version. */
-  NOVITA_BASE_URL: (process.env.NOVITA_BASE_URL ?? 'https://api.novita.ai/openai').replace(/\/+$/, ''),
+  get NOVITA_BASE_URL(): string { return getManagedPodSettings()?.direct.novita.baseURL ?? ((process.env.NOVITA_BASE_URL ?? 'https://api.novita.ai/openai').replace(/\/+$/, '')) },
   /**
    * OrcaRouter LLM API key. Optional — when unset, agents configured with a
    * `orcarouter/<model>` model id (see server/src/orcarouter.ts) fall back to
    * the legacy/sub2api client instead, so an unconfigured deployment doesn't
    * break the run; the model just won't resolve to OrcaRouter as intended.
    */
-  ORCAROUTER_API_KEY: process.env.ORCAROUTER_API_KEY ?? '',
+  get ORCAROUTER_API_KEY(): string { return getManagedPodSettings()?.direct.orcarouter.apiKey ?? (process.env.ORCAROUTER_API_KEY ?? '') },
   /** OrcaRouter's OpenAI-compatible Responses base. OrcaRouter speaks the
    *  Responses API natively, so the `orcarouter/<model>` route is a pure
    *  base-URL swap (no Chat-Completions translation, unlike Novita). */
-  ORCAROUTER_BASE_URL: (process.env.ORCAROUTER_BASE_URL ?? 'https://api.orcarouter.ai/v1').replace(/\/+$/, ''),
+  get ORCAROUTER_BASE_URL(): string { return getManagedPodSettings()?.direct.orcarouter.baseURL ?? ((process.env.ORCAROUTER_BASE_URL ?? 'https://api.orcarouter.ai/v1').replace(/\/+$/, '')) },
   /**
    * Webhook URL for process-level alerts (unhandledRejection /
    * uncaughtException). Currently expects a Discord-compatible
@@ -346,8 +348,9 @@ export const env = {
    * unmapped, leave user without group" — useful for staged rollout
    * (the user has a sub2api account but can't call upstream yet).
    */
-  SUB2API_INTERNAL_URL: (process.env.SUB2API_INTERNAL_URL ?? '').replace(/\/+$/, ''),
-  SUB2API_PUBLIC_URL:   (process.env.SUB2API_PUBLIC_URL ?? '').replace(/\/+$/, ''),
+  get SUB2API_INTERNAL_URL(): string { return getManagedPodSettings()?.gateway.baseURL ?? sub2apiInternalURL },
+  set SUB2API_INTERNAL_URL(value: string) { sub2apiInternalURL = value },
+  get SUB2API_PUBLIC_URL(): string { return getManagedPodSettings()?.gateway.baseURL ?? ((process.env.SUB2API_PUBLIC_URL ?? '').replace(/\/+$/, '')) },
   SUB2API_ADMIN_KEY:    process.env.SUB2API_ADMIN_KEY ?? '',
   // Legacy single-value tier mapping (pre platform-split). Still honored as
   // the last-resort fallback in tierGroups().
@@ -521,6 +524,8 @@ export function normalizeLlmEndpoint(value: string): string {
 
 /** Protected env is read only here; public plans carry source names, never keys. */
 export function resolveDirectLlmEnv(slot: DirectLlmSlot) {
+  const managed = getManagedPodSettings()
+  if (managed) return managed.direct[slot]
   const prefix = slot === 'text' ? 'OPENAI' : slot === 'novita' || slot === 'orcarouter' ? slot.toUpperCase() : `OPENAI_${slot.toUpperCase()}`
   const ownKey = (process.env[`${prefix}_API_KEY`] ?? '').trim()
   const imageKey = (process.env.OPENAI_IMAGE_API_KEY ?? '').trim()

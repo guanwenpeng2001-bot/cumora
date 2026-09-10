@@ -79,6 +79,8 @@ function fixture() {
     require(name: string) {
       if (name === './db/pool.js') return { pool }
       if (name === './env.js') return { env }
+      if (name === './sub2api.js') return {}
+      if (name === './managed-pod-settings.js') return { getManagedPodSettings: () => null }
       throw new Error('unexpected dependency: ' + name)
     },
     process: { env: {} }, console: { warn() {} },

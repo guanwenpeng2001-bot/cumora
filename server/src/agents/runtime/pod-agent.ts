@@ -21,7 +21,8 @@
  *   CUMORA_AGENT_RUNTIME_URL   server origin + /runtime suffix
  *   CUMORA_AGENT_RUNTIME_TOKEN signed JWT pinning agentId + companyId
  *   CUMORA_AGENT_IDLE_MS       idle timeout (ms); default 10 min
- *   OPENAI_API_KEY             agent's LLM key
+ *   CUMORA_MANAGED_POD_BOOTSTRAP versioned policy, identity and direct settings
+ *   OPENAI_API_KEY             legacy direct bootstrap (optional)
  *
  * Exit codes:
  *   0  graceful shutdown (idle, SIGTERM, SIGINT)
@@ -29,7 +30,7 @@
  *   3  unrecoverable stream error (couldn't connect after N retries)
  */
 import { pool } from '../../db/pool.js'
-import { loadServerSettings, startServerSettingsRefresher } from '../../settings.js'
+import { initializeManagedPodSettings } from '../../settings.js'
 import { runAgentTurn, type AgentTurnOptions } from '../turn.js'
 import { runtime } from './select.js'
 import { notifyAlert } from '../../alerting.js'
@@ -281,11 +282,8 @@ async function gracefulExit(reason: string, finalStatus: 'resting' | null): Prom
       console.warn(`[pod-agent] failed to set status=${finalStatus}:`, err instanceof Error ? err.message : String(err))
     }
   }
-  // pool.end() waits for every connection in the pool to drain — in
-  // the pod-only world we never query pg from inside the pod, so the
-  // pool is empty and this is instant; still, guard with a 2s race
-  // so a stuck connection doesn't keep the Pod alive past its idle
-  // bedtime.
+  // Settings refreshes may still hold a connection. Bound pool shutdown
+  // so a stuck read doesn't keep the Pod alive past its idle bedtime.
   await Promise.race([
     pool.end().catch(() => { /* swallow */ }),
     new Promise<void>((r) => setTimeout(r, 2000)),
@@ -305,11 +303,7 @@ async function main(): Promise<void> {
   }
   console.log(`[pod-agent] starting · agent=${agentId} idleMs=${idleMs} noWorkMs=${noWorkMs} pid=${process.pid}`)
 
-  // Model settings follow the server_settings table (pods have DATABASE_URL);
-  // env fallbacks serve until the first load lands.
-  void loadServerSettings()
-    .then(() => startServerSettingsRefresher())
-    .catch((e) => console.warn('[settings] init failed; env fallbacks in effect', e instanceof Error ? e.message : e))
+  await initializeManagedPodSettings()
 
   // Announce "I'm awake" — agent shows up in UI as `avail` while
   // waiting for wakes. The turn loop itself flips status to

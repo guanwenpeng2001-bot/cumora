@@ -21,11 +21,12 @@
  * correctly whether the server itself runs in-cluster or on a dev
  * laptop.
  */
+import { randomBytes } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { env } from '../../env.js'
 import { pool } from '../../db/pool.js'
-import { sub2apiConfigured, sub2apiOpenAIBaseURL, parseApiKeyMap, SUB2API_PLATFORMS } from '../../sub2api.js'
-import { getBrainModel, getSupportModel, getCompactionModel } from '../../settings.js'
+import type { ManagedPodSettings } from '../../managed-pod-settings.js'
+import { createManagedPodBootstrap, getBrainModel, getSupportModel, getCompactionModel } from '../../settings.js'
 import { agentReasoningEffort, agentMaxOutputTokens, supportReasoningEffort, supportReasoningHeadroom } from '../reasoning.js'
 import { inprocClient } from './inproc-client.js'
 import { signAgentToken } from './jwt.js'
@@ -327,14 +328,14 @@ function podManifest(args: {
   image: string
   serverUrl: string
   openaiKey: string
-  /** Optional override for the OpenAI base URL. When set, the agent
-   *  pod's OpenAI SDK calls go to this base instead of api.openai.com.
-   *  Used to route per-agent LLM traffic through sub2api. The pod's
-   *  pre-baked OpenAI SDK reads OPENAI_BASE_URL automatically. */
+  bootstrap?: ManagedPodSettings
+  /** Legacy direct bootstrap projection; gateway identity is separate. */
   openaiBaseUrl: string
   idleMs: number
   noWorkMs: number
 }): string {
+  // Satisfy the image's production-secret gate without sharing the server's signing authority.
+  const podLocalSecret = randomBytes(32).toString('hex')
   const indent = (s: string): string => s.split('\n').map((l) => `              ${l}`).join('\n')
   const pullSecretsBlock = PULL_SECRETS.length === 0 ? '' : `
   imagePullSecrets:
@@ -425,15 +426,16 @@ spec:
     - name: CUMORA_AGENT_RUNTIME_TOKEN
       value: |-
 ${indent(args.token)}
-    - name: OPENAI_API_KEY
+${args.bootstrap ? `    - name: CUMORA_MANAGED_POD_BOOTSTRAP
+      value: ${yamlQuote(JSON.stringify(args.bootstrap))}
+` : ''}    - name: OPENAI_API_KEY
       value: |-
 ${indent(args.openaiKey)}
     - name: OPENAI_BASE_URL
       value: |-
 ${indent(podUrl(args.openaiBaseUrl))}
     - name: AGENT_RUNTIME_SECRET
-      value: |-
-${indent(env.AGENT_RUNTIME_SECRET)}
+      value: ${yamlQuote(podLocalSecret)}
     - name: REDIS_URL
       value: |-
 ${indent(podUrl(env.REDIS_URL))}
@@ -1021,42 +1023,7 @@ async function ensurePodImpl(agentId: string, signal: AbortSignal): Promise<Ensu
     ttlSeconds: TOKEN_TTL_SECONDS,
   })
 
-  // Resolve the workspace's per-user sub2api key so this pod's LLM
-  // traffic counts against that user's quota. Falls back to the
-  // legacy single OPENAI_API_KEY when sub2api isn't configured OR the
-  // workspace owner hasn't been provisioned yet. The same logic lives
-  // in llm.ts but pods don't share memory with the server process —
-  // we have to bake the resolved key into the manifest env at
-  // pod-spawn time.
-  //
-  // Platform split: users.sub2api_api_key may hold a JSON
-  // platform→key map. The pod's OWN getLlmClient does the per-platform
-  // routing (it has DATABASE_URL); the env var is the fallback key for
-  // legacy/direct readers, which is the openai-platform key by
-  // definition of the fallback chain.
-  let resolvedKey = env.OPENAI_API_KEY
-  let resolvedBaseUrl = process.env.OPENAI_BASE_URL ?? '' // empty → OpenAI SDK uses its default (api.openai.com/v1)
-  if (sub2apiConfigured()) {
-    try {
-      const { rows } = await pool.query<{ sub2api_api_key: string | null }>(
-        `SELECT u.sub2api_api_key FROM companies c
-            JOIN users u ON u.id = c.owner_user_id
-          WHERE c.id = $1`,
-        [persona.companyId],
-      )
-      const k = rows[0]?.sub2api_api_key
-      if (k) {
-        const keys = parseApiKeyMap(k)
-        const fallback = keys.openai ?? SUB2API_PLATFORMS.map((p) => keys[p]).find((v) => v)
-        if (fallback) {
-          resolvedKey = fallback
-          resolvedBaseUrl = sub2apiOpenAIBaseURL()
-        }
-      }
-    } catch (e) {
-      console.warn(`[orchestrator] sub2api key lookup failed for ${persona.companyId}; legacy fallback`, e instanceof Error ? e.message : e)
-    }
-  }
+  const bootstrap = await createManagedPodBootstrap(agentId, persona.companyId, podUrl)
 
   // Re-read immediately before the first Kubernetes mutation. This closes the
   // scheduler-to-orchestrator and preparation-time race: moving the Agent to a
@@ -1096,8 +1063,9 @@ async function ensurePodImpl(agentId: string, signal: AbortSignal): Promise<Ensu
     token,
     image: IMAGE,
     serverUrl: env.AGENT_RUNTIME_SERVER_URL,
-    openaiKey: resolvedKey,
-    openaiBaseUrl: resolvedBaseUrl,
+    bootstrap,
+    openaiKey: bootstrap.direct.text.apiKey,
+    openaiBaseUrl: bootstrap.direct.text.baseURL,
     idleMs: env.AGENT_IDLE_MS,
     noWorkMs: env.AGENT_NO_WORK_MS,
   })
