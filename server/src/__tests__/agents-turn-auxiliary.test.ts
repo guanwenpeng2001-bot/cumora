@@ -31,7 +31,7 @@ function fixture(behavior: (request: any, signal?: AbortSignal) => AsyncIterable
     './agents/model-config.js': { REASONING_EFFORTS: new Set(['none']), parseAgentModelConfig: () => null },
   })
   const fallback = compile(read('../agents/fallback.ts'), { '../settings.js': {} })
-  const cost = compile(read('../agents/cost.ts'), { '../model-pricing.js': { captureDbPricing: () => () => null, refreshModelPricing: async () => {} }, 'node:crypto': { createHash } })
+  const cost = compile(read('../agents/cost.ts'), { './token-usage.js': compile(read('../agents/token-usage.ts'), {}), '../model-pricing.js': { captureDbPricing: () => () => null, refreshModelPricing: async () => {} }, 'node:crypto': { createHash } })
   const create = async (request: any, options: any) => {
     requests.push({ ...request, signal: options?.signal })
     return behavior(request, options?.signal)

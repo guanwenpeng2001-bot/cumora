@@ -26,7 +26,7 @@ function fixture(statuses: (number | Error)[] = [], gateway = false, content: un
     './agents/model-config.js': { REASONING_EFFORTS: new Set(['none']) },
   })
   const fallback = compile(read('../agents/fallback.ts'), { '../settings.js': {} })
-  const cost = compile(read('../agents/cost.ts'), { '../model-pricing.js': { captureDbPricing: () => () => null, refreshModelPricing: async () => {} }, 'node:crypto': { createHash } })
+  const cost = compile(read('../agents/cost.ts'), { './token-usage.js': compile(read('../agents/token-usage.ts'), {}), '../model-pricing.js': { captureDbPricing: () => () => null, refreshModelPricing: async () => {} }, 'node:crypto': { createHash } })
   const getLlmCandidateClient = async (plan: any, candidate: any) => ({ post: async (path: string, options: any) => {
     requests.push({ path, options, company: plan.companyId, route: candidate.route })
     const status = statuses[requests.length - 1]

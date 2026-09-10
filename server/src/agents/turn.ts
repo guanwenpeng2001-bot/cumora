@@ -1561,6 +1561,7 @@ export async function executeAgentTurnHop(args: {
   signal?: AbortSignal
   wallTimeoutMs?: number
   idleTimeoutMs?: number
+  retryEvent?: (kind: string, data: Record<string, unknown>) => Promise<void>
   requestEvent?: (data: Record<string, unknown>) => Promise<void>
   record?: (record: import('./llm-ledger.js').LlmCallRecord) => Promise<void>
 }): Promise<{ state: ResponseStreamState; input: ResponseInputItem[] }> {
@@ -1569,6 +1570,7 @@ export async function executeAgentTurnHop(args: {
   const { compactHistory } = await import('./turn-compaction.js')
   const { measuredUsage } = await import('./cost.js')
   const { chatResponseStream } = await import('../novita.js')
+  const { fallbackReason } = await import('./fallback.js')
   const controller = new AbortController()
   const signal = args.signal ? AbortSignal.any([args.signal, controller.signal]) : controller.signal
   const timer = setTimeout(() => controller.abort(new DOMException('Model hop wall timeout', 'TimeoutError')),
@@ -1577,6 +1579,14 @@ export async function executeAgentTurnHop(args: {
   try {
     return await executeLlmPlan({
       plan: args.plan, context: args.context, signal, sdkMaxRetries: 0, record: args.record,
+      transportRetry: { maxRetries: 2, shouldRetry: error => {
+        if (typeof (error as { status?: unknown } | null)?.status === 'number') return false
+        return isModelProviderConnectionError(error) || fallbackReason(error)?.startsWith('transport:') === true
+      } },
+      onRetry: async (reason, candidate, error) => {
+        await args.retryEvent?.(reason === 'retry-without-images' ? 'model.retry_no_images' : 'model.retry_provider_connection',
+          { model: candidate.model, route: candidate.route.id, reason: errorText(error) })
+      },
       retry: { maxRetries: 1, shouldRetry: error => {
         if (stripImages || !isImageFetchFailure(error)) return false
         stripImages = true
@@ -2691,6 +2701,11 @@ Mechanics:
         input: nextInput, instructions,
         tools: mcpToolDefs.length > 0 ? [...TOOL_DEFS_RESPONSES, ...mcpToolDefs] : TOOL_DEFS_RESPONSES,
         signal: options.signal,
+        retryEvent: async (kind, data) => { await runtime.recordEvent({
+          runId, agentId, companyId: runCompanyId, kind, level: 'warn',
+          title: kind === 'model.retry_no_images' ? 'Retrying model without images' : 'Retrying model provider connection',
+          data: { ...data, hop: hop + 1 }, stage: `model_hop_${hop + 1}`,
+        }) },
         requestEvent: async data => { await runtime.recordEvent({
           runId, agentId, companyId: runCompanyId, kind: 'model.request',
           title: `Model hop ${hop + 1} started`,

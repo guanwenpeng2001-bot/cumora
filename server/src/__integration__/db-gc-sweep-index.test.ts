@@ -74,7 +74,7 @@ test('[integration] the sweep query is the one the index is for', async () => {
   // `ORDER BY id` or an added predicate would silently strip the plan back to
   // a sort, and the index check above would keep passing.
   const { readFile } = await import('node:fs/promises')
-  const source = await readFile(new URL('../db-gc.ts', import.meta.url), 'utf8')
+  const source = (await readFile(new URL('../db-gc.ts', import.meta.url), 'utf8')).replace(/\r\n/g, '\n')
   const fn = source.slice(source.indexOf('async function deleteBatch'))
   const body = fn.slice(0, fn.indexOf('\n}\n') + 2)
 

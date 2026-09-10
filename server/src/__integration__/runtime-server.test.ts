@@ -1292,7 +1292,17 @@ test('[integration] runtime: /llm-calls atomically records multiple caller-owned
       ORDER BY model`,
     [runId, models],
   )
-  assert.deepEqual(rows, [
+  for (const row of rows) {
+    assert.equal(row.extras.measurement, row.measured ? 'measured' : 'unknown')
+    assert.ok(row.extras.pricing, 'each hop captures pricing provenance')
+    assert.equal(row.extras.pricing.match, 'fallback')
+    assert.equal(row.extras.unpriced, row.measured ? undefined : 'usage-unavailable')
+    assert.deepEqual(row.extras.usage, row.measured ? {
+      inputTokens: row.input_tokens, cachedInputTokens: row.cached_input_tokens,
+      cacheCreationTokens: row.cache_creation_tokens, outputTokens: row.output_tokens,
+    } : null)
+  }
+  assert.deepEqual(rows.map(row => ({ ...row, extras: { hop: row.extras.hop } })), [
     {
       agent_id: caller.agentId, company_id: caller.companyId, run_id: runId,
       purpose: 'agent-turn', source: 'byoa-codex', model: models[0],

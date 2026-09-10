@@ -28,12 +28,14 @@ import { pool } from '../db/pool.js'
 import { ensureSchemaOnce, resetAllTables, teardownAll } from './_helpers.js'
 import { __setLlmClientOverrideForTesting } from '../llm.js'
 import { __setPodToolOverrideForTesting } from '../agents/runtime/pod-tools.js'
-import { runAgentTurn } from '../agents/turn.js'
+import { runAgentTurn, executeAgentTurnHop } from '../agents/turn.js'
 import { runCli } from '../agents/cli.js'
 import { __setImageFetchOverrideForTesting } from '../agents/image-fetcher.js'
 import type { ToolResult } from '../agents/tools-shared.js'
 
+const originalImageProvider = process.env.OPENAI_IMAGE_PROVIDER
 before(async () => {
+  process.env.OPENAI_IMAGE_PROVIDER = 'openai'
   await ensureSchemaOnce()
 })
 
@@ -45,6 +47,8 @@ beforeEach(async () => {
 })
 
 after(async () => {
+  if (originalImageProvider === undefined) delete process.env.OPENAI_IMAGE_PROVIDER
+  else process.env.OPENAI_IMAGE_PROVIDER = originalImageProvider
   __setLlmClientOverrideForTesting(null)
   __setPodToolOverrideForTesting(null)
   __setImageFetchOverrideForTesting(null)
@@ -337,6 +341,80 @@ test('[integration] provider connection failure: short retry can recover the tur
 // ────────────────────────────────────────────────────────────────────────────
 // G. Image-strip retry on image_url fetch failure
 // ────────────────────────────────────────────────────────────────────────────
+
+test('[integration] turn hop retries each candidate before fallback and never replays committed output or cancellation', async t => {
+  const { resolveRoleCall } = await import('../llm-resolver.js')
+  const original = await resolveRoleCall(null, 'server', 'brain', 'agent-turn')
+  const primary = original.candidates[0]!
+  const plan = { ...original, candidates: ['primary', 'backup'].map(model => ({ ...primary, model, requestModel: model })) }
+  const context = { companyId: null, purpose: 'agent-turn' as const }
+  await t.test('each candidate gets two retries, with one ledger record per actual attempt', async () => {
+    const calls: string[] = []
+    const records: import('../agents/llm-ledger.js').LlmCallRecord[] = []
+    const retries: string[] = []
+    __setLlmClientOverrideForTesting(async () => ({
+      responses: { create: async (request: { model: string }) => {
+        calls.push(request.model)
+        if (calls.length < 6) throw Object.assign(new Error('Connection error.'), { code: 'ECONNRESET' })
+        return (async function* () {
+          yield { type: 'response.completed', response: { status: 'completed', output: [], usage: { input_tokens: 1, output_tokens: 1 } } }
+        })()
+      } },
+    }) as unknown as Awaited<ReturnType<typeof import('../llm.js').getLlmClient>>)
+    await executeAgentTurnHop({ plan, context, input: [], instructions: '', tools: [],
+      record: async record => { records.push(record) },
+      retryEvent: async kind => { retries.push(kind) } })
+    assert.deepEqual(calls, ['primary', 'primary', 'primary', 'backup', 'backup', 'backup'])
+    assert.equal(retries.length, 4)
+    assert.ok(retries.every(kind => kind === 'model.retry_provider_connection'))
+    assert.deepEqual(records.map(record => record.extras?.attempt), [1, 2, 3, 4, 5, 6])
+    assert.equal(new Set(records.map(record => record.extras?.logicalCallId)).size, 1)
+    assert.equal(records[2].extras?.nextCandidate, 'backup')
+    assert.equal(records[2].extras?.nextCandidateReason, 'transport:ECONNRESET')
+    assert.equal(records[5].status, 'ok')
+  })
+  await t.test('HTTP authentication failure advances without transport retries', async () => {
+    const calls: string[] = []
+    const records: import('../agents/llm-ledger.js').LlmCallRecord[] = []
+    __setLlmClientOverrideForTesting(async () => ({
+      responses: { create: async (request: { model: string }) => {
+        calls.push(request.model)
+        if (request.model === 'primary') throw Object.assign(new Error('Connection error.'), { status: 401 })
+        return (async function* () {
+          yield { type: 'response.completed', response: { status: 'completed', output: [] } }
+        })()
+      } },
+    }) as unknown as Awaited<ReturnType<typeof import('../llm.js').getLlmClient>>)
+    await executeAgentTurnHop({ plan, context, input: [], instructions: '', tools: [],
+      record: async record => { records.push(record) } })
+    assert.deepEqual(calls, ['primary', 'backup'])
+    assert.equal(records.length, 2)
+    assert.equal(records[0].extras?.nextCandidateReason, 'upstream-http-401')
+  })
+  for (const boundary of ['output', 'tool', 'cancel'] as const) {
+    await t.test(boundary + ' prevents retries and fallback', async () => {
+      let calls = 0
+      const controller = new AbortController()
+      const records: import('../agents/llm-ledger.js').LlmCallRecord[] = []
+      __setLlmClientOverrideForTesting(async () => ({
+        responses: { create: async () => {
+          calls++
+          return (async function* () {
+            if (boundary === 'output') yield { type: 'response.output_text.delta', item_id: 'text', output_index: 0, content_index: 0, delta: 'visible' }
+            if (boundary === 'tool') yield { type: 'response.output_item.added', item: { id: 'tool', type: 'function_call', call_id: 'call', name: 'bash', arguments: '' } }
+            if (boundary === 'cancel') controller.abort()
+            throw Object.assign(new Error('Connection error.'), { code: 'ECONNRESET' })
+          })()
+        } },
+      }) as unknown as Awaited<ReturnType<typeof import('../llm.js').getLlmClient>>)
+      await assert.rejects(executeAgentTurnHop({ plan, context, input: [], instructions: '', tools: [],
+        signal: controller.signal, record: async record => { records.push(record) } }))
+      assert.equal(calls, 1)
+      assert.equal(records.length, 1)
+      assert.equal(records[0].extras?.stopReason, boundary === 'cancel' ? 'cancelled' : 'output-committed')
+    })
+  }
+})
 
 test('[integration] image_url fetch fail on attempt 0 → retry with images stripped → succeeds', async () => {
   // turn.ts has a strip-and-retry inner loop: if the LLM call's first

@@ -164,13 +164,16 @@ process.stdin.on('data', chunk => {
 
 for (const mode of ['initialize-error', 'tools/list-error', 'initialize-timeout', 'tools/list-timeout', 'collision', 'invalid-name', 'invalid-list', 'invalid-handshake', 'truncation', 'tree']) {
   test(`failed stdio ${mode}: child has exited before rejection`, async (t) => {
-    const { mkdtempSync, readFileSync } = await import('node:fs')
+    const { mkdtempSync, readFileSync, existsSync } = await import('node:fs')
     const root = mkdtempSync(join(tmpdir(), 'mcp-failure-'))
     t.after(() => rmSync(root, { recursive: true, force: true }))
     const pidFile = join(root, 'pid')
     await assert.rejects(connectMcpConnector({ name: 'broken', type: 'stdio', command: process.execPath,
       args: ['-e', FAILURE_SERVER], env: { MCP_TEST_MODE: mode, MCP_TEST_PID: pidFile } },
     { cwd: root, connectTimeoutMs: 500 }), /MCP/)
+    // The fixture writes its pid asynchronously at spawn; wait briefly on slow CI.
+    const pidDeadline = Date.now() + 5000
+    while (!existsSync(pidFile) && Date.now() < pidDeadline) await new Promise((r) => setTimeout(r, 25))
     const pid = Number(readFileSync(pidFile, 'utf8'))
     assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' })
     if (mode === 'tree') assert.throws(() => process.kill(Number(readFileSync(pidFile + '.child', 'utf8')), 0), { code: 'ESRCH' })

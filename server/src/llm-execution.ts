@@ -28,6 +28,8 @@ export interface LlmExecutionOptions<T> {
   /** Streaming consumers must finish here and mark the first committed output. */
   consume?: (value: T, state: LlmAttemptState) => Promise<T>
   retry?: { maxRetries: number; shouldRetry: (error: unknown, candidate: RoleCallCandidate) => boolean }
+  transportRetry?: { maxRetries: number; shouldRetry: (error: unknown) => boolean }
+  onRetry?: (reason: 'retry-without-images' | 'retry-provider-connection', candidate: RoleCallCandidate, error: unknown) => Promise<void>
   record?: (record: LlmCallRecord) => Promise<void>
   log?: (event: Record<string, unknown>) => void
 }
@@ -41,6 +43,7 @@ export async function executeLlmPlan<T>(options: LlmExecutionOptions<T>): Promis
   const checkAbort = () => { if (signal?.aborted) throw signal.reason ?? new DOMException('Aborted', 'AbortError') }
   let retryCount = 0
   let attempt = 0
+  let transportRetryCount = 0
   for (let index = 0; index < plan.candidates.length; index++) {
     checkAbort()
     const candidate = plan.candidates[index]!
@@ -63,10 +66,15 @@ export async function executeLlmPlan<T>(options: LlmExecutionOptions<T>): Promis
       error = err
     }
     const cancelled = signal?.aborted || isLlmCancellation(error)
-    const reason = failed && !cancelled ? fallbackReason(error) : null
-    const retry = failed && !state.committed && !cancelled && options.retry
-      && retryCount < Math.min(options.retry.maxRetries, 1)
+    const transport = failed && !cancelled && options.transportRetry?.shouldRetry(error)
+    const reason = failed && !cancelled ? fallbackReason(error) ?? (transport ? 'transport:provider-connection' : null) : null
+    const imageRetry = failed && !state.committed && !cancelled && options.retry
+      && retryCount < options.retry.maxRetries
       && options.retry.shouldRetry(error, candidate)
+    const transportRetry = failed && !state.committed && !cancelled && transport
+      && transportRetryCount < (options.transportRetry?.maxRetries ?? 0)
+    const retryReason = imageRetry ? 'retry-without-images' : transportRetry ? 'retry-provider-connection' : null
+    const retry = retryReason !== null
     const next = retry ? candidate : failed && reason && !state.committed && !cancelled ? plan.candidates[index + 1] : undefined
     const status = failed ? classifyLlmCallError(error) : 'ok'
     const extras = {
@@ -77,7 +85,7 @@ export async function executeLlmPlan<T>(options: LlmExecutionOptions<T>): Promis
       protocol: state.protocol ?? candidate.protocol, plannedProtocol: candidate.protocol, usageProtocol: state.usageProtocol ?? null, revision: plan.revision, authorizationVersion: plan.authorizationVersion ?? null,
       status, httpStatus: (error as { status?: number } | null)?.status ?? null,
       failureReason: cancelled ? 'cancelled' : reason ?? (failed ? 'non-fallbackable-error' : null),
-      nextCandidate: next?.model ?? null, nextCandidateReason: retry ? 'retry-without-images' : next ? reason : null,
+      nextCandidate: next?.model ?? null, nextCandidateReason: retryReason ?? (next ? reason : null),
       stopReason: !failed ? 'completed' : cancelled ? 'cancelled' : state.committed ? 'output-committed' : next ? 'advance' : !reason ? 'non-fallbackable-error' : 'exhausted',
       usage: state.usage, rawUsage: state.rawUsage, measurement: state.usage ? 'measured' : 'unknown',
       sdkMaxRetries: options.sdkMaxRetries ?? null, sdkRetryPolicy: options.sdkMaxRetries === undefined ? 'client-default' : 'request-override', sdkRetriesIndividuallyObservable: false,
@@ -92,7 +100,12 @@ export async function executeLlmPlan<T>(options: LlmExecutionOptions<T>): Promis
     log(extras)
     if (!failed) return value as T
     if (!next) throw error
-    if (retry) { retryCount++; index-- }
+    if (retryReason) {
+      if (imageRetry) retryCount++
+      else transportRetryCount++
+      await options.onRetry?.(retryReason, candidate, error)
+      index--
+    } else transportRetryCount = 0
   }
   throw new Error('LLM candidate chain is empty')
 }

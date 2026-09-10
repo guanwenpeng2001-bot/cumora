@@ -31,7 +31,9 @@ import { runAgentTurn } from '../agents/turn.js'
 import { runCli } from '../agents/cli.js'
 import { tBash } from '../agents/tools-shared.js'
 
+const originalImageProvider = process.env.OPENAI_IMAGE_PROVIDER
 before(async () => {
+  process.env.OPENAI_IMAGE_PROVIDER = 'openai'
   await ensureSchemaOnce()
 })
 
@@ -42,6 +44,8 @@ beforeEach(async () => {
 })
 
 after(async () => {
+  if (originalImageProvider === undefined) delete process.env.OPENAI_IMAGE_PROVIDER
+  else process.env.OPENAI_IMAGE_PROVIDER = originalImageProvider
   __setLlmClientOverrideForTesting(null)
   __setPodToolOverrideForTesting(null)
   await teardownAll()

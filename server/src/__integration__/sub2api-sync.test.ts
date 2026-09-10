@@ -25,6 +25,7 @@ test('T32 durable reconciliation and appended migration', { skip: !integrationUr
   const { env } = await import('../env.js')
   const { ensureSchema } = await import('../db/migrate.js')
   const { SUB2API_SYNC_SQL } = await import('../db/migrations/0012-sub2api-sync.js')
+  const { MAX_SUPPORTED_SCHEMA_VERSION } = await import('../db/migrations/manifest.js')
   const { requestSub2apiSync, reconcileSub2apiSync, getSub2apiSyncStatus, enqueueSub2apiSync, runSub2apiSyncTick } = await import('../sub2api-sync.js')
   const { tierGroups, parseApiKeyMap, SUB2API_PLATFORMS } = await import('../sub2api.js')
   const groups = Object.fromEntries(SUB2API_PLATFORMS.map((p, i) => [p, i + 1]))
@@ -148,15 +149,17 @@ test('T32 durable reconciliation and appended migration', { skip: !integrationUr
       await mkdir(dir, { recursive: true })
       const manifestURL = new URL('../db/migrations/manifest.ts', import.meta.url)
       let manifest = await readFile(manifestURL, 'utf8')
-      manifest = manifest.replace(/  \{\s+version: 12,[\s\S]*?  \},/, '')
-        .replace('MIN_SUPPORTED_SCHEMA_VERSION = 12', 'MIN_SUPPORTED_SCHEMA_VERSION = 10')
-        .replace('MAX_SUPPORTED_SCHEMA_VERSION = 12', 'MAX_SUPPORTED_SCHEMA_VERSION = 11')
+      manifest = manifest.replace(/ {2}\{\s+version: (\d+),[\s\S]*? {2}\},/g,
+        (entry, version: string) => Number(version) > 11 ? '' : entry)
+        .replace(/MIN_SUPPORTED_SCHEMA_VERSION = \d+/, 'MIN_SUPPORTED_SCHEMA_VERSION = 10')
+        .replace(/MAX_SUPPORTED_SCHEMA_VERSION = \d+/, 'MAX_SUPPORTED_SCHEMA_VERSION = 11')
       const manifestPath = join(dir, 'manifest.mts')
       await writeFile(manifestPath, manifest)
       const migrateURL = new URL('../db/migrate.ts', import.meta.url)
       let source = await readFile(migrateURL, 'utf8')
       source = source.replace(/^import \{ SUB2API_SYNC_SQL.*$/m, '')
-        .replace(/  \{\s+\.\.\.SCHEMA_MIGRATIONS\[11\],[\s\S]*?  \},/, '')
+        .replace(/ {2}\{\s+\.\.\.SCHEMA_MIGRATIONS\[(\d+)\],[\s\S]*? {2}\},/g,
+          (entry, index: string) => Number(index) >= 11 ? '' : entry)
         .replace(/from '([^']+)'/g, (all, spec: string) => {
           if (spec === './migrations/manifest.js') return `from '${pathToFileURL(manifestPath).href}'`
           return spec.startsWith('.') ? `from '${new URL(spec.replace(/\.js$/, '.ts'), migrateURL).href}'` : all
@@ -175,7 +178,7 @@ test('T32 durable reconciliation and appended migration', { skip: !integrationUr
       } finally { await admin.query(`DROP DATABASE ${upgradeName}`) }
       await pool.query(SUB2API_SYNC_SQL)
       await pool.query(SUB2API_SYNC_SQL)
-      assert.equal(Number((await pool.query('SELECT max(version) AS v FROM schema_migrations')).rows[0].v), 12)
+      assert.equal(Number((await pool.query('SELECT max(version) AS v FROM schema_migrations')).rows[0].v), MAX_SUPPORTED_SCHEMA_VERSION)
     })
     await t.test('uncommitted intent is invisible and registration survives gateway outage', async () => {
       const client = await pool.connect()

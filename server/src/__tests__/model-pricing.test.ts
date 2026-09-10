@@ -37,7 +37,7 @@ function fixture(env: Record<string, unknown> = {}) {
     return { rows: [row] }
   } }
   const pricing: Record<string, any> = {}
-  const cost = compile(read('../agents/cost.ts'), { '../model-pricing.js': pricing, 'node:crypto': { createHash } },
+  const cost = compile(read('../agents/cost.ts'), { './token-usage.js': compile(read('../agents/token-usage.ts'), {}), '../model-pricing.js': pricing, 'node:crypto': { createHash } },
     { process: { env: { CUMORA_MODEL_PRICES_JSON: JSON.stringify(env) } }, console: { warn: (...args: any[]) => warnings.push(args) } })
   Object.assign(pricing, compile(read('../model-pricing.ts'), { './db/pool.js': { pool }, './agents/cost.js': cost },
     { console: { warn: (...args: any[]) => warnings.push(args) } }))
