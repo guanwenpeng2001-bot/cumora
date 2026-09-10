@@ -48,6 +48,7 @@ import {
 } from '../runtime/wake-options.js'
 import { SKYPE_EMOTICONS_GUIDE } from '../skype-emoticons.js'
 import { finalizeTriage, isRateLimited, parseTriage, triageDisposition, deferTriage, type InboxTriageVerdict } from '../triage-core.js'
+import { BYOA_SYNC_INTERVALS, ByoaPolicyController } from './runtime-policy.js'
 import { type ActionSurface, actionSurfaceFor, actionSurfaceText, calendarExampleText, postingMechanicsText } from './prompt-surface.js'
 import { allowUnsandboxedByoa, detectEnginesWithStatus, ENGINE_IDS, type DetectedEngineSnapshot, type EngineHopReport, type EngineId, type EngineRunResult, type EngineSession, type EngineUsage, enrichDetectedEngines, evaluateRunnableEngines, getAdapter, runEngineDoctor, type RunnableEngineEvaluation, snapshotDetectedEngines } from './engine.js'
 
@@ -96,8 +97,8 @@ const SESSIONS_DIR = join(CONFIG_DIR, 'sessions')
 const SHUTDOWN_GRACE_MS = Number(process.env.CUMORA_SHUTDOWN_GRACE_MS) || 15_000
 const DEFAULT_SERVER = process.env.CUMORA_SERVER_URL || 'https://api.cumora.ai'
 const TOKEN_REFRESH_SKEW_MS = 5 * 60 * 1000 // refresh 5min before expiry
-const AGENT_POLL_MS = 60_000
-const HEARTBEAT_MS = 30_000
+const AGENT_POLL_MS = BYOA_SYNC_INTERVALS.resourceSyncMs
+const HEARTBEAT_MS = BYOA_SYNC_INTERVALS.policyHeartbeatMs
 // How often the daemon re-scans PATH for installed engines. Deliberately much
 // slower than the heartbeat: detection spawns a `which`/`where` per engine, and
 // nobody installs a CLI twice a minute. The heartbeat carries the CACHED result,
@@ -295,33 +296,6 @@ export function backoffUntilFor(outcome: TurnOutcome, now: number): number | nul
 const TRIAGE_DIR = join(CONFIG_DIR, 'triage')
 const TRIAGE_TIMEOUT_MS = 30_000
 
-/** Per-computer concurrency gate for big-brain spawns. acquire() resolves
- *  immediately if a slot is free; otherwise it queues FIFO and resolves
- *  when an earlier holder releases. Pure in-process — bounded queue size
- *  follows the agent count (~7 typical), no memory concern. */
-class BigBrainSemaphore {
-  private inFlight = 0
-  private readonly waiters: Array<() => void> = []
-  constructor(private readonly max: number) {}
-  async acquire(): Promise<void> {
-    if (this.inFlight < this.max) {
-      this.inFlight += 1
-      return
-    }
-    await new Promise<void>((resolve) => this.waiters.push(resolve))
-    this.inFlight += 1
-  }
-  release(): void {
-    this.inFlight -= 1
-    const next = this.waiters.shift()
-    if (next) next()
-  }
-  /** Diagnostic only — number of waiters currently queued. */
-  get queueDepth(): number { return this.waiters.length }
-}
-const bigBrainSem = new BigBrainSemaphore(BIG_BRAIN_CONCURRENCY)
-const triageSem = new BigBrainSemaphore(TRIAGE_CONCURRENCY)
-
 /** Per-computer ADAPTIVE minimum interval between local-CLI spawns.
  *  Deterministic spacing (see MIN_SPAWN_INTERVAL_MS above) that
  *  auto-tunes to the user's actual Anthropic/OpenAI burst quota: starts
@@ -337,8 +311,14 @@ class AdaptivePacer {
   private next = 0
   private current: number
   private consecutiveOk = 0
-  constructor(private readonly base: number, private readonly maxMs = 8000) {
+  constructor(private base: number, private readonly maxMs = 8000) {
     this.current = base
+  }
+  setBase(base: number): void {
+    this.base = base
+    this.current = base
+    this.consecutiveOk = 0
+    this.next = Math.max(this.next, Date.now() + base)
   }
   async gate(): Promise<void> {
     if (this.current <= 0) return
@@ -353,10 +333,10 @@ class AdaptivePacer {
    *  back too fast on the next OK. */
   onRateLimited(): void {
     const prev = this.current
-    this.current = Math.min(this.maxMs, Math.max(this.base, this.current * 2))
+    this.current = Math.min(Math.max(this.maxMs, this.base), Math.max(this.base, this.current * 2))
     this.consecutiveOk = 0
     if (this.current !== prev) {
-      console.warn(`[pacer] adapt: ${prev}ms → ${this.current}ms (rate-limited; cap ${this.maxMs}ms)`)
+      console.warn(`[pacer] adapt: ${prev}ms → ${this.current}ms (rate-limited; cap ${Math.max(this.maxMs, this.base)}ms)`)
     }
   }
   /** Called when a spawn completes cleanly (no rate-limit). After enough
@@ -376,6 +356,14 @@ class AdaptivePacer {
   get intervalMs(): number { return this.current }
 }
 const spawnPacer = new AdaptivePacer(MIN_SPAWN_INTERVAL_MS)
+const runtimePolicy = new ByoaPolicyController({
+  bigBrainConcurrency: BIG_BRAIN_CONCURRENCY, triageConcurrency: TRIAGE_CONCURRENCY,
+  spawnIntervalMs: MIN_SPAWN_INTERVAL_MS, triageTimeoutMs: TRIAGE_TIMEOUT_MS,
+  triageBackoffBaseMs: 30_000, triageBackoffMaxMs: 10 * 60_000,
+  groupSteerEnabled: STEER_GROUP_IN_TURN, groupSteerIntervalMs: GROUP_STEER_MIN_INTERVAL_MS,
+}, (policy) => { spawnPacer.setBase(policy.spawnIntervalMs) })
+const bigBrainSem = runtimePolicy.bigBrain
+const triageSem = runtimePolicy.triage
 
 // ─── self-update ──────────────────────────────────────────────────────────
 // Injected by esbuild at build time (agent-cli/build.mjs). Source-mode
@@ -2182,7 +2170,7 @@ class AgentRunner {
     await triageSem.acquire()
     await spawnPacer.gate()
     const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), TRIAGE_TIMEOUT_MS)
+    const timer = setTimeout(() => controller.abort(), runtimePolicy.values.triageTimeoutMs)
     const callId = randomUUID()
     const startedAt = Date.now()
     let attempted = false
@@ -2713,7 +2701,7 @@ class AgentRunner {
         r.author_kind === 'human' ||
         (typeof r.body === 'string' && r.body.includes(`@${this.agent.id}`)))
       if (!direct) {
-        if (!STEER_GROUP_IN_TURN) return
+        if (!runtimePolicy.values.groupSteerEnabled) return
         // Content-free GROUP nudge (opt-in): tell the busy agent that
         // activity happened WITHOUT injecting bodies — throttled, deduped by latest
         // id. The agent glances + posts through the normal server gates (freshness
@@ -2722,7 +2710,7 @@ class AgentRunner {
         const nowMs = Date.now()
         const latestGroup = rows[rows.length - 1]
         if (!latestGroup.id || latestGroup.id === this.lastGroupSteeredMsgId) return
-        if (nowMs - this.lastGroupSteerAt < GROUP_STEER_MIN_INTERVAL_MS) return
+        if (nowMs - this.lastGroupSteerAt < runtimePolicy.values.groupSteerIntervalMs) return
         this.lastGroupSteeredMsgId = latestGroup.id
         this.lastGroupSteerAt = nowMs
         session.steer(
@@ -2834,7 +2822,7 @@ class AgentRunner {
         const triageMs = Date.now() - turnStart // ensureToken + snapshot + triage
         if (triage?.outcome === 'defer') {
           this.triageTroubleStreak += 1
-          const backoff = Math.min(10 * 60_000, 30_000 * 2 ** Math.min(5, this.triageTroubleStreak - 1))
+          const backoff = Math.min(runtimePolicy.values.triageBackoffMaxMs, runtimePolicy.values.triageBackoffBaseMs * 2 ** Math.min(31, this.triageTroubleStreak - 1))
           this.triageBackoffUntil = Math.max(Date.now() + backoff, triage.retryAt ?? 0)
           console.warn(`[computer] ${this.agent.id} triage deferred (${triage.failureCategory}, triage ${triageMs}ms), not waking or acking`)
           await runtimeBest(this.cfg.serverUrl, '/status', token, { status: 'avail' })
@@ -3425,7 +3413,7 @@ async function doRun(serverOverride?: string): Promise<void> {
   // cannot be swallowed by the older scan finishing afterward.
   const rescanEngines = createEngineRescanQueue(scanEnginesOnce)
 
-  const heartbeat = async (): Promise<void> => {
+  const heartbeatOnce = async (): Promise<void> => {
     try {
       const response = await fetch(`${cfg.serverUrl}/api/computers/heartbeat`, {
         method: 'POST',
@@ -3436,12 +3424,23 @@ async function doRun(serverOverride?: string): Promise<void> {
         // `supervised` tells the server HOW this daemon runs (service vs. a
         // foreground command), so the app's upgrade banner can show the right
         // update instructions for this machine.
-        body: JSON.stringify({ version: CURRENT_VERSION, supervised: SUPERVISED, engines: engineInventory.current }),
+        body: JSON.stringify({ version: CURRENT_VERSION, supervised: SUPERVISED, engines: engineInventory.current, runtimePolicy: runtimePolicy.report() }),
       })
       if (!response.ok) return
-      const heartbeatResult = await response.json().catch(() => null) as { detectRequested?: boolean } | null
+      const heartbeatResult = await response.json().catch(() => null) as { detectRequested?: boolean; runtimePolicy?: unknown } | null
+      runtimePolicy.receive(heartbeatResult?.runtimePolicy)
       if (heartbeatResult?.detectRequested) void rescanEngines(true)
     } catch { /* transient — next tick retries */ }
+  }
+
+  let heartbeatInFlight: Promise<void> | null = null
+  const heartbeat = (): Promise<void> => {
+    if (heartbeatInFlight) return heartbeatInFlight
+    const running = heartbeatOnce().finally(() => {
+      if (heartbeatInFlight === running) heartbeatInFlight = null
+    })
+    heartbeatInFlight = running
+    return running
   }
 
   let shuttingDown = false
@@ -3482,6 +3481,7 @@ async function doRun(serverOverride?: string): Promise<void> {
     }
   }
 
+  console.log(`[computer] policy heartbeat ${HEARTBEAT_MS / 1000}s; resource sync ${AGENT_POLL_MS / 1000}s; policy applies after active spawns finish`)
   await heartbeat()
   await sync()
   if (runners.size === 0) {

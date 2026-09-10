@@ -55,7 +55,7 @@ import { discoverSub2apiGroups, getUserQuota, sub2apiConfigured } from '../sub2a
 import {
   ensureCloudComputer, issuePairingCode, pairComputer, announceComputerOnline,
   resolveDevice, mintAgentRuntimeToken, listAgentsForComputer,
-  listComputers, revokeComputer, assignAgentToComputer, heartbeatComputer,
+  listComputers, revokeComputer, assignAgentToComputer, heartbeatComputer, syncComputerRuntimePolicy,
   cloudComputerId, issueRepairCode, requestEngineDetect, reportDetectedEngines,
   setComputerDefaultEngine,
   PAIRABLE_ENGINES, type EngineId,
@@ -1681,7 +1681,7 @@ api.get('/computers/me/agents', safe(async (req, res) => {
 // Daemon liveness heartbeat — keeps the computer 'online' (an offline sweep
 // flips it once heartbeats go stale).
 api.post('/computers/heartbeat', safe(async (req, res) => {
-  const { computerId } = await requireDevice(req)
+  const { computerId, companyId } = await requireDevice(req)
   const version = typeof req.body?.version === 'string' ? req.body.version : undefined
   const supervised = typeof req.body?.supervised === 'boolean' ? req.body.supervised : undefined
   // Engines the daemon can currently see on PATH. Optional: an older daemon
@@ -1690,7 +1690,8 @@ api.post('/computers/heartbeat', safe(async (req, res) => {
     ? (req.body.engines as unknown[]).filter((e): e is string => typeof e === 'string')
     : undefined
   const detectRequested = await heartbeatComputer(computerId, version, supervised, engines)
-  res.json({ ok: true, detectRequested })
+  const policy = await syncComputerRuntimePolicy(companyId, computerId, req.body?.runtimePolicy)
+  res.json({ ok: true, detectRequested, ...policy })
 }))
 
 // Mint a per-agent runtime JWT for the calling computer (daemon refresh loop).

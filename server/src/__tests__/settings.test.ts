@@ -674,3 +674,43 @@ test('stale-run expiry is disabled by zero and retains running-only scope and de
   assert.deepEqual(Array.from(calls[0].params), [600_000])
   assert.ok(calls[0].sql.includes("WHERE status = 'running'"))
 })
+
+test('BYOA policy has a versioned allowlist and preserves BYOA backoff defaults', async () => {
+  const f = fixture()
+  await f.settings.loadServerSettings()
+  const initial = f.settings.getByoaRuntimePolicyValues()
+  assert.equal(initial.values.bigBrainConcurrency, 6)
+  assert.equal(initial.values.triageConcurrency, 8)
+  assert.equal(initial.values.triageBackoffMaxMs, 600_000)
+  const saved = await f.settings.writeServerSettings({ byoa_big_brain_concurrency: '2', byoa_spawn_interval_ms: '1000', byoa_group_steer_enabled: 'false', byoa_triage_timeout_ms: '7000' })
+  const next = f.settings.getByoaRuntimePolicyValues()
+  assert.equal(next.revision, saved.revision)
+  assert.equal(next.values.bigBrainConcurrency, 2)
+  assert.equal(next.values.spawnIntervalMs, 1000)
+  assert.equal(next.values.groupSteerEnabled, false)
+  assert.equal(next.values.triageTimeoutMs, 7000)
+  assert.equal(Object.keys(next.values).length, 8)
+  for (const def of f.settings.SETTING_DEFS.filter(d => d.scope === 'byoa')) assert.equal(def.effect, 'next-gate')
+})
+
+test('BYOA rejects invalid concurrency/pacing/backoff and restores inheritance', async () => {
+  const f = fixture()
+  await f.settings.loadServerSettings()
+  for (const entries of [{ byoa_big_brain_concurrency: '0' }, { byoa_triage_concurrency: '1.5' }, { byoa_spawn_interval_ms: '-1' }, { byoa_triage_timeout_ms: '0' }, { byoa_triage_backoff_base_ms: '600001' }] as Array<Record<string, string>>) {
+    await assert.rejects(f.settings.writeServerSettings(entries))
+  }
+  await f.settings.writeServerSettings({ byoa_triage_backoff_base_ms: '700000', byoa_triage_backoff_max_ms: '800000', byoa_big_brain_concurrency: '1' })
+  assert.equal(f.settings.getByoaRuntimePolicyValues().values.triageBackoffBaseMs, 700000)
+  await f.settings.writeServerSettings({ byoa_big_brain_concurrency: null })
+  assert.equal(f.settings.getByoaRuntimePolicyValues().values.bigBrainConcurrency, 6)
+})
+
+test('invalid stored BYOA backoff emits diagnostics and retains the original safe defaults', async () => {
+  const f = fixture()
+  f.data.set('byoa_triage_backoff_base_ms', '700000')
+  f.data.set('byoa_triage_backoff_max_ms', '600000')
+  await f.settings.loadServerSettings()
+  assert.equal(f.settings.getByoaRuntimePolicyValues().values.triageBackoffBaseMs, 30000)
+  assert.equal(f.settings.getByoaRuntimePolicyValues().values.triageBackoffMaxMs, 600000)
+  assert.ok(f.settings.getServerSettingsSnapshot().diagnostics?.some(d => d.includes('byoa_triage_backoff')))
+})

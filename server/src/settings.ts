@@ -18,6 +18,7 @@
 import type { PoolClient, QueryConfig } from 'pg'
 import { pool } from './db/pool.js'
 import { env, resolveDirectLlmEnv } from './env.js'
+import type { ByoaPolicyValues } from './agents/computer/runtime-policy.js'
 import type { CompactionPolicy } from './agents/turn-compaction.js'
 import { parseApiKeyMap, sub2apiOpenAIBaseURL } from './sub2api.js'
 import { DIRECT_LLM_SLOTS, getManagedPodSettings, installManagedPodSettings, type ManagedPodSettings } from './managed-pod-settings.js'
@@ -80,15 +81,20 @@ export const SETTING_DEFS: readonly SettingDef[] = [
   { key: 'scanner_min_messages', type: 'integer', defaultValue: '8', min: 1, max: 80, scope: 'server', effect: 'next-tick', envValue: () => '8' },
   { key: 'scanner_window_hours', type: 'integer', defaultValue: '24', min: 1, max: 8760, scope: 'server', effect: 'next-tick', envValue: () => '24' },
   { key: 'steer_enabled', type: 'boolean', defaultValue: 'true', pod: true, scope: 'managed', effect: 'next-turn', description: 'Disables mid-turn injection only; durable messages remain available to the next turn.', envValue: () => (env.STEER_ENABLED ? 'true' : 'false') },
-  { key: 'byoa_group_steer_enabled', type: 'boolean', defaultValue: 'true', scope: 'byoa', effect: 'pending-T41', description: 'Saved policy; delivery and daemon consumption pending T41.', envValue: () => process.env.CUMORA_BYOA_STEER_GROUP ?? 'true' },
-  { key: 'byoa_group_steer_interval_ms', type: 'integer', defaultValue: '8000', min: 0, max: 2147483647, unit: 'milliseconds', scope: 'byoa', effect: 'pending-T41', description: 'Saved policy; delivery and daemon consumption pending T41.', envValue: () => process.env.CUMORA_BYOA_STEER_GROUP_INTERVAL_MS ?? '8000' },
+  { key: 'byoa_big_brain_concurrency', type: 'integer', defaultValue: '6', min: 1, max: 2147483647, scope: 'byoa', effect: 'next-gate', envValue: () => process.env.CUMORA_BYOA_MAX_CONCURRENT_BIG_BRAIN ?? '6' },
+  { key: 'byoa_triage_concurrency', type: 'integer', defaultValue: '8', min: 1, max: 2147483647, scope: 'byoa', effect: 'next-gate', envValue: () => process.env.CUMORA_BYOA_MAX_CONCURRENT_TRIAGE ?? '8' },
+  { key: 'byoa_spawn_interval_ms', type: 'integer', defaultValue: '500', min: 0, max: 2147483647, unit: 'milliseconds', scope: 'byoa', effect: 'next-gate', envValue: () => process.env.CUMORA_BYOA_MIN_SPAWN_INTERVAL_MS ?? '500' },
+  { key: 'byoa_triage_backoff_base_ms', type: 'integer', defaultValue: '30000', min: 1, max: 2147483647, unit: 'milliseconds', scope: 'byoa', effect: 'next-gate', envValue: () => '30000' },
+  { key: 'byoa_triage_backoff_max_ms', type: 'integer', defaultValue: '600000', min: 1, max: 2147483647, unit: 'milliseconds', scope: 'byoa', effect: 'next-gate', envValue: () => '600000' },
+  { key: 'byoa_group_steer_enabled', type: 'boolean', defaultValue: 'true', scope: 'byoa', effect: 'next-gate', description: 'Discovered on the 30s BYOA heartbeat; applied after active spawns finish. Resources sync separately every 60s.', envValue: () => process.env.CUMORA_BYOA_STEER_GROUP ?? 'true' },
+  { key: 'byoa_group_steer_interval_ms', type: 'integer', defaultValue: '8000', min: 0, max: 2147483647, unit: 'milliseconds', scope: 'byoa', effect: 'next-gate', description: 'Discovered on the 30s BYOA heartbeat; applied after active spawns finish. Resources sync separately every 60s.', envValue: () => process.env.CUMORA_BYOA_STEER_GROUP_INTERVAL_MS ?? '8000' },
   { key: 'synthetic_gate_enabled', type: 'boolean', defaultValue: 'true', pod: true, scope: 'managed', effect: 'next-gate', description: 'Disabled suppresses synthetic wakes; never bypasses the gate.', envValue: () => 'true' },
   { key: 'synthetic_gate_failure_mode', type: 'string', defaultValue: 'closed', pod: true, readOnly: true, allowedValues: ['closed'], scope: 'managed', effect: 'next-gate', description: 'Safety floor: no brain wake and no inbox acknowledgement on failure.', envValue: () => 'closed' },
   { key: 'triage_rate_limit_mode', type: 'string', defaultValue: 'closed', pod: true, readOnly: true, allowedValues: ['closed'], scope: 'managed', effect: 'next-gate', description: 'Safety floor: no brain wake and no inbox acknowledgement on failure.', envValue: () => 'closed' },
   { key: 'inbox_triage_failure_mode', type: 'string', defaultValue: 'defer', pod: true, allowedValues: ['defer'], scope: 'managed', effect: 'next-gate', envValue: () => 'defer' },
   { key: 'cloud_inbox_triage_timeout_ms', type: 'integer', defaultValue: '8000', min: 1, max: 2147483647, unit: 'milliseconds', pod: true, scope: 'managed', effect: 'next-gate', envValue: () => '8000' },
   { key: 'synthetic_gate_timeout_ms', type: 'integer', defaultValue: '8000', min: 1, max: 2147483647, unit: 'milliseconds', pod: true, scope: 'managed', effect: 'next-gate', envValue: () => '8000' },
-  { key: 'byoa_triage_timeout_ms', type: 'integer', defaultValue: '30000', min: 1, max: 2147483647, unit: 'milliseconds', scope: 'byoa', effect: 'pending-T41', description: 'Saved policy; delivery and daemon consumption pending T41.', envValue: () => '30000' },
+  { key: 'byoa_triage_timeout_ms', type: 'integer', defaultValue: '30000', min: 1, max: 2147483647, unit: 'milliseconds', scope: 'byoa', effect: 'next-gate', description: 'Discovered on the 30s BYOA heartbeat; applied after active spawns finish. Resources sync separately every 60s.', envValue: () => '30000' },
   { key: 'triage_backoff_base_ms', type: 'integer', defaultValue: '30000', min: 1, max: 2147483647, unit: 'milliseconds', pod: true, scope: 'managed', effect: 'next-gate', envValue: () => '30000' },
   { key: 'triage_backoff_max_ms', type: 'integer', defaultValue: '60000', min: 1, max: 2147483647, unit: 'milliseconds', pod: true, scope: 'managed', effect: 'next-gate', envValue: () => '60000' },
   { key: 'support_inbox_triage_output_tokens', type: 'integer', defaultValue: '2000', min: 1, max: 1000000, pod: true, scope: 'managed', effect: 'next-gate', description: 'Base output tokens; support reasoning headroom is added once.', envValue: () => '2000' },
@@ -214,6 +220,12 @@ function makeSnapshot(rows: { key: string; value: string }[], defaults?: Readonl
     sources.triage_backoff_base_ms = sources.triage_backoff_max_ms = 'env'
   }
   const definitions = Object.freeze(SETTING_DEFS.map(({ envValue: _envValue, ...def }) => Object.freeze(def)))
+  if (Number(settings.byoa_triage_backoff_base_ms) > Number(settings.byoa_triage_backoff_max_ms)) {
+    diagnostics.push('byoa_triage_backoff: base must not exceed maximum; using defaults')
+    settings.byoa_triage_backoff_base_ms = '30000'
+    settings.byoa_triage_backoff_max_ms = '600000'
+    sources.byoa_triage_backoff_base_ms = sources.byoa_triage_backoff_max_ms = 'env'
+  }
   return Object.freeze({ revision, definitions, source: 'db', settings: Object.freeze(settings), sources: Object.freeze(sources), diagnostics: Object.freeze(diagnostics) })
 }
 
@@ -610,6 +622,14 @@ export async function writeServerSettings(entries: Record<string, string | null>
   }
   const rows = Object.entries(entries)
   return commitSettings(async (client) => {
+    if (rows.some(([key]) => key === 'byoa_triage_backoff_base_ms' || key === 'byoa_triage_backoff_max_ms')) {
+      const current = await client.query<{ key: string; value: string }>('SELECT key, value FROM server_settings')
+      const after = { ...makeSnapshot(current.rows).settings }
+      for (const [key, value] of rows) after[key] = value ?? settingEnvValue(SETTING_DEFS.find(d => d.key === key)!)
+      if (Number(after.byoa_triage_backoff_base_ms) > Number(after.byoa_triage_backoff_max_ms)) {
+        throw new InvalidServerSettingError('BYOA triage backoff must satisfy base <= max')
+      }
+    }
     if (rows.some(([key]) => key === 'triage_backoff_base_ms' || key === 'triage_backoff_max_ms')) {
       const current = await client.query<{ key: string; value: string }>('SELECT key, value FROM server_settings')
       const after = { ...makeSnapshot(current.rows).settings }
@@ -787,4 +807,18 @@ export function parseGroupConfig(raw: string, strict = false): Sub2apiGroupConfi
     console.warn('[settings] invalid sub2api_group_config; using env mapping')
     return {}
   }
+}
+
+export function getByoaRuntimePolicyValues(): { revision: string; values: ByoaPolicyValues } {
+  const { revision, settings } = getServerSettingsSnapshot()
+  return { revision, values: {
+    bigBrainConcurrency: Number(settings.byoa_big_brain_concurrency),
+    triageConcurrency: Number(settings.byoa_triage_concurrency),
+    spawnIntervalMs: Number(settings.byoa_spawn_interval_ms),
+    triageTimeoutMs: Number(settings.byoa_triage_timeout_ms),
+    triageBackoffBaseMs: Number(settings.byoa_triage_backoff_base_ms),
+    triageBackoffMaxMs: Number(settings.byoa_triage_backoff_max_ms),
+    groupSteerEnabled: settings.byoa_group_steer_enabled === 'true',
+    groupSteerIntervalMs: Number(settings.byoa_group_steer_interval_ms),
+  } }
 }

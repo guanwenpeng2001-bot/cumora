@@ -15,6 +15,8 @@
  *     runtime/jwt.ts — the same token a pod gets)
  */
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
+import { getByoaRuntimePolicyValues } from '../../settings.js'
+import { BYOA_SYNC_INTERVALS, makeByoaPolicy, parseByoaPolicyReport, type ByoaPolicyReport } from './runtime-policy.js'
 import { pool } from '../../db/pool.js'
 import { CH_STATUS, publish, redis } from '../../redis.js'
 import { canonicalAgentResources, type AgentResourcePayload, type ResourceApplicationState, type ResourceApplicationResult } from '../runtime/client.js'
@@ -285,6 +287,7 @@ export interface ComputerWithUpgrade extends ComputerRow {
   /** True iff this is a BYOA daemon running behind the latest version (or one so
    *  old it never reported a version). Cloud computers are never outdated. */
   daemon_outdated: boolean
+  runtimePolicy?: ByoaPolicyState
 }
 
 /** semver-ish "a > b" over dotted numbers. Pre-release/build tags are ignored
@@ -751,8 +754,9 @@ export async function listComputers(companyId: string): Promise<ComputerWithUpgr
     [companyId],
   )
   const latest = await getLatestDaemonVersion()
-  return rows.map((r) => ({
+  return Promise.all(rows.map(async (r) => ({
     ...r,
+    ...(r.kind !== 'cloud' ? { runtimePolicy: await getComputerPolicyState(r.company_id, r.id) } : {}),
     latest_daemon_version: latest,
     // Only BYOA daemons can be outdated, and only when we actually know the
     // latest. A daemon that never reported a version (NULL) is pre-feature →
@@ -760,7 +764,7 @@ export async function listComputers(companyId: string): Promise<ComputerWithUpgr
     daemon_outdated:
       r.kind !== 'cloud' && latest != null &&
       (r.daemon_version == null || versionGt(latest, r.daemon_version)),
-  }))
+  })))
 }
 
 export interface ResolvedAgentHost {
@@ -1194,4 +1198,52 @@ export async function reportAgentResources(snapshot: AgentResourceSnapshot, repo
   // Store by reported content version: a late acknowledgement cannot make a newer edit applied.
   await redis.set(resourceStateKey(snapshot), JSON.stringify({ version: report.version, status: report.status,
     ...(report.status === 'failed' ? { error: 'resource_application_failed' } : {}) }))
+}
+
+export interface ByoaPolicyState {
+  desired: string
+  received: string | null
+  applied: string | null
+  status: 'unknown' | 'unsupported' | 'pending' | 'received' | 'applied'
+  reportedAt: string | null
+  policyHeartbeatMs: number
+  resourceSyncMs: number
+}
+
+function computerPolicyKey(companyId: string, computerId: string): string {
+  return `cumora:byoa-policy:${companyId}:${computerId}`
+}
+
+export function currentByoaRuntimePolicy() {
+  const { revision, values } = getByoaRuntimePolicyValues()
+  return makeByoaPolicy(revision, values)
+}
+
+export function computerPolicyState(desired: string, report: ByoaPolicyReport | null, reportedAt: string | null): ByoaPolicyState {
+  return {
+    desired, received: report?.received ?? null, applied: report?.applied ?? null, reportedAt,
+    status: !reportedAt ? 'unknown' : !report ? 'unsupported' : report.applied === desired ? 'applied'
+      : report.received === desired ? 'received' : 'pending',
+    ...BYOA_SYNC_INTERVALS,
+  }
+}
+
+export async function syncComputerRuntimePolicy(companyId: string, computerId: string, raw: unknown) {
+  const runtimePolicy = currentByoaRuntimePolicy()
+  const report = parseByoaPolicyReport(raw)
+  const reportedAt = new Date().toISOString()
+  try {
+    await redis.set(computerPolicyKey(companyId, computerId), JSON.stringify({ report, reportedAt }), 'EX', 120)
+  } catch { /* Policy delivery and liveness survive a failed acknowledgement cache. */ }
+  return { runtimePolicy, runtimePolicyState: computerPolicyState(runtimePolicy.version, report, reportedAt) }
+}
+
+async function getComputerPolicyState(companyId: string, computerId: string): Promise<ByoaPolicyState> {
+  const desired = currentByoaRuntimePolicy().version
+  try {
+    const raw = await redis.get(computerPolicyKey(companyId, computerId))
+    const stored = raw ? JSON.parse(raw) : null
+    return computerPolicyState(desired, parseByoaPolicyReport(stored?.report),
+      typeof stored?.reportedAt === 'string' ? stored.reportedAt : null)
+  } catch { return computerPolicyState(desired, null, null) }
 }
