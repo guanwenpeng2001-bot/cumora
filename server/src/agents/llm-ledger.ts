@@ -42,8 +42,10 @@ import { randomUUID } from 'node:crypto'
 import type OpenAI from 'openai'
 import type { PoolClient } from 'pg'
 import { pool } from '../db/pool.js'
-import { getLlmClient } from '../llm.js'
-import { EMPTY_USAGE, effectiveCostUsd, priceFor, type TokenUsage, usageFromOpenAI } from './cost.js'
+import { getLlmClient, __isLlmTestOverrideActive } from '../llm.js'
+import { executeTrackedText } from '../llm-execution.js'
+import type { RoleCallPlan, RoleCallAgent } from '../llm-resolver.js'
+import { EMPTY_USAGE, effectiveCostUsd, priceFor, usageFromOpenAI, type TokenUsage, measuredUsage } from './cost.js'
 
 /** The exhaustive set of business purposes that spend sub2api. Adding a new
  *  callsite REQUIRES adding its purpose here — that's the discipline knob that
@@ -82,6 +84,9 @@ export type LlmCallSource = 'cloud' | 'byoa-claude' | 'byoa-codex' | 'byoa-grok'
 export interface LlmCallContext {
   purpose: LlmCallPurpose
   companyId: string | null
+  role?: RoleCallPlan['role']
+  domain?: RoleCallPlan['domain']
+  agent?: RoleCallAgent
   agentId?: string | null
   runId?: string | null
   conversationId?: string | null
@@ -135,7 +140,7 @@ function llmCallValues(rec: LlmCallRecord): unknown[] {
     measured ? cost.usd : 0, cost.estimated, measured,
     rec.latencyMs, rec.status,
     rec.error ? rec.error.slice(0, 500) : null,
-    rec.extras ? JSON.stringify(rec.extras) : null,
+    JSON.stringify({ ...rec.extras, usage: rec.usage ?? null, measurement: measured ? 'measured' : 'unknown' }),
     rec.daemonVersion ?? null,
   ]
 }
@@ -148,12 +153,20 @@ async function insertLlmCall(rec: LlmCallRecord): Promise<void> {
   )
 }
 
+let droppedLlmCalls = 0
+let lastLlmCallDropAt: string | null = null
+export function getLlmLedgerHealth(): { droppedCalls: number; lastDropAt: string | null } {
+  return { droppedCalls: droppedLlmCalls, lastDropAt: lastLlmCallDropAt }
+}
+
 /** Single INSERT into `llm_calls`. Never throws — the ledger is observability,
  *  not a hard dependency of the call path. */
 export async function recordLlmCall(rec: LlmCallRecord): Promise<void> {
   try {
     await insertLlmCall(rec)
   } catch (err) {
+    droppedLlmCalls++
+    lastLlmCallDropAt = new Date().toISOString()
     console.warn('[llm-ledger] insert failed — dropping', err instanceof Error ? err.message : err)
   }
 }
@@ -206,7 +219,7 @@ export function readStreamUsage(ev: { type?: string } & Record<string, unknown>)
   // so we re-use the same mapper.
   const r = (ev as { response?: { usage?: unknown } }).response
   if (!r?.usage) return null
-  return usageFromOpenAI(r.usage)
+  return measuredUsage(r.usage, 'responses')
 }
 
 /** Like readStreamUsage but for `output_tokens_details.reasoning_tokens` on
@@ -244,19 +257,17 @@ type AnyResponse = { usage?: unknown } & Record<string, unknown>
 export async function getTrackedLlmClient(ctx: LlmCallContext): Promise<OpenAI> {
   const raw = await getLlmClient(ctx.companyId)
 
-  // Wrap an awaited create() with timing + ledger. Used by responses & chat.
   const wrapAwaited = (
+    api: 'responses' | 'chat',
     boundCreate: (args: AnyArgs, opts?: unknown) => Promise<AnyResponse>,
-  ) =>
-    async (args: AnyArgs, opts?: unknown): Promise<AnyResponse> => {
+  ) => async (args: AnyArgs, opts?: unknown): Promise<AnyResponse> => {
+    // Existing stream consumers own their records until their migration wave.
+    if (args.stream === true) return boundCreate(args, opts)
+    // Test seam: with a stubbed client there is no tenant to resolve, so skip
+    // plan resolution and record the direct call like the legacy path did.
+    if (__isLlmTestOverrideActive()) {
       const t0 = Date.now()
       const model = String(args.model ?? '<unknown>')
-      // Streaming: hand the stream back unwrapped, ledger is the caller's job.
-      // We don't even record a placeholder — duplicate rows on a failed stream
-      // (one here, one in finishAgentRun) would muddy per-purpose rollups.
-      if (args.stream === true) {
-        return await boundCreate(args, opts)
-      }
       try {
         const r = await boundCreate(args, opts)
         void recordLlmCall({
@@ -276,6 +287,8 @@ export async function getTrackedLlmClient(ctx: LlmCallContext): Promise<OpenAI> 
         throw err
       }
     }
+    return executeTrackedText(ctx, api, args, opts)
+  }
 
   // Images don't surface token usage; we still record latency/status + tag
   // `extras.n` / `extras.size` so per-image spend is countable (cost is
@@ -317,7 +330,7 @@ export async function getTrackedLlmClient(ctx: LlmCallContext): Promise<OpenAI> 
           get(rt: object, p: string | symbol, rr: unknown): unknown {
             if (p === 'create') {
               const create = (target.responses as { create: (...a: unknown[]) => Promise<unknown> }).create
-              return wrapAwaited(create.bind(target.responses) as (a: AnyArgs, o?: unknown) => Promise<AnyResponse>)
+              return wrapAwaited('responses', create.bind(target.responses) as (a: AnyArgs, o?: unknown) => Promise<AnyResponse>)
             }
             return Reflect.get(rt, p, rr)
           },
@@ -331,7 +344,7 @@ export async function getTrackedLlmClient(ctx: LlmCallContext): Promise<OpenAI> 
                 get(cct: object, pp: string | symbol, ccr: unknown): unknown {
                   if (pp === 'create') {
                     const create = ((target.chat as { completions: { create: (...a: unknown[]) => Promise<unknown> } }).completions).create
-                    return wrapAwaited(create.bind((target.chat as { completions: object }).completions) as (a: AnyArgs, o?: unknown) => Promise<AnyResponse>)
+                    return wrapAwaited('chat', create.bind((target.chat as { completions: object }).completions) as (a: AnyArgs, o?: unknown) => Promise<AnyResponse>)
                   }
                   return Reflect.get(cct, pp, ccr)
                 },

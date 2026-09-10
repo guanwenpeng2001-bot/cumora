@@ -184,6 +184,19 @@ export function usageFromOpenAI(raw: unknown): TokenUsage {
   }
 }
 
+/** Strict mapper for tracked calls: absent/incomplete usage stays unknown. */
+export function measuredUsage(raw: unknown, protocol: 'responses' | 'chat'): TokenUsage | null {
+  if (!raw || typeof raw !== 'object') return null
+  const u = raw as Record<string, unknown>
+  const input = u[protocol === 'chat' ? 'prompt_tokens' : 'input_tokens']
+  const output = u[protocol === 'chat' ? 'completion_tokens' : 'output_tokens']
+  const details = u[protocol === 'chat' ? 'prompt_tokens_details' : 'input_tokens_details'] as { cached_tokens?: unknown } | undefined
+  const cached = details?.cached_tokens ?? 0
+  const valid = (n: unknown): n is number => typeof n === 'number' && Number.isSafeInteger(n) && n >= 0
+  if (!valid(input) || !valid(output) || !valid(cached) || cached > input) return null
+  return { inputTokens: input - cached, cachedInputTokens: cached, cacheCreationTokens: 0, outputTokens: output }
+}
+
 /** Map an Anthropic / Claude Code stream-json `usage` to TokenUsage. Anthropic's
  *  `input_tokens` already EXCLUDES the cached read/write portions, which are
  *  reported separately as cache_read_input_tokens / cache_creation_input_tokens. */

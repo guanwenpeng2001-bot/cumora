@@ -42,8 +42,9 @@ import { resolveTenantLlmContext, tenantModelSnapshot, invalidateTenantModelSnap
 import OpenAI from 'openai'
 import { env, resolveDirectLlmEnv } from './env.js'
 export { resolveRoleCall } from './llm-resolver.js'
+import type { RoleCallPlan, RoleCallCandidate } from './llm-resolver.js'
 import { isNovitaModel, novitaResponsesShim } from './novita.js'
-import { resolvedChain, runWithFallback, isFallbackableError } from './agents/fallback.js'
+import { resolvedChain, isFallbackableError } from './agents/fallback.js'
 import { isOrcaRouterModel, orcarouterResponsesCreate } from './orcarouter.js'
 import { sub2apiRoutingConfigured, pickPlatformForModel, SUB2API_PLATFORMS, type Platform, type ApiKeyMap } from './sub2api.js'
 
@@ -80,6 +81,12 @@ const SDK_TIMEOUT_MS = 5 * 60_000
 let testLlmOverride: ((tenant: string | null) => OpenAI | Promise<OpenAI>) | null = null
 export function __setLlmClientOverrideForTesting(fn: typeof testLlmOverride): void {
   testLlmOverride = fn
+}
+/** True while a test override is installed. The ledger/executor check this to
+ *  keep the legacy direct-call recording path: a stubbed client cannot drive
+ *  real candidate resolution (no tenant rows exist in unit tests). */
+export function __isLlmTestOverrideActive(): boolean {
+  return testLlmOverride !== null
 }
 
 /** Wrap a client so any call whose `model` carries a recognized provider
@@ -151,48 +158,32 @@ function withProviderRouting(client: OpenAI): OpenAI {
   })
 }
 
-/** Text-role fallback wrapper: when the requested model IS a role primary
- *  (brain/support/compaction), retry the call down the role's chain on
- *  fallbackable errors (402/429/5xx/network). Chain hops re-enter the
- *  wrapped client's normal routing (provider prefixes, then per-platform
- *  sub2api keys), so a hop can live on a different platform group. */
-function withModelFallback(client: OpenAI): OpenAI {
-  return new Proxy(client, {
-    get(target, prop, receiver): unknown {
-      if (prop !== 'responses') return Reflect.get(target, prop, receiver)
-      const real = target.responses
-      return new Proxy(real, {
-        get(rt, p, rr): unknown {
-          if (p !== 'create') return Reflect.get(rt, p, rr)
-          const realCreate = real.create as (a: unknown, o?: unknown) => unknown
-          return (args: { model?: string } & Record<string, unknown>, opts?: unknown) => {
-            let chain: string[] = []
-            const model = args?.model
-            // Provider-prefixed models can still be role primaries. The
-            // provider router below decides where each hop is sent.
-            if (model) {
-              for (const role of ['brain', 'support', 'compaction'] as const) {
-                const c = resolvedChain(role)
-                if (c[0] && c[0] === model) { chain = c; break }
-              }
-            }
-            if (chain.length <= 1) return realCreate.call(real, args, opts)
-            return runWithFallback(chain, (m) => realCreate.call(real, { ...args, model: m }, opts) as Promise<unknown>)
-          }
-        },
-      })
-    },
-  })
-}
-
 interface LlmClientOptions {
   /** The caller owns an explicit hop chain and must avoid a second wrapper. */
   skipModelFallback?: boolean
 }
 
-function prepareLlmClient(client: OpenAI, options: LlmClientOptions): OpenAI {
-  const routed = withProviderRouting(client)
-  return options.skipModelFallback ? routed : withModelFallback(routed)
+function prepareLlmClient(client: OpenAI, _options: LlmClientOptions): OpenAI {
+  return withProviderRouting(client)
+}
+
+/** A resolved candidate is one route; it never contains an application retry chain. */
+export async function getLlmCandidateClient(plan: RoleCallPlan, candidate: RoleCallCandidate): Promise<OpenAI> {
+  if (testLlmOverride) return testLlmOverride(plan.companyId)
+  if (!candidate.available) throw new Error(candidate.diagnostic ?? 'LLM candidate unavailable')
+  if (candidate.route.kind === 'gateway') {
+    if (!plan.companyId || !candidate.route.platform) throw new Error('Missing tenant LLM route')
+    const context = await resolveTenantLlmContext(plan.companyId)
+    if (context.authorizationVersion !== plan.authorizationVersion) throw new Error('Tenant LLM authorization changed; resolve the plan again')
+    const apiKey = context.keys[candidate.route.platform]
+    if (!apiKey || !context.baseURL) throw new Error('Tenant LLM route is unavailable')
+    return new OpenAI({ apiKey, baseURL: context.baseURL, maxRetries: SDK_MAX_RETRIES, timeout: SDK_TIMEOUT_MS })
+  }
+  const direct = resolveDirectLlmEnv(candidate.route.env ?? 'text')
+  if (!direct.configured) throw new Error('Direct LLM route is not configured')
+  const client = new OpenAI({ apiKey: direct.apiKey, baseURL: direct.baseURL, maxRetries: SDK_MAX_RETRIES, timeout: SDK_TIMEOUT_MS })
+  if (candidate.route.env === 'novita' || candidate.route.env === 'orcarouter') return withProviderRouting(client)
+  return client
 }
 
 async function routePlatformForModel(

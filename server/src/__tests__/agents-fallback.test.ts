@@ -16,10 +16,13 @@ test('isFallbackableError: 402/429/5xx and transport errors advance the chain', 
   assert.equal(isFallbackableError(new Error('ECONNRESET')), true)
 })
 
-test('isFallbackableError: 400/401 surface immediately', () => {
+test('isFallbackableError: 400/404 surface immediately; 401/403 advance (P2-2)', () => {
   assert.equal(isFallbackableError(Object.assign(new Error('bad request'), { status: 400 })), false)
-  assert.equal(isFallbackableError(Object.assign(new Error('unauthorized'), { status: 401 })), false)
   assert.equal(isFallbackableError(Object.assign(new Error('not found'), { status: 404 })), false)
+  // P2-2: upstream auth failures try the next candidate (e.g. a different
+  // provider key); the reason is recorded per attempt in the ledger.
+  assert.equal(isFallbackableError(Object.assign(new Error('unauthorized'), { status: 401 })), true)
+  assert.equal(isFallbackableError(Object.assign(new Error('forbidden'), { status: 403 })), true)
 })
 
 test('runWithFallback: advances on fallbackable errors and returns the first success', async () => {
@@ -38,9 +41,9 @@ test('runWithFallback: non-fallbackable error stops the chain immediately', asyn
   await assert.rejects(
     runWithFallback(['a', 'b'], async (model) => {
       tried.push(model)
-      throw Object.assign(new Error('bad key'), { status: 401 })
+      throw Object.assign(new Error('bad request'), { status: 400 })
     }),
-    /bad key/,
+    /bad request/,
   )
   assert.deepEqual(tried, ['a'])
 })
