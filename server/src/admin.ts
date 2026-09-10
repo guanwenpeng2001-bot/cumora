@@ -29,7 +29,8 @@ import { companyTier } from './tier.js'
 import { ensureCloudComputer, cloudComputerId } from './agents/computer/registry.js'
 import { mirrorAvatar } from './oauth.js'
 import { insertPersonalWorkspace } from './personal-workspace.js'
-import { provisionUser as provisionSub2apiUser, sub2apiConfigured, serializeApiKeyMap, setUserTier } from './sub2api.js'
+import { sub2apiConfigured, sub2apiRoutingConfigured } from './sub2api.js'
+import { enqueueSub2apiSync } from './sub2api-sync.js'
 import { formatAddress, mintMessageId, sendViaProvider } from './email.js'
 
 /* ============== Bootstrap admin allow-list ============== */
@@ -575,6 +576,7 @@ export async function approveWaitlist(waitlistId: string, decidedBy: string): Pr
       `UPDATE waitlist SET status = 'approved', decided_at = NOW(), decided_by = $2 WHERE id = $1`,
       [waitlistId, decidedBy],
     )
+    if (sub2apiConfigured() || sub2apiRoutingConfigured()) await enqueueSub2apiSync(client, userId, 'free')
     await client.query('COMMIT')
 
     // Post-commit side effects — same best-effort pattern as oauth.ts.
@@ -591,23 +593,6 @@ export async function approveWaitlist(waitlistId: string, decidedBy: string): Pr
       try { await joinAllHands({ companyId, participantId: userId }) } catch (e) { console.warn('[admin] join all-hands failed', e) }
     }
     try { await sendWaitlistApprovedEmail({ email: row.email, displayName: row.display_name }) } catch (e) { console.warn('[admin] waitlist-approved email failed', e) }
-    if (sub2apiConfigured()) {
-      try {
-        const r = await provisionSub2apiUser({
-          cumoraUserId: userId,
-          email: row.email,
-          displayName: row.display_name,
-          tier: 'free',
-        })
-        await pool.query(
-          `UPDATE users SET sub2api_user_id = $1, sub2api_api_key = $2 WHERE id = $3`,
-          [r.sub2apiUserId, serializeApiKeyMap(r.apiKeys), userId],
-        )
-        await invalidateOwnerLlmCaches(userId)
-      } catch (e) {
-        console.warn(`[admin] sub2api provisioning failed for ${userId}; legacy fallback`, e instanceof Error ? e.message : e)
-      }
-    }
     return { userId, companyId }
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {})
@@ -739,46 +724,25 @@ export async function unsuspendUser(args: {
 
 /* ============== Tier change (admin-driven) ============== */
 
-/** Set a user's tier in cumora DB AND mirror to sub2api. Used by the
- *  user-detail UI. If the sub2api mirror exists, it is the quota
- *  enforcement layer, so a failed mirror must fail the admin action
- *  instead of reporting success while the gateway keeps the old tier. */
+/** Persist the target; the effective tier changes only after gateway confirmation. */
 export async function changeUserTier(userId: string, tier: 'free' | 'pro' | 'max'): Promise<void> {
   const client = await pool.connect()
+  let gatewaySync = false
   try {
     await client.query('BEGIN')
-    await client.query(
-      'SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))',
-      ['cumora.user-tier', userId],
-    )
-    const { rows } = await client.query<{ sub2api_user_id: number | null }>(
-      'SELECT sub2api_user_id FROM users WHERE id = $1',
-      [userId],
-    )
-    if (rows.length === 0) throw new HttpError(404, 'user not found')
-    const sub2 = rows[0].sub2api_user_id
-    if (sub2 && sub2apiConfigured()) {
-      try {
-        await setUserTier(sub2, tier, userId)
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e)
-        console.warn('[admin] sub2api tier swap failed for user ' + userId, msg)
-        throw new HttpError(502, 'sub2api tier sync failed: ' + msg)
-      }
+    const user = await client.query('SELECT id, sub2api_user_id FROM users WHERE id = $1 AND deleted_at IS NULL FOR UPDATE', [userId])
+    if (!user.rowCount) throw new HttpError(404, 'user not found')
+    gatewaySync = sub2apiConfigured() || sub2apiRoutingConfigured() || user.rows[0].sub2api_user_id != null
+    if (gatewaySync) {
+      await enqueueSub2apiSync(client, userId, tier)
+      await client.query('UPDATE users SET pro_trial_expires_at = NULL WHERE id = $1', [userId])
+    } else {
+      await client.query('UPDATE users SET tier = $2, pro_trial_expires_at = NULL WHERE id = $1', [userId, tier])
     }
-    // Clear any mobile-trial stamp: a manual tier change supersedes the trial,
-    // and a leftover stamp would let the trial-sweep worker auto-downgrade a
-    // genuinely-upgraded user when the old trial window lapses.
-    await client.query(
-      'UPDATE users SET tier = $2, pro_trial_expires_at = NULL WHERE id = $1',
-      [userId, tier],
-    )
     await client.query('COMMIT')
-  } catch (e) {
-    await client.query('ROLLBACK').catch(() => { /* preserve original error */ })
-    throw e
-  } finally {
-    client.release()
-  }
-  await invalidateOwnerLlmCaches(userId)
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally { client.release() }
+  if (!gatewaySync) await invalidateOwnerLlmCaches(userId)
 }

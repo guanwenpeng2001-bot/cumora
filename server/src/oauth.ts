@@ -29,7 +29,6 @@
  * For GitHub specifically: `email` from /user is often null because users
  * keep it private. We instead hit /user/emails and pick `primary + verified`.
  */
-import { invalidateOwnerLlmCaches } from './tenant-llm-context.js'
 import { randomBytes, createHash, randomUUID } from 'node:crypto'
 import { pool } from './db/pool.js'
 import { redis } from './redis.js'
@@ -44,7 +43,8 @@ import { onboardStarterAgents, joinAllHands } from './onboardCompany.js'
 import { companyTier } from './tier.js'
 import { ensureCloudComputer, cloudComputerId } from './agents/computer/registry.js'
 import { storage } from './storage.js'
-import { provisionUser as provisionSub2apiUser, sub2apiConfigured, serializeApiKeyMap } from './sub2api.js'
+import { sub2apiConfigured, sub2apiRoutingConfigured } from './sub2api.js'
+import { enqueueSub2apiSync } from './sub2api-sync.js'
 import { isWaitlistEnabled, enqueueWaitlist, isAllowlistedAdmin } from './admin.js'
 import { insertPersonalWorkspace } from './personal-workspace.js'
 
@@ -479,16 +479,14 @@ export async function findOrCreateUserByProfile(
     // leave a stray "Their Name's workspace" they never wanted (the
     // invite-onboarding bug, pre-fix).
     const userId = `u-${randomUUID().slice(0, 12)}`
-    // Apple signups start on a Pro trial (see APPLE_SIGNUP_TRIAL_DAYS) so
-    // their first session has working cloud starter agents. Committed with
-    // the user row, so the post-commit companyTier() check below sees 'pro'
-    // and seeds the cloud starters immediately.
+    // Keep the Apple trial target and original expiry policy; gateway-backed
+    // signups confirm the effective tier asynchronously.
     const trialTier = appleSignupTrial ? 'pro' : 'free'
     await client.query(
       `INSERT INTO users (id, email, display_name, password_hash, email_verified_at, is_admin, tier, pro_trial_expires_at)
-         VALUES ($1, $2, $3, NULL, NOW(), $4, $5,
+         VALUES ($1, $2, $3, NULL, NOW(), $4, CASE WHEN $7 THEN 'free' ELSE $5 END,
                  CASE WHEN $5 = 'pro' THEN NOW() + make_interval(days => $6) END)`,
-      [userId, profile.email, profile.displayName, isAllowlistedAdmin(profile.email), trialTier, APPLE_SIGNUP_TRIAL_DAYS],
+      [userId, profile.email, profile.displayName, isAllowlistedAdmin(profile.email), trialTier, APPLE_SIGNUP_TRIAL_DAYS, sub2apiConfigured() || sub2apiRoutingConfigured()],
     )
     await client.query(
       `INSERT INTO user_identities (provider, provider_id, user_id, email_lower)
@@ -526,6 +524,7 @@ export async function findOrCreateUserByProfile(
         [userId, profile.displayName, profile.displayName.charAt(0).toUpperCase(), avatar, companyId],
       )
     }
+    if (sub2apiConfigured() || sub2apiRoutingConfigured()) await enqueueSub2apiSync(client, userId, trialTier)
     await client.query('COMMIT')
 
     // Starter agents + all-hands are best-effort — never block first login.
@@ -543,30 +542,6 @@ export async function findOrCreateUserByProfile(
         }
       } catch (e) { console.warn('[oauth] starter onboarding failed', e) }
       try { await joinAllHands({ companyId, participantId: userId }) } catch (e) { console.warn('[oauth] join all-hands failed', e) }
-    }
-
-    // Mirror the user into sub2api so their LLM calls land on a
-    // per-user quota counter from now on. Pool query is outside the
-    // create transaction so a sub2api hiccup never rolls back signup.
-    // A future backfill can pick up users whose sub2api_user_id stays
-    // NULL (sub2api was down at signup time).
-    if (sub2apiConfigured()) {
-      try {
-        const r = await provisionSub2apiUser({
-          cumoraUserId: userId,
-          email: profile.email,
-          displayName: profile.displayName,
-          tier: trialTier,
-        })
-        await pool.query(
-          `UPDATE users SET sub2api_user_id = $1, sub2api_api_key = $2 WHERE id = $3`,
-          // Fresh signup — no stored map to merge against.
-          [r.sub2apiUserId, serializeApiKeyMap(r.apiKeys), userId],
-        )
-        await invalidateOwnerLlmCaches(userId)
-      } catch (e) {
-        console.warn(`[oauth] sub2api provisioning failed for ${userId}; legacy fallback`, e instanceof Error ? e.message : e)
-      }
     }
 
     return { userId, email: profile.email, displayName: profile.displayName, companyId }

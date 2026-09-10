@@ -58,6 +58,7 @@ import {
   USAGE_LOGS_INDEX_SQL,
   usageLogsIndexChecksum,
 } from './migrations/0011-usage-logs-company-created-index.js'
+import { SUB2API_SYNC_SQL, sub2apiSyncChecksum } from './migrations/0012-sub2api-sync.js'
 
 /** Frozen data backfill embedded in migration 0001. Exported so its behavior
  * can be exercised against PostgreSQL without replaying the whole migration. */
@@ -2654,6 +2655,12 @@ const VERSIONED_MIGRATIONS: readonly VersionedMigration[] = [
     sourceChecksum: usageLogsIndexChecksum(),
     transactional: false,
     up: applyUsageLogsIndex,
+  },
+  {
+    ...SCHEMA_MIGRATIONS[11],
+    sourceChecksum: sub2apiSyncChecksum(),
+    transactional: true,
+    up: async (client) => { await client.query(SUB2API_SYNC_SQL) },
   },
 ]
 

@@ -33,6 +33,7 @@ import { startCalendarScheduler } from './calendar.js'
 import { startPollExpirationSweeper } from './polls.js'
 import { startLlmRollupRefresher } from './agents/llm-rollup.js'
 import { startTrialSweepWorker } from './trial-sweep.js'
+import { startSub2apiSyncWorker } from './sub2api-sync.js'
 import { seedAdmins } from './admin.js'
 import { notifyAlert } from './alerting.js'
 import { startShippingMaintenance } from './shipping-maintenance.js'
@@ -308,6 +309,7 @@ async function main() {
   // Mobile Pro-trial expiry — hourly sweep that downgrades lapsed trials
   // back to free (mirrors sub2api via the same path the admin UI uses).
   startTrialSweepWorker()
+  startSub2apiSyncWorker()
 
   // Calendar dispatcher — once a minute, scan calendar_events for due
   // occurrences and post the scheduled prompt into the target conversation

@@ -25,6 +25,8 @@ import {
   suspendUser, unsuspendUser,
 } from '../admin.js'
 
+import { getSub2apiSyncStatus } from '../sub2api-sync.js'
+
 export const adminRouter = Router()
 
 function safe(handler: (req: Request & AuthedRequest, res: Response) => Promise<void> | void) {
@@ -210,6 +212,7 @@ adminRouter.get('/users/:id', safe(async (req, res) => {
   )
   res.json({
     ...rowToUser(rows[0]),
+    sub2apiSync: await getSub2apiSyncStatus(id),
     companies: companies.map((c) => ({
       id: c.id, name: c.name, slug: c.slug, role: c.role,
       createdAt: c.created_at, agentCount: Number(c.agent_count),
@@ -271,7 +274,7 @@ adminRouter.patch('/users/:id', safe(async (req, res) => {
     [id],
   )
   if (!rows[0]) throw new HttpError(404, 'user not found')
-  res.json(rowToUser(rows[0]))
+  res.json({ ...rowToUser(rows[0]), sub2apiSync: await getSub2apiSyncStatus(id) })
 }))
 
 /* ============== Waitlist ============== */

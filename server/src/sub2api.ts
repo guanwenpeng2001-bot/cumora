@@ -16,26 +16,11 @@
  * bare string are read as the openai-platform key. Model → platform
  * routing happens at call time in server/src/llm.ts.
  *
- * Provisioning flow (`provisionUser`) — every step uses the admin
- * x-api-key; no auth endpoint is ever touched:
- *   1. POST /api/v1/admin/users               — create user
- *   2. POST /api/v1/admin/subscriptions/assign — bind the primary
- *      (openai-platform) group; platform groups are `standard`
- *      subscription_type, so their keys need no subscription record
- *   3. POST /api/v1/admin/users/:id/api-keys   — mint one key per
- *      platform group (reusing existing keys on retry)
- *   4. caller persists {sub2api_user_id, sub2api_api_key} on users
- *
- * The fork's POST /admin/users/:id/api-keys keeps provisioning pure
- * admin API — the user-facing POST /keys would require logging in as
- * the user via /auth/*, which app-level Turnstile gates.
- *
- * Best-effort posture: every helper here returns a Result-shaped value
- * rather than throwing. OAuth sign-in must NEVER fail because sub2api
- * provisioning hiccupped — the user just lands without a sub2api_key
- * and the LLM client falls back to the legacy global key.
+ * Signup and tier changes persist an intent in sub2api-sync.ts. Its consumer
+ * owns retries, per-user serialization and atomic confirmation of the key map.
+ * Only keys with confirmed integration ownership are managed here.
  */
-import { randomBytes } from 'node:crypto'
+import { randomBytes, randomUUID } from 'node:crypto'
 import { env, normalizeLlmEndpoint } from './env.js'
 import { getServerSetting, parseGroupConfig, InvalidServerSettingError, type Sub2apiGroupConfig } from './settings.js'
 
@@ -202,6 +187,7 @@ interface SubResponse<T> {
 
 async function adminFetch<T = unknown>(path: string, init: RequestInit = {}): Promise<T> {
   const r = await fetch(`${env.SUB2API_INTERNAL_URL}${path}`, {
+    signal: AbortSignal.timeout(15_000),
     ...init,
     headers: {
       'x-api-key': env.SUB2API_ADMIN_KEY,
@@ -222,147 +208,188 @@ interface ApiKeyResponse    { id: number; key: string }
 interface AdminAPIKeyRow    { id: number; group_id: number | null; name?: string; key?: string }
 interface AdminAPIKeyList   { items: AdminAPIKeyRow[]; total: number; page: number; page_size: number; pages: number }
 
-/** End-to-end: create sub2api user + assign the primary subscription +
- *  mint one key per platform group. Returns the numeric user id and the
- *  platform→key map, both to be persisted on the cumora users row. On
- *  any step failure, throws — caller decides whether to swallow (we do
- *  during OAuth signup to never block login).
- *
- *  Idempotent convergence: if the sub2api user already exists, we
- *  re-assert allowed_groups in place, and existing keys are REUSED when
- *  their group already matches (no key rotation on retry); only missing
- *  platform groups get fresh keys.
- *
- *  We mirror the cumora user with their REAL email. sub2api's user
- *  list is the operator's source of truth for "who is on this
- *  platform" — showing synthetic addresses defeats that. The sub2api
- *  admin account is provisioned out of the way (ADMIN_EMAIL something
- *  like `admin@cumora.local`) so there's no collision with real emails. */
-export async function provisionUser(args: {
+export interface ManagedIntegrationKey {
+  id?: number
+  key?: string
+  mintGroup: number
+  idempotencyKey: string
+}
+export type ManagedIntegrationKeys = Partial<Record<Platform, ManagedIntegrationKey>>
+
+interface IntegrationUser extends AdminUserResponse {
+  notes?: string
+  balance: number
+  allowed_groups?: number[]
+}
+interface IntegrationKey extends AdminAPIKeyRow {
+  user_id: number
+  status: string
+  expires_at?: string | null
+  quota?: number
+  quota_used?: number
+}
+interface IntegrationGroup {
+  id: number
+  platform: string
+  status: string
+  subscription_type: string
+}
+
+export interface ReconcileSub2apiArgs {
   cumoraUserId: string
   email: string
   displayName: string
-  tier?: Tier
-  /** The caller's currently persisted key map (if any). Used as a
-   *  fallback for deployments whose admin key list masks the secret. */
-  existingKeys?: ApiKeyMap
-}): Promise<ProvisionResult> {
-  const tier = args.tier ?? 'free'
-  const groups = tierGroups(tier)
-  const primaryGroupId = groups.openai
-  // Unique configured groups across platforms (platforms may share a
-  // group via the fallback chain).
-  const groupIds = [...new Set(SUB2API_PLATFORMS.map((p) => groups[p]).filter((id) => id > 0))]
-  // 24 bytes of base64url = 32 chars — well above sub2api's min=6.
-  // The admin create-user endpoint requires a password; we never store
-  // it or use it to authenticate (keys are minted via the admin API).
-  const throwawayPw = randomBytes(24).toString('base64url')
+  intentId: string
+  groups: Record<Platform, number>
+  remoteUserId: number | null
+  existingKeys: ApiKeyMap
+  managedKeys: ManagedIntegrationKeys
+  checkpoint: (remoteUserId: number, keys: ManagedIntegrationKeys) => Promise<void>
+}
 
-  let created: AdminUserResponse
-  try {
-    created = await adminFetch<AdminUserResponse>('/api/v1/admin/users', {
-      method: 'POST',
-      body: JSON.stringify({
-        email: args.email,
-        password: throwawayPw,
-        username: args.displayName,
-        // Empty means "unmapped tier" — we still create the user but with
-        // no group access. They'll get gated until SUB2API_TIER_*_GROUP_*
-        // is configured. Better than refusing signup.
-        allowed_groups: groupIds,
-        // Tag the sub2api row with the cumora user id so the operator
-        // can grep / trace either direction.
-        notes: `cumora user ${args.cumoraUserId}`,
-      }),
-    })
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e)
-    if (!/email already exists|409/i.test(msg)) throw e
-    // Find the existing sub2api user by email.
-    const list = await adminFetch<{ items: Array<{ id: number; email: string }> }>(
-      `/api/v1/admin/users?search=${encodeURIComponent(args.email)}&page=1&page_size=1`,
-    )
-    const existing = list.items?.find((u) => u.email.toLowerCase() === args.email.toLowerCase())
-    if (!existing) throw new Error(`sub2api claims ${args.email} exists but admin search can't find it`)
-    // Re-assert group coverage (no password reset — keys are minted
-    // admin-side, so the password is never needed).
-    await adminFetch(`/api/v1/admin/users/${existing.id}`, {
-      method: 'PUT',
-      body: JSON.stringify({ allowed_groups: groupIds }),
-    })
-    created = { id: existing.id, email: existing.email }
+/** External work only; the consumer checkpoints progress after its intent commits. */
+export async function reconcileSub2apiUser(args: ReconcileSub2apiArgs): Promise<ProvisionResult> {
+  const groupIds = [...new Set(Object.values(args.groups))]
+  if (groupIds.some(id => !Number.isSafeInteger(id) || id <= 0)) throw new Error('unconfigured_group')
+  const groupRows = new Map<number, IntegrationGroup>()
+  for (const id of groupIds) {
+    const group = await adminFetch<IntegrationGroup>(`/api/v1/admin/groups/${id}`)
+    if (group.id !== id || group.status !== 'active' || !['standard', 'subscription'].includes(group.subscription_type)) {
+      throw new Error('unavailable_group')
+    }
+    groupRows.set(id, group)
   }
-
-  // Assign a subscription for the PRIMARY (openai-platform) group.
-  // sub2api groups marked `subscription_type: subscription` refuse to
-  // bind an API key to the group without an active subscription record;
-  // the primary group anchors quota reads (getUserQuota). Platform
-  // groups are `standard` and need no subscription. ~10 years validity
-  // so the subscription effectively never expires; tier downgrades go
-  // through setUserTier.
-  if (primaryGroupId > 0) {
-    try {
-      await adminFetch('/api/v1/admin/subscriptions/assign', {
-        method: 'POST',
-        body: JSON.stringify({
-          user_id: created.id,
-          group_id: primaryGroupId,
-          validity_days: TIER_SUBSCRIPTION_VALIDITY_DAYS,
-          notes: TIER_SUBSCRIPTION_NOTES,
-        }),
-      })
-    } catch (e) {
-      // If the user already has an active subscription on this group
-      // (e.g. retry after a partial failure), sub2api typically returns
-      // a conflict-shaped error. Don't fail the whole provisioning.
-      const msg = e instanceof Error ? e.message : String(e)
-      if (!/already|exists|active/i.test(msg)) throw e
+  for (const platform of SUB2API_PLATFORMS) {
+    const group = groupRows.get(args.groups[platform])!
+    // Preserve the established primary-group fallback for unconfigured platforms.
+    if (group.platform !== platform && !(args.groups[platform] === args.groups.openai && group.platform === 'openai')) {
+      throw new Error('group_platform_mismatch')
     }
   }
 
-  // One key per platform group. Existing keys whose group already
-  // matches are reused from the admin list response (or the caller's
-  // stored map when that response masks the secret); only an un-recoverable
-  // existing key requires a fresh key.
-  const existingKeys = await adminFetch<AdminAPIKeyList>(
-    `/api/v1/admin/users/${created.id}/api-keys?page=1&page_size=1000`,
-  )
-  const groupsWithKey = new Set<number>()
-  for (const k of existingKeys.items ?? []) {
-    if (k.group_id != null) groupsWithKey.add(k.group_id)
-  }
-  const keyValueByGroup = new Map<number, string>()
-  for (const groupId of groupIds) {
-    if (groupsWithKey.has(groupId)) {
-      const stored = SUB2API_PLATFORMS
-        .filter((q) => groups[q] === groupId)
-        .map((q) => args.existingKeys?.[q])
-        .find((v) => v)
-      const listed = existingKeys.items?.find((k) => k.group_id === groupId)?.key
-      if (listed || stored) {
-        keyValueByGroup.set(groupId, listed ?? stored!)
-        continue
+  const marker = `cumora user ${args.cumoraUserId}`
+  const findUser = async (): Promise<IntegrationUser | undefined> => {
+    for (let page = 1; ; page++) {
+      const list = await adminFetch<{ items: IntegrationUser[]; pages: number }>(
+        `/api/v1/admin/users?search=${encodeURIComponent(args.email)}&page=${page}&page_size=100`,
+      )
+      const found = list.items.find(user => user.email.toLowerCase() === args.email.toLowerCase())
+      if (found) {
+        if (found.notes !== marker) throw new Error('remote_user_ownership_unconfirmed')
+        return found
       }
+      if (page >= list.pages || list.items.length < 100) return undefined
     }
-    const apiKey = await adminFetch<ApiKeyResponse>(`/api/v1/admin/users/${created.id}/api-keys`, {
-      method: 'POST',
-      body: JSON.stringify({
-        name: `cumora · ${args.displayName} · g${groupId}`,
-        group_id: groupId,
-      }),
-    })
-    keyValueByGroup.set(groupId, apiKey.key)
   }
-
+  let user = args.remoteUserId
+    ? await adminFetch<IntegrationUser>(`/api/v1/admin/users/${args.remoteUserId}`)
+    : await findUser()
+  if (!user) {
+    try {
+      user = await adminFetch<IntegrationUser>('/api/v1/admin/users', {
+        method: 'POST',
+        body: JSON.stringify({ email: args.email, password: randomBytes(24).toString('base64url'),
+          username: args.displayName, allowed_groups: groupIds, notes: marker }),
+      })
+    } catch (error) {
+      user = await findUser()
+      if (!user) throw error
+    }
+  }
+  if (!Number.isSafeInteger(user.id) || user.id <= 0 || (args.remoteUserId && user.id !== args.remoteUserId)) throw new Error('invalid_remote_user')
+  await args.checkpoint(user.id, args.managedKeys)
+  // Preserve personal group access; this integration never grants wallet credit.
+  const allowed = [...new Set([...(user.allowed_groups ?? []), ...groupIds])]
+  if ([...groupRows.values()].some(g => g.subscription_type === 'standard')
+    && (!Number.isFinite(Number(user.balance)) || Number(user.balance) <= 0)) {
+    throw new Error('standard_group_requires_balance')
+  }
+  await adminFetch(`/api/v1/admin/users/${user.id}`, {
+    method: 'PUT', body: JSON.stringify({ allowed_groups: allowed }),
+  })
+  const subscriptions = await adminFetch<AdminSubscriptionRow[]>(`/api/v1/admin/users/${user.id}/subscriptions`)
+  for (const group of groupRows.values()) {
+    if (group.subscription_type !== 'subscription') continue
+    if (subscriptions.some(sub => sub.group_id === group.id && subscriptionIsActive(sub))) continue
+    for (const sub of subscriptions.filter(sub => sub.group_id === group.id && !subscriptionIsActive(sub))) {
+      if (sub.notes !== TIER_SUBSCRIPTION_NOTES) throw new Error('subscription_ownership_unconfirmed')
+      await adminFetch(`/api/v1/admin/subscriptions/${sub.id}`, { method: 'DELETE' })
+    }
+    await adminFetch('/api/v1/admin/subscriptions/assign', {
+      method: 'POST', body: JSON.stringify({ user_id: user.id, group_id: group.id,
+        validity_days: TIER_SUBSCRIPTION_VALIDITY_DAYS, notes: TIER_SUBSCRIPTION_NOTES }),
+    })
+  }
+  const listKeys = async (): Promise<IntegrationKey[]> => {
+    const rows: IntegrationKey[] = []
+    for (let page = 1; ; page++) {
+      const list = await adminFetch<{ items: IntegrationKey[]; pages: number }>(
+        `/api/v1/admin/users/${user.id}/api-keys?page=${page}&page_size=100`,
+      )
+      rows.push(...list.items)
+      if (page >= list.pages || list.items.length < 100) return rows
+    }
+  }
+  let listed = await listKeys()
+  const valid = (key: IntegrationKey) => key.user_id === user.id && key.status === 'active'
+    && (!key.expires_at || Date.parse(key.expires_at) > Date.now())
+    && (!(Number(key.quota) > 0) || Number(key.quota_used) < Number(key.quota))
   const apiKeys: ApiKeyMap = {}
   for (const platform of SUB2API_PLATFORMS) {
-    const groupId = groups[platform]
-    if (groupId <= 0) continue
-    const value = keyValueByGroup.get(groupId)
-    if (value) apiKeys[platform] = value
+    const target = args.groups[platform]
+    let managed = args.managedKeys[platform]
+    if (!managed) {
+      const legacy = listed.find(key => key.key === args.existingKeys[platform] && valid(key)
+        && (key.name?.startsWith('cumora · ') || key.name?.startsWith(`cumora:${args.cumoraUserId}:`))
+        && !Object.values(args.managedKeys).some(entry => entry.id === key.id))
+      managed = { mintGroup: target, idempotencyKey: `${args.intentId}:${platform}:${randomUUID()}`,
+        ...(legacy ? { id: legacy.id, key: legacy.key } : {}) }
+      args.managedKeys[platform] = managed
+      await args.checkpoint(user.id, args.managedKeys)
+    }
+    let key = listed.find(key => key.id === managed.id)
+    if (!managed.id) {
+      const minted = await adminFetch<ApiKeyResponse>(`/api/v1/admin/users/${user.id}/api-keys`, {
+        method: 'POST', headers: { 'Idempotency-Key': managed.idempotencyKey },
+        body: JSON.stringify({ name: `cumora:${args.cumoraUserId}:${platform}`, group_id: managed.mintGroup }),
+      })
+      managed.id = minted.id
+      managed.key = minted.key
+      await args.checkpoint(user.id, args.managedKeys)
+      listed = await listKeys()
+      key = listed.find(row => row.id === managed.id)
+    }
+    if (!key || !valid(key) || !key.key || key.key !== managed.key) throw new Error('managed_key_unavailable')
+    if (key.group_id !== target) {
+      if (key.group_id == null) throw new Error('managed_key_group_missing')
+      const old = await adminFetch<IntegrationGroup>(`/api/v1/admin/groups/${key.group_id}`)
+      if (!SUB2API_PLATFORMS.includes(old.platform as Platform)) throw new Error('unknown_group_platform')
+      await adminFetch(`/api/v1/admin/api-keys/${key.id}`, { method: 'PUT', body: JSON.stringify({ group_id: target }) })
+    }
+    apiKeys[platform] = key.key
   }
+  for (const sub of subscriptions) {
+    if (!groupIds.includes(sub.group_id) && configuredTierGroupIds().has(sub.group_id)
+      && sub.notes === TIER_SUBSCRIPTION_NOTES && subscriptionIsActive(sub)) {
+      await adminFetch(`/api/v1/admin/subscriptions/${sub.id}`, { method: 'DELETE' })
+    }
+  }
+  const finalKeys = await listKeys()
+  for (const platform of SUB2API_PLATFORMS) {
+    if (!finalKeys.some(key => key.id === args.managedKeys[platform]?.id && key.group_id === args.groups[platform]
+      && key.key === apiKeys[platform] && valid(key))) throw new Error('managed_key_verification_failed')
+  }
+  return { sub2apiUserId: user.id, apiKeys, groupId: args.groups.openai }
+}
 
-  return { sub2apiUserId: created.id, apiKeys, groupId: primaryGroupId }
+export async function provisionUser(args: {
+  cumoraUserId: string; email: string; displayName: string; tier?: Tier; existingKeys?: ApiKeyMap
+}): Promise<ProvisionResult> {
+  const { requestSub2apiSync, reconcileSub2apiSync } = await import('./sub2api-sync.js')
+  await requestSub2apiSync(args.cumoraUserId, args.tier ?? 'free')
+  const result = await reconcileSub2apiSync(args.cumoraUserId)
+  if (!result) throw new Error('sub2api_sync_pending')
+  return result
 }
 
 /** sub2api subscription window — used + limit per period, in USD. `null`
@@ -389,6 +416,7 @@ interface AdminSubscriptionRow {
   user_id: number
   group_id: number
   status: string
+  notes?: string
   starts_at: string
   expires_at: string
   daily_window_start: string | null
@@ -536,103 +564,15 @@ export async function listKeyModels(baseUrl: string, apiKey: string): Promise<Se
   return (await listKeyModelsWithStatus(baseUrl, apiKey)).models
 }
 
-/** Tier change. Idempotent: re-calling with the same tier is fine.
- *
- *  sub2api's `replace-group` endpoint is only for non-subscription
- *  exclusive groups. Cumora's primary tier groups are subscription
- *  groups, so tier changes must keep three records in sync:
- *    1. target primary subscription is active,
- *    2. the user's API keys point at the target tier's group for the
- *       platform each key currently serves (resolved via the group's
- *       platform, admin-side),
- *    3. stale Cumora tier subscriptions are revoked so quota reads
- *       don't keep seeing the old tier. */
-async function syncUserTier(sub2apiUserId: number, tier: Tier): Promise<void> {
-  const groups = tierGroups(tier)
-  const primaryGroupId = groups.openai
-  if (primaryGroupId <= 0) {
-    console.warn(`[sub2api] tier=${tier} has no group_id mapped; skip`)
-    return
-  }
-
-  const tierGroupIds = configuredTierGroupIds()
-  const allowedGroups = [...new Set(Object.values(groups).filter((id) => id > 0))]
-  await adminFetch('/api/v1/admin/users/' + sub2apiUserId, {
-    method: 'PUT',
-    body: JSON.stringify({ allowed_groups: allowedGroups }),
-  })
-  const subscriptions = await adminFetch<AdminSubscriptionRow[]>(
-    `/api/v1/admin/users/${sub2apiUserId}/subscriptions`,
-  )
-  const now = Date.now()
-  const staleTargetSubs = subscriptions.filter((s) => s.group_id === primaryGroupId && !subscriptionIsActive(s, now))
-  for (const sub of staleTargetSubs) {
-    await adminFetch(`/api/v1/admin/subscriptions/${sub.id}`, { method: 'DELETE' })
-  }
-
-  const hasActiveTarget = subscriptions.some((s) => s.group_id === primaryGroupId && subscriptionIsActive(s, now))
-  if (!hasActiveTarget) {
-    await adminFetch('/api/v1/admin/subscriptions/assign', {
-      method: 'POST',
-      body: JSON.stringify({
-        user_id: sub2apiUserId,
-        group_id: primaryGroupId,
-        validity_days: TIER_SUBSCRIPTION_VALIDITY_DAYS,
-        notes: TIER_SUBSCRIPTION_NOTES,
-      }),
-    })
-  }
-
-  const keys = await adminFetch<AdminAPIKeyList>(
-    `/api/v1/admin/users/${sub2apiUserId}/api-keys?page=1&page_size=1000`,
-  )
-  // Resolve each key's platform from the group it currently points at,
-  // then retarget to the new tier's group for that platform.
-  const groupPlatformCache = new Map<number, string | null>()
-  for (const key of keys.items ?? []) {
-    if (key.group_id == null) continue
-    let platform = groupPlatformCache.get(key.group_id)
-    if (platform === undefined) {
-      const g = await adminFetch<{ id: number; platform?: string }>(`/api/v1/admin/groups/${key.group_id}`).catch(() => null)
-      platform = g?.platform ?? null
-      groupPlatformCache.set(key.group_id, platform)
-    }
-    const target = platform && SUB2API_PLATFORMS.includes(platform as Platform)
-      ? groups[platform as Platform]
-      : primaryGroupId
-    if (target <= 0 || key.group_id === target) continue
-    await adminFetch(`/api/v1/admin/api-keys/${key.id}`, {
-      method: 'PUT',
-      body: JSON.stringify({ group_id: target }),
-    })
-  }
-
-  const staleTierSubs = subscriptions.filter((s) => (
-    s.group_id !== primaryGroupId
-    && tierGroupIds.has(s.group_id)
-    && subscriptionIsActive(s, now)
-  ))
-  for (const sub of staleTierSubs) {
-    await adminFetch('/api/v1/admin/subscriptions/' + sub.id, {
-      method: 'DELETE',
-    })
-  }
-}
-
 export async function setUserTier(sub2apiUserId: number, tier: Tier, ownerId?: string): Promise<void> {
-  try {
-    await syncUserTier(sub2apiUserId, tier)
-  } finally {
-    // Partial upstream updates also invalidate the old authorization snapshot.
-    // Publish a new committed row version even when the key string is unchanged.
-    const { pool } = await import('./db/pool.js')
-    const { rows } = await pool.query<{ id: string }>(
-      'UPDATE users SET sub2api_api_key = sub2api_api_key WHERE sub2api_user_id = $1 RETURNING id', [sub2apiUserId],
-    )
-    const { invalidateOwnerLlmCaches } = await import('./tenant-llm-context.js')
-    for (const { id } of rows) await invalidateOwnerLlmCaches(id)
-    if (ownerId && !rows.some((row) => row.id === ownerId)) await invalidateOwnerLlmCaches(ownerId)
-  }
+  const { pool } = await import('./db/pool.js')
+  const { rows } = await pool.query<{ id: string }>(
+    'SELECT id FROM users WHERE sub2api_user_id = $1 AND ($2::text IS NULL OR id = $2)',
+    [sub2apiUserId, ownerId ?? null],
+  )
+  if (rows.length !== 1) throw new Error('remote_user_ownership_unconfirmed')
+  const { requestSub2apiSync } = await import('./sub2api-sync.js')
+  await requestSub2apiSync(rows[0].id, tier)
 }
 
 export interface Sub2apiGroupChoice { id: number; name: string; platform: Platform }
