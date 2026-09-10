@@ -4,16 +4,26 @@
  * (src/components/AgentEditor.tsx): a free-input model field with catalog
  * suggestions, and an ordered fallback-chain editor.
  */
-import { useId, useRef, useState } from 'react'
+import { useRef, useState } from 'react'
+import { Combobox } from '@/components/Combobox'
 import { translate, useLocaleStore } from '@/lib/i18n'
-import { catalogPlatforms, catalogSource, type Catalog } from '@/stores/modelCatalog'
+import { catalogOptions, catalogPlatforms, catalogSource, type Catalog } from '@/stores/modelCatalog'
 import { useT, type MessageKey } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
 
 type T = ReturnType<typeof useT>
 
+/** All managed platforms and capabilities; both primary and fallback pickers use this set. */
+export function modelSuggestions(catalog: Catalog | null, ...values: string[][]): string[] {
+  return [...new Set([
+    ...catalogPlatforms(catalog).flatMap((platform) => platform.models ?? []),
+    ...(['text', 'image', 'audio', 'embedding'] as const).flatMap((bucket) => catalogOptions(catalog, bucket)),
+    ...values.flat(),
+  ].filter(Boolean))]
+}
+
 /** Model input with catalog suggestions but free text allowed. */
-export function ModelInput({ value, onChange, options, listId, placeholder, catalog }: {
+export function ModelInput({ value, onChange, options, placeholder, catalog }: {
   value: string
   onChange: (v: string) => void
   options: string[]
@@ -21,23 +31,18 @@ export function ModelInput({ value, onChange, options, listId, placeholder, cata
   placeholder?: string
   catalog?: Catalog | null
 }) {
-  const id = `${listId}-${useId()}`
-  return (
-    <>
-      <input
-        list={id}
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        placeholder={placeholder}
-        className="w-full h-8 px-2.5 rounded-[8px] text-[12.5px] text-ink-900 bg-paper outline-none focus:ring-2 focus:ring-skype/30 font-mono"
-        style={{ border: '1px solid var(--ink-100)' }}
-        spellCheck={false}
-      />
-      <datalist id={id}>
-        {[...new Set([...options, value].filter(Boolean))].map((m) => <option key={m} value={m} label={catalogSource(catalog ?? null, m)} />)}
-      </datalist>
-    </>
-  )
+  const t = useT()
+  return <Combobox
+    value={value}
+    onValueChange={onChange}
+    options={modelSuggestions(catalog ?? null, options, [value]).map((model) => ({
+      value: model, label: model, hint: catalogSource(catalog ?? null, model),
+    }))}
+    ariaLabel={placeholder ?? t('me.models.primary')}
+    placeholder={placeholder}
+    allowCustom
+    className="min-w-0 w-full"
+  />
 }
 
 /** Ordered fallback chain editor: rows with up/down/remove + an add input. */
@@ -52,10 +57,8 @@ export function FallbackChainEditor({ value, onChange, options, listId, t, prima
   catalog?: Catalog | null
 }) {
   const [adding, setAdding] = useState('')
-  const id = `${listId}-${useId()}`
   const historical = useRef([...value, ...history])
-  const zh = useLocaleStore((s) => s.locale) === 'zh-CN'
-  const suggestions = [...new Set([...options, primary ?? '', ...historical.current, ...history, ...value].filter(Boolean))]
+  const suggestions = modelSuggestions(catalog ?? null, options, [primary ?? ''], historical.current, history, value)
   const move = (i: number, dir: -1 | 1) => {
     const j = i + dir
     if (j < 0 || j >= value.length) return
@@ -71,13 +74,6 @@ export function FallbackChainEditor({ value, onChange, options, listId, t, prima
   }
   return (
     <div className="space-y-1.5">
-      <datalist id={id}>
-        {suggestions.map((m) => <option key={m} value={m} label={[
-          options.includes(m) ? catalogSource(catalog ?? null, m) : null,
-          m === primary ? (translate(zh ? 'zh-CN' : 'en', 'settings.currentPrimary')) : null,
-          historical.current.includes(m) || history.includes(m) || value.includes(m) ? (translate(zh ? 'zh-CN' : 'en', 'settings.fallbackHistory')) : null,
-        ].filter(Boolean).join(' · ')} />)}
-      </datalist>
       {value.map((m, i) => (
         <div key={`${m}-${i}`} className="flex items-center gap-1.5">
           <span className="text-[10px] text-ink-300 w-4 text-right tabular-nums">{i + 1}.</span>
@@ -94,15 +90,13 @@ export function FallbackChainEditor({ value, onChange, options, listId, t, prima
         </div>
       ))}
       <div className="flex items-center gap-1.5">
-        <input
-          list={id}
+        <ModelInput
           value={adding}
-          onChange={(e) => setAdding(e.target.value)}
+          onChange={setAdding}
+          options={suggestions}
+          listId={listId}
+          catalog={catalog}
           placeholder={t('me.models.addFallback' as MessageKey)}
-          className="flex-1 min-w-0 h-7 px-2 rounded-[7px] text-[12px] text-ink-900 bg-paper outline-none focus:ring-2 focus:ring-skype/30 font-mono"
-          style={{ border: '1px solid var(--ink-100)' }}
-          spellCheck={false}
-          onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); add() } }}
         />
         <button type="button"
           className="h-7 px-2.5 rounded-[7px] text-[11.5px] font-semibold text-skype-deep hover:bg-sky2-50 transition"

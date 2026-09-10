@@ -1,17 +1,17 @@
 /**
  * Settings-page "Models" tab — global per-role model configuration backed by
  * server_settings (DB → env fallback, no restart). Each role card edits a
- * primary model (datalist from the catalog API, free input allowed), an
+ * primary model (searchable full catalog, free input allowed), an
  * ordered fallback chain, and for text roles the reasoning knobs.
  */
 import { useEffect, useRef, useState } from 'react'
-import { api, type ApiModelCatalog, type ApiModelSettings } from '@/api/client'
+import { api, type ApiModelSettings } from '@/api/client'
 import { translate, useT, useLocaleStore, type MessageKey } from '@/lib/i18n'
-import { ModelInput, FallbackChainEditor, CatalogStatus, EFFORT_OPTIONS, modelInteger } from '@/components/ModelFields'
+import { ModelInput, FallbackChainEditor, CatalogStatus, modelSuggestions, EFFORT_OPTIONS, modelInteger } from '@/components/ModelFields'
 import { ModelRoutingPanel, SettingInfo, newerSettings } from './RuntimeSettingsPanel'
 import { cn } from '@/lib/utils'
 import { useAuth } from '@/stores/auth'
-import { useModelCatalog, catalogOptions } from '@/stores/modelCatalog'
+import { useModelCatalog } from '@/stores/modelCatalog'
 
 interface RoleDef {
   key: string
@@ -19,7 +19,6 @@ interface RoleDef {
   subKey: MessageKey
   modelKey: string
   fallbackKey?: string
-  bucket: keyof Pick<ApiModelCatalog, 'text' | 'image' | 'audio' | 'embedding'>
   effortKey?: string
   tokensKey?: string
   headroomKey?: string
@@ -27,12 +26,12 @@ interface RoleDef {
 }
 
 const ROLES: RoleDef[] = [
-  { key: 'brain', labelKey: 'me.models.brain', subKey: 'me.models.brainSub', modelKey: 'brain_model', fallbackKey: 'brain_fallback_models', bucket: 'text', effortKey: 'agent_reasoning_effort', tokensKey: 'agent_max_output_tokens' },
-  { key: 'support', labelKey: 'me.models.support', subKey: 'me.models.supportSub', modelKey: 'support_model', fallbackKey: 'support_fallback_models', bucket: 'text', effortKey: 'support_reasoning_effort', headroomKey: 'support_reasoning_headroom' },
-  { key: 'compaction', labelKey: 'me.models.compaction', subKey: 'me.models.compactionSub', modelKey: 'compaction_model', fallbackKey: 'compaction_fallback_models', bucket: 'text' },
-  { key: 'image', labelKey: 'me.models.image', subKey: 'me.models.imageSub', modelKey: 'image_model', fallbackKey: 'image_fallback_models', bucket: 'image' },
-  { key: 'audio', labelKey: 'me.models.audio', subKey: 'me.models.audioSub', modelKey: 'audio_model', fallbackKey: 'audio_fallback_models', bucket: 'audio' },
-  { key: 'embed', labelKey: 'me.models.embed', subKey: 'me.models.embedSub', modelKey: 'embed_model', bucket: 'embedding', embedNote: true },
+  { key: 'brain', labelKey: 'me.models.brain', subKey: 'me.models.brainSub', modelKey: 'brain_model', fallbackKey: 'brain_fallback_models', effortKey: 'agent_reasoning_effort', tokensKey: 'agent_max_output_tokens' },
+  { key: 'support', labelKey: 'me.models.support', subKey: 'me.models.supportSub', modelKey: 'support_model', fallbackKey: 'support_fallback_models', effortKey: 'support_reasoning_effort', headroomKey: 'support_reasoning_headroom' },
+  { key: 'compaction', labelKey: 'me.models.compaction', subKey: 'me.models.compactionSub', modelKey: 'compaction_model', fallbackKey: 'compaction_fallback_models' },
+  { key: 'image', labelKey: 'me.models.image', subKey: 'me.models.imageSub', modelKey: 'image_model', fallbackKey: 'image_fallback_models' },
+  { key: 'audio', labelKey: 'me.models.audio', subKey: 'me.models.audioSub', modelKey: 'audio_model', fallbackKey: 'audio_fallback_models' },
+  { key: 'embed', labelKey: 'me.models.embed', subKey: 'me.models.embedSub', modelKey: 'embed_model', embedNote: true },
 ]
 
 const MODEL_KEYS = ROLES.flatMap((r) => [r.modelKey, r.fallbackKey, r.effortKey, r.tokensKey, r.headroomKey].filter((k): k is string => !!k))
@@ -156,7 +155,11 @@ function ModelsTabContent() {
       <fieldset disabled={saving} className="space-y-6">
       {ROLES.map((role) => {
         const listId = `models-catalog-${role.key}`
-        const options = catalogOptions(catalog, role.bucket)
+        const options = modelSuggestions(catalog,
+          [draft[role.modelKey] ?? '', initial[role.modelKey] ?? ''],
+          splitList(role.fallbackKey ? draft[role.fallbackKey] ?? '' : ''),
+          splitList(role.fallbackKey ? initial[role.fallbackKey] ?? '' : ''),
+        )
         const allowedEfforts = snapshot?.definitions?.find(d => d.key === role.effortKey)?.allowedValues ?? (role.effortKey ? metadata?.[role.effortKey]?.allowedValues : undefined)
         const efforts = EFFORT_OPTIONS.filter(v => !allowedEfforts || allowedEfforts.includes(v))
         return (

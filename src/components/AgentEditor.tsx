@@ -1,8 +1,8 @@
 import { agentCliCommand } from '@/lib/agentCliRelease'
 import { useEffect, useRef, useState } from 'react'
 import { api, http, getPairingServerOrigin, resolveAssetUrl, type AgentInput } from '@/api/client'
-import { AgentModelFields, CatalogStatus, EFFORT_OPTIONS, modelInteger } from '@/components/ModelFields'
-import { useModelCatalog, catalogOptions, catalogSource } from '@/stores/modelCatalog'
+import { AgentModelFields, CatalogStatus, modelSuggestions, EFFORT_OPTIONS, modelInteger } from '@/components/ModelFields'
+import { useModelCatalog, catalogSource } from '@/stores/modelCatalog'
 import { Checkbox } from '@/components/Checkbox'
 import type { AgentModelConfig } from '@/types'
 import { isNativePlatform } from '@/lib/native'
@@ -245,10 +245,12 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
       ].filter(Boolean).join(' · ') || undefined,
     })),
   ]
-  // Managed agents pick from the global models catalog (text bucket);
+  // Managed primary and fallback pickers share the full global model catalog;
   // BYOA keeps using the host engine's reported catalog (modelOptions).
   const catalogState = useModelCatalog(!isByoa && !contextChanged)
-  const catalogText = catalogOptions(catalogState.catalog, 'text')
+  const catalogText = modelSuggestions(catalogState.catalog,
+    [model, agent?.model ?? ''], mcFallbacks, agent?.modelConfig?.fallbackModels ?? [],
+  )
   const effortOptions = EFFORT_OPTIONS
 
   const origin = getPairingServerOrigin()
@@ -525,7 +527,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
                 onValueChange={setModel}
                 options={[
                   { value: '', label: t('agent.followGlobalDefault') },
-                  ...[...new Set([...catalogText, model, ...(agent?.modelConfig?.fallbackModels ?? [])].filter(Boolean))].map((m) => ({ value: m, label: m, hint: catalogSource(catalogState.catalog, m) })),
+                  ...catalogText.map((m) => ({ value: m, label: m, hint: catalogSource(catalogState.catalog, m) })),
                 ]}
                 searchPlaceholder={t('agent.searchModels')}
                 allowCustom
