@@ -31,7 +31,7 @@ function daemonFixture(result: any, options: { payload?: any; abort?: boolean; m
   let calls = 0
   const payload = 'payload' in options ? options.payload : { instructions: 'classify', input: 'message', messageIds: ['m1'] }
   const { Runner } = compile(`export class Runner { ${methods} }`, {
-    ...triage, randomUUID, AbortController, Date, TRIAGE_TIMEOUT_MS: 1, TRIAGE_DIR: 'fake-triage', CURRENT_VERSION: 'test-daemon',
+    ...triage, randomUUID, AbortController, Date, runtimePolicy: { values: { triageTimeoutMs: 1 } }, TRIAGE_DIR: 'fake-triage', CURRENT_VERSION: 'test-daemon',
     triageSem: { acquire: async () => {}, release() {} }, spawnPacer: { gate: async () => {} },
     setTimeout: options.abort ? (fn: () => void) => { fn(); return 1 } : () => 1, clearTimeout() {},
     mkdir: async () => { if (options.mkdirFails) throw new Error('local directory failure') },

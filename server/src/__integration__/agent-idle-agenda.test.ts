@@ -8,8 +8,8 @@
  *   2. Agenda + classifier "actionable" → background_scan wake with a
  *                                         focused brief from agenda_scheduler.
  *   3. Agenda + classifier "skip"      → NO wake at all (cost-saving).
- *   4. Agenda + classifier ERROR        → fall back to generic idle wake
- *                                         (outage safety).
+ *   4. Agenda + classifier ERROR        → defer without waking the brain;
+ *                                         retry on a later idle tick.
  *   5. Done-column cards must be excluded from the agenda load.
  *   6. Calendar events in the current ±slot window must surface in the
  *      brief; events outside the window must not.
@@ -240,7 +240,7 @@ test('[integration] agenda + classifier=skip → NO wake fires (cost-saving path
   assert.equal(log?.ref.agendaCards, 1)
 })
 
-test('[integration] classifier ERROR → fall back to generic idle wake (outage safety)', async () => {
+test('[integration] classifier ERROR → defer brain wake and retry the existing agenda after recovery', async () => {
   const { agentId, boardId, todoColumnId, humanId } = await seedCompanyWithAgent()
   await insertCard({
     boardId, columnId: todoColumnId, title: 'Real work',
@@ -250,8 +250,7 @@ test('[integration] classifier ERROR → fall back to generic idle wake (outage 
   __setIdleWakeForTesting(async (id, reason, conversationId, _steer, options) => {
     wakes.push({ agentId: id, reason, conversationId: conversationId ?? null, options })
   })
-  // Classifier returns the AGENDA_CLASSIFIER_ERROR sentinel — same as if
-  // the LLM call threw. We must NOT silence the agent in this case.
+  // T22: classifier failure defers work without bypassing the brain gate.
   __setIdleClassifierForTesting(async () => ({
     actionable: false,
     focus: '',
@@ -260,12 +259,24 @@ test('[integration] classifier ERROR → fall back to generic idle wake (outage 
 
   await runIdleTick()
 
-  assert.equal(wakes.length, 1, 'classifier outage must fall back to a generic idle wake')
-  assert.equal(wakes[0].reason, 'idle')
-  assert.match(wakes[0].options?.idleReason ?? '', /agenda triage unavailable/)
+  assert.equal(wakes.length, 0, 'classifier outage must not bypass the brain gate')
 
   const log = await latestIdleLog(agentId)
   assert.equal(log?.ref.agendaVerdict, 'classifier_error')
+  assert.equal(log?.ref.agendaCards, 1)
+
+  __setIdleClassifierForTesting(async () => ({
+    actionable: true,
+    focus: 'Resume real work',
+    reason: 'classifier recovered',
+  }))
+  await runIdleTick()
+
+  assert.equal(wakes.length, 1, 'existing agenda is retried without inserting new work')
+  assert.equal(wakes[0].agentId, agentId)
+  assert.equal(wakes[0].reason, 'background_scan')
+  assert.match(wakes[0].options?.backgroundBrief?.body ?? '', /Real work/)
+  assert.equal((await latestIdleLog(agentId))?.ref.agendaVerdict, 'actionable')
 })
 
 test('[integration] done-column cards are excluded from the agenda load', async () => {

@@ -35,6 +35,7 @@ import { __setLlmClientOverrideForTesting } from '../llm.js'
 import { __setPodToolOverrideForTesting } from '../agents/runtime/pod-tools.js'
 import type { ToolResult } from '../agents/tools-shared.js'
 import { runAgentTurn } from '../agents/turn.js'
+import { getServerSettingsSnapshot, getTurnBudgetPolicy, writeServerSettings } from '../settings.js'
 
 before(async () => {
   await ensureSchemaOnce()
@@ -1607,17 +1608,19 @@ test('[integration] unknown tool name: agent gets an error in function_call_outp
   assert.equal(d.error, 'unknown tool')
 })
 
-test('[integration] MAX_HOPS: model that keeps requesting tools is capped without crashing', async () => {
+test('[integration] MAX_HOPS: model that keeps requesting tools is capped without crashing', async t => {
+  const snapshot = getServerSettingsSnapshot()
+  const previous = snapshot.sources.agent_max_hops === 'db' ? snapshot.settings.agent_max_hops : null
+  t.after(async () => { await writeServerSettings({ agent_max_hops: previous }) })
+  const maxHops = 3
+  await writeServerSettings({ agent_max_hops: String(maxHops) })
+  assert.equal(getTurnBudgetPolicy().maxHops, maxHops)
   const { companyId, agentId, humanId, conversationId } = await seedConvo({ kind: 'direct' })
   await postHumanMessage({ conversationId, companyId, humanId, body: 'loop' })
 
-  // turn.ts currently has MAX_HOPS = 200 (raised over time once
-  // auto-compaction took over the cost-containment job). Script
-  // MAX_HOPS + 1 streams; the +1 is a tripwire — if the loop ever
-  // ran past the cap the stub would yield it and we'd see
-  // tool_call_count == 201.
+  // One extra stream detects a loop that exceeds the configured hop budget.
   const streams = []
-  for (let i = 1; i <= 201; i++) {
+  for (let i = 1; i <= maxHops + 1; i++) {
     streams.push(streamWithToolCall({
       fcId: `fc_${i}`, callId: `call_${i}`, name: 'bash',
       argsJson: JSON.stringify({ command: 'cumora kanban ls' }),
@@ -1638,11 +1641,13 @@ test('[integration] MAX_HOPS: model that keeps requesting tools is capped withou
   )
   assert.equal(runs.length, 1)
   assert.equal(runs[0].status, 'failed', 'run must not be marked completed when capped mid-task')
-  assert.match(runs[0].summary, /MAX_HOPS/)
-  assert.equal(runs[0].tool_call_count, 200, 'tool_call_count caps at MAX_HOPS = 200')
-  // We deliberately don't assert the LLM call count exactly — if there's
-  // ever a budget guard tweak that breaks one hop earlier we want the
-  // test to still mostly hold; the run-row assertion is the real signal.
+  assert.match(runs[0].summary, /max hops=3/i)
+  assert.equal(runs[0].tool_call_count, maxHops, 'tool calls stop at the settings hop budget')
+  const capEvents = (await eventsForAgent(agentId)).filter(e => e.kind === 'turn.cap_reached')
+  assert.equal(capEvents.length, 1)
+  const cap = capEvents[0].data as { maxHops: number; toolCallCount: number }
+  assert.equal(cap.maxHops, maxHops)
+  assert.equal(cap.toolCallCount, maxHops)
   // Suppress unused warning on conversationId — verify the convo is the
   // direct one we seeded.
   assert.match(conversationId, /^direct-/)

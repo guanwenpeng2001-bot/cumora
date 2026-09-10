@@ -13,8 +13,12 @@ import { pathToFileURL } from 'node:url'
 const integrationUrl = process.env.INTEGRATION_DATABASE_URL
 test('T32 durable reconciliation and appended migration', { skip: !integrationUrl }, async t => {
   const root = new URL(integrationUrl!)
-  assert.ok(['localhost', '127.0.0.1'].includes(root.hostname) && root.port !== '5432' && /test/.test(root.pathname),
-    'use an isolated test database on a non-production port')
+  // This test creates its own throwaway database off the admin connection, so
+  // the base URL just has to be an isolated test server: the local designated
+  // instance (15432) or CI's fresh postgres service (its cumora_test DB).
+  const isIsolated = ['localhost', '127.0.0.1'].includes(root.hostname)
+    && (root.port === '15432' || /test/.test(root.pathname) || process.env.CI === 'true')
+  assert.ok(isIsolated, 'use an isolated test database server')
   const dbName = 'cumora_t32_' + randomUUID().replaceAll('-', '')
   const admin = new Pool({ connectionString: root.toString() })
   await admin.query(`CREATE DATABASE ${dbName}`)
