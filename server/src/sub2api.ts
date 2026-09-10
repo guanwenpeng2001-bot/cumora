@@ -120,17 +120,23 @@ export function parseApiKeyMap(raw: string | null | undefined): ApiKeyMap {
   if (!raw) return {}
   const trimmed = raw.trim()
   if (!trimmed) return {}
-  if (trimmed.startsWith('{')) {
+  if ((trimmed.startsWith('{') || trimmed.startsWith('[') || trimmed.startsWith('"')) || trimmed === 'null') {
     try {
       const parsed = JSON.parse(trimmed) as Record<string, unknown>
+      if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') throw new Error('invalid key map')
+      for (const provider of Object.keys(parsed)) {
+        if (!SUB2API_PLATFORMS.includes(provider as Platform)) console.warn('[sub2api] unknown key provider', provider)
+      }
       const out: ApiKeyMap = {}
       for (const platform of SUB2API_PLATFORMS) {
         const v = parsed[platform]
-        if (typeof v === 'string' && v) out[platform] = v
+        if (typeof v === 'string' && v.trim()) out[platform] = v.trim()
+        else if (v != null) console.warn('[sub2api] invalid API key value for platform', platform)
       }
       return out
     } catch {
-      // fall through to legacy handling
+      console.warn('[sub2api] invalid API key map JSON')
+      return {}
     }
   }
   return { openai: trimmed }
@@ -225,12 +231,6 @@ interface AdminAPIKeyList   { items: AdminAPIKeyRow[]; total: number; page: numb
  *  platform" — showing synthetic addresses defeats that. The sub2api
  *  admin account is provisioned out of the way (ADMIN_EMAIL something
  *  like `admin@cumora.local`) so there's no collision with real emails. */
-async function invalidateTenantLlmCaches(tenant: string): Promise<void> {
-  const { invalidateLlmClient, invalidateModelRouteCache } = await import('./llm.js')
-  invalidateLlmClient(tenant)
-  invalidateModelRouteCache(tenant)
-}
-
 export async function provisionUser(args: {
   cumoraUserId: string
   email: string
@@ -355,7 +355,6 @@ export async function provisionUser(args: {
     if (value) apiKeys[platform] = value
   }
 
-  await invalidateTenantLlmCaches(args.cumoraUserId)
   return { sub2apiUserId: created.id, apiKeys, groupId: primaryGroupId }
 }
 
@@ -492,20 +491,37 @@ export function pickPlatformForModel(
 /** Fetch the model ids a user key can call (gateway /v1/models is
  *  scoped to the key's group). `listKeyModelsWithStatus` preserves whether
  *  the fetch succeeded so route-cache refreshes can retain stale data. */
-export async function listKeyModelsWithStatus(baseUrl: string, apiKey: string): Promise<{ models: Set<string>; ok: boolean }> {
+export interface KeyModelsResult {
+  models: Set<string>
+  ok: boolean
+  status: 'success' | 'empty' | 'no-key' | 'unauthorized' | 'timeout' | 'unavailable'
+  diagnostic?: 'invalid-json' | 'invalid-format' | 'http-error' | 'network-error' | 'gateway-unconfigured'
+}
+
+export async function listKeyModelsWithStatus(baseUrl: string, apiKey: string): Promise<KeyModelsResult> {
+  if (!apiKey) return { models: new Set(), ok: false, status: 'no-key' }
   try {
     const r = await fetch(baseUrl.replace(/\/+$/, '') + '/models', {
       headers: { authorization: 'Bearer ' + apiKey, accept: 'application/json' },
       signal: AbortSignal.timeout(15_000),
     })
-    if (!r.ok) return { models: new Set(), ok: false }
-    const body = (await r.json()) as { data?: Array<{ id?: string }> }
-    return {
-      models: new Set((body.data ?? []).map((m) => m.id).filter((id): id is string => Boolean(id))),
-      ok: true,
+    if (!r.ok) return { models: new Set(), ok: false, status: r.status === 401 || r.status === 403 ? 'unauthorized' : 'unavailable', diagnostic: 'http-error' }
+    let body: unknown
+    try { body = await r.json() } catch (e) {
+      if (!(e instanceof SyntaxError)) throw e
+      console.warn('[sub2api] model discovery returned invalid JSON')
+      return { models: new Set(), ok: false, status: 'unavailable', diagnostic: 'invalid-json' }
     }
-  } catch {
-    return { models: new Set(), ok: false }
+    const data = (body as { data?: unknown } | null)?.data
+    if (!Array.isArray(data) || data.some((m) => !m || typeof m.id !== 'string' || !m.id.trim())) {
+      console.warn('[sub2api] model discovery returned invalid format')
+      return { models: new Set(), ok: false, status: 'unavailable', diagnostic: 'invalid-format' }
+    }
+    const models = new Set<string>(data.map((m) => m.id))
+    return { models, ok: true, status: models.size ? 'success' : 'empty' }
+  } catch (e) {
+    const timeout = e instanceof Error && (e.name === 'TimeoutError' || e.name === 'AbortError')
+    return { models: new Set(), ok: false, status: timeout ? 'timeout' : 'unavailable', diagnostic: timeout ? undefined : 'network-error' }
   }
 }
 
@@ -524,7 +540,7 @@ export async function listKeyModels(baseUrl: string, apiKey: string): Promise<Se
  *       platform, admin-side),
  *    3. stale Cumora tier subscriptions are revoked so quota reads
  *       don't keep seeing the old tier. */
-export async function setUserTier(sub2apiUserId: number, tier: Tier, tenant?: string): Promise<void> {
+async function syncUserTier(sub2apiUserId: number, tier: Tier): Promise<void> {
   const groups = tierGroups(tier)
   const primaryGroupId = groups.openai
   if (primaryGroupId <= 0) {
@@ -594,5 +610,20 @@ export async function setUserTier(sub2apiUserId: number, tier: Tier, tenant?: st
       method: 'DELETE',
     })
   }
-  if (tenant) await invalidateTenantLlmCaches(tenant)
+}
+
+export async function setUserTier(sub2apiUserId: number, tier: Tier, ownerId?: string): Promise<void> {
+  try {
+    await syncUserTier(sub2apiUserId, tier)
+  } finally {
+    // Partial upstream updates also invalidate the old authorization snapshot.
+    // Publish a new committed row version even when the key string is unchanged.
+    const { pool } = await import('./db/pool.js')
+    const { rows } = await pool.query<{ id: string }>(
+      'UPDATE users SET sub2api_api_key = sub2api_api_key WHERE sub2api_user_id = $1 RETURNING id', [sub2apiUserId],
+    )
+    const { invalidateOwnerLlmCaches } = await import('./tenant-llm-context.js')
+    for (const { id } of rows) await invalidateOwnerLlmCaches(id)
+    if (ownerId && !rows.some((row) => row.id === ownerId)) await invalidateOwnerLlmCaches(ownerId)
+  }
 }

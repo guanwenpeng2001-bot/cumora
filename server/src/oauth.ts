@@ -29,6 +29,7 @@
  * For GitHub specifically: `email` from /user is often null because users
  * keep it private. We instead hit /user/emails and pick `primary + verified`.
  */
+import { invalidateOwnerLlmCaches } from './tenant-llm-context.js'
 import { randomBytes, createHash, randomUUID } from 'node:crypto'
 import { pool } from './db/pool.js'
 import { redis } from './redis.js'
@@ -562,6 +563,7 @@ export async function findOrCreateUserByProfile(
           // Fresh signup — no stored map to merge against.
           [r.sub2apiUserId, serializeApiKeyMap(r.apiKeys), userId],
         )
+        await invalidateOwnerLlmCaches(userId)
       } catch (e) {
         console.warn(`[oauth] sub2api provisioning failed for ${userId}; legacy fallback`, e instanceof Error ? e.message : e)
       }

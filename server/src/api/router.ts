@@ -20,6 +20,7 @@ import { fetchImageBytes } from '../agents/image-fetcher.js'
 import { transcribeAudio } from '../llm.js'
 import { getServerSettingsSnapshot, writeServerSettings, validateServerSettings, InvalidServerSettingError } from '../settings.js'
 import { availableModels, invalidateModelCatalog } from '../models-catalog.js'
+import { TenantLlmAccessError } from '../tenant-llm-context.js'
 import { parseUsageRange, usageSummary, usageTrend, usageByAgent, usageByModel, usageByProvider, usageLogs } from '../usage.js'
 import { modelPricingTable, upsertModelPricing } from '../model-pricing.js'
 import {
@@ -730,8 +731,15 @@ api.put('/settings/models', safe(async (req, res) => {
  *  catalogs + configured settings, bucketed by capability. 5min cache,
  *  ?refresh=1 forces a rebuild. */
 api.get('/models/available', safe(async (req, res) => {
-  const userId = requireAuth(req)
-  res.json(await availableModels(userId, req.query?.refresh === '1'))
+  const { userId, companyId } = await requireCompany(req)
+  const computerId = typeof req.query?.computerId === 'string' ? req.query.computerId : undefined
+  const engine = typeof req.query?.engine === 'string' ? req.query.engine : undefined
+  try {
+    res.json(await availableModels(userId, req.query?.refresh === '1', companyId, computerId, engine))
+  } catch (e) {
+    if (e instanceof TenantLlmAccessError) throw new HttpError(e.status, e.message)
+    throw e
+  }
 }))
 
 /** Usage dashboard — pure reads over the llm_calls ledger, tenant-scoped. */

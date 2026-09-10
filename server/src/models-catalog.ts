@@ -1,32 +1,17 @@
-/**
- * Available-models catalog for the settings page's model tab.
- *
- * Merges three sources, in priority order:
- *   1. sub2api live — what the caller's per-platform gateway keys can
- *      actually call right now (skipped silently when the gateway is
- *      unconfigured or the user isn't provisioned)
- *   2. BYOA computers — model catalogs reported by paired daemons
- *      (computers.detected_engines[].modelCatalog)
- *   3. configured settings — the current primaries + fallback chains
- *      (server_settings with env fallback), so a hand-typed model that's
- *      not in any live list is still selectable
- *
- * Bucketed by capability (text/image/audio/embedding) with a 5-minute cache.
- * The BYOA/configured portion is global; only the gateway portion is keyed by
- * user because it depends on that user's sub2api credentials.
- */
 import { pool } from './db/pool.js'
 import { SETTING_DEFS, getServerSetting, getServerSettingList } from './settings.js'
-import { listKeyModels, parseApiKeyMap, sub2apiRoutingConfigured, sub2apiOpenAIBaseURL, SUB2API_PLATFORMS } from './sub2api.js'
+import { SUB2API_PLATFORMS, type Platform, type KeyModelsResult } from './sub2api.js'
+import { TenantLlmAccessError, resolveTenantLlmContext, tenantModelSnapshot, invalidateTenantModelSnapshot } from './tenant-llm-context.js'
 
 export interface ModelCatalog {
   text: string[]
   image: string[]
   audio: string[]
   embedding: string[]
-  /** False when the sub2api side contributed nothing — the UI shows the
-   *  "gateway unavailable, env fallback" banner off this. */
+  /** Compatibility flag: discovery succeeded or retained a same-version snapshot. */
   gateway: boolean
+  platforms?: Partial<Record<Platform, { status: KeyModelsResult['status']; stale: boolean; models: string[]; diagnostic?: KeyModelsResult['diagnostic'] }>>
+  byoa?: Array<{ companyId: string; computerId: string; engine: string; models: string[] }>
 }
 
 type Bucket = 'text' | 'image' | 'audio' | 'embedding'
@@ -39,53 +24,25 @@ function bucketOf(id: string): Bucket {
   return 'text'
 }
 
-const CACHE_TTL_MS = 5 * 60_000
-const globalCache: { models: Set<string>; at: number } = { models: new Set(), at: 0 }
-const gatewayCache = new Map<string, { models: Set<string>; at: number }>()
-
-export function invalidateModelCatalog(userId?: string): void {
-  if (userId) gatewayCache.delete(userId)
-  else {
-    globalCache.models = new Set()
-    globalCache.at = 0
-    gatewayCache.clear()
-  }
+export function invalidateModelCatalog(companyId?: string): void {
+  invalidateTenantModelSnapshot(companyId)
 }
 
-async function gatewayModels(userId: string): Promise<Set<string>> {
-  const out = new Set<string>()
-  if (!sub2apiRoutingConfigured()) return out
-  const { rows } = await pool.query<{ sub2api_api_key: string | null }>(
-    `SELECT sub2api_api_key FROM users WHERE id = $1`, [userId],
+async function byoaModels(companyId: string, computerId?: string, engine?: string): Promise<NonNullable<ModelCatalog['byoa']>> {
+  const { rows } = await pool.query<{ id: string; detected_engines: unknown }>(
+    `SELECT id, detected_engines FROM computers
+      WHERE company_id = $1 AND revoked_at IS NULL AND kind <> 'cloud'
+        AND ($2::text IS NULL OR id = $2)`, [companyId, computerId ?? null],
   )
-  const keys = parseApiKeyMap(rows[0]?.sub2api_api_key)
-  const base = sub2apiOpenAIBaseURL()
-  await Promise.all(SUB2API_PLATFORMS.map(async (p) => {
-    const key = keys[p]
-    if (!key) return
-    for (const m of await listKeyModels(base, key)) out.add(m)
-  }))
-  return out
-}
-
-async function byoaModels(): Promise<Set<string>> {
-  const out = new Set<string>()
-  try {
-    const { rows } = await pool.query<{ detected_engines: unknown }>(
-      `SELECT detected_engines FROM computers
-        WHERE detected_engines IS NOT NULL AND revoked_at IS NULL`,
-    )
-    for (const row of rows) {
-      const engines = row.detected_engines
-      if (!Array.isArray(engines)) continue
-      for (const e of engines) {
-        const models = (e as { modelCatalog?: { models?: Array<{ id?: string }> } })?.modelCatalog?.models
-        if (!Array.isArray(models)) continue
-        for (const m of models) if (m?.id) out.add(m.id)
-      }
+  const out: NonNullable<ModelCatalog['byoa']> = []
+  for (const row of rows) {
+    if (!Array.isArray(row.detected_engines)) continue
+    for (const e of row.detected_engines) {
+      if (!e || typeof e.id !== 'string' || (engine && e.id !== engine)) continue
+      const models = e.modelCatalog?.models
+      if (!Array.isArray(models)) continue
+      out.push({ companyId, computerId: row.id, engine: e.id, models: models.filter((m) => typeof m?.id === 'string' && m.id).map((m) => m.id) })
     }
-  } catch (e) {
-    console.warn('[models] BYOA catalog read failed', e instanceof Error ? e.message : e)
   }
   return out
 }
@@ -107,29 +64,32 @@ function configuredModels(): Set<string> {
   return out
 }
 
-export async function availableModels(userId: string, refresh: boolean): Promise<ModelCatalog> {
-  const now = Date.now()
-  const gatewayHit = !refresh ? gatewayCache.get(userId) : undefined
-  const globalHit = !refresh && now - globalCache.at < CACHE_TTL_MS ? globalCache.models : null
-  const [gateway, global] = await Promise.all([
-    gatewayHit && now - gatewayHit.at < CACHE_TTL_MS ? gatewayHit.models : gatewayModels(userId),
-    globalHit ?? Promise.all([byoaModels(), Promise.resolve(configuredModels())]).then(([byoa, configured]) => {
-      const models = new Set<string>([...byoa, ...configured])
-      globalCache.models = models
-      globalCache.at = Date.now()
-      return models
-    }),
+export async function availableModels(userId: string, refresh: boolean, companyId?: string, computerId?: string, engine?: string): Promise<ModelCatalog> {
+  // Preserve callers that omit company, using the same oldest-membership default as the API.
+  if (!companyId) {
+    const { rows } = await pool.query<{ company_id: string }>(
+      'SELECT company_id FROM company_members WHERE user_id = $1 ORDER BY joined_at ASC LIMIT 1', [userId],
+    )
+    companyId = rows[0]?.company_id
+  }
+  if (!companyId) throw new TenantLlmAccessError('No company membership')
+  const context = await resolveTenantLlmContext(companyId, userId)
+  const [snapshot, byoa] = await Promise.all([
+    tenantModelSnapshot(context, refresh), byoaModels(companyId, computerId, engine),
   ])
-  if (!gatewayHit || now - gatewayHit.at >= CACHE_TTL_MS || refresh) {
-    gatewayCache.set(userId, { models: gateway, at: Date.now() })
-  }
-  const catalog: ModelCatalog = { text: [], image: [], audio: [], embedding: [], gateway: gateway.size > 0 }
+  // Recheck membership before releasing a potentially slow discovery response.
+  const current = await resolveTenantLlmContext(companyId, userId)
+  if (current.authorizationVersion !== snapshot.authorizationVersion) return availableModels(userId, refresh, companyId, computerId, engine)
+  const catalog: ModelCatalog = { text: [], image: [], audio: [], embedding: [], gateway: false, platforms: {}, byoa }
   const buckets: Record<Bucket, Set<string>> = { text: new Set(), image: new Set(), audio: new Set(), embedding: new Set() }
-  for (const source of [gateway, global]) {
-    for (const m of source) buckets[bucketOf(m)].add(m)
+  for (const platform of SUB2API_PLATFORMS) {
+    const result = snapshot.platforms[platform]
+    catalog.platforms![platform] = { status: result.status, stale: result.stale, models: [...result.models].sort(), diagnostic: result.diagnostic }
+    if (result.ok || result.stale) catalog.gateway = true
+    for (const model of result.models) buckets[bucketOf(model)].add(model)
   }
-  for (const b of ['text', 'image', 'audio', 'embedding'] as const) {
-    catalog[b] = [...buckets[b]].sort()
-  }
+  for (const model of configuredModels()) buckets[bucketOf(model)].add(model)
+  for (const entry of byoa) for (const model of entry.models) buckets[bucketOf(model)].add(model)
+  for (const b of ['text', 'image', 'audio', 'embedding'] as const) catalog[b] = [...buckets[b]].sort()
   return catalog
 }

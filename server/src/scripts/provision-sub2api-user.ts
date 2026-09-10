@@ -20,6 +20,7 @@
  *
  *   docker compose exec server npx tsx server/src/scripts/provision-sub2api-user.ts <email> [free|pro|max]
  */
+import { invalidateOwnerLlmCaches } from '../tenant-llm-context.js'
 import 'dotenv/config'
 import { pool } from '../db/pool.js'
 import {
@@ -64,5 +65,6 @@ await pool.query(
   `UPDATE users SET sub2api_user_id = $1, sub2api_api_key = $2 WHERE id = $3`,
   [r.sub2apiUserId, serialized, user.id],
 )
+await invalidateOwnerLlmCaches(user.id)
 console.log(`provisioned ${email}: sub2api_user_id=${r.sub2apiUserId} platforms=${Object.keys(r.apiKeys).join(',')} tier=${tier}`)
 await pool.end()

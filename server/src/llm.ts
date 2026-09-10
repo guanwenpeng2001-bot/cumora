@@ -19,9 +19,7 @@
  * call this on every LLM hop. Cache by tenant; invalidate explicitly
  * (e.g. tier change handler) via `invalidateLlmClient(tenant)`.
  *
- * Critical: failures resolving the sub2api key are NEVER fatal — we
- * fall back to the legacy client. A wedged sub2api lookup must not
- * take down agent turns.
+ * Database lookup failures propagate; they do not authorize env fallback.
  *
  * Provider routing (model-based, on top of the above): whichever client is
  * chosen by the tenant rules is wrapped by `withProviderRouting` before it's
@@ -40,15 +38,16 @@
  * embeddings, non-prefixed responses.create calls) is the same object
  * callers already know.
  */
+import { resolveTenantLlmContext, tenantModelSnapshot, invalidateTenantModelSnapshot, onTenantLlmInvalidated } from './tenant-llm-context.js'
 import OpenAI from 'openai'
-import { pool } from './db/pool.js'
 import { env } from './env.js'
 import { isNovitaModel, novitaResponsesShim } from './novita.js'
 import { resolvedChain, runWithFallback, isFallbackableError } from './agents/fallback.js'
 import { isOrcaRouterModel, orcarouterResponsesCreate } from './orcarouter.js'
-import { sub2apiRoutingConfigured, sub2apiOpenAIBaseURL, parseApiKeyMap, pickPlatformForModel, listKeyModelsWithStatus, SUB2API_PLATFORMS, type Platform, type ApiKeyMap } from './sub2api.js'
+import { sub2apiRoutingConfigured, pickPlatformForModel, SUB2API_PLATFORMS, type Platform, type ApiKeyMap } from './sub2api.js'
 
 interface CachedClient {
+  authorizationVersion: string
   client: OpenAI
   /** unix-ms when the cache entry was minted; expire after 5 min so a
    *  silent tier change / key rotation doesn't strand the cache forever
@@ -195,61 +194,6 @@ function prepareLlmClient(client: OpenAI, options: LlmClientOptions): OpenAI {
   return options.skipModelFallback ? routed : withModelFallback(routed)
 }
 
-/** Per-tenant model→platform route cache for multi-key sub2api users.
- *  Built from each platform key's gateway /v1/models view (scoped to the
- *  key's group); failed refreshes retain the previous route and mark it
- *  stale, while an initial failure falls back without caching an empty set. */
-interface ModelRouteCache {
-  byPlatform: Partial<Record<Platform, ReadonlySet<string>>>
-  at: number
-  stale: boolean
-}
-const MODEL_ROUTE_TTL_MS = 5 * 60_000
-const modelRouteCache = new Map<string, ModelRouteCache>()
-const modelRouteRefreshes = new Map<string, Promise<ModelRouteCache | null>>()
-const modelRouteGenerations = new Map<string, number>()
-
-async function refreshModelRouteCache(
-  baseURL: string,
-  keys: ApiKeyMap,
-  tenant: string,
-): Promise<ModelRouteCache | null> {
-  const running = modelRouteRefreshes.get(tenant)
-  if (running) return running
-
-  const existing = modelRouteCache.get(tenant)
-  const generation = modelRouteGenerations.get(tenant) ?? 0
-  const available = SUB2API_PLATFORMS.filter((p) => keys[p])
-  const refresh = (async (): Promise<ModelRouteCache | null> => {
-    const results = await Promise.all(available.map(async (platform) => ({
-      platform,
-      result: await listKeyModelsWithStatus(baseURL, keys[platform]!),
-    })))
-    if ((modelRouteGenerations.get(tenant) ?? 0) !== generation) {
-      return modelRouteCache.get(tenant) ?? existing ?? null
-    }
-
-    if (results.some(({ result }) => !result.ok)) {
-      if (!existing) return null
-      const stale = { ...existing, at: Date.now(), stale: true }
-      modelRouteCache.set(tenant, stale)
-      return stale
-    }
-
-    const byPlatform: Partial<Record<Platform, ReadonlySet<string>>> = {}
-    for (const { platform, result } of results) byPlatform[platform] = result.models
-    const fresh = { byPlatform, at: Date.now(), stale: false }
-    modelRouteCache.set(tenant, fresh)
-    return fresh
-  })()
-  modelRouteRefreshes.set(tenant, refresh)
-  try {
-    return await refresh
-  } finally {
-    if (modelRouteRefreshes.get(tenant) === refresh) modelRouteRefreshes.delete(tenant)
-  }
-}
-
 async function routePlatformForModel(
   baseURL: string,
   keys: ApiKeyMap,
@@ -259,11 +203,16 @@ async function routePlatformForModel(
   const available = SUB2API_PLATFORMS.filter((p) => keys[p])
   const fallback: Platform = available.includes('openai') ? 'openai' : available[0] ?? 'openai'
   if (!model || available.length <= 1) return fallback
-  let entry = modelRouteCache.get(tenant)
-  if (!entry || Date.now() - entry.at > MODEL_ROUTE_TTL_MS) {
-    entry = await refreshModelRouteCache(baseURL, keys, tenant) ?? entry
+  const context = await resolveTenantLlmContext(tenant)
+  // A client already handed to a caller must never use a newer key's discovery.
+  if (context.baseURL !== baseURL || SUB2API_PLATFORMS.some((p) => context.keys[p] !== keys[p])) {
+    throw new Error('Tenant LLM authorization changed; resolve the client again')
   }
-  return pickPlatformForModel(entry?.byPlatform ?? {}, model, available)
+  const snapshot = await tenantModelSnapshot(context)
+  if (snapshot.authorizationVersion !== context.authorizationVersion) {
+    throw new Error('Tenant LLM authorization changed; resolve the client again')
+  }
+  return pickPlatformForModel(Object.fromEntries(SUB2API_PLATFORMS.map((p) => [p, snapshot.platforms[p].models])), model, available)
 }
 
 /** Build the sub2api client for a tenant. Single-key users get a plain
@@ -325,42 +274,23 @@ function buildSub2apiClient(baseURL: string, keys: ApiKeyMap, tenant: string): O
 
 /** Build (and cache) the OpenAI client for this tenant. Async because
  *  resolving the tenant's owner_user_id + sub2api_api_key is a DB hop.
- *  Always returns a working client — never throws on lookup failure. */
+ *  Lookup failures propagate without changing the credential source. */
 export async function getLlmClient(tenant: string | null, options: LlmClientOptions = {}): Promise<OpenAI> {
   if (testLlmOverride) return testLlmOverride(tenant)
   // No tenant context → legacy. Gate on the base URL only (not the
   // admin key): agent pods route per-platform without admin rights.
   if (!tenant || !sub2apiRoutingConfigured()) return prepareLlmClient(legacyClient(), options)
 
+  const context = await resolveTenantLlmContext(tenant)
   const cached = cache.get(tenant)
-  if (cached && Date.now() - cached.mintedAt < CACHE_TTL_MS) {
+  if (cached && cached.authorizationVersion === context.authorizationVersion && Date.now() - cached.mintedAt < CACHE_TTL_MS) {
     return prepareLlmClient(cached.client, options)
   }
-
-  try {
-    const { rows } = await pool.query<{ sub2api_api_key: string | null }>(
-      `SELECT u.sub2api_api_key
-         FROM companies c
-         JOIN users u ON u.id = c.owner_user_id
-        WHERE c.id = $1`,
-      [tenant],
-    )
-    const rawKey = rows[0]?.sub2api_api_key
-    if (!rawKey) {
-      // Tenant exists but owner hasn't been provisioned in sub2api yet.
-      // Cache the legacy fallback briefly so we don't re-query on every
-      // hop, but with a short TTL so the next backfill picks up quickly.
-      const c = legacyClient()
-      cache.set(tenant, { client: c, mintedAt: Date.now() })
-      return prepareLlmClient(c, options)
-    }
-    const c = buildSub2apiClient(sub2apiOpenAIBaseURL(), parseApiKeyMap(rawKey), tenant)
-    cache.set(tenant, { client: c, mintedAt: Date.now() })
-    return prepareLlmClient(c, options)
-  } catch (e) {
-    console.warn(`[llm] tenant ${tenant} client lookup failed; legacy fallback`, e instanceof Error ? e.message : e)
-    return prepareLlmClient(legacyClient(), options)
-  }
+  const client = SUB2API_PLATFORMS.some((p) => context.keys[p])
+    ? buildSub2apiClient(context.baseURL, context.keys, tenant)
+    : legacyClient()
+  cache.set(tenant, { client, mintedAt: Date.now(), authorizationVersion: context.authorizationVersion })
+  return prepareLlmClient(client, options)
 }
 
 /** Drop a tenant's cached client. Call from tier-change handlers so the
@@ -370,9 +300,10 @@ export function invalidateLlmClient(tenant: string): void {
 }
 
 export function invalidateModelRouteCache(tenant: string): void {
-  modelRouteGenerations.set(tenant, (modelRouteGenerations.get(tenant) ?? 0) + 1)
-  modelRouteCache.delete(tenant)
+  invalidateTenantModelSnapshot(tenant)
 }
+
+onTenantLlmInvalidated(invalidateLlmClient)
 
 let _legacy: OpenAI | null = null
 function legacyClient(): OpenAI {

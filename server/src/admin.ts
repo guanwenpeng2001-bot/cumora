@@ -18,6 +18,7 @@
  * on `requireAuth` having already attached a userId. Returns the userId
  * for ergonomic destructuring at the call site.
  */
+import { invalidateOwnerLlmCaches } from './tenant-llm-context.js'
 import { randomUUID } from 'node:crypto'
 import { pool } from './db/pool.js'
 import { env } from './env.js'
@@ -602,6 +603,7 @@ export async function approveWaitlist(waitlistId: string, decidedBy: string): Pr
           `UPDATE users SET sub2api_user_id = $1, sub2api_api_key = $2 WHERE id = $3`,
           [r.sub2apiUserId, serializeApiKeyMap(r.apiKeys), userId],
         )
+        await invalidateOwnerLlmCaches(userId)
       } catch (e) {
         console.warn(`[admin] sub2api provisioning failed for ${userId}; legacy fallback`, e instanceof Error ? e.message : e)
       }
@@ -778,4 +780,5 @@ export async function changeUserTier(userId: string, tier: 'free' | 'pro' | 'max
   } finally {
     client.release()
   }
+  await invalidateOwnerLlmCaches(userId)
 }
