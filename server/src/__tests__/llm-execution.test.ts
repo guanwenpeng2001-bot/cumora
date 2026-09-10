@@ -6,12 +6,12 @@ import ts from 'typescript'
 
 // Compile the real module graph; only external state is replaced. Unknown imports fail closed.
 const nativeRequire = createRequire(import.meta.url)
-let clientFactory: (() => any) | null = null
+let clientFactory: ((options: any) => any) | null = null
 const RealOpenAI = nativeRequire('openai')
 const FixtureOpenAI = new Proxy(RealOpenAI, {
-  construct(target, args) { return clientFactory ? clientFactory() : Reflect.construct(target, args) },
+  construct(target, args) { return clientFactory ? clientFactory(args[0]) : Reflect.construct(target, args) },
 })
-function setSdkClientFactory(factory: (() => any) | null) { clientFactory = factory }
+function setSdkClientFactory(factory: ((options: any) => any) | null) { clientFactory = factory }
 const allowed = new Set([
   'llm-execution.ts', 'llm.ts', 'llm-resolver.ts', 'settings.ts', 'env.ts',
   'managed-pod-settings.ts', 'tenant-llm-context.ts', 'sub2api.ts', 'novita.ts',
@@ -32,6 +32,7 @@ const compiled = new Map<string, string>()
 let modules = new Map<string, any>()
 function load(relative: string): any {
   if (relative === 'db/pool.ts') return { pool }
+  if (relative === 'agents/image-fetcher.ts') return { fetchImageBytes: async () => ({ ok: true, buffer: Buffer.from('image-bytes') }) }
   assert.ok(allowed.has(relative), `Unexpected module: ${relative}`)
   if (modules.has(relative)) return modules.get(relative)
   const exports = {}
@@ -418,4 +419,168 @@ test('real embedding SDK receives 429 once with no hidden retry or second model'
   assert.equal(inserts.length, 1)
   assert.equal(inserts[0][17], 'rate_limited')
   assert.equal(extras(inserts[0]).nextCandidate, null)
+})
+
+function gatewayFixture(models: string[] = []) {
+  const originalQuery = pool.query
+  let ownerReads = 0, version = 'v1'
+  pool.query = async (sql: any, values?: any[]) => {
+    if (typeof sql === 'object' && sql.text.includes('owner_user_id')) {
+      ownerReads++
+      return { rows: [{ owner_user_id: 'owner-a', authorization_version: version,
+        sub2api_api_key: JSON.stringify({ openai: 'gateway-key', grok: 'grok-key' }) }] }
+    }
+    return originalQuery(sql, values)
+  }
+  const sub = load('sub2api.ts')
+  sub.sub2apiRoutingConfigured = () => true
+  sub.sub2apiOpenAIBaseURL = () => 'https://gateway.invalid/v1'
+  sub.listKeyModelsWithStatus = async () => ({ models: new Set(models), ok: true, status: 'success' })
+  return { sub, reads: () => ownerReads, rotate: () => { version = 'v2' } }
+}
+
+test('F04/F10: configured DashScope stays direct with gateway keys and records measured image usage', async t => {
+  const env = isolatedProcess.env as Record<string, string>
+  Object.assign(env, { OPENAI_IMAGE_PROVIDER: 'dashscope', OPENAI_IMAGE_API_KEY: 'dashscope-key', OPENAI_IMAGE_NATIVE_BASE_URL: 'https://dashscope.invalid/api/v1' })
+  t.after(() => { delete env.OPENAI_IMAGE_PROVIDER; delete env.OPENAI_IMAGE_API_KEY; delete env.OPENAI_IMAGE_NATIVE_BASE_URL })
+  gatewayFixture(['qwen-image-plus', 'wanx-v1'])
+  const calls: { url: string; body: any }[] = []
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url: String(url), body: JSON.parse(String(options?.body ?? '{}')) })
+    const output = String(url).includes('/tasks/') ? { task_status: 'SUCCEEDED', results: [{ url: 'https://image.invalid/generated.png' }] }
+      : String(url).includes('image-synthesis') ? { task_id: 'isolated-task' }
+      : { choices: [{ message: { content: [{ image: 'https://image.invalid/generated.png' }] } }] }
+    return new Response(JSON.stringify({ output, usage: { input_tokens: 20, output_tokens: 100 } }))
+  }
+  setSdkClientFactory(options => ({ apiKey: options.apiKey, baseURL: options.baseURL }))
+  for (const model of ['qwen-image-plus', 'wanx-v1']) {
+    settings.image_model = model
+    await refreshServerSettings(true)
+    const plan = await load('llm-resolver.ts').resolveRoleCall('company-a', 'managed', 'image', 'agent-image')
+    assert.equal(plan.candidates[0].route.kind, 'direct')
+    assert.equal(plan.candidates[0].protocol, 'dashscope-image')
+    assert.equal(plan.candidates[0].available, true)
+    assert.equal(await load('llm.ts').executeImage({ companyId: 'company-a', purpose: 'agent-image' },
+      { prompt: 'isolated image', size: '1024x1024' }, async (bytes: Buffer) => bytes.toString()), 'image-bytes')
+    const row = inserts.at(-1)
+    assert.equal(row[8], 20); assert.equal(row[11], 100); assert.equal(row[15], true)
+    assert.deepEqual(extras(row).rawUsage, { input_tokens: 20, output_tokens: 100 })
+    assert.equal(extras(row).unpriced, 'image-pricing-unavailable')
+  }
+  assert.equal(calls.length, 3)
+  assert.ok(calls.every(call => call.url.startsWith('https://dashscope.invalid/api/v1/')))
+  assert.match(calls[0].url, /multimodal-generation/)
+  assert.match(calls[1].url, /image-synthesis/)
+})
+
+test('F04: visible but unsupported explicit gateway image candidates are unavailable', async () => {
+  gatewayFixture(['qwen-image-plus', 'wanx-v1', 'random-image'])
+  for (const model of ['qwen-image-plus', 'wanx-v1', 'random-image', 'gpt-image-2', 'grok-imagine-image']) {
+    settings.llm_config = JSON.stringify({ version: 1, routes: [{ id: 'gw', kind: 'gateway', platform: 'openai', protocol: 'images' }],
+      models: [{ model, route: 'gw' }], roles: [{ role: 'image', models: [model] }] })
+    await refreshServerSettings(true)
+    const plan = await load('llm-resolver.ts').resolveRoleCall('company-a', 'managed', 'image', 'agent-image')
+    const supported = model.startsWith('gpt-') || model.startsWith('grok-')
+    assert.equal(plan.candidates[0].available, supported)
+    if (!supported) assert.equal(plan.candidates[0].diagnostic, 'gateway-image-model-unsupported')
+  }
+})
+
+test('F10: Images usage survives storage failure; missing usage remains unknown', async () => {
+  settings.image_model = 'gpt-image-2'
+  await refreshServerSettings(true)
+  const rawUsage = { input_tokens: 20, output_tokens: 100, input_tokens_details: { cached_tokens: 5, image_tokens: 10 } }
+  let usage: unknown = rawUsage
+  setSdkClientFactory(() => ({ images: { generate: async () => ({ data: [{ b64_json: Buffer.from('image').toString('base64') }], usage }) } }))
+  const image = () => load('llm.ts').executeImage({ companyId: null, purpose: 'agent-image' },
+    { prompt: 'image', size: '1024x1024' }, async () => { throw new Error('storage failed') })
+  await assert.rejects(image(), /storage failed/)
+  assert.equal(inserts[0][8], 15); assert.equal(inserts[0][9], 5); assert.equal(inserts[0][11], 100)
+  assert.equal(inserts[0][15], true)
+  assert.deepEqual(extras(inserts[0]).rawUsage, rawUsage)
+  assert.equal(extras(inserts[0]).unpriced, 'image-pricing-unavailable')
+  usage = undefined
+  await assert.rejects(image(), /storage failed/)
+  assert.equal(inserts[1][15], false)
+  assert.equal(extras(inserts[1]).rawUsage, null)
+})
+
+test('F17: hung cold discovery is bounded and candidate clients share the authorization context', async () => {
+  const gateway = gatewayFixture()
+  gateway.sub.listKeyModelsWithStatus = () => new Promise(() => {})
+  const start = performance.now()
+  const plan = await load('llm-resolver.ts').resolveRoleCall('company-a', 'managed', 'support', 'palette')
+  assert.ok(performance.now() - start < 1_500, 'discovery must leave most of the 8s classification budget')
+  assert.ok(plan.diagnostics.includes('discovery:pending'))
+  const llm = load('llm.ts')
+  const first = await llm.getLlmCandidateClient(plan, plan.candidates[0])
+  assert.equal(await llm.getLlmCandidateClient(plan, plan.candidates[1]), first)
+  assert.equal(gateway.reads(), 1)
+  gateway.rotate()
+  load('tenant-llm-context.ts').invalidateTenantModelSnapshot('company-a')
+  await assert.rejects(llm.getLlmCandidateClient(plan, plan.candidates[0]), /authorization changed/)
+  const next = await load('llm-resolver.ts').resolveRoleCall('company-a', 'managed', 'support', 'palette')
+  assert.notEqual(await llm.getLlmCandidateClient(next, next.candidates[0]), first)
+})
+
+test('F17: stale same-version routing returns immediately while discovery refresh is suspended', async () => {
+  const gateway = gatewayFixture(['same'])
+  const tenant = load('tenant-llm-context.ts')
+  const context = await tenant.resolveTenantLlmContext('company-a')
+  const first = await tenant.tenantModelSnapshot(context)
+  first.at = Date.now() - 31_000
+  let requests = 0
+  gateway.sub.listKeyModelsWithStatus = () => { requests++; return new Promise(() => {}) }
+  const start = performance.now()
+  const plan = await load('llm-resolver.ts').resolveRoleCall('company-a', 'managed', 'support', 'palette')
+  assert.ok(performance.now() - start < 150, 'warm routing must not wait for directory I/O')
+  assert.equal(plan.authorizationVersion, context.authorizationVersion)
+  assert.equal(requests, 2)
+  assert.equal(gateway.reads(), 1)
+  assert.equal(await tenant.tenantRoutingSnapshot(context), first)
+  assert.equal(requests, 2, 'refresh is deduplicated')
+})
+
+test('F17: cold owner lookup has its own small budget and never authorizes direct fallback on failure', async () => {
+  gatewayFixture()
+  pool.query = async () => new Promise(() => {})
+  const start = performance.now()
+  await assert.rejects(load('llm-resolver.ts').resolveRoleCall('company-a', 'managed', 'support', 'palette'), /resolution timed out/)
+  assert.ok(performance.now() - start < 1_500)
+  assert.equal(sent.length, 0)
+})
+
+test('F13/F17: cancelling during cold discovery returns promptly without sending a model request', async () => {
+  const gateway = gatewayFixture()
+  let started!: () => void
+  const discoveryStarted = new Promise<void>(resolve => { started = resolve })
+  gateway.sub.listKeyModelsWithStatus = () => { started(); return new Promise(() => {}) }
+  const controller = new AbortController()
+  const result = load('llm-resolver.ts').resolveRoleCall('company-a', 'managed', 'audio', 'audio-transcription', undefined, undefined, controller.signal)
+  const rejected = assert.rejects(result, (error: Error) => error.name === 'AbortError')
+  await discoveryStarted
+  const start = performance.now()
+  controller.abort()
+  await rejected
+  assert.ok(performance.now() - start < 150)
+  assert.equal(sent.length, 0)
+})
+
+test('F17: an obsolete directory refresh cannot replace the next authorization version', async () => {
+  const gateway = gatewayFixture()
+  const tenant = load('tenant-llm-context.ts')
+  const oldContext = await tenant.resolveTenantLlmContext('company-a')
+  const complete: ((value: unknown) => void)[] = []
+  gateway.sub.listKeyModelsWithStatus = () => new Promise(resolve => complete.push(resolve))
+  const oldRefresh = tenant.tenantModelSnapshot(oldContext)
+  const rejected = assert.rejects(oldRefresh, /authorization changed/)
+  gateway.rotate()
+  tenant.invalidateTenantModelSnapshot('company-a')
+  const nextContext = await tenant.resolveTenantLlmContext('company-a')
+  gateway.sub.listKeyModelsWithStatus = async () => ({ models: new Set(['new-model']), ok: true, status: 'success' })
+  const nextSnapshot = await tenant.tenantModelSnapshot(nextContext)
+  complete.forEach(resolve => { resolve({ models: new Set(['old-model']), ok: true, status: 'success' }) })
+  await rejected
+  assert.equal(await tenant.tenantRoutingSnapshot(nextContext), nextSnapshot)
+  assert.equal(nextSnapshot.platforms.openai.models.has('old-model'), false)
 })

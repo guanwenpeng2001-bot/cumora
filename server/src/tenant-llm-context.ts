@@ -29,6 +29,20 @@ const snapshots = new Map<string, TenantModelSnapshot>()
 const refreshes = new Map<string, { version: string; promise: Promise<TenantModelSnapshot> }>()
 const invalidators = new Set<(companyId: string) => void>()
 const SNAPSHOT_TTL_MS = 30_000
+const CONTEXT_TTL_MS = 1_000
+const contexts = new Map<string, { context: TenantLlmContext; at: number }>()
+
+/** Bound route preparation independently of a business call's model budget. */
+export function waitForLlmResolution<T>(promise: Promise<T>, timeoutMs: number, signal?: AbortSignal): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const abort = () => finish(() => reject(signal?.reason ?? new DOMException('Aborted', 'AbortError')))
+    const timer = setTimeout(() => finish(() => reject(new DOMException('LLM route resolution timed out', 'TimeoutError'))), timeoutMs)
+    function finish(done: () => void) { clearTimeout(timer); signal?.removeEventListener('abort', abort); done() }
+    signal?.addEventListener('abort', abort, { once: true })
+    promise.then(value => finish(() => resolve(value)), error => finish(() => reject(error)))
+    if (signal?.aborted) abort()
+  })
+}
 
 export function onTenantLlmInvalidated(callback: (companyId: string) => void): void {
   invalidators.add(callback)
@@ -40,6 +54,7 @@ export function invalidateTenantModelSnapshot(companyId?: string): void {
     return
   }
   generations.set(companyId, (generations.get(companyId) ?? 0) + 1)
+  contexts.delete(companyId)
   snapshots.delete(companyId)
   refreshes.delete(companyId)
 }
@@ -56,22 +71,27 @@ export async function resolveTenantLlmContext(companyId: string, userId?: string
   }
   const generation = generations.get(companyId) ?? 0
   generations.set(companyId, generation)
-  const { rows } = await pool.query<{ owner_user_id: string; sub2api_api_key: string | null; authorization_version: string }>(
-    `SELECT c.owner_user_id, u.sub2api_api_key, u.xmin::text AS authorization_version
+  const cached = contexts.get(companyId)
+  if (userId === undefined && cached && cached.context.generation === generation
+    && cached.context.baseURL === sub2apiOpenAIBaseURL() && Date.now() - cached.at < CONTEXT_TTL_MS) return cached.context
+  const { rows } = await waitForLlmResolution(pool.query<{ owner_user_id: string; sub2api_api_key: string | null; authorization_version: string }>(
+    { text: `SELECT c.owner_user_id, u.sub2api_api_key, u.xmin::text AS authorization_version
        FROM companies c JOIN users u ON u.id = c.owner_user_id
       WHERE c.id = $1
         AND ($2::text IS NULL OR EXISTS (
           SELECT 1 FROM company_members cm WHERE cm.company_id = c.id AND cm.user_id = $2
-        ))`, [companyId, userId ?? null],
-  )
+        ))`, values: [companyId, userId ?? null], query_timeout: 500 } as import('pg').QueryConfig & { query_timeout: number },
+  ), 500)
   if (generation !== (generations.get(companyId) ?? 0)) return resolveTenantLlmContext(companyId, userId)
   const row = rows[0]
   if (!row) throw new TenantLlmAccessError('Company not found or access denied')
-  return {
+  const context: TenantLlmContext = {
     companyId, ownerId: row.owner_user_id, generation,
     authorizationVersion: `${row.owner_user_id}:${row.authorization_version}:${generation}:${sub2apiOpenAIBaseURL()}`,
     keys: parseApiKeyMap(row.sub2api_api_key), baseURL: sub2apiOpenAIBaseURL(),
   }
+  if (userId === undefined) contexts.set(companyId, { context, at: Date.now() })
+  return context
 }
 
 /** Call after the local key commit. The owner can own more than one company. */
@@ -105,9 +125,10 @@ export async function tenantModelSnapshot(context: TenantLlmContext, refresh = f
       const stale = !result.ok && result.status !== 'no-key' && !!old && (old.ok || old.stale)
       return [platform, { ...result, models: stale ? old.models : result.models, stale }] as const
     }))
-    const current = await resolveTenantLlmContext(companyId)
-    if (current.authorizationVersion !== authorizationVersion || current.generation !== (generations.get(companyId) ?? 0)) {
-      return tenantModelSnapshot(current)
+    const current = getManagedPodSettings()?.gateway ?? contexts.get(companyId)?.context
+    if (context.generation !== (generations.get(companyId) ?? 0)
+      || current && current.authorizationVersion !== authorizationVersion) {
+      throw new TenantLlmAccessError('Tenant LLM authorization changed during discovery')
     }
     const snapshot: TenantModelSnapshot = {
       authorizationVersion, platforms: Object.fromEntries(entries) as Record<Platform, PlatformSnapshot>, at: Date.now(),
@@ -118,5 +139,22 @@ export async function tenantModelSnapshot(context: TenantLlmContext, refresh = f
   refreshes.set(companyId, { version: authorizationVersion, promise })
   try { return await promise } finally {
     if (refreshes.get(companyId)?.promise === promise) refreshes.delete(companyId)
+  }
+}
+
+/** Business routes use only this authorization version; refresh never blocks a warm call. */
+export async function tenantRoutingSnapshot(context: TenantLlmContext, signal?: AbortSignal): Promise<TenantModelSnapshot | null> {
+  signal?.throwIfAborted()
+  const existing = snapshots.get(context.companyId)
+  const previous = existing?.authorizationVersion === context.authorizationVersion ? existing : null
+  const refresh = tenantModelSnapshot(context)
+  // Background discovery can fail after the caller has returned or cancelled.
+  void refresh.catch(() => {})
+  if (previous) return previous
+  try { return await waitForLlmResolution(refresh, 250, signal) }
+  catch (error) {
+    signal?.throwIfAborted()
+    if (error instanceof Error && error.name === 'TimeoutError') return null
+    throw error
   }
 }

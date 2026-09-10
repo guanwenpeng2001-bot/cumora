@@ -189,3 +189,55 @@ test('metadata uses settings for pause, stale interval and raw-retention boundar
   assert.deepEqual(parameters[1], ['tenant', 1_800_000, 120])
   assert.ok(!readFileSync(new URL('../usage.ts', import.meta.url), 'utf8').includes('process.env'))
 })
+
+test('usage log DTO preserves unknown actual models and retains requested and historical models separately', async () => {
+  const cases = [
+    { model: 'requested', requested_model: 'requested', actual_model: null, status: 'failed', http_status: '401' },
+    { model: 'requested', requested_model: 'requested', actual_model: null, status: 'failed', failure_reason: 'connection-error' },
+    { model: 'legacy', requested_model: null, actual_model: null, status: 'ok' },
+    { model: 'requested', requested_model: 'requested', actual_model: '', status: 'failed' },
+    { model: 'requested', requested_model: 'requested', actual_model: 'provider-reported', status: 'ok' },
+  ]
+  const usage = loadUsage(async (sql) => {
+    if (sql.includes('COUNT(*)')) return { rows: [{ total: String(cases.length) }] }
+    assert.match(sql, /NULLIF\(l.extras->>'actualModel', ''\) AS actual_model/)
+    return { rows: cases.map((row, id) => ({ id: String(id), created_at: new Date(0), ...row })) }
+  })
+  const result = JSON.parse(JSON.stringify(await usage.usageLogs('tenant', { from: new Date(0), to: new Date(1) }, { page: 1, pageSize: 50 })))
+  assert.deepEqual(result.items.map((row: any) => row.actualModel), [null, null, null, null, 'provider-reported'])
+  assert.deepEqual(result.items.map((row: any) => row.requestedModel), ['requested', 'requested', 'legacy', 'requested', 'requested'])
+  assert.equal(result.items[0].httpStatus, 401)
+})
+
+test('dashboard renders unknown actual model in both log cell and details while retaining requested model', async () => {
+  const source = readFileSync(new URL('../../../src/desktop/UsageDashboard.tsx', import.meta.url), 'utf8')
+  const ast = ts.createSourceFile('UsageDashboard.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
+  let cell: ts.JsxElement | undefined
+  function visit(node: ts.Node) {
+    if (ts.isJsxElement(node) && node.openingElement.tagName.getText(ast) === 'td' && node.getText(ast).includes('r.actualModel')) cell = node
+    ts.forEachChild(node, visit)
+  }
+  visit(ast)
+  assert.ok(cell, 'render the real actual-model cell including its details')
+  const js = ts.transpileModule(`exports.render = (r) => (${cell.getText(ast)})`, {
+    fileName: 'cell.tsx', compilerOptions: { jsx: ts.JsxEmit.ReactJSX, module: ts.ModuleKind.CommonJS },
+  }).outputText
+  const jsx = await import('react/jsx-runtime')
+  const { renderToStaticMarkup } = await import('react-dom/server')
+  const labels: Record<string, string> = { 'settings.actualModel': '实际模型', 'settings.requestedModel': '请求模型' }
+  const exports: Record<string, any> = {}
+  new Function('exports', 'require', 'unknown', 'translate', 't', 'locale', 'cn', 'td', js)(
+    exports, () => jsx, '未知', (_locale: string, key: string) => labels[key] ?? key,
+    (key: string) => key, 'zh', (...args: string[]) => args.join(' '), '',
+  )
+  for (const actualModel of [null, undefined, '']) {
+    const html = renderToStaticMarkup(exports.render({ actualModel, requestedModel: 'requested-only', model: 'legacy-only' }))
+    assert.match(html, /^<td[^>]*>未知<details/)
+    assert.match(html, /实际模型: 未知/)
+    assert.match(html, /请求模型: requested-only/)
+    assert.doesNotMatch(html, /legacy-only/)
+  }
+  const html = renderToStaticMarkup(exports.render({ actualModel: 'provider-reported', requestedModel: 'requested-only' }))
+  assert.match(html, /^<td[^>]*>provider-reported<details/)
+  assert.match(html, /实际模型: provider-reported/)
+})

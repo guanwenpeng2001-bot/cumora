@@ -504,6 +504,12 @@ export async function getUserQuota(sub2apiUserId: number): Promise<QuotaSnapshot
  *  model lists (e.g. a deepseek-* model exists on both the native
  *  deepseek group and an openai-platform reseller): native platforms
  *  first, openai as the universal fallback. */
+/** Matches sub2api's Images admission; discovery alone does not imply protocol support. */
+export function supportsGatewayImages(model: string): boolean {
+  const id = model.trim().toLowerCase()
+  return id.startsWith('gpt-image-') || id === 'grok-imagine' || id === 'grok-imagine-edit' || id.startsWith('grok-imagine-image')
+}
+
 export const MODEL_PLATFORM_PRIORITY: readonly Platform[] = ['kimi', 'deepseek', 'grok', 'openai']
 
 /** Pick the platform whose model list claims `model`. Falls back to

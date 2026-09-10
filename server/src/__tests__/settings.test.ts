@@ -743,3 +743,31 @@ test('setting sources distinguish explicit env at default value, DB, inheritance
   assert.equal(f.settings.getServerSettingsSnapshot().sources.compaction_hard_ratio, 'default')
   assert.ok(routerSource.includes('res.json(getServerSettingsSnapshot())'))
 })
+
+test('auxiliary stream deadline is validated, revisioned, resettable and fixed within a turn', async () => {
+  const f = fixture()
+  await f.settings.loadServerSettings()
+  const key = 'compaction_stream_timeout_ms'
+  const def = f.settings.SETTING_DEFS.find(d => d.key === key)!
+  assert.equal(def.type, 'integer')
+  assert.equal(def.pod, true)
+  assert.equal(def.scope, 'managed')
+  assert.equal(def.effect, 'next-turn')
+  assert.equal(def.unit, 'milliseconds')
+  assert.equal(f.settings.getServerSetting(key), '30000')
+  for (const value of ['0', '-1', '1.5', 'NaN', '2147483648']) {
+    await assert.rejects(f.settings.writeServerSettings({ [key]: value }))
+  }
+  for (const value of ['1', '2147483647', '45000']) {
+    await f.settings.writeServerSettings({ [key]: value })
+    assert.equal(f.settings.getServerSetting(key), value)
+  }
+  await f.settings.withServerSettingsSnapshot(async () => {
+    await f.settings.writeServerSettings({ [key]: '60000' })
+    assert.equal(f.settings.getServerSettingsSnapshot().settings[key], '45000')
+  })
+  assert.equal(f.settings.getServerSetting(key), '60000')
+  await f.settings.writeServerSettings({ [key]: null })
+  assert.equal(f.settings.getServerSetting(key), '30000')
+  assert.equal(f.settings.getServerSettingsSnapshot().sources[key], 'default')
+})

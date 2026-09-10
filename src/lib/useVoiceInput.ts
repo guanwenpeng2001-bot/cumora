@@ -1,5 +1,5 @@
 import { useLayoutEffect, useRef, useState } from 'react'
-import { api } from '@/api/client'
+import { http } from '@/api/client'
 import { useAuth } from '@/stores/auth'
 import { isApiAbortError } from './apiErrors'
 import { translate, useLocale, useT } from './i18n'
@@ -142,6 +142,7 @@ export function useVoiceInput(scopeKey: string | null, onText: (text: string) =>
     if (!current(op)) return
     op.phase = 'transcribing'
     setVoiceState('transcribing')
+    const deadlineAt = Date.now() + 60_000
     deadline(op, 60_000)
     try {
       if (!blob.size) throw new Error('Empty recording')
@@ -153,7 +154,10 @@ export function useVoiceInput(scopeKey: string | null, onText: (text: string) =>
       for (let i = 0; i < bytes.length; i += 0x8000) {
         binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000))
       }
-      const { text } = await api.transcribeAudio(btoa(binary), format, op.controller.signal)
+      const { text } = await http<{ text: string }>('/audio/transcription', {
+        method: 'POST', signal: op.controller.signal,
+        body: JSON.stringify({ audio: btoa(binary), format, deadlineAt }),
+      })
       if (!current(op)) return
       if (text.trim()) context.current.onText(text.trim())
       cancel()

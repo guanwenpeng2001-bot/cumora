@@ -677,15 +677,26 @@ api.post('/uploads/refresh-url', safe(async (req, res) => {
  *  ASR model (see server/src/llm.ts transcribeAudio) and return the plain
  *  text so the user can edit before sending. */
 api.post('/audio/transcription', requireAuthBeforeLargeBody, audioJsonParser, safe(async (req, res) => {
-  const { companyId } = await requireCompany(req)
-  let text: string
+  const controller = new AbortController()
+  const disconnect = () => { if (!res.writableEnded) controller.abort() }
+  res.once('close', disconnect)
+  if (res.destroyed) disconnect()
+  const startedAt = Date.now()
   try {
-    text = await transcribeAudio(req.body?.audio, req.body?.format, companyId)
+    const { companyId } = await requireCompany(req)
+    controller.signal.throwIfAborted()
+    const requestedDeadline = req.body?.deadlineAt
+    const deadlineAt = typeof requestedDeadline === 'number' && Number.isSafeInteger(requestedDeadline)
+      ? Math.min(requestedDeadline, startedAt + 60_000) : startedAt + 60_000
+    const text = await transcribeAudio(req.body?.audio, req.body?.format, companyId, { signal: controller.signal, deadlineAt })
+    if (!controller.signal.aborted) res.json({ text })
   } catch (error) {
+    if (controller.signal.aborted) return
     if (error instanceof AudioInputError) throw new HttpError(error.status, error.message)
     throw error
+  } finally {
+    res.off('close', disconnect)
   }
-  res.json({ text })
 }))
 
 /** Site-admin gate for server-global settings (users.is_admin). */

@@ -24,7 +24,7 @@
  * Provider routes are resolved from configuration before constructing a candidate client.
  * Request model strings cannot change a candidate's endpoint or credentials.
  */
-import { resolveTenantLlmContext, tenantModelSnapshot, invalidateTenantModelSnapshot, onTenantLlmInvalidated } from './tenant-llm-context.js'
+import { resolveTenantLlmContext, tenantRoutingSnapshot, invalidateTenantModelSnapshot, onTenantLlmInvalidated } from './tenant-llm-context.js'
 import OpenAI from 'openai'
 import { resolveDirectLlmEnv } from './env.js'
 export { resolveRoleCall } from './llm-resolver.js'
@@ -44,6 +44,8 @@ interface CachedClient {
 
 const CACHE_TTL_MS = 5 * 60_000
 const cache = new Map<string, CachedClient>()
+const candidateClients = new Map<string, { version: string; clients: Map<string, OpenAI> }>()
+const directCandidateClients = new Map<string, { apiKey: string; baseURL: string; client: OpenAI }>()
 
 /** Tolerance settings for both the sub2api-routed client AND the legacy
  *  fallback. Production has surfaced "all four agents 502'd at once →
@@ -93,19 +95,35 @@ export async function getLlmCandidateClient(plan: RoleCallPlan, candidate: RoleC
     if (context.authorizationVersion !== plan.authorizationVersion) throw new Error('Tenant LLM authorization changed; resolve the plan again')
     const apiKey = context.keys[candidate.route.platform]
     if (!apiKey || !context.baseURL) throw new Error('Tenant LLM route is unavailable')
-    return new OpenAI({ apiKey, baseURL: context.baseURL, maxRetries: SDK_MAX_RETRIES, timeout: SDK_TIMEOUT_MS })
+    let cached = candidateClients.get(plan.companyId)
+    if (cached?.version !== context.authorizationVersion) {
+      cached = { version: context.authorizationVersion, clients: new Map() }
+      candidateClients.set(plan.companyId, cached)
+    }
+    let client = cached.clients.get(candidate.route.platform)
+    if (!client) {
+      client = new OpenAI({ apiKey, baseURL: context.baseURL, maxRetries: SDK_MAX_RETRIES, timeout: SDK_TIMEOUT_MS })
+      cached.clients.set(candidate.route.platform, client)
+    }
+    return client
   }
   const direct = resolveDirectLlmEnv(candidate.route.env ?? 'text')
   if (!direct.configured) throw new Error('Direct LLM route is not configured')
-  const client = new OpenAI({ apiKey: direct.apiKey, baseURL: direct.baseURL, maxRetries: SDK_MAX_RETRIES, timeout: SDK_TIMEOUT_MS })
+  const cacheKey = JSON.stringify([candidate.route.env, candidate.protocol,
+    ['novita', 'orcarouter'].includes(candidate.route.env ?? '') ? candidate.requestModel : null])
+  const cached = directCandidateClients.get(cacheKey)
+  if (cached?.apiKey === direct.apiKey && cached.baseURL === direct.baseURL) return cached.client
+  let client = new OpenAI({ apiKey: direct.apiKey, baseURL: direct.baseURL, maxRetries: SDK_MAX_RETRIES, timeout: SDK_TIMEOUT_MS })
   if (candidate.route.env === 'novita' || candidate.route.env === 'orcarouter') {
-    const responses = candidate.protocol === 'chat' ? createChatResponsesShim(client, candidate.requestModel) : {
-      create: (args: Record<string, unknown>, opts?: unknown) => client.responses.create({ ...args, model: candidate.requestModel } as never, opts as never),
+    const baseClient = client
+    const responses = candidate.protocol === 'chat' ? createChatResponsesShim(baseClient, candidate.requestModel) : {
+      create: (args: Record<string, unknown>, opts?: unknown) => baseClient.responses.create({ ...args, model: candidate.requestModel } as never, opts as never),
     }
-    return new Proxy(client, {
+    client = new Proxy(client, {
       get(target, prop, receiver): unknown { return prop === 'responses' ? responses : Reflect.get(target, prop, receiver) },
     })
   }
+  directCandidateClients.set(cacheKey, { apiKey: direct.apiKey, baseURL: direct.baseURL, client })
   return client
 }
 
@@ -123,7 +141,8 @@ async function routePlatformForModel(
   if (context.baseURL !== baseURL || SUB2API_PLATFORMS.some((p) => context.keys[p] !== keys[p])) {
     throw new Error('Tenant LLM authorization changed; resolve the client again')
   }
-  const snapshot = await tenantModelSnapshot(context)
+  const snapshot = await tenantRoutingSnapshot(context)
+  if (!snapshot) return fallback
   if (snapshot.authorizationVersion !== context.authorizationVersion) {
     throw new Error('Tenant LLM authorization changed; resolve the client again')
   }
@@ -212,6 +231,8 @@ export async function getLlmClient(tenant: string | null, options: LlmClientOpti
  *  next LLM hop picks up the swapped key / group. */
 export function invalidateLlmClient(tenant: string): void {
   cache.delete(tenant)
+  candidateClients.delete(tenant)
+  invalidateTenantModelSnapshot(tenant)
 }
 
 export function invalidateModelRouteCache(tenant: string): void {
@@ -265,6 +286,8 @@ function legacyClient(): OpenAI {
  *  /images/generations — image models only exist on the native async task
  *  API, so we create a task and poll it to completion here. */
 interface DashscopeTaskResponse {
+  usage?: unknown
+  model?: string
   output?: {
     task_id?: string
     task_status?: string
@@ -296,11 +319,12 @@ function dashscopeImageClient(apiKey: string, base: string, progress?: (stage: '
     if (!resp.ok) throw dashscopeHttpError(`dashscope multimodal-generation failed: ${resp.status} ${await resp.text()}`, resp.status)
     progress?.('poll')
     const body = (await resp.json()) as {
+      usage?: unknown; model?: string
       output?: { choices?: { message?: { content?: { image?: string }[] } }[] }
     }
     const url = body.output?.choices?.[0]?.message?.content?.find((c) => c.image)?.image
     if (!url) throw new Error(`dashscope multimodal-generation returned no image: ${JSON.stringify(body).slice(0, 300)}`)
-    return { data: [{ url }] }
+    return { data: [{ url }], usage: body.usage, model: body.model }
   }
 
   async function generateAsync(model: string, prompt: string, size?: string, n?: number) {
@@ -338,7 +362,7 @@ function dashscopeImageClient(apiKey: string, base: string, progress?: (stage: '
       if (state === 'SUCCEEDED') {
         const url = status.output?.results?.[0]?.url
         if (!url) throw new Error('dashscope task succeeded with no result url')
-        return { data: [{ url }] }
+        return { data: [{ url }], usage: status.usage, model: status.model }
       }
       if (state === 'FAILED' || state === 'CANCELED') {
         throw dashscopeHttpError(`dashscope task ${state}: ${status.output?.message ?? 'no message'}`, 400)
@@ -379,6 +403,7 @@ export async function executeImage<T>(context: import('./agents/llm-ledger.js').
   const { executeLlmPlan } = await import('./llm-execution.js')
   const { recordLlmCall } = await import('./agents/llm-ledger.js')
   const { fetchImageBytes } = await import('./agents/image-fetcher.js')
+  const { measuredUsage } = await import('./agents/cost.js')
   if (!args.prompt.trim()) throw new Error('Image prompt is empty')
   const plan = await resolveRoleCall(context.companyId, context.domain ?? (context.companyId ? 'managed' : 'server'),
     'image', context.purpose, { id: context.agentId ?? undefined })
@@ -407,6 +432,9 @@ export async function executeImage<T>(context: import('./agents/llm-ledger.js').
       return async () => {
         const response = await client.images.generate({ ...args, model: candidate.requestModel }, { maxRetries: 0 })
         state.committed = true
+        state.rawUsage = response.usage ?? null
+        state.usage = measuredUsage(response.usage, 'responses')
+        state.usageProtocol = 'responses'
         const actualModel = (response as unknown as { model?: unknown }).model
         state.actualModel = typeof actualModel === 'string' ? actualModel : null
         const first = response.data?.[0]
@@ -459,14 +487,18 @@ export function validateAudioInput(audio: unknown, format: unknown = 'webm'): { 
 }
 
 /** Chat input_audio retains the existing data-URL protocol on gateway and env routes. */
-export async function transcribeAudio(audioBase64: unknown, format: unknown = 'webm', companyId: string | null = null): Promise<string> {
+export async function transcribeAudio(audioBase64: unknown, format: unknown = 'webm', companyId: string | null = null, options: { signal?: AbortSignal; deadlineAt?: number } = {}): Promise<string> {
   const clip = validateAudioInput(audioBase64, format)
+  const remaining = Math.max(0, Math.min(60_000, (options.deadlineAt ?? Date.now() + 60_000) - Date.now()))
+  const signal = AbortSignal.any([...(options.signal ? [options.signal] : []), AbortSignal.timeout(remaining)])
+  signal.throwIfAborted()
+  if (!remaining) throw new DOMException('Audio deadline expired', 'TimeoutError')
   const { resolveRoleCall } = await import('./llm-resolver.js')
   const { executeLlmPlan } = await import('./llm-execution.js')
   const { measuredUsage } = await import('./agents/cost.js')
   const context = { companyId, purpose: 'audio-transcription' as const, role: 'audio' as const }
-  const plan = await resolveRoleCall(companyId, companyId ? 'managed' : 'server', 'audio', context.purpose)
-  return executeLlmPlan({ plan, context, sdkMaxRetries: 0,
+  const plan = await resolveRoleCall(companyId, companyId ? 'managed' : 'server', 'audio', context.purpose, undefined, undefined, signal)
+  return executeLlmPlan({ plan, context, signal, sdkMaxRetries: 0,
     prepare: async (candidate, state) => {
       if (candidate.protocol !== 'chat') throw new Error('Non-audio LLM protocol')
       const client = await getLlmCandidateClient(plan, candidate)
@@ -475,7 +507,7 @@ export async function transcribeAudio(audioBase64: unknown, format: unknown = 'w
           const body = await client.post<{ model?: unknown; usage?: unknown; choices?: { message?: { content?: unknown } }[] }>('/chat/completions', {
             body: { model: candidate.requestModel, messages: [{ role: 'user', content: [
               { type: 'input_audio', input_audio: { data: `data:${clip.mime};base64,${clip.audio}` } },
-            ] }] }, maxRetries: 0, timeout: 120_000,
+            ] }] }, maxRetries: 0, signal, timeout: remaining,
           })
           state.usage = measuredUsage(body?.usage, 'chat')
           state.usageProtocol = 'chat'

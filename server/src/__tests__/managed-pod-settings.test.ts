@@ -253,6 +253,7 @@ test('unchanged candidate client uses owner platform keys and direct credentials
   const exports: { getLlmCandidateClient?: (plan: unknown, candidate: unknown) => Promise<{ options: { apiKey: string; baseURL: string } }> } = {}
   runInNewContext(transpile(functionsFrom('llm', ['getLlmCandidateClient'])), {
     exports, testLlmOverride: null, SDK_MAX_RETRIES: 0, SDK_TIMEOUT_MS: 100,
+    candidateClients: new Map(), directCandidateClients: new Map(),
     resolveTenantLlmContext: pod.tenant.resolveTenantLlmContext, resolveDirectLlmEnv: pod.env.resolveDirectLlmEnv,
     OpenAI: class { constructor(public options: unknown) {} }, withProviderRouting: (client: unknown) => client,
   })
@@ -335,13 +336,15 @@ test('legacy Pod bootstrap inherits the optional turn policy and refreshes it wi
 function fallbackConfig(role: Settings.LlmRole = 'brain', fallbackPolicy: 'disabled' | 'env_after_chain' = 'env_after_chain') {
   const slot = role === 'image' || role === 'audio' ? role : 'text'
   const protocol = role === 'image' ? 'images' : role === 'audio' ? 'chat' : 'responses'
+  const first = role === 'image' ? 'gpt-image-a' : 'gateway-a'
+  const second = role === 'image' ? 'gpt-image-b' : 'gateway-b'
   return { version: 1 as const,
     routes: [{ id: 'gateway', kind: 'gateway' as const, platform: 'openai' as const, protocol },
       { id: 'backup', kind: 'direct' as const, env: slot, protocol },
       { id: 'backup-alias', kind: 'direct' as const, env: slot, protocol }],
-    models: [{ model: 'gateway-a', route: 'gateway' }, { model: 'gateway-b', route: 'gateway' }],
-    roles: [{ role, models: ['gateway-a', 'gateway-b'], fallbackPolicy,
-      directTargets: [{ model: 'gateway-b', route: 'backup' }, { model: 'gateway-b', route: 'backup-alias' }] }],
+    models: [{ model: first, route: 'gateway' }, { model: second, route: 'gateway' }],
+    roles: [{ role, models: [first, second], fallbackPolicy,
+      directTargets: [{ model: second, route: 'backup' }, { model: second, route: 'backup-alias' }] }],
   }
 }
 
@@ -580,4 +583,21 @@ test('model provenance includes default models and inherited support env without
   await explicit.settings.loadServerSettings()
   assert.equal(explicit.settings.getServerSettingsSnapshot().sources.image_model, 'env')
   assert.equal(explicit.settings.getServerSettingsSnapshot().sources.agent_reasoning_effort, 'env')
+})
+
+test('auxiliary stream timeout survives bootstrap and read-only Pod refresh', async () => {
+  const key = 'compaction_stream_timeout_ms'
+  const main = fixture()
+  main.setRows([{ key: '__settings_revision', value: '18' }, { key, value: '45000' }])
+  const config = await main.settings.createManagedPodBootstrap('agent-a', 'company-a', value => value)
+  assert.equal(config.defaults[key], '30000')
+  assert.equal(config.policy.settings[key], '45000')
+  const pod = fixture(config)
+  pod.fail()
+  await pod.settings.initializeManagedPodSettings()
+  assert.equal(pod.settings.getServerSettingsSnapshot().settings[key], '45000')
+  pod.fail(false)
+  pod.setRows([{ key: '__settings_revision', value: '19' }, { key, value: '60000' }])
+  await pod.settings.loadServerSettings()
+  assert.equal(pod.settings.getServerSettingsSnapshot().settings[key], '60000')
 })
