@@ -150,15 +150,9 @@
     },
     "publish": [
       {
-        "provider": "generic",
-        "url": "https://updates.cumora.ai",
-        "channel": "latest",
-        "useMultipleRangeRequest": false
-      },
-      {
         "provider": "github",
-        "owner": "yetone",
-        "repo": "cumora-releases",
+        "owner": "guanwenpeng2001-bot",
+        "repo": "cumora",
         "releaseType": "release",
         "publishAutoUpdate": true
       }
