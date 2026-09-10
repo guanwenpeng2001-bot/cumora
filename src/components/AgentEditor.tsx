@@ -461,7 +461,11 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
           >×</button>
         </div>
 
-        <fieldset disabled={!canWrite || busy || !!progress || contextChanged || generatingAvatar} className="px-6 py-5 space-y-4 overflow-y-auto flex-1 min-h-0 min-w-0">
+        {/* Chromium does not reliably clip/scroll a flex-shrunk fieldset's anonymous
+            content box. Let a regular flex item own scrolling; keep the fieldset
+            at its intrinsic height so native disabled semantics still apply. */}
+        <div className="overflow-y-auto flex-1 min-h-0 min-w-0">
+        <fieldset disabled={!canWrite || busy || !!progress || contextChanged || generatingAvatar} className="px-6 py-5 space-y-4 min-w-0">
           <Field label={t('agent.nameLabel')} hint={t('agent.nameHint')}>
             <Input
               type="text"
@@ -837,6 +841,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
           </Field>
 
         </fieldset>
+        </div>
 
         {!contextChanged && <ResourceApplication agentId={savedAgentId ?? save.current?.agentId ?? agent?.id ?? null} refresh={resourceRefresh} saving={busy} />}
         {!canWrite && <div role="status" className="px-6 py-2 text-[12px]">{translate(locale, 'settings.readOnlyEditingAgentsAndBindingsRequiresCompanyOwner')}</div>}
