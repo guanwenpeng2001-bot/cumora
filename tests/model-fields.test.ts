@@ -21,8 +21,10 @@ function harness(initialSlots: unknown[] = [], mocks: Record<string, unknown> = 
     useRef: (current: unknown) => ({ current }),
     useId: () => 'model-picker',
     useMemo: (compute: () => unknown) => compute(),
+    useCallback: (callback: unknown) => callback,
     useEffect: () => {},
     useLayoutEffect: () => {},
+    memo: (component: unknown) => component,
   }
   const require = createRequire(import.meta.url)
   const cache = new Map<string, Record<string, any>>()
@@ -40,6 +42,15 @@ function harness(initialSlots: unknown[] = [], mocks: Record<string, unknown> = 
         if (id in mocks) return mocks[id]
         if (id === 'react') return react
         if (id === 'react-dom') return { createPortal: (child: unknown) => child }
+        if (id === 'react-virtuoso') return {
+          Virtuoso: ({ data = [], itemContent }: { data?: unknown[]; itemContent: (i: number, item: unknown) => unknown }) =>
+            data.map((item, i) => itemContent(i, item)),
+          TableVirtuoso: ({ data = [], itemContent, fixedHeaderContent }: {
+            data?: unknown[]
+            itemContent: (i: number, item: unknown) => unknown
+            fixedHeaderContent?: () => unknown
+          }) => [fixedHeaderContent?.(), data.map((item, i) => itemContent(i, item))],
+        }
         if (id === '@/lib/i18n') return { useT: () => (key: string) => key,
           translate: (_locale: string, key: string) => key,
           useLocaleStore: (select: (s: unknown) => unknown) => select({ locale: 'en' }) }
@@ -59,7 +70,10 @@ function harness(initialSlots: unknown[] = [], mocks: Record<string, unknown> = 
 function elements(node: any): any[] {
   if (!node || typeof node !== 'object') return []
   if (Array.isArray(node)) return node.flatMap(elements)
-  return [node, ...elements(node.props?.children)]
+  const fromVirtuoso = typeof node.props?.itemContent === 'function' && Array.isArray(node.props?.data)
+    ? node.props.data.map((row: unknown, i: number) => node.props.itemContent(i, row))
+    : []
+  return [node, ...elements(node.props?.children), ...elements(fromVirtuoso)]
 }
 const catalog = {
   text: ['kimi-k3', 'deepseek-chat', 'gpt-5', 'grok-4', 'claude-sonnet-4-6', 'glm-4.6', 'local-only'],
@@ -145,6 +159,66 @@ test('empty or failed catalog allows committing an arbitrary model and shows pla
   assert.match(arrayText, /Gemini/)
 })
 
+test('catalog status renders a responsive card grid with success color, gray failures, and diagnostics', () => {
+  const h = harness()
+  const { CatalogStatus } = h.load('src/components/ModelFields.tsx')
+  const entries: Array<[string, { status: string; stale?: boolean; models?: string[]; diagnostic?: string }]> = [
+    ['openai', { status: 'success', models: ['gpt-5', 'gpt-image'] }],
+    ['kimi', { status: 'timeout', diagnostic: 'gateway-timeout' }],
+    ['deepseek', { status: 'success', models: ['deepseek-chat'] }],
+    ['grok', { status: 'unavailable', stale: true, diagnostic: 'network-error' }],
+    ['anthropic', { status: 'ready', models: ['claude-sonnet-4-6'] }],
+    ['gemini', { status: 'empty' }],
+    ['zhipu', { status: 'success', models: ['glm-4.6'] }],
+    ['minimax', { status: 'no-key' }],
+    ['dashscope', { status: 'unauthorized', diagnostic: 'http-error' }],
+    ['novita', { status: 'failed', diagnostic: 'upstream' }],
+  ]
+  const props = {
+    catalog: { platforms: Object.fromEntries(entries) },
+    error: null,
+    loading: false,
+    refresh() {},
+  }
+  const render = () => h.render(CatalogStatus, props)
+  const cardsOf = (tree: any) => elements(tree).filter((e) => e.type === 'button' && e.props?.['aria-expanded'] !== undefined)
+  const dotOf = (card: any) => elements(card).find((e) => String(e.props?.className ?? '').includes('rounded-full'))
+  let tree = render()
+  const grid = elements(tree).find((e) => String(e.props?.className ?? '').includes('grid-cols-2'))
+  assert.ok(grid)
+  assert.match(String(grid.props.className), /md:grid-cols-4/)
+  assert.match(String(grid.props.className), /xl:grid-cols-5/)
+  assert.match(String(grid.props.style?.gridTemplateColumns ?? ''), /minmax/)
+  assert.equal(grid.props['aria-label'], 'settings.catalogPlatforms')
+
+  const cards = cardsOf(tree)
+  assert.equal(cards.length, 10)
+  assert.deepEqual(cards.map((c) => c.key), entries.map(([id]) => id))
+  for (const [platform, entry] of entries) {
+    const card = cards.find((c) => c.key === platform)
+    assert.ok(card, platform)
+    const ok = entry.status === 'success' || entry.status === 'ready'
+    assert.match(String(card.props.className), ok ? /bg-paper/ : /bg-cloud/)
+    assert.match(String(dotOf(card)?.props?.className ?? ''), ok ? /bg-avail/ : /bg-ink-300/)
+    assert.match(String(card.props.title), /catalogModelCount/)
+    if (entry.diagnostic) assert.match(String(card.props.title), new RegExp(entry.diagnostic))
+  }
+
+  const grok = cards.find((c) => String(c.props['aria-label']).includes('Grok'))
+  assert.ok(grok)
+  assert.equal(grok.props['aria-expanded'], false)
+  grok.props.onClick()
+  tree = render()
+  const grokOpen = cardsOf(tree).find((c) => String(c.props['aria-label']).includes('Grok'))
+  assert.equal(grokOpen?.props['aria-expanded'], true)
+  const panel = JSON.stringify(tree)
+  assert.match(panel, /Grok/)
+  assert.match(panel, /catalogUnavailable/)
+  assert.match(panel, /catalogModelCount/)
+  assert.match(panel, /catalogStale/)
+  assert.match(panel, /network-error/)
+})
+
 test('ModelsTab wires all six roles to the full catalog and keeps embedding without fallback', () => {
   const settings = {
     brain_model: 'kimi-k3', brain_fallback_models: 'old-brain',
@@ -161,12 +235,13 @@ test('ModelsTab wires all six roles to the full catalog and keeps embedding with
   })
   const store = h.load('src/stores/modelCatalog.ts')
   store.useModelCatalog = () => ({ catalog, error: null, loading: false, refresh() {} })
-  const { ModelsTab } = h.load('src/desktop/ModelsTab.tsx')
+  const { ModelsTab, ModelsRoleCard } = h.load('src/desktop/ModelsTab.tsx')
   const page = h.render(ModelsTab, {})
   const tree = h.render(page.type, page.props)
   const { ModelInput, FallbackChainEditor } = h.load('src/components/ModelFields.tsx')
-  const primaries = elements(tree).filter((e) => e.type === ModelInput)
-  const fallbacks = elements(tree).filter((e) => e.type === FallbackChainEditor)
+  const expanded = elements(tree).filter((e) => e.type === ModelsRoleCard).flatMap((card) => elements(h.render(card.type, card.props)))
+  const primaries = expanded.filter((e) => e.type === ModelInput)
+  const fallbacks = expanded.filter((e) => e.type === FallbackChainEditor)
   assert.equal(primaries.length, 6)
   assert.equal(fallbacks.length, 5)
   for (const primary of primaries) {
@@ -195,7 +270,7 @@ function sourceFunction(file: string, name: string, scope: Record<string, unknow
   visit(ast)
   assert.ok(expression, name)
   const code = ts.transpileModule(`result = (${expression})`, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText
-  const context = { ...scope, result: undefined }
+  const context = { ...scope, result: undefined, Error }
   vm.runInNewContext(code, context)
   return context.result as unknown as (...args: any[]) => any
 }
@@ -247,6 +322,17 @@ test('desktop and mobile editor close refresh a partially created agent, even if
     onKey({ key: 'Escape', defaultPrevented: false })
     assert.deepEqual(calls, file.includes('desktop') ? ['close', 'participants', 'conversations', 'roster'] : ['close', 'participants', 'conversations'])
   }
+})
+
+test('portrait error maps gateway no-accounts copy without HTTP wrapping', () => {
+  const format = sourceFunction('src/components/AgentEditor.tsx', 'formatAvatarError', {}) as (
+    error: unknown, t: (key: string) => string,
+  ) => string
+  const t = (key: string) => key === 'agent.avatarGatewayNoAccounts' ? 'mapped-copy' : key
+  assert.equal(format(new Error('No available compatible accounts (503)'), t), 'mapped-copy')
+  assert.equal(format(new Error("The current image model's gateway group has no available accounts. Change the image model in settings or configure a direct connection. (409)"), t), 'mapped-copy')
+  assert.equal(format(new Error('当前图像模型所在网关组没有可用账号,请在模型设置更换图像模型或配置直连 (409)'), t), 'mapped-copy')
+  assert.equal(format(new Error('storage failed (502)'), t), 'storage failed (502)')
 })
 
 test('portrait waits for all staged writes; failed save never generates; retry skips committed stages', async () => {
@@ -342,4 +428,102 @@ test('usage requests summary, trend, logs and only the selected breakdown on ini
       assert.deepEqual(calls.sort(), ['Summary', 'Trend', 'Logs', `By${dim[0].toUpperCase()}${dim.slice(1)}`].sort())
     }
   }
+})
+
+test('catalog options are grouped by platform when the menu opens', () => {
+  const h = harness()
+  const { ModelInput } = h.load('src/components/ModelFields.tsx')
+  const picker = h.render(ModelInput, { value: 'kimi-k3', options: [], catalog, listId: 'brain', onChange() {} })
+  const render = () => h.render(picker.type, picker.props)
+  elements(render()).find((e) => e.props?.role === 'combobox').props.onFocus()
+  const groups = elements(render()).filter((e) => e.props?.['data-combobox-group'])
+  const names = groups.map((e) => e.props['data-combobox-group'])
+  for (const name of ['Kimi', 'DeepSeek', 'OpenAI', 'Grok', 'Anthropic', 'Zhipu']) {
+    assert.ok(names.includes(name), name)
+  }
+})
+
+test('catalogIndex is cached on catalog identity and catalogSource uses the index', () => {
+  const h = harness()
+  const { catalogIndex, catalogSource } = h.load('src/stores/modelCatalog.ts')
+  const first = catalogIndex(catalog)
+  const second = catalogIndex(catalog)
+  assert.equal(first, second)
+  assert.match(catalogSource(catalog, 'gpt-5'), /OpenAI/)
+  assert.equal(catalogSource(catalog, 'retired-x'), 'configured / history')
+})
+
+test('ModelsTab only loads the catalog for admins', () => {
+  const source = readFileSync(new URL('../src/desktop/ModelsTab.tsx', import.meta.url), 'utf8')
+  assert.match(source, /useModelCatalog\(isAdmin\)/)
+  const skills = readFileSync(new URL('../src/desktop/SkillsTab.tsx', import.meta.url), 'utf8')
+  assert.equal(skills.includes('getModelSettings()'), false)
+  const runtime = readFileSync(new URL('../src/desktop/RuntimeSettingsPanel.tsx', import.meta.url), 'utf8')
+  assert.doesNotMatch(runtime, /<details key=\{domain\} open/)
+  assert.match(runtime, /opened\[domain\]/)
+})
+
+test('model catalog store coalesces in-flight fetches', async () => {
+  let calls = 0
+  const authState = { user: { id: 'u', isAdmin: true }, contextEpoch: 1, activeCompanyId: 'company', token: 't' }
+  const useAuth = Object.assign((select: (s: unknown) => unknown) => select(authState), { getState: () => authState })
+  const h = harness([], {
+    '@/stores/auth': { useAuth },
+    '@/api/client': {
+      api: {
+        getAvailableModels: async () => {
+          calls++
+          await new Promise((r) => setTimeout(r, 20))
+          return catalog
+        },
+      },
+    },
+  })
+  const store = h.load('src/stores/modelCatalog.ts')
+  await Promise.all([
+    store.useModelCatalogStore.getState().ensure('["1","u","company"]'),
+    store.useModelCatalogStore.getState().ensure('["1","u","company"]'),
+  ])
+  assert.equal(calls, 1)
+  assert.ok(store.useModelCatalogStore.getState().catalog)
+})
+
+test('downsampleTrend keeps endpoints and stays within the width budget', () => {
+  const h = harness()
+  const { downsampleTrend } = h.load('src/desktop/UsageDashboard.tsx')
+  const points = Array.from({ length: 2208 }, (_, i) => ({ i }))
+  const sampled = downsampleTrend(points, 240)
+  assert.ok(sampled.length <= 240)
+  assert.equal(sampled[0]?.i, 0)
+  assert.equal(sampled.at(-1)?.i, 2207)
+  assert.deepEqual(downsampleTrend(points.slice(0, 10), 240), points.slice(0, 10))
+})
+
+test('computers refresh coalesces in-flight and keeps byId when unchanged', async () => {
+  let calls = 0
+  const list = [{
+    id: 'c1', name: 'box', kind: 'local', status: 'online', available_engines: [],
+    company_id: 'co', owner_user_id: null, last_seen_at: null, paired_at: null,
+  }]
+  const authState = { contextEpoch: 1, token: 't', activeCompanyId: 'co' }
+  const h = harness([], {
+    '@/stores/auth': {
+      useAuth: Object.assign((select: (s: unknown) => unknown) => select(authState), { getState: () => authState }),
+      commitIfContextCurrent: async (request: () => Promise<unknown>, commit: (v: unknown) => void) => {
+        commit(await request())
+        return true
+      },
+    },
+    '@/api/client': {
+      api: { getComputers: async () => { calls++; return list } },
+      ws: { connect() {}, on() {} },
+    },
+  })
+  const { useComputers } = h.load('src/stores/computers.ts')
+  await Promise.all([useComputers.getState().refresh(), useComputers.getState().refresh()])
+  assert.equal(calls, 1)
+  const byId = useComputers.getState().byId
+  await useComputers.getState().refresh()
+  assert.equal(calls, 2)
+  assert.equal(useComputers.getState().byId, byId)
 })
