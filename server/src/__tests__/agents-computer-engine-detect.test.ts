@@ -248,3 +248,19 @@ test('assignAgentToComputer persists model pins in the host assignment update', 
     'comp-1', 'codex', false, 'gpt-5.6-sol', null, 'bram', 'co-1',
   ])
 })
+
+
+test('assignAgentToComputer rejects existing MCP names that collide in Codex', async () => {
+  const calls = installPoolMock(({ sql }) => {
+    if (/SELECT kind, available_engines/.test(sql)) return { rows: [{ kind: 'local', available_engines: ['codex'] }] }
+    if (/SELECT c.\* FROM mcp_connectors/.test(sql)) return { rows: ['a-b', 'a_b'].map((name, i) => ({
+      id: String(i), company_id: 'co-1', name, type: 'stdio', command: 'node', args: [], env: {}, headers: {},
+      url: null, enabled: true, created_at: '2026-01-01',
+    })) }
+    return { rows: [] }
+  })
+  await assert.rejects(registry.assignAgentToComputer({
+    agentId: 'bram', companyId: 'co-1', computerId: 'comp-1', engine: 'codex', inherit: false,
+  }), { status: 409 })
+  assert.equal(calls.some(call => /UPDATE participants/.test(call.sql)), false)
+})

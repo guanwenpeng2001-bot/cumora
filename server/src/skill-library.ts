@@ -14,7 +14,7 @@
  * agents receive them in the daemon's seedHome payload
  * (/api/computers/me/agents → EnginePersona.skills).
  */
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { readdir, readFile, stat, realpath, lstat } from 'node:fs/promises'
 import { join, relative, isAbsolute } from 'node:path'
 import { pool } from './db/pool.js'
@@ -399,6 +399,9 @@ export async function setAgentSkills(companyId: string, agentId: string, skillId
   // The next runtime boundary reads the committed binding state.
 }
 
+const appliedResourceSnapshots = new Map<string, { version: string; workspace: string }>()
+const skillBodyDigest = (body: string) => createHash('md5').update(body).digest('hex')
+
 export async function applyPendingAgentResources(agentId: string, version?: string): Promise<import('./agents/runtime/client.js').ResourceApplicationResult> {
   const { loadAgentResources, reportAgentResources } = await import('./agents/computer/registry.js')
   const { invalidatePersonaCache } = await import('./agents/personas.js')
@@ -408,26 +411,44 @@ export async function applyPendingAgentResources(agentId: string, version?: stri
     await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ')
     // Shared across replicas, and uses the same agent row lock as binding writes.
     await client.query(`SELECT id FROM participants WHERE id = $1 AND kind = 'agent' AND departed_at IS NULL FOR UPDATE`, [agentId])
-    snapshot = await loadAgentResources(agentId, undefined, client)
+    snapshot = await loadAgentResources(agentId, undefined, client, true)
     if (!snapshot) throw new ResourceError(404, 'agent not found')
     if (version && version !== snapshot.resourceVersion) throw new ResourceError(409, 'resource version changed')
     if (snapshot.computerKind && snapshot.computerKind !== 'cloud') throw new ResourceError(409, 'resources are applied by the computer')
+    const { rows } = await client.query<{ path: string; digest: string; managed: boolean }>(
+      `SELECT path, md5(body) AS digest, (meta->>'cumoraLibrarySkill' = 'true') AS managed FROM agent_workspace
+        WHERE agent_id = $1 AND company_id = $2 AND path LIKE 'skills/%' ORDER BY path FOR UPDATE`, [agentId, snapshot.companyId],
+    )
+    const cacheKey = JSON.stringify([snapshot.companyId, agentId, snapshot.assignmentId])
+    rows.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0)
+    const workspace = JSON.stringify(rows)
+    const applied = appliedResourceSnapshots.get(cacheKey)
+    const result = { version: snapshot.resourceVersion, status: 'applied' as const }
+    if (applied?.version === snapshot.resourceVersion && applied.workspace === workspace) {
+      await client.query('COMMIT')
+      return result
+    }
     const skills = snapshot.skills ?? []
     for (const skill of skills) validateLibraryManifest(skill)
     const desired = new Map<string, string>(skills.flatMap(skill => skill.files.map(file => [`skills/${skill.name}/${file.path}`, file.body] as const)))
-    const { rows } = await client.query<{ path: string; body: string; managed: boolean }>(
-      `SELECT path, body, (meta->>'cumoraLibrarySkill' = 'true') AS managed FROM agent_workspace
-        WHERE agent_id = $1 AND company_id = $2 AND path LIKE 'skills/%' FOR UPDATE`, [agentId, snapshot.companyId],
-    )
+    const existing = new Map(rows.map(row => [row.path, row]))
+    let changed = false
     for (const row of rows) {
-      if (!row.managed && desired.has(row.path) && desired.get(row.path) !== row.body) {
+      if (!row.managed && desired.has(row.path) && skillBodyDigest(desired.get(row.path)!) !== row.digest) {
         throw new ResourceError(409, 'resource conflicts with an unowned workspace file')
       }
       if (row.managed && !desired.has(row.path)) {
+        changed = true
+        existing.delete(row.path)
         await client.query(`DELETE FROM agent_workspace WHERE agent_id = $1 AND company_id = $2 AND path = $3`, [agentId, snapshot.companyId, row.path])
       }
     }
     for (const [path, body] of desired) {
+      const digest = skillBodyDigest(body)
+      // Identical unowned files remain unowned, including after unbinding.
+      if (existing.get(path)?.digest === digest) continue
+      changed = true
+      existing.set(path, { path, digest, managed: true })
       await client.query(
         `INSERT INTO agent_workspace (agent_id, path, body, meta, company_id, updated_at)
          VALUES ($1, $2, $3, '{"cumoraLibrarySkill":true}'::jsonb, $4, NOW())
@@ -437,11 +458,14 @@ export async function applyPendingAgentResources(agentId: string, version?: stri
       )
     }
     await client.query('COMMIT')
-    invalidatePersonaCache(agentId)
-    const result = { version: snapshot.resourceVersion, status: 'applied' as const }
+    if (changed) invalidatePersonaCache(agentId)
     await reportAgentResources(snapshot, result)
+    if (appliedResourceSnapshots.size >= 256) appliedResourceSnapshots.delete(appliedResourceSnapshots.keys().next().value!)
+    appliedResourceSnapshots.set(cacheKey, { version: snapshot.resourceVersion,
+      workspace: JSON.stringify([...existing.values()].sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0)) })
     return result
   } catch {
+    if (snapshot) appliedResourceSnapshots.delete(JSON.stringify([snapshot.companyId, agentId, snapshot.assignmentId]))
     await client.query('ROLLBACK').catch(() => {})
     const result = { version: version ?? snapshot?.resourceVersion ?? '', status: 'failed' as const, error: 'resource_application_failed' }
     if (snapshot) await reportAgentResources(snapshot, result).catch(() => {})

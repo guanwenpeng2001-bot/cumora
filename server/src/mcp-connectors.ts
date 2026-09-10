@@ -103,23 +103,47 @@ export async function upsertConnector(companyId: string, input: {
   const error = validateConnector(input)
   if (error) throw new ResourceError(400, error)
   const id = input.id ?? `mcp-${randomUUID()}`
-  const { rows } = await pool.query<DbRow>(
-    `INSERT INTO mcp_connectors (id, company_id, name, type, command, args, env, url, headers, enabled)
-     VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8, $9::jsonb, $10)
-     ON CONFLICT (id) DO UPDATE SET
-       name = EXCLUDED.name, type = EXCLUDED.type, command = EXCLUDED.command,
-       args = EXCLUDED.args, env = EXCLUDED.env, url = EXCLUDED.url,
-       headers = EXCLUDED.headers, enabled = EXCLUDED.enabled
-     WHERE mcp_connectors.company_id = EXCLUDED.company_id
-     RETURNING *`,
-    [id, companyId, input.name, input.type, input.command ?? null,
-     JSON.stringify(input.args ?? []), JSON.stringify(input.env ?? {}),
-     input.url ?? null, JSON.stringify(input.headers ?? {}), input.enabled ?? true],
-  )
-  if (!rows[0]) throw new ResourceError(404, 'connector not found')
-  const { invalidatePersonaCache } = await import('./agents/personas.js')
-  invalidatePersonaCache()
-  return toRow(rows[0])
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    await client.query('LOCK TABLE mcp_connectors IN SHARE ROW EXCLUSIVE MODE')
+    if (input.enabled !== false) {
+      const bound = await client.query<{ agent_id: string; name: string | null }>(
+        `SELECT p.id AS agent_id, c.name FROM participants p
+          LEFT JOIN agent_mcp_connectors a ON a.agent_id = p.id AND a.connector_id <> $2
+          LEFT JOIN mcp_connectors c ON c.id = a.connector_id AND c.company_id = p.company_id AND c.enabled
+         WHERE p.company_id = $1 AND p.engine = 'codex'
+           AND p.id IN (SELECT agent_id FROM agent_mcp_connectors WHERE connector_id = $2)`, [companyId, id])
+      const groups = new Map<string, { name: string }[]>()
+      for (const row of bound.rows) {
+        const names = groups.get(row.agent_id) ?? []
+        if (row.name) names.push({ name: row.name })
+        groups.set(row.agent_id, names)
+      }
+      for (const names of groups.values()) assertCodexConnectorNames([...names, { name: input.name }])
+    }
+    const { rows } = await client.query<DbRow>(
+      `INSERT INTO mcp_connectors (id, company_id, name, type, command, args, env, url, headers, enabled)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8, $9::jsonb, $10)
+       ON CONFLICT (id) DO UPDATE SET
+         name = EXCLUDED.name, type = EXCLUDED.type, command = EXCLUDED.command,
+         args = EXCLUDED.args, env = EXCLUDED.env, url = EXCLUDED.url,
+         headers = EXCLUDED.headers, enabled = EXCLUDED.enabled
+       WHERE mcp_connectors.company_id = EXCLUDED.company_id
+       RETURNING *`,
+      [id, companyId, input.name, input.type, input.command ?? null,
+       JSON.stringify(input.args ?? []), JSON.stringify(input.env ?? {}),
+       input.url ?? null, JSON.stringify(input.headers ?? {}), input.enabled ?? true],
+    )
+    if (!rows[0]) throw new ResourceError(404, 'connector not found')
+    await client.query('COMMIT')
+    const { invalidatePersonaCache } = await import('./agents/personas.js')
+    invalidatePersonaCache()
+    return toRow(rows[0])
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw e
+  } finally { client.release() }
 }
 
 export async function deleteConnector(companyId: string, id: string): Promise<boolean> {
@@ -162,11 +186,14 @@ export async function setAgentConnectors(companyId: string, agentId: string, con
   const client = await pool.connect()
   try {
     await client.query('BEGIN')
+    await client.query('LOCK TABLE mcp_connectors IN SHARE ROW EXCLUSIVE MODE')
     await requireResourceAgent(client, companyId, agentId)
     if (!Array.isArray(connectorIds) || connectorIds.some((id) => typeof id !== 'string' || !id)) throw new ResourceError(400, 'invalid connectorIds')
     const ids = [...new Set(connectorIds)]
-    const resources = await client.query(`SELECT id FROM mcp_connectors WHERE company_id = $1 AND id = ANY($2::text[]) AND enabled FOR SHARE`, [companyId, ids])
+    const resources = await client.query(`SELECT id, name FROM mcp_connectors WHERE company_id = $1 AND id = ANY($2::text[]) AND enabled FOR SHARE`, [companyId, ids])
     if (resources.rows.length !== ids.length) throw new ResourceError(400, 'connector not found in company')
+    const agent = await client.query<{ engine: string }>('SELECT engine FROM participants WHERE id = $1 AND company_id = $2', [agentId, companyId])
+    if (agent.rows[0]?.engine === 'codex') assertCodexConnectorNames(resources.rows)
     await client.query(
       `DELETE FROM agent_mcp_connectors a
         USING mcp_connectors c
@@ -209,9 +236,14 @@ export async function enabledConnectorsForAgent(agentId: string): Promise<McpCon
  *  The generators live in agents/computer/engine.ts (the daemon bundle
  *  stays pg-free); these adapt registry rows to the engine-side spec. */
 import {
-  buildEngineMcpServers, mergeEngineSecureMcpConfig, buildEngineCodexMcpArgs,
+  buildEngineMcpServers, mergeEngineSecureMcpConfig, buildEngineCodexMcpArgs, buildEngineCodexMcpInjection,
   type EngineMcpConnector,
 } from './agents/computer/engine.js'
+
+export function assertCodexConnectorNames(connectors: { name: string }[]): void {
+  const result = buildEngineCodexMcpInjection(connectors.map(c => ({ name: c.name, type: 'stdio' })))
+  if (result.failures.length) throw new ResourceError(409, 'MCP connector names conflict with Codex normalized names or the built-in cumora server')
+}
 
 function toEngineSpec(c: McpConnectorRow): EngineMcpConnector {
   return {

@@ -17,14 +17,14 @@ test('T5 isolated PostgreSQL: tenant binding, rollback, delivery and summaries',
   await db.connect()
   t.after(async () => { await db.end() })
   await db.query([
-    "CREATE TEMP TABLE participants (id text PRIMARY KEY, company_id text, kind text, departed_at timestamptz, computer_id text);",
+    "CREATE TEMP TABLE participants (id text PRIMARY KEY, company_id text, kind text, departed_at timestamptz, computer_id text, engine text);",
     "CREATE TEMP TABLE computers (id text PRIMARY KEY, kind text);",
     "CREATE TEMP TABLE skills (id text PRIMARY KEY, company_id text, name text, description text, source text, hub_id text, files jsonb DEFAULT '[]', created_at timestamptz DEFAULT now());",
     "CREATE TEMP TABLE mcp_connectors (id text PRIMARY KEY, company_id text, name text, type text, command text, args jsonb DEFAULT '[]', env jsonb DEFAULT '{}', url text, headers jsonb DEFAULT '{}', enabled boolean DEFAULT true, created_at timestamptz DEFAULT now());",
     "CREATE TEMP TABLE agent_skills (agent_id text REFERENCES participants(id), skill_id text REFERENCES skills(id), PRIMARY KEY(agent_id, skill_id));",
     "CREATE TEMP TABLE agent_mcp_connectors (agent_id text REFERENCES participants(id), connector_id text REFERENCES mcp_connectors(id), PRIMARY KEY(agent_id, connector_id));",
     "INSERT INTO computers VALUES ('local', 'local');",
-    "INSERT INTO participants VALUES ('a', 'c1', 'agent', NULL, 'local'), ('b', 'c2', 'agent', NULL, 'local'), ('human', 'c1', 'human', NULL, NULL), ('departed', 'c1', 'agent', now(), 'local');",
+    "INSERT INTO participants VALUES ('a', 'c1', 'agent', NULL, 'local', 'claude'), ('b', 'c2', 'agent', NULL, 'local', 'claude'), ('human', 'c1', 'human', NULL, NULL, NULL), ('departed', 'c1', 'agent', now(), 'local', 'claude');",
     "INSERT INTO skills (id, company_id, name, description, source) VALUES ('s1', 'c1', 'one', 'fixture', 'paste'), ('s2', 'c2', 'two', 'fixture', 'paste');",
     "INSERT INTO mcp_connectors (id, company_id, name, type, command, args, env, url, headers, enabled) VALUES ('m1', 'c1', 'one', 'stdio', 'command-secret', '[\"arg-secret\"]', '{\"TOKEN\":\"env-secret\"}', 'https://url-secret', '{\"Authorization\":\"header-secret\"}', true), ('m2', 'c2', 'two', 'http', NULL, '[]', '{}', 'https://tenant-two-secret', '{}', true), ('off', 'c1', 'off', 'stdio', 'node', '[]', '{}', NULL, '{}', false);",
     "INSERT INTO agent_skills VALUES ('a', 's1');",
@@ -99,7 +99,7 @@ test('T5 isolated PostgreSQL: tenant binding, rollback, delivery and summaries',
   })
 
   await t.test('device delivery SQL filters resource and computer ownership and revoked devices', async () => {
-    await db.query("ALTER TABLE participants ADD name text, ADD role text, ADD system_prompt text, ADD engine text, ADD model text, ADD fast_model text")
+    await db.query("ALTER TABLE participants ADD name text, ADD role text, ADD system_prompt text, ADD model text, ADD fast_model text")
     await db.query("ALTER TABLE computers ADD company_id text, ADD revoked_at timestamptz, ADD available_engines jsonb DEFAULT '[]', ADD detected_engines jsonb DEFAULT '[]'")
     await db.query("UPDATE computers SET company_id = 'c1'")
     const source = readFileSync(new URL('../agents/computer/registry.ts', import.meta.url), 'utf8')

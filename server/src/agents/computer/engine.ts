@@ -495,13 +495,25 @@ function mcpTomlEscape(v: string): string {
 /** Codex 0.153.4 accepts http_headers in its streamable-HTTP config.
  *  Bound operator tools use the same approval mode as the cumora bridge;
  *  the server itself stays optional so connection failure cannot block a turn. */
+export interface CodexMcpInjectionResult {
+  args: string[]
+  failures: { name: string; error: 'mcp_name_conflict' | 'mcp_invalid_name' }[]
+}
+
 export function buildEngineCodexMcpArgs(connectors: EngineMcpConnector[]): string[] {
+  const result = buildEngineCodexMcpInjection(connectors)
+  if (result.failures.length) throw Object.assign(new Error('MCP connector names conflict or are invalid'), { failures: result.failures })
+  return result.args
+}
+
+export function buildEngineCodexMcpInjection(connectors: EngineMcpConnector[]): CodexMcpInjectionResult {
   const out: string[] = []
+  const failures: CodexMcpInjectionResult['failures'] = []
   const names = new Set(['cumora'])
   for (const c of connectors) {
     const key = c.name.replace(/-/g, '_')
     if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(c.name) || c.name.includes('__') || names.has(key)) {
-      console.warn(`[codex] MCP connector ${c.name} failed: invalid or conflicting server name`)
+      failures.push({ name: c.name, error: names.has(key) ? 'mcp_name_conflict' : 'mcp_invalid_name' })
       continue
     }
     names.add(key)
@@ -520,7 +532,7 @@ export function buildEngineCodexMcpArgs(connectors: EngineMcpConnector[]): strin
       out.push('-c', `mcp_servers.${key}={${parts.join(',')},default_tools_approval_mode="approve"}`)
     }
   }
-  return out
+  return { args: failures.length ? [] : out, failures }
 }
 
 /** Read the daemon-provided connector list from the engine env. */

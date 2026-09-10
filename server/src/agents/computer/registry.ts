@@ -1024,6 +1024,10 @@ export async function assignAgentToComputer(args: {
 }): Promise<{ kind: ComputerKind; engine: EngineId; inherit: boolean } | null> {
   const placement = await resolveComputerAssignment({ ...args, strictEngine: true })
   if (!placement) return null
+  if (placement.engine === 'codex') {
+    const { enabledConnectorsForAgent, assertCodexConnectorNames } = await import('../../mcp-connectors.js')
+    assertCodexConnectorNames(await enabledConnectorsForAgent(args.agentId))
+  }
 
   const sets = ['computer_id = $1', 'engine = $2', 'engine_inherit = $3']
   const params: unknown[] = [args.computerId, placement.engine, placement.inherit]
@@ -1156,25 +1160,41 @@ export interface AgentResourceSnapshot extends AgentResourcePayload {
   resourceVersion: string
 }
 
-export async function loadAgentResources(agentId: string, companyId?: string, db: Queryable = pool): Promise<AgentResourceSnapshot | null> {
-  const { rows } = await db.query<AgentResourceSnapshot>(
-    `SELECT p.id, p.company_id AS "companyId", p.computer_id AS "computerId",
+// Checked inside the caller's transaction; bounded to avoid retaining old payloads.
+const resourceSnapshots = new Map<string, { fingerprint: string; snapshot: AgentResourceSnapshot }>()
+
+export async function loadAgentResources(agentId: string, companyId?: string, db: Queryable = pool, reuseUnchanged = false): Promise<AgentResourceSnapshot | null> {
+  const sql = `SELECT p.id, p.company_id AS "companyId", p.computer_id AS "computerId",
             p.runtime_assignment_id AS "assignmentId", c.kind AS "computerKind",
             p.name, p.role, p.system_prompt AS "systemPrompt",
-            COALESCE((SELECT jsonb_agg(jsonb_build_object('name', s.name, 'description', s.description, 'files', s.files))
+            COALESCE((SELECT jsonb_agg(jsonb_build_object('name', s.name, 'description', s.description, 'files', s.files) ORDER BY s.id)
               FROM agent_skills a JOIN skills s ON s.id = a.skill_id
               WHERE a.agent_id = p.id AND s.company_id = p.company_id), '[]'::jsonb) AS skills,
             COALESCE((SELECT jsonb_agg(jsonb_build_object('name', m.name, 'type', m.type, 'command', m.command,
-              'args', m.args, 'env', m.env, 'url', m.url, 'headers', m.headers))
+              'args', m.args, 'env', m.env, 'url', m.url, 'headers', m.headers) ORDER BY m.id)
               FROM agent_mcp_connectors a JOIN mcp_connectors m ON m.id = a.connector_id
               WHERE a.agent_id = p.id AND m.company_id = p.company_id AND m.enabled), '[]'::jsonb) AS "mcpConnectors"
        FROM participants p LEFT JOIN computers c ON c.id = p.computer_id AND c.company_id = p.company_id
       WHERE p.id = $1 AND ($2::text IS NULL OR p.company_id = $2) AND p.kind = 'agent' AND p.departed_at IS NULL
-        AND (p.computer_id IS NULL OR (c.id IS NOT NULL AND c.revoked_at IS NULL))`,
-    [agentId, companyId ?? null],
-  )
+        AND (p.computer_id IS NULL OR (c.id IS NOT NULL AND c.revoked_at IS NULL))`
+  const params = [agentId, companyId ?? null]
+  const cacheKey = JSON.stringify(params)
+  let fingerprint: string | undefined
+  if (reuseUnchanged) {
+    const result = await db.query<{ fingerprint: string }>(`SELECT md5(row_to_json(resource)::text) AS fingerprint FROM (${sql}) resource`, params)
+    fingerprint = result.rows[0]?.fingerprint
+    if (!fingerprint) { resourceSnapshots.delete(cacheKey); return null }
+    const cached = resourceSnapshots.get(cacheKey)
+    if (cached?.fingerprint === fingerprint) return cached.snapshot
+  }
+  const { rows } = await db.query<AgentResourceSnapshot>(sql, params)
   const row = rows[0]
-  return row ? { ...row, resourceVersion: agentResourceVersion(row) } : null
+  const snapshot = row ? { ...row, resourceVersion: agentResourceVersion(row) } : null
+  if (fingerprint && snapshot) {
+    if (resourceSnapshots.size >= 256) resourceSnapshots.delete(resourceSnapshots.keys().next().value!)
+    resourceSnapshots.set(cacheKey, { fingerprint, snapshot })
+  }
+  return snapshot
 }
 
 function resourceStateKey(snapshot: AgentResourceSnapshot): string {

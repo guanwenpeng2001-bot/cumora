@@ -22,6 +22,7 @@ test('skills/MCP endpoint contracts: role redaction, errors and strict ID arrays
     if (sql.includes('company_members')) return { rows: [{ role }] }
     if (sql.includes('SELECT id FROM participants')) return { rows: params?.[0] === 'a' ? [{ id: 'a' }] : [] }
     if (sql.includes('FROM mcp_connectors')) return { rows: [connector] }
+    if (sql === 'LOCK TABLE mcp_connectors IN SHARE ROW EXCLUSIVE MODE') return { rows: [] }
     if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') return { rows: [] }
     writes++
     throw new Error('unexpected query')

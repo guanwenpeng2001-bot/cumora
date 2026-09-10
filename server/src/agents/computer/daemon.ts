@@ -50,7 +50,7 @@ import { SKYPE_EMOTICONS_GUIDE } from '../skype-emoticons.js'
 import { finalizeTriage, isRateLimited, parseTriage, triageDisposition, deferTriage, type InboxTriageVerdict } from '../triage-core.js'
 import { BYOA_SYNC_INTERVALS, ByoaPolicyController } from './runtime-policy.js'
 import { type ActionSurface, actionSurfaceFor, actionSurfaceText, calendarExampleText, postingMechanicsText } from './prompt-surface.js'
-import { allowUnsandboxedByoa, detectEnginesWithStatus, ENGINE_IDS, type DetectedEngineSnapshot, type EngineHopReport, type EngineId, type EngineRunResult, type EngineSession, type EngineUsage, enrichDetectedEngines, evaluateRunnableEngines, getAdapter, runEngineDoctor, type RunnableEngineEvaluation, snapshotDetectedEngines } from './engine.js'
+import { buildEngineCodexMcpInjection, allowUnsandboxedByoa, detectEnginesWithStatus, ENGINE_IDS, type DetectedEngineSnapshot, type EngineHopReport, type EngineId, type EngineRunResult, type EngineSession, type EngineUsage, enrichDetectedEngines, evaluateRunnableEngines, getAdapter, runEngineDoctor, type RunnableEngineEvaluation, snapshotDetectedEngines } from './engine.js'
 
 export { conversationHeader }
 
@@ -1902,8 +1902,11 @@ class AgentRunner {
 
   private resourceResult(agent: AgentInfo): ResourceApplicationResult {
     const unsupported = !!agent.mcpConnectors?.length && !['claude', 'codex'].includes(this.adapter.id)
-    return { version: agent.resourceVersion!, status: unsupported ? 'failed' : 'applied',
-      ...(unsupported ? { error: 'resource_application_failed' } : {}) }
+    const conflicts = this.adapter.id === 'codex'
+      ? buildEngineCodexMcpInjection(agent.mcpConnectors ?? []).failures.length > 0
+      : (agent.mcpConnectors ?? []).some(connector => connector.name === 'cumora')
+    return { version: agent.resourceVersion!, status: unsupported || conflicts ? 'failed' : 'applied',
+      ...(unsupported || conflicts ? { error: 'resource_application_failed' } : {}) }
   }
 
   private async reportResources(): Promise<void> {

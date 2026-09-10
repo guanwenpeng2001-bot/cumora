@@ -4,6 +4,11 @@
  *   node --import tsx --test server/src/__tests__/mcp-connectors.test.ts
  */
 import { test } from 'node:test'
+import { readFileSync } from 'node:fs'
+import ts from 'typescript'
+import { buildEngineCodexMcpInjection } from '../agents/computer/engine.js'
+import { pool } from '../db/pool.js'
+import { setAgentConnectors, upsertConnector } from '../mcp-connectors.js'
 import assert from 'node:assert/strict'
 import {
   validateConnector, buildClaudeMcpServers, buildClaudeMcpJson,
@@ -76,16 +81,16 @@ test('buildCodexMcpArgs: one -c pair per connector, dashes normalized, escaping'
   assert.match(esc[1] ?? '', /command="C:\\\\tools\\\\\\"x\\"\.exe"/)
 })
 
-test('Codex rejects normalized name collisions and preserves the built-in cumora bridge', (t) => {
-  const warnings: string[] = []
-  t.mock.method(console, 'warn', (line: string) => warnings.push(line))
-  const args = buildCodexMcpArgs([stdio, { ...http, name: 'fs_local' }, { ...http, name: 'cumora' }, http])
-  assert.equal(args.filter(arg => arg.startsWith('mcp_servers.fs_local=')).length, 1)
-  assert.equal(args.some(arg => arg.startsWith('mcp_servers.cumora=')), false)
-  assert.equal(args.some(arg => arg.startsWith('mcp_servers.remote_api=')), true)
-  assert.equal(warnings.length, 2)
-  assert.ok(warnings.every(line => line.includes('failed')))
-  assert.ok(warnings.every(line => !line.includes('Bearer t')))
+test('Codex rejects normalized collisions atomically with structured failures', () => {
+  const connectors = [stdio, { ...http, name: 'fs_local' }, { ...http, name: 'cumora' }, http]
+  const result = buildEngineCodexMcpInjection(connectors)
+  assert.deepEqual(result.args, [])
+  assert.deepEqual(result.failures, [
+    { name: 'fs_local', error: 'mcp_name_conflict' },
+    { name: 'cumora', error: 'mcp_name_conflict' },
+  ])
+  assert.throws(() => buildCodexMcpArgs(connectors), /names conflict/)
+  assert.ok(!JSON.stringify(result).includes('Bearer t'))
 })
 
 test('Codex headers preserve quoted names and control-character escaping in TOML', () => {
@@ -100,4 +105,41 @@ test('Codex TOML escapes DEL rather than emitting a forbidden literal character'
   const args = buildCodexMcpArgs([{ ...stdio, args: [String.fromCharCode(127)] }])
   assert.ok(args[1].includes(String.raw`args=["\u007f"]`))
   assert.equal(args[1].includes(String.fromCharCode(127)), false)
+})
+
+
+test('daemon reports failed for normalized and built-in conflicts', () => {
+  const source = readFileSync(new URL('../agents/computer/daemon.ts', import.meta.url), 'utf8')
+  const ast = ts.createSourceFile('daemon.ts', source, ts.ScriptTarget.Latest, true)
+  const cls = ast.statements.find(n => ts.isClassDeclaration(n) && n.name?.text === 'AgentRunner') as ts.ClassDeclaration
+  const method = cls.members.find(n => n.name?.getText(ast) === 'resourceResult')!.getText(ast)
+  const js = ts.transpile(`class Runner { ${method} }; return Runner`, { target: ts.ScriptTarget.ES2022 })
+  const Runner = new Function('buildEngineCodexMcpInjection', js)(buildEngineCodexMcpInjection)
+  const runner = new Runner()
+  runner.adapter = { id: 'codex' }
+  for (const mcpConnectors of [[stdio, { ...http, name: 'fs_local' }], [{ ...http, name: 'cumora' }]]) {
+    assert.equal(runner.resourceResult({ resourceVersion: 'v1', mcpConnectors }).status, 'failed')
+  }
+  assert.deepEqual(runner.resourceResult({ resourceVersion: 'v2', mcpConnectors: [stdio, http] }), { version: 'v2', status: 'applied' })
+  runner.adapter.id = 'claude'
+  assert.equal(runner.resourceResult({ resourceVersion: 'v3', mcpConnectors: [{ ...http, name: 'cumora' }] }).status, 'failed')
+})
+
+test('Codex binding and bound connector updates reject conflicts before mutation', async (t) => {
+  const sqls: string[] = []
+  let names = ['a-b', 'a_b']
+  const query = async (sql: string) => {
+    sqls.push(sql)
+    if (sql.includes('SELECT id, name FROM mcp_connectors')) return { rows: names.map((name, i) => ({ id: String(i), name })) }
+    if (sql.includes('SELECT engine')) return { rows: [{ engine: 'codex' }] }
+    if (sql.includes('SELECT p.id AS agent_id')) return { rows: [{ agent_id: 'a', name: 'a-b' }] }
+    if (sql.includes('SELECT id FROM participants')) return { rows: [{ id: 'a' }] }
+    return { rows: [] }
+  }
+  t.mock.method(pool, 'connect', async () => ({ query, release() {} }))
+  await assert.rejects(setAgentConnectors('c1', 'a', ['0', '1']), { status: 409 })
+  names = ['cumora']
+  await assert.rejects(setAgentConnectors('c1', 'a', ['0']), { status: 409 })
+  await assert.rejects(upsertConnector('c1', { id: 'm', name: 'a_b', type: 'stdio', command: 'node' }), { status: 409 })
+  assert.equal(sqls.filter(sql => /^\s*(INSERT|UPDATE|DELETE)/.test(sql)).length, 0)
 })
