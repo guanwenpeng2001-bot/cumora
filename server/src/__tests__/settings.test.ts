@@ -17,7 +17,7 @@ function deferred<T>() {
   return { promise, resolve }
 }
 
-function fixture(clock?: { now: number; ticks: Array<() => void> }) {
+function fixture(clock?: { now: number; ticks: Array<() => void> }, processEnv: Record<string, string> = {}) {
   let data = new Map<string, string>([['brain_model', 'old'], [REVISION, '0']])
   const statements: string[] = []
   let failKey = ''
@@ -85,7 +85,7 @@ function fixture(clock?: { now: number; ticks: Array<() => void> }) {
       if (name === './managed-pod-settings.js') return { getManagedPodSettings: () => null }
       throw new Error('unexpected dependency: ' + name)
     },
-    process: { env: {} }, console: { warn() {}, error() {} },
+    process: { env: { ...env, ...processEnv } }, console: { warn() {}, error() {} },
     Date: clock ? class extends Date { static now() { return clock.now } } : Date,
     setInterval: (tick: () => void) => { assert.ok(clock); clock.ticks.push(tick); return { unref() {}, tick } },
     clearInterval: (timer: { tick: () => void }) => { assert.ok(clock); const index = clock.ticks.indexOf(timer.tick); if (index >= 0) clock.ticks[index] = () => {} },
@@ -274,6 +274,10 @@ test('settings endpoints keep site-admin authorization and distinguish null from
   assert.equal(reset.body.settings.brain_model, 'env-brain')
   assert.equal(reset.body.sources.brain_model, 'env')
   assert.equal(reset.body.ok, true)
+  assert.equal(reset.body.sources.compaction_soft_ratio, 'default')
+  const override = await api.request('PUT', { settings: { idle_interval_ms: '900000' } })
+  assert.equal(override.body.sources.idle_interval_ms, 'db')
+  assert.equal((await api.request('GET')).body.sources.idle_interval_ms, 'db')
 })
 
 test('failed initial read serves a complete env snapshot without seeding', async () => {
@@ -375,7 +379,7 @@ test('turn definitions publish all nine defaults alongside automation and cerebe
     assert.equal(defs[0].effect, 'next-turn', key)
     assert.equal(defs[0].pod, true, key)
     assert.equal(snapshot.settings[key], value, key)
-    assert.equal(snapshot.sources[key], 'env', key)
+    assert.equal(snapshot.sources[key], 'default', key)
   }
   const otherKeys = [
     'idle_enabled', 'idle_interval_ms', 'idle_min_quiet_min', 'agenda_gate_enabled', 'agenda_error_mode',
@@ -395,7 +399,7 @@ test('turn definitions publish all nine defaults alongside automation and cerebe
   const inherited = f.settings.getServerSettingsSnapshot()
   for (const [key, value] of Object.entries(defaults)) {
     assert.equal(inherited.settings[key], value, key)
-    assert.equal(inherited.sources[key], 'env', key)
+    assert.equal(inherited.sources[key], 'default', key)
   }
   assert.equal(inherited.settings.idle_enabled, 'false')
   assert.equal(inherited.settings.support_inbox_triage_output_tokens, '2500')
@@ -436,7 +440,7 @@ test('Pod domain preserves defaults, fixed safety floors, and actual application
   f.data.set('wake_fanout_concurrency', '999')
   await f.settings.loadServerSettings()
   assert.equal(f.settings.getServerSetting('wake_fanout_concurrency'), '6')
-  assert.equal(f.settings.getServerSettingsSnapshot().sources.wake_fanout_concurrency, 'env')
+  assert.equal(f.settings.getServerSettingsSnapshot().sources.wake_fanout_concurrency, 'default')
   assert.ok(f.settings.getServerSettingsSnapshot().diagnostics!.includes('ignored-db-setting:wake_fanout_concurrency'))
 })
 
@@ -713,4 +717,29 @@ test('invalid stored BYOA backoff emits diagnostics and retains the original saf
   assert.equal(f.settings.getByoaRuntimePolicyValues().values.triageBackoffBaseMs, 30000)
   assert.equal(f.settings.getByoaRuntimePolicyValues().values.triageBackoffMaxMs, 600000)
   assert.ok(f.settings.getServerSettingsSnapshot().diagnostics?.some(d => d.includes('byoa_triage_backoff')))
+})
+
+
+test('setting sources distinguish explicit env at default value, DB, inheritance and invalid fallback', async () => {
+  const f = fixture(undefined, { IDLE_INTERVAL_MS: '900000', DB_GC_BATCH: 'invalid' })
+  await f.settings.loadServerSettings()
+  let snapshot = f.settings.getServerSettingsSnapshot()
+  assert.equal(snapshot.sources.idle_interval_ms, 'env')
+  assert.equal(snapshot.sources.scanner_interval_ms, 'default')
+  assert.equal(snapshot.sources.db_gc_batch, 'default')
+  assert.ok(snapshot.diagnostics?.includes('invalid-env-setting:db_gc_batch'))
+  await f.settings.writeServerSettings({ idle_interval_ms: '900000', scanner_interval_ms: '90000' })
+  snapshot = f.settings.getServerSettingsSnapshot()
+  assert.equal(snapshot.sources.idle_interval_ms, 'db')
+  assert.equal(snapshot.sources.scanner_interval_ms, 'db')
+  await f.settings.writeServerSettings({ idle_interval_ms: null, scanner_interval_ms: null })
+  snapshot = f.settings.getServerSettingsSnapshot()
+  assert.equal(snapshot.sources.idle_interval_ms, 'env')
+  assert.equal(snapshot.sources.scanner_interval_ms, 'default')
+  f.data.set('compaction_soft_ratio', '0.98')
+  f.data.set('compaction_hard_ratio', '0.8')
+  await f.settings.loadServerSettings()
+  assert.equal(f.settings.getServerSettingsSnapshot().sources.compaction_soft_ratio, 'default')
+  assert.equal(f.settings.getServerSettingsSnapshot().sources.compaction_hard_ratio, 'default')
+  assert.ok(routerSource.includes('res.json(getServerSettingsSnapshot())'))
 })

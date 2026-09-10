@@ -38,6 +38,8 @@ export interface SettingDef {
   min?: number
   max?: number
   description?: string
+  /** Environment inputs, before env.ts applies defaults. */
+  envKeys?: readonly string[]
   /** Env fallback when the DB has no row. */
   envValue: () => string
 }
@@ -45,23 +47,23 @@ export interface SettingDef {
 /** The full key inventory. Values are always stored as strings; list-typed
  *  keys are comma-separated. */
 export const SETTING_DEFS: readonly SettingDef[] = [
-  { key: 'llm_config', pod: true, type: 'json', envValue: () => process.env.CUMORA_LLM_CONFIG ?? '' },
+  { key: 'llm_config', pod: true, type: 'json', envKeys: ['CUMORA_LLM_CONFIG'], envValue: () => process.env.CUMORA_LLM_CONFIG ?? '' },
   { key: 'sub2api_group_config', type: 'json', envValue: () => '' },
-  { key: 'brain_model', pod: true, type: 'model', required: true, envValue: () => env.OPENAI_MODEL ?? '' },
+  { key: 'brain_model', pod: true, type: 'model', required: true, envKeys: ['OPENAI_MODEL'], envValue: () => env.OPENAI_MODEL ?? '' },
   { key: 'brain_fallback_models', pod: true, type: 'list', envValue: () => '' },
-  { key: 'support_model', pod: true, type: 'model', required: true, envValue: () => env.OPENAI_MODEL_SUPPORT ?? '' },
+  { key: 'support_model', pod: true, type: 'model', required: true, envKeys: ['OPENAI_MODEL_SUPPORT'], envValue: () => env.OPENAI_MODEL_SUPPORT ?? '' },
   { key: 'support_fallback_models', pod: true, type: 'list', envValue: () => '' },
-  { key: 'compaction_model', pod: true, type: 'model', required: true, envValue: () => env.OPENAI_COMPACTION_MODEL ?? '' },
+  { key: 'compaction_model', pod: true, type: 'model', required: true, envKeys: ['OPENAI_COMPACTION_MODEL', 'OPENAI_MODEL_SUPPORT'], envValue: () => env.OPENAI_COMPACTION_MODEL ?? '' },
   { key: 'compaction_fallback_models', pod: true, type: 'list', envValue: () => '' },
-  { key: 'image_model', pod: true, type: 'model', required: true, envValue: () => env.OPENAI_IMAGE_MODEL ?? '' },
-  { key: 'image_fallback_models', pod: true, type: 'list', envValue: () => process.env.OPENAI_IMAGE_FALLBACK_MODELS ?? '' },
-  { key: 'audio_model', pod: true, type: 'model', required: true, envValue: () => process.env.OPENAI_AUDIO_MODEL ?? '' },
-  { key: 'audio_fallback_models', pod: true, type: 'list', envValue: () => process.env.OPENAI_AUDIO_FALLBACK_MODELS ?? '' },
-  { key: 'embed_model', pod: true, type: 'model', required: true, envValue: () => process.env.OPENAI_EMBED_MODEL || 'text-embedding-3-small' },
-  { key: 'agent_reasoning_effort', pod: true, type: 'reasoning', envValue: () => process.env.CUMORA_REASONING_EFFORT ?? 'low' },
-  { key: 'agent_max_output_tokens', pod: true, type: 'integer', envValue: () => process.env.CUMORA_AGENT_MAX_OUTPUT_TOKENS ?? '4000' },
-  { key: 'support_reasoning_effort', pod: true, type: 'reasoning', envValue: () => process.env.CUMORA_SUPPORT_REASONING_EFFORT ?? 'low' },
-  { key: 'support_reasoning_headroom', pod: true, type: 'integer', envValue: () => process.env.CUMORA_SUPPORT_REASONING_HEADROOM ?? '0' },
+  { key: 'image_model', pod: true, type: 'model', required: true, envKeys: ['OPENAI_IMAGE_MODEL'], envValue: () => env.OPENAI_IMAGE_MODEL ?? '' },
+  { key: 'image_fallback_models', pod: true, type: 'list', envKeys: ['OPENAI_IMAGE_FALLBACK_MODELS'], envValue: () => process.env.OPENAI_IMAGE_FALLBACK_MODELS ?? '' },
+  { key: 'audio_model', pod: true, type: 'model', required: true, envKeys: ['OPENAI_AUDIO_MODEL'], envValue: () => process.env.OPENAI_AUDIO_MODEL ?? '' },
+  { key: 'audio_fallback_models', pod: true, type: 'list', envKeys: ['OPENAI_AUDIO_FALLBACK_MODELS'], envValue: () => process.env.OPENAI_AUDIO_FALLBACK_MODELS ?? '' },
+  { key: 'embed_model', pod: true, type: 'model', required: true, envKeys: ['OPENAI_EMBED_MODEL'], envValue: () => process.env.OPENAI_EMBED_MODEL || 'text-embedding-3-small' },
+  { key: 'agent_reasoning_effort', pod: true, type: 'reasoning', envKeys: ['CUMORA_REASONING_EFFORT'], envValue: () => process.env.CUMORA_REASONING_EFFORT ?? 'low' },
+  { key: 'agent_max_output_tokens', pod: true, type: 'integer', envKeys: ['CUMORA_AGENT_MAX_OUTPUT_TOKENS'], envValue: () => process.env.CUMORA_AGENT_MAX_OUTPUT_TOKENS ?? '4000' },
+  { key: 'support_reasoning_effort', pod: true, type: 'reasoning', envKeys: ['CUMORA_SUPPORT_REASONING_EFFORT'], envValue: () => process.env.CUMORA_SUPPORT_REASONING_EFFORT ?? 'low' },
+  { key: 'support_reasoning_headroom', pod: true, type: 'integer', envKeys: ['CUMORA_SUPPORT_REASONING_HEADROOM'], envValue: () => process.env.CUMORA_SUPPORT_REASONING_HEADROOM ?? '0' },
   { key: 'auto_compaction_enabled', pod: true, defaultValue: 'true', type: 'boolean', scope: 'managed', effect: 'next-turn', envValue: () => 'true' },
   { key: 'compaction_soft_ratio', pod: true, defaultValue: '0.75', type: 'number', scope: 'managed', effect: 'next-turn', unit: 'ratio', envValue: () => '0.75' },
   { key: 'compaction_hard_ratio', pod: true, defaultValue: '0.95', type: 'number', scope: 'managed', effect: 'next-turn', unit: 'ratio', envValue: () => '0.95' },
@@ -71,23 +73,23 @@ export const SETTING_DEFS: readonly SettingDef[] = [
   { key: 'compaction_summary_max_chars', pod: true, defaultValue: '4000', type: 'integer', min: 1, scope: 'managed', effect: 'next-turn', unit: 'characters', envValue: () => '4000' },
   { key: 'agent_max_hops', pod: true, defaultValue: '200', type: 'integer', min: 1, scope: 'managed', effect: 'next-turn', unit: 'hops', envValue: () => '200', description: 'Main turn hops; fallback attempts do not consume additional hops.' },
   { key: 'agent_turn_timeout_ms', pod: true, defaultValue: '0', type: 'integer', min: 0, max: 2147483647, scope: 'managed', effect: 'next-turn', unit: 'milliseconds', envValue: () => '0', description: 'Managed turn only; 0 disables the turn deadline. BYOA retains its local CUMORA_TURN_TIMEOUT_MS and engine behavior.' },
-  { key: 'idle_enabled', type: 'boolean', defaultValue: 'true', scope: 'server', effect: 'next-tick', envValue: () => process.env.ENABLE_IDLE ?? 'true' },
-  { key: 'idle_interval_ms', type: 'integer', defaultValue: '900000', min: 0, max: 2147483647, unit: 'milliseconds', scope: 'server', effect: 'next-tick', envValue: () => process.env.IDLE_INTERVAL_MS ?? '900000' },
-  { key: 'idle_min_quiet_min', type: 'integer', defaultValue: '25', min: 0, max: 525600, scope: 'server', effect: 'next-tick', envValue: () => process.env.IDLE_MIN_QUIET_MIN ?? '25' },
+  { key: 'idle_enabled', type: 'boolean', defaultValue: 'true', scope: 'server', effect: 'next-tick', envKeys: ['ENABLE_IDLE'], envValue: () => process.env.ENABLE_IDLE ?? 'true' },
+  { key: 'idle_interval_ms', type: 'integer', defaultValue: '900000', min: 0, max: 2147483647, unit: 'milliseconds', scope: 'server', effect: 'next-tick', envKeys: ['IDLE_INTERVAL_MS'], envValue: () => process.env.IDLE_INTERVAL_MS ?? '900000' },
+  { key: 'idle_min_quiet_min', type: 'integer', defaultValue: '25', min: 0, max: 525600, scope: 'server', effect: 'next-tick', envKeys: ['IDLE_MIN_QUIET_MIN'], envValue: () => process.env.IDLE_MIN_QUIET_MIN ?? '25' },
   { key: 'agenda_gate_enabled', type: 'boolean', defaultValue: 'true', scope: 'server', effect: 'next-gate', description: 'Disabled stops automatic agenda decisions; human messages, calendar delivery and manual briefs remain enabled.', envValue: () => 'true' },
   { key: 'agenda_error_mode', type: 'string', defaultValue: 'defer', allowedValues: ['defer'], scope: 'server', effect: 'next-gate', description: 'Classifier errors defer without a brain wake or acknowledgement.', envValue: () => 'defer' },
-  { key: 'scanner_enabled', type: 'boolean', defaultValue: 'true', scope: 'server', effect: 'next-tick', envValue: () => process.env.ENABLE_SCANNER ?? 'true' },
-  { key: 'scanner_interval_ms', type: 'integer', defaultValue: '90000', min: 0, max: 2147483647, unit: 'milliseconds', scope: 'server', effect: 'next-tick', envValue: () => process.env.SCANNER_INTERVAL_MS ?? '90000' },
+  { key: 'scanner_enabled', type: 'boolean', defaultValue: 'true', scope: 'server', effect: 'next-tick', envKeys: ['ENABLE_SCANNER'], envValue: () => process.env.ENABLE_SCANNER ?? 'true' },
+  { key: 'scanner_interval_ms', type: 'integer', defaultValue: '90000', min: 0, max: 2147483647, unit: 'milliseconds', scope: 'server', effect: 'next-tick', envKeys: ['SCANNER_INTERVAL_MS'], envValue: () => process.env.SCANNER_INTERVAL_MS ?? '90000' },
   { key: 'scanner_min_messages', type: 'integer', defaultValue: '8', min: 1, max: 80, scope: 'server', effect: 'next-tick', envValue: () => '8' },
   { key: 'scanner_window_hours', type: 'integer', defaultValue: '24', min: 1, max: 8760, scope: 'server', effect: 'next-tick', envValue: () => '24' },
-  { key: 'steer_enabled', type: 'boolean', defaultValue: 'true', pod: true, scope: 'managed', effect: 'next-turn', description: 'Disables mid-turn injection only; durable messages remain available to the next turn.', envValue: () => (env.STEER_ENABLED ? 'true' : 'false') },
-  { key: 'byoa_big_brain_concurrency', type: 'integer', defaultValue: '6', min: 1, max: 2147483647, scope: 'byoa', effect: 'next-gate', envValue: () => process.env.CUMORA_BYOA_MAX_CONCURRENT_BIG_BRAIN ?? '6' },
-  { key: 'byoa_triage_concurrency', type: 'integer', defaultValue: '8', min: 1, max: 2147483647, scope: 'byoa', effect: 'next-gate', envValue: () => process.env.CUMORA_BYOA_MAX_CONCURRENT_TRIAGE ?? '8' },
-  { key: 'byoa_spawn_interval_ms', type: 'integer', defaultValue: '500', min: 0, max: 2147483647, unit: 'milliseconds', scope: 'byoa', effect: 'next-gate', envValue: () => process.env.CUMORA_BYOA_MIN_SPAWN_INTERVAL_MS ?? '500' },
+  { key: 'steer_enabled', type: 'boolean', defaultValue: 'true', pod: true, scope: 'managed', effect: 'next-turn', description: 'Disables mid-turn injection only; durable messages remain available to the next turn.', envKeys: ['STEER_ENABLED'], envValue: () => (env.STEER_ENABLED ? 'true' : 'false') },
+  { key: 'byoa_big_brain_concurrency', type: 'integer', defaultValue: '6', min: 1, max: 2147483647, scope: 'byoa', effect: 'next-gate', envKeys: ['CUMORA_BYOA_MAX_CONCURRENT_BIG_BRAIN'], envValue: () => process.env.CUMORA_BYOA_MAX_CONCURRENT_BIG_BRAIN ?? '6' },
+  { key: 'byoa_triage_concurrency', type: 'integer', defaultValue: '8', min: 1, max: 2147483647, scope: 'byoa', effect: 'next-gate', envKeys: ['CUMORA_BYOA_MAX_CONCURRENT_TRIAGE'], envValue: () => process.env.CUMORA_BYOA_MAX_CONCURRENT_TRIAGE ?? '8' },
+  { key: 'byoa_spawn_interval_ms', type: 'integer', defaultValue: '500', min: 0, max: 2147483647, unit: 'milliseconds', scope: 'byoa', effect: 'next-gate', envKeys: ['CUMORA_BYOA_MIN_SPAWN_INTERVAL_MS'], envValue: () => process.env.CUMORA_BYOA_MIN_SPAWN_INTERVAL_MS ?? '500' },
   { key: 'byoa_triage_backoff_base_ms', type: 'integer', defaultValue: '30000', min: 1, max: 2147483647, unit: 'milliseconds', scope: 'byoa', effect: 'next-gate', envValue: () => '30000' },
   { key: 'byoa_triage_backoff_max_ms', type: 'integer', defaultValue: '600000', min: 1, max: 2147483647, unit: 'milliseconds', scope: 'byoa', effect: 'next-gate', envValue: () => '600000' },
-  { key: 'byoa_group_steer_enabled', type: 'boolean', defaultValue: 'true', scope: 'byoa', effect: 'next-gate', description: 'Discovered on the 30s BYOA heartbeat; applied after active spawns finish. Resources sync separately every 60s.', envValue: () => process.env.CUMORA_BYOA_STEER_GROUP ?? 'true' },
-  { key: 'byoa_group_steer_interval_ms', type: 'integer', defaultValue: '8000', min: 0, max: 2147483647, unit: 'milliseconds', scope: 'byoa', effect: 'next-gate', description: 'Discovered on the 30s BYOA heartbeat; applied after active spawns finish. Resources sync separately every 60s.', envValue: () => process.env.CUMORA_BYOA_STEER_GROUP_INTERVAL_MS ?? '8000' },
+  { key: 'byoa_group_steer_enabled', type: 'boolean', defaultValue: 'true', scope: 'byoa', effect: 'next-gate', description: 'Discovered on the 30s BYOA heartbeat; applied after active spawns finish. Resources sync separately every 60s.', envKeys: ['CUMORA_BYOA_STEER_GROUP'], envValue: () => process.env.CUMORA_BYOA_STEER_GROUP ?? 'true' },
+  { key: 'byoa_group_steer_interval_ms', type: 'integer', defaultValue: '8000', min: 0, max: 2147483647, unit: 'milliseconds', scope: 'byoa', effect: 'next-gate', description: 'Discovered on the 30s BYOA heartbeat; applied after active spawns finish. Resources sync separately every 60s.', envKeys: ['CUMORA_BYOA_STEER_GROUP_INTERVAL_MS'], envValue: () => process.env.CUMORA_BYOA_STEER_GROUP_INTERVAL_MS ?? '8000' },
   { key: 'synthetic_gate_enabled', type: 'boolean', defaultValue: 'true', pod: true, scope: 'managed', effect: 'next-gate', description: 'Disabled suppresses synthetic wakes; never bypasses the gate.', envValue: () => 'true' },
   { key: 'synthetic_gate_failure_mode', type: 'string', defaultValue: 'closed', pod: true, readOnly: true, allowedValues: ['closed'], scope: 'managed', effect: 'next-gate', description: 'Safety floor: no brain wake and no inbox acknowledgement on failure.', envValue: () => 'closed' },
   { key: 'triage_rate_limit_mode', type: 'string', defaultValue: 'closed', pod: true, readOnly: true, allowedValues: ['closed'], scope: 'managed', effect: 'next-gate', description: 'Safety floor: no brain wake and no inbox acknowledgement on failure.', envValue: () => 'closed' },
@@ -104,12 +106,12 @@ export const SETTING_DEFS: readonly SettingDef[] = [
   { key: 'pod_admission_enabled', type: 'boolean', defaultValue: 'true', scope: 'server', readOnly: true, allowedValues: ['true'], effect: 'fixed', envValue: () => 'true' },
   { key: 'pod_capacity_unknown_mode', type: 'string', defaultValue: 'closed', scope: 'server', readOnly: true, allowedValues: ['closed'], effect: 'fixed', envValue: () => 'closed' },
   { key: 'pod_assignment_policy', type: 'string', defaultValue: 'deny', scope: 'server', readOnly: true, allowedValues: ['deny'], effect: 'fixed', description: 'Invalid placement is always denied; tenant and assignment verification cannot be disabled.', envValue: () => 'deny' },
-  { key: 'pod_admission_max', type: 'integer', defaultValue: '40', scope: 'server', min: 0, max: 1000000, effect: 'next-admission', description: '0 retains the cluster capacity ceiling only. Changes never cancel admitted work.', envValue: () => String(env.AGENT_POD_ADMISSION_MAX ?? 40) },
+  { key: 'pod_admission_max', type: 'integer', defaultValue: '40', scope: 'server', min: 0, max: 1000000, effect: 'next-admission', description: '0 retains the cluster capacity ceiling only. Changes never cancel admitted work.', envKeys: ['AGENT_POD_ADMISSION_MAX'], envValue: () => String(env.AGENT_POD_ADMISSION_MAX ?? 40) },
   { key: 'pod_fuse_threshold', type: 'number', defaultValue: '0.90', scope: 'server', effect: 'next-admission', unit: 'ratio', description: 'Admission stops at this ratio of the effective cap; existing Pods are not cancelled.', envValue: () => '0.90' },
-  { key: 'pod_gc_enabled', type: 'boolean', defaultValue: 'true', scope: 'server', effect: 'next-tick', envValue: () => process.env.ENABLE_AGENT_POD_GC === 'false' ? 'false' : 'true' },
-  { key: 'chrome_pvc_gc_enabled', type: 'boolean', defaultValue: 'true', scope: 'server', effect: 'next-tick', envValue: () => process.env.ENABLE_CHROME_PVC_GC === 'false' ? 'false' : 'true' },
-  { key: 'cluster_monitor_enabled', type: 'boolean', defaultValue: 'true', scope: 'server', effect: 'next-tick', envValue: () => process.env.ENABLE_CLUSTER_MONITOR === 'false' ? 'false' : 'true' },
-  { key: 'agent_run_sweeper_enabled', type: 'boolean', defaultValue: 'true', scope: 'server', effect: 'next-tick', envValue: () => process.env.ENABLE_AGENT_RUN_SWEEPER === 'false' ? 'false' : 'true' },
+  { key: 'pod_gc_enabled', type: 'boolean', defaultValue: 'true', scope: 'server', effect: 'next-tick', envKeys: ['ENABLE_AGENT_POD_GC'], envValue: () => process.env.ENABLE_AGENT_POD_GC === 'false' ? 'false' : 'true' },
+  { key: 'chrome_pvc_gc_enabled', type: 'boolean', defaultValue: 'true', scope: 'server', effect: 'next-tick', envKeys: ['ENABLE_CHROME_PVC_GC'], envValue: () => process.env.ENABLE_CHROME_PVC_GC === 'false' ? 'false' : 'true' },
+  { key: 'cluster_monitor_enabled', type: 'boolean', defaultValue: 'true', scope: 'server', effect: 'next-tick', envKeys: ['ENABLE_CLUSTER_MONITOR'], envValue: () => process.env.ENABLE_CLUSTER_MONITOR === 'false' ? 'false' : 'true' },
+  { key: 'agent_run_sweeper_enabled', type: 'boolean', defaultValue: 'true', scope: 'server', effect: 'next-tick', envKeys: ['ENABLE_AGENT_RUN_SWEEPER'], envValue: () => process.env.ENABLE_AGENT_RUN_SWEEPER === 'false' ? 'false' : 'true' },
   { key: 'cluster_monitor_pending_min', type: 'integer', defaultValue: '20', scope: 'server', effect: 'next-tick', min: 1, max: 2147483647, envValue: () => '20' },
   { key: 'cluster_monitor_ratio_min', type: 'number', defaultValue: '0.95', scope: 'server', effect: 'next-tick', unit: 'ratio', envValue: () => '0.95' },
   { key: 'cluster_monitor_sustained_ms', type: 'integer', defaultValue: '300000', scope: 'server', effect: 'next-tick', min: 1, max: 2147483647, unit: 'milliseconds', envValue: () => '300000' },
@@ -117,34 +119,34 @@ export const SETTING_DEFS: readonly SettingDef[] = [
   { key: 'pod_gc_interval_ms', type: 'integer', defaultValue: '60000', scope: 'server', min: 0, max: 2147483647, unit: 'milliseconds', effect: 'next-tick', description: '0 pauses future ticks; in-flight work completes without re-entry.', envValue: () => '60000' },
   { key: 'cluster_monitor_interval_ms', type: 'integer', defaultValue: '60000', scope: 'server', min: 0, max: 2147483647, unit: 'milliseconds', effect: 'next-tick', description: '0 pauses future ticks; in-flight work completes without re-entry.', envValue: () => '60000' },
   { key: 'agent_run_sweeper_interval_ms', type: 'integer', defaultValue: '60000', scope: 'server', min: 0, max: 2147483647, unit: 'milliseconds', effect: 'next-tick', description: '0 pauses future ticks; in-flight work completes without re-entry.', envValue: () => '60000' },
-  { key: 'email_retry_interval_ms', type: 'integer', defaultValue: '60000', scope: 'server', min: 0, max: 2147483647, unit: 'milliseconds', effect: 'next-tick', envValue: () => process.env.EMAIL_RETRY_INTERVAL_MS ?? '60000' },
-  { key: 'email_gc_interval_ms', type: 'integer', defaultValue: '86400000', scope: 'server', min: 0, max: 2147483647, unit: 'milliseconds', effect: 'next-tick', envValue: () => process.env.EMAIL_GC_INTERVAL_MS ?? '86400000' },
-  { key: 'db_gc_interval_ms', type: 'integer', defaultValue: '300000', scope: 'server', min: 0, max: 2147483647, unit: 'milliseconds', effect: 'next-tick', envValue: () => process.env.DB_GC_INTERVAL_MS ?? '300000' },
-  { key: 'workspace_cleanup_interval_ms', type: 'integer', defaultValue: '60000', scope: 'server', min: 0, max: 2147483647, unit: 'milliseconds', effect: 'next-tick', envValue: () => process.env.WORKSPACE_CLEANUP_INTERVAL_MS ?? '60000' },
-  { key: 'poll_sweep_interval_ms', type: 'integer', defaultValue: '60000', scope: 'server', min: 0, max: 2147483647, unit: 'milliseconds', effect: 'next-tick', envValue: () => process.env.POLL_SWEEP_INTERVAL_MS ?? '60000' },
-  { key: 'llm_rollup_interval_ms', type: 'integer', defaultValue: '120000', scope: 'server', min: 0, max: 2147483647, unit: 'milliseconds', effect: 'next-tick', envValue: () => process.env.LLM_ROLLUP_INTERVAL_MS ?? '120000' },
-  { key: 'db_gc_batch', type: 'integer', defaultValue: '10000', scope: 'server', min: 1, max: 1000000, effect: 'next-tick', envValue: () => process.env.DB_GC_BATCH ?? '10000' },
-  { key: 'db_gc_ws_tickets_days', type: 'integer', defaultValue: '1', scope: 'server', min: 0, max: 365000, effect: 'next-tick', envValue: () => process.env.DB_GC_WS_TICKETS_DAYS ?? '1' },
-  { key: 'db_gc_agent_log_days', type: 'integer', defaultValue: '30', scope: 'server', min: 0, max: 365000, effect: 'next-tick', envValue: () => process.env.DB_GC_AGENT_LOG_DAYS ?? '30' },
-  { key: 'db_gc_agent_events_days', type: 'integer', defaultValue: '30', scope: 'server', min: 0, max: 365000, effect: 'next-tick', envValue: () => process.env.DB_GC_AGENT_EVENTS_DAYS ?? '30' },
-  { key: 'db_gc_agent_runs_days', type: 'integer', defaultValue: '30', scope: 'server', min: 0, max: 365000, effect: 'next-tick', envValue: () => process.env.DB_GC_AGENT_RUNS_DAYS ?? '30' },
-  { key: 'db_gc_llm_calls_days', type: 'integer', defaultValue: '90', scope: 'server', min: 0, max: 365000, effect: 'next-tick', envValue: () => process.env.DB_GC_LLM_CALLS_DAYS ?? '90' },
-  { key: 'workspace_cleanup_batch', type: 'integer', defaultValue: '8', scope: 'server', min: 1, max: 32, effect: 'next-tick', envValue: () => process.env.WORKSPACE_CLEANUP_BATCH ?? '8' },
-  { key: 'workspace_cleanup_retention_days', type: 'integer', defaultValue: '7', scope: 'server', min: 0, max: 365000, effect: 'next-tick', envValue: () => process.env.WORKSPACE_CLEANUP_RETENTION_DAYS ?? '7' },
-  { key: 'llm_rollup_retention_hours', type: 'integer', defaultValue: '2280', scope: 'server', min: 0, max: 8760000, effect: 'next-tick', envValue: () => process.env.LLM_ROLLUP_RETENTION_HOURS ?? '2280' },
-  { key: 'agent_run_stale_age_ms', type: 'integer', defaultValue: '600000', scope: 'server', min: 0, max: 2147483647, unit: 'milliseconds', effect: 'next-tick', envValue: () => process.env.AGENT_RUN_STALE_AGE_MS ?? '600000' },
-  { key: 'workspace_runtime_cleanup_enabled', type: 'boolean', defaultValue: 'false', scope: 'server', effect: 'next-tick', envValue: () => process.env.WORKSPACE_RUNTIME_CLEANUP_ENABLED ?? 'false' },
-  { key: 'chrome_pvc_gc_interval_ms', type: 'integer', defaultValue: '3600000', scope: 'server', min: 0, max: 2147483647, unit: 'milliseconds', effect: 'next-tick', description: '0 pauses future ticks; in-flight work completes without re-entry.', envValue: () => String(env.CHROME_PVC_GC_INTERVAL_MS ?? 3600000) },
-  { key: 'chrome_pvc_gc_idle_days', type: 'integer', defaultValue: '30', scope: 'server', min: 0, max: 365000, effect: 'next-tick', envValue: () => String(env.CHROME_PVC_GC_IDLE_DAYS ?? 30) },
-  { key: 'pod_idle_ms', type: 'integer', defaultValue: '180000', scope: 'server', min: 0, max: 2147483647, unit: 'milliseconds', effect: 'next-create', envValue: () => String(env.AGENT_IDLE_MS ?? 180000) },
-  { key: 'pod_no_work_ms', type: 'integer', defaultValue: '90000', scope: 'server', min: 0, max: 2147483647, unit: 'milliseconds', effect: 'next-create', envValue: () => String(env.AGENT_NO_WORK_MS ?? 90000) },
-  { key: 'wake_fanout_concurrency', type: 'integer', defaultValue: '6', scope: 'server', readOnly: true, envOnly: true, effect: 'restart', description: 'Env-managed process semaphore; change the deployment env and restart. DB writes are unsupported.', envValue: () => String(env.WAKE_FANOUT_CONCURRENCY ?? 6) },
-  { key: 'kubectl_max_concurrency', type: 'integer', defaultValue: '8', scope: 'server', readOnly: true, envOnly: true, effect: 'restart', description: 'Env-managed process semaphore; change the deployment env and restart. DB writes are unsupported.', envValue: () => String(env.KUBECTL_MAX_CONCURRENCY ?? 8) },
-  { key: 'chrome_profile_pvc_enabled', type: 'boolean', defaultValue: 'true', scope: 'server', readOnly: true, envOnly: true, effect: 'restart-next-create', description: 'Deployment env; restart before next Pod/PVC creation. Existing storage requires a separate migration, not a hot settings update.', envValue: () => process.env.CUMORA_CHROME_PROFILE_PVC === 'false' ? 'false' : 'true' },
-  { key: 'chrome_pvc_size', type: 'string', defaultValue: '500Mi', scope: 'server', readOnly: true, envOnly: true, effect: 'restart-next-create', description: 'Deployment env; restart before next Pod/PVC creation. Existing storage requires a separate migration, not a hot settings update.', envValue: () => process.env.CUMORA_CHROME_PVC_SIZE ?? '500Mi' },
-  { key: 'chrome_pvc_storage_class', type: 'string', defaultValue: '', scope: 'server', readOnly: true, envOnly: true, effect: 'restart-next-create', description: 'Deployment env; restart before next Pod/PVC creation. Existing storage requires a separate migration, not a hot settings update.', envValue: () => process.env.CUMORA_CHROME_PVC_STORAGECLASS ?? '' },
+  { key: 'email_retry_interval_ms', type: 'integer', defaultValue: '60000', scope: 'server', min: 0, max: 2147483647, unit: 'milliseconds', effect: 'next-tick', envKeys: ['EMAIL_RETRY_INTERVAL_MS'], envValue: () => process.env.EMAIL_RETRY_INTERVAL_MS ?? '60000' },
+  { key: 'email_gc_interval_ms', type: 'integer', defaultValue: '86400000', scope: 'server', min: 0, max: 2147483647, unit: 'milliseconds', effect: 'next-tick', envKeys: ['EMAIL_GC_INTERVAL_MS'], envValue: () => process.env.EMAIL_GC_INTERVAL_MS ?? '86400000' },
+  { key: 'db_gc_interval_ms', type: 'integer', defaultValue: '300000', scope: 'server', min: 0, max: 2147483647, unit: 'milliseconds', effect: 'next-tick', envKeys: ['DB_GC_INTERVAL_MS'], envValue: () => process.env.DB_GC_INTERVAL_MS ?? '300000' },
+  { key: 'workspace_cleanup_interval_ms', type: 'integer', defaultValue: '60000', scope: 'server', min: 0, max: 2147483647, unit: 'milliseconds', effect: 'next-tick', envKeys: ['WORKSPACE_CLEANUP_INTERVAL_MS'], envValue: () => process.env.WORKSPACE_CLEANUP_INTERVAL_MS ?? '60000' },
+  { key: 'poll_sweep_interval_ms', type: 'integer', defaultValue: '60000', scope: 'server', min: 0, max: 2147483647, unit: 'milliseconds', effect: 'next-tick', envKeys: ['POLL_SWEEP_INTERVAL_MS'], envValue: () => process.env.POLL_SWEEP_INTERVAL_MS ?? '60000' },
+  { key: 'llm_rollup_interval_ms', type: 'integer', defaultValue: '120000', scope: 'server', min: 0, max: 2147483647, unit: 'milliseconds', effect: 'next-tick', envKeys: ['LLM_ROLLUP_INTERVAL_MS'], envValue: () => process.env.LLM_ROLLUP_INTERVAL_MS ?? '120000' },
+  { key: 'db_gc_batch', type: 'integer', defaultValue: '10000', scope: 'server', min: 1, max: 1000000, effect: 'next-tick', envKeys: ['DB_GC_BATCH'], envValue: () => process.env.DB_GC_BATCH ?? '10000' },
+  { key: 'db_gc_ws_tickets_days', type: 'integer', defaultValue: '1', scope: 'server', min: 0, max: 365000, effect: 'next-tick', envKeys: ['DB_GC_WS_TICKETS_DAYS'], envValue: () => process.env.DB_GC_WS_TICKETS_DAYS ?? '1' },
+  { key: 'db_gc_agent_log_days', type: 'integer', defaultValue: '30', scope: 'server', min: 0, max: 365000, effect: 'next-tick', envKeys: ['DB_GC_AGENT_LOG_DAYS'], envValue: () => process.env.DB_GC_AGENT_LOG_DAYS ?? '30' },
+  { key: 'db_gc_agent_events_days', type: 'integer', defaultValue: '30', scope: 'server', min: 0, max: 365000, effect: 'next-tick', envKeys: ['DB_GC_AGENT_EVENTS_DAYS'], envValue: () => process.env.DB_GC_AGENT_EVENTS_DAYS ?? '30' },
+  { key: 'db_gc_agent_runs_days', type: 'integer', defaultValue: '30', scope: 'server', min: 0, max: 365000, effect: 'next-tick', envKeys: ['DB_GC_AGENT_RUNS_DAYS'], envValue: () => process.env.DB_GC_AGENT_RUNS_DAYS ?? '30' },
+  { key: 'db_gc_llm_calls_days', type: 'integer', defaultValue: '90', scope: 'server', min: 0, max: 365000, effect: 'next-tick', envKeys: ['DB_GC_LLM_CALLS_DAYS'], envValue: () => process.env.DB_GC_LLM_CALLS_DAYS ?? '90' },
+  { key: 'workspace_cleanup_batch', type: 'integer', defaultValue: '8', scope: 'server', min: 1, max: 32, effect: 'next-tick', envKeys: ['WORKSPACE_CLEANUP_BATCH'], envValue: () => process.env.WORKSPACE_CLEANUP_BATCH ?? '8' },
+  { key: 'workspace_cleanup_retention_days', type: 'integer', defaultValue: '7', scope: 'server', min: 0, max: 365000, effect: 'next-tick', envKeys: ['WORKSPACE_CLEANUP_RETENTION_DAYS'], envValue: () => process.env.WORKSPACE_CLEANUP_RETENTION_DAYS ?? '7' },
+  { key: 'llm_rollup_retention_hours', type: 'integer', defaultValue: '2280', scope: 'server', min: 0, max: 8760000, effect: 'next-tick', envKeys: ['LLM_ROLLUP_RETENTION_HOURS'], envValue: () => process.env.LLM_ROLLUP_RETENTION_HOURS ?? '2280' },
+  { key: 'agent_run_stale_age_ms', type: 'integer', defaultValue: '600000', scope: 'server', min: 0, max: 2147483647, unit: 'milliseconds', effect: 'next-tick', envKeys: ['AGENT_RUN_STALE_AGE_MS'], envValue: () => process.env.AGENT_RUN_STALE_AGE_MS ?? '600000' },
+  { key: 'workspace_runtime_cleanup_enabled', type: 'boolean', defaultValue: 'false', scope: 'server', effect: 'next-tick', envKeys: ['WORKSPACE_RUNTIME_CLEANUP_ENABLED'], envValue: () => process.env.WORKSPACE_RUNTIME_CLEANUP_ENABLED ?? 'false' },
+  { key: 'chrome_pvc_gc_interval_ms', type: 'integer', defaultValue: '3600000', scope: 'server', min: 0, max: 2147483647, unit: 'milliseconds', effect: 'next-tick', description: '0 pauses future ticks; in-flight work completes without re-entry.', envKeys: ['CHROME_PVC_GC_INTERVAL_MS'], envValue: () => String(env.CHROME_PVC_GC_INTERVAL_MS ?? 3600000) },
+  { key: 'chrome_pvc_gc_idle_days', type: 'integer', defaultValue: '30', scope: 'server', min: 0, max: 365000, effect: 'next-tick', envKeys: ['CHROME_PVC_GC_IDLE_DAYS'], envValue: () => String(env.CHROME_PVC_GC_IDLE_DAYS ?? 30) },
+  { key: 'pod_idle_ms', type: 'integer', defaultValue: '180000', scope: 'server', min: 0, max: 2147483647, unit: 'milliseconds', effect: 'next-create', envKeys: ['AGENT_IDLE_MS'], envValue: () => String(env.AGENT_IDLE_MS ?? 180000) },
+  { key: 'pod_no_work_ms', type: 'integer', defaultValue: '90000', scope: 'server', min: 0, max: 2147483647, unit: 'milliseconds', effect: 'next-create', envKeys: ['AGENT_NO_WORK_MS'], envValue: () => String(env.AGENT_NO_WORK_MS ?? 90000) },
+  { key: 'wake_fanout_concurrency', type: 'integer', defaultValue: '6', scope: 'server', readOnly: true, envOnly: true, effect: 'restart', description: 'Env-managed process semaphore; change the deployment env and restart. DB writes are unsupported.', envKeys: ['WAKE_FANOUT_CONCURRENCY'], envValue: () => String(env.WAKE_FANOUT_CONCURRENCY ?? 6) },
+  { key: 'kubectl_max_concurrency', type: 'integer', defaultValue: '8', scope: 'server', readOnly: true, envOnly: true, effect: 'restart', description: 'Env-managed process semaphore; change the deployment env and restart. DB writes are unsupported.', envKeys: ['KUBECTL_MAX_CONCURRENCY'], envValue: () => String(env.KUBECTL_MAX_CONCURRENCY ?? 8) },
+  { key: 'chrome_profile_pvc_enabled', type: 'boolean', defaultValue: 'true', scope: 'server', readOnly: true, envOnly: true, effect: 'restart-next-create', description: 'Deployment env; restart before next Pod/PVC creation. Existing storage requires a separate migration, not a hot settings update.', envKeys: ['CUMORA_CHROME_PROFILE_PVC'], envValue: () => process.env.CUMORA_CHROME_PROFILE_PVC === 'false' ? 'false' : 'true' },
+  { key: 'chrome_pvc_size', type: 'string', defaultValue: '500Mi', scope: 'server', readOnly: true, envOnly: true, effect: 'restart-next-create', description: 'Deployment env; restart before next Pod/PVC creation. Existing storage requires a separate migration, not a hot settings update.', envKeys: ['CUMORA_CHROME_PVC_SIZE'], envValue: () => process.env.CUMORA_CHROME_PVC_SIZE ?? '500Mi' },
+  { key: 'chrome_pvc_storage_class', type: 'string', defaultValue: '', scope: 'server', readOnly: true, envOnly: true, effect: 'restart-next-create', description: 'Deployment env; restart before next Pod/PVC creation. Existing storage requires a separate migration, not a hot settings update.', envKeys: ['CUMORA_CHROME_PVC_STORAGECLASS'], envValue: () => process.env.CUMORA_CHROME_PVC_STORAGECLASS ?? '' },
   // Not a model — the skills tab's local hub directory.
-  { key: 'local_skillhub_path', type: 'string', envValue: () => process.env.LOCAL_SKILLHUB_PATH ?? '' },
+  { key: 'local_skillhub_path', type: 'string', envKeys: ['LOCAL_SKILLHUB_PATH'], envValue: () => process.env.LOCAL_SKILLHUB_PATH ?? '' },
 ]
 
 const KNOWN_KEYS = new Set(SETTING_DEFS.map((d) => d.key))
@@ -163,8 +165,9 @@ export interface ServerSettingsSnapshot {
   /** Decimal string: preserves PostgreSQL bigint precision across JSON. */
   revision: string
   settings: Readonly<Record<string, string>>
-  sources: Readonly<Record<string, 'db' | 'env'>>
-  definitions?: readonly Readonly<Omit<SettingDef, 'envValue'>>[]
+  sources: Readonly<Record<string, 'db' | 'env' | 'default'>>
+  inheritedSources?: Readonly<Record<string, 'env' | 'default'>>
+  definitions?: readonly Readonly<Omit<SettingDef, 'envValue' | 'envKeys'>>[]
   diagnostics?: readonly string[]
   source?: 'db' | 'env' | 'bootstrap'
 }
@@ -185,24 +188,31 @@ let refreshing: Promise<void> | null = null
 let generation = 0
 let writing: Promise<unknown> = Promise.resolve()
 
-function makeSnapshot(rows: { key: string; value: string }[], defaults?: Readonly<Record<string, string>>): ServerSettingsSnapshot {
+function makeSnapshot(rows: { key: string; value: string }[], defaults?: Readonly<Record<string, string>>, defaultSources?: ServerSettingsSnapshot['inheritedSources']): ServerSettingsSnapshot {
   const values = new Map(rows.map((r) => [r.key, r.value]))
   const revision = values.get(REVISION_KEY) ?? '0'
   if (!/^\d+$/.test(revision)) throw new Error('invalid settings revision')
   const diagnostics: string[] = []
   const settings: Record<string, string> = {}
-  const sources: Record<string, 'db' | 'env'> = {}
+  const sources: Record<string, 'db' | 'env' | 'default'> = {}
+  const inheritedSources: Record<string, 'env' | 'default'> = {}
   for (const def of SETTING_DEFS) {
     const fallback = defaults ? defaults[def.key] ?? def.defaultValue ?? '' : settingEnvValue(def, diagnostics)
+    const fallbackSource = defaultSources?.[def.key] ?? (!def.envKeys?.some(key => def.key === 'embed_model' ? Boolean(process.env[key]) : process.env[key] !== undefined)
+      || diagnostics.includes(`invalid-env-setting:${def.key}`) ? 'default' : 'env')
+    inheritedSources[def.key] = fallbackSource
     settings[def.key] = def.envOnly ? fallback : values.get(def.key) ?? fallback
-    sources[def.key] = !def.envOnly && values.has(def.key) ? 'db' : 'env'
+    sources[def.key] = !def.envOnly && values.has(def.key) ? 'db' : fallbackSource
     if (def.envOnly && values.has(def.key) && values.get(def.key) !== fallback) diagnostics.push(`ignored-db-setting:${def.key}`)
     try { validateServerSettings({ [def.key]: settings[def.key] }, true) } catch {
       diagnostics.push(`invalid-setting:${def.key}`)
       console.warn('[settings] invalid value; using env/default', def.key)
       settings[def.key] = fallback
-      sources[def.key] = 'env'
-      try { validateServerSettings({ [def.key]: settings[def.key] }, true) } catch { settings[def.key] = def.defaultValue ?? '' }
+      sources[def.key] = fallbackSource
+      try { validateServerSettings({ [def.key]: settings[def.key] }, true) } catch {
+        settings[def.key] = def.defaultValue ?? ''
+        sources[def.key] = 'default'
+      }
     }
   }
   if (!(Number(settings.compaction_soft_ratio) < Number(settings.compaction_hard_ratio))) {
@@ -210,23 +220,23 @@ function makeSnapshot(rows: { key: string; value: string }[], defaults?: Readonl
     console.warn('[settings] invalid compaction ratios; using defaults')
     settings.compaction_soft_ratio = '0.75'
     settings.compaction_hard_ratio = '0.95'
-    sources.compaction_soft_ratio = sources.compaction_hard_ratio = 'env'
+    sources.compaction_soft_ratio = sources.compaction_hard_ratio = 'default'
   }
   if (Number(settings.triage_backoff_base_ms) > Number(settings.triage_backoff_max_ms)) {
     diagnostics.push('invalid-setting:triage-backoff')
     console.warn('[settings] invalid triage backoff; using defaults')
     settings.triage_backoff_base_ms = '30000'
     settings.triage_backoff_max_ms = '60000'
-    sources.triage_backoff_base_ms = sources.triage_backoff_max_ms = 'env'
+    sources.triage_backoff_base_ms = sources.triage_backoff_max_ms = 'default'
   }
-  const definitions = Object.freeze(SETTING_DEFS.map(({ envValue: _envValue, ...def }) => Object.freeze(def)))
+  const definitions = Object.freeze(SETTING_DEFS.map(({ envValue: _envValue, envKeys: _envKeys, ...def }) => Object.freeze(def)))
   if (Number(settings.byoa_triage_backoff_base_ms) > Number(settings.byoa_triage_backoff_max_ms)) {
     diagnostics.push('byoa_triage_backoff: base must not exceed maximum; using defaults')
     settings.byoa_triage_backoff_base_ms = '30000'
     settings.byoa_triage_backoff_max_ms = '600000'
-    sources.byoa_triage_backoff_base_ms = sources.byoa_triage_backoff_max_ms = 'env'
+    sources.byoa_triage_backoff_base_ms = sources.byoa_triage_backoff_max_ms = 'default'
   }
-  return Object.freeze({ revision, definitions, source: 'db', settings: Object.freeze(settings), sources: Object.freeze(sources), diagnostics: Object.freeze(diagnostics) })
+  return Object.freeze({ revision, definitions, source: 'db', settings: Object.freeze(settings), inheritedSources: Object.freeze(inheritedSources), sources: Object.freeze(sources), diagnostics: Object.freeze(diagnostics) })
 }
 
 function installSnapshot(next: ServerSettingsSnapshot): void {
@@ -242,6 +252,7 @@ function podPolicy(policy: ServerSettingsSnapshot): ServerSettingsSnapshot {
     revision: policy.revision, source: policy.source,
     settings: Object.freeze(Object.fromEntries(allowed.map(def => [def.key, policy.settings[def.key]]))),
     sources: Object.freeze(Object.fromEntries(allowed.map(def => [def.key, policy.sources[def.key]]))),
+    inheritedSources: policy.inheritedSources && Object.freeze(Object.fromEntries(allowed.map(def => [def.key, policy.inheritedSources![def.key]]))),
     definitions: policy.definitions?.filter(def => def.pod),
     diagnostics: policy.diagnostics,
   })
@@ -265,7 +276,7 @@ async function readManagedPodSettings(base: ManagedPodSettings): Promise<Managed
   const row = rows[0]
   if (!row) throw new Error('Managed Pod owner identity unavailable')
   return {
-    ...base, source: 'db', policy: podPolicy(makeSnapshot(row.settings, base.defaults)),
+    ...base, source: 'db', policy: podPolicy(makeSnapshot(row.settings, base.defaults, base.policy.inheritedSources)),
     gateway: {
       companyId: base.gateway.companyId, ownerId: row.owner_user_id, generation: 0,
       authorizationVersion: `${row.owner_user_id}:${row.authorization_version}:0:${base.gateway.baseURL}`,
@@ -301,19 +312,19 @@ function installPodBootstrap(): ManagedPodSettings | null {
       defaults[def.key] ??= settingEnvValue(def)
       if (settings[def.key] === undefined) {
         settings[def.key] = defaults[def.key]
-        sources[def.key] = 'env'
+        sources[def.key] = def.envKeys?.some(key => process.env[key] !== undefined) ? 'env' : 'default'
       }
     }
     managed = { ...managed, defaults, policy: { ...managed.policy, settings, sources } }
     for (const def of SETTING_DEFS.filter(def => def.pod && def.defaultValue === undefined)) {
       if (typeof managed.policy.settings[def.key] !== 'string' || typeof managed.defaults[def.key] !== 'string'
-        || !['db', 'env'].includes(managed.policy.sources[def.key])) throw new Error('Incomplete managed Pod policy')
+        || !['db', 'env', 'default'].includes(managed.policy.sources[def.key])) throw new Error('Incomplete managed Pod policy')
     }
     installManagedPodSettings(managed)
     const normalized = podPolicy(makeSnapshot([
       ...Object.entries(managed.policy.settings).map(([key, value]) => ({ key, value })),
       { key: REVISION_KEY, value: managed.policy.revision },
-    ], managed.defaults))
+    ], managed.defaults, managed.policy.inheritedSources))
     const originalPolicy = managed.policy
     installSnapshot(Object.freeze({ ...normalized, source: managed.source,
       sources: Object.freeze(Object.fromEntries(Object.entries(normalized.sources).map(([key, source]) => [

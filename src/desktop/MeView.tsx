@@ -11,6 +11,7 @@ import { AppearancePicker, ChatLayoutPicker } from '@/components/AppearancePicke
 import { LanguagePicker } from '@/components/LanguagePicker'
 import { useT, useLocale, type MessageKey } from '@/lib/i18n'
 import { ModelsTab } from './ModelsTab'
+import { RuntimeSettingsPanel } from './RuntimeSettingsPanel'
 import { cn } from '@/lib/utils'
 import { UsageDashboard } from './UsageDashboard'
 import { SkillsTab } from './SkillsTab'
@@ -26,6 +27,7 @@ const tabs = [
   { key: 'profile', label: 'me.tab.profile' },
   { key: 'usage', label: 'me.tab.usage' },
   { key: 'models', label: 'me.tab.models' },
+  { key: 'runtime', label: 'me.tab.models' },
   { key: 'skills', label: 'me.tab.skills' },
   { key: 'connectors', label: 'me.tab.connectors' },
   { key: 'computers', label: 'me.tab.computers' },
@@ -1343,6 +1345,7 @@ function DaemonUpgradeBanner({ onJump }: { onJump: () => void }) {
 
 export function MeView() {
   const t = useT()
+  const zh = useLocale() === 'zh-CN'
   const [tab, setTab] = useState<Tab>('profile')
   const hasOutdated = useComputers((s) => Object.values(s.byId).some((c) => c.daemonOutdated))
   useEffect(() => { void useComputers.getState().refresh() }, [])
@@ -1362,7 +1365,7 @@ export function MeView() {
 
         <DaemonUpgradeBanner onJump={() => setTab('computers')} />
 
-        <div className="flex gap-1 mb-7 border-b border-ink-100">
+        <div className="flex flex-wrap gap-1 mb-7 border-b border-ink-100">
           {tabs.map((tabDef, i) => (
             <button
               type="button"
@@ -1373,7 +1376,7 @@ export function MeView() {
                 i === 0 ? 'pl-0 pr-5' : 'px-5',
                 tab === tabDef.key ? 'border-skype text-skype-deep' : 'border-transparent text-ink-500 hover:text-ink-700',
               )}>
-              {t(tabDef.label)}
+              {tabDef.key === 'runtime' ? (zh ? '运行／自动化' : 'Runtime / automation') : t(tabDef.label)}
               {tabDef.key === 'computers' && hasOutdated && (
                 <span className="w-1.5 h-1.5 rounded-full" style={{ background: 'var(--gold-deep)' }} title={t('me.daemonNeedsUpdate')} />
               )}
@@ -1384,6 +1387,7 @@ export function MeView() {
         {tab === 'profile' && <ProfileTab />}
         {tab === 'usage' && <UsageTab />}
         {tab === 'models' && <ModelsTab />}
+        {tab === 'runtime' && <RuntimeSettingsPanel />}
         {tab === 'skills' && <SkillsTab />}
         {tab === 'connectors' && <ConnectorsTab />}
         {tab === 'computers' && <ComputersTab />}

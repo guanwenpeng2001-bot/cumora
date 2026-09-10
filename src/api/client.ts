@@ -250,15 +250,64 @@ export interface ApiSettingMetadata {
   applyMode?: 'immediate' | 'next_turn' | 'next_create' | 'restart'
 }
 
+export interface ApiSettingDefinition {
+  key: string
+  type: 'model' | 'list' | 'string' | 'integer' | 'reasoning' | 'json' | 'boolean' | 'number'
+  scope?: 'managed' | 'server' | 'byoa'
+  effect?: 'immediate' | 'next-turn' | 'next-gate' | 'next-tick' | 'next-admission' | 'next-create' | 'restart' | 'restart-next-create' | 'fixed' | 'pending-T41'
+  allowedValues?: readonly string[]
+  defaultValue?: string
+  min?: number
+  max?: number
+  unit?: string
+  description?: string
+  required?: boolean
+  readOnly?: boolean
+  envOnly?: boolean
+  sensitive?: boolean
+}
+
+export interface ApiModelRoutePreview {
+  domain: 'managed' | 'server' | 'byoa'
+  role: ApiModelRole
+  purpose: string
+  revision: string
+  routable: boolean
+  provisionable: boolean
+  candidates: Array<{
+    model: string
+    requestModel: string
+    protocol: string
+    available: boolean
+    source: string
+    route: { id: string; kind: 'gateway' | 'direct'; platform?: ApiModelPlatform; env?: string; endpointSource: string; credentialSource: string }
+    diagnostic?: string
+  }>
+  diagnostics: string[]
+}
+
+export interface ApiModelGroup { id: number; name: string; platform: ApiModelPlatform }
+export interface ApiByoaPolicyState {
+  desired: string
+  received: string | null
+  applied: string | null
+  status: 'unknown' | 'unsupported' | 'pending' | 'received' | 'applied'
+  reportedAt: string | null
+  policyHeartbeatMs: number
+  resourceSyncMs: number
+}
+
 export interface ApiModelSettings {
   settings: Record<string, string>
-  revision?: number
+  revision?: string
+  definitions?: readonly ApiSettingDefinition[]
+  sources?: Record<string, 'db' | 'env' | 'default'>
+  diagnostics?: readonly string[]
   metadata?: Record<string, ApiSettingMetadata>
 }
 
-export interface ApiSettingsWriteResult {
+export interface ApiSettingsWriteResult extends Partial<ApiModelSettings> {
   ok: boolean
-  revision?: number
 }
 
 export interface ApiSyncStatus {
@@ -502,6 +551,7 @@ export interface ApiComputer {
   latest_daemon_version?: string | null
   /** True when this BYOA daemon is behind the latest version → show upgrade banner. */
   daemon_outdated?: boolean
+  runtimePolicy?: ApiByoaPolicyState
 }
 
 /** Universal-search response. The backend ranks results inside each bucket;
@@ -1226,7 +1276,7 @@ export const api = {
   getParticipants: () => http<ApiParticipant[]>('/participants'),
 
   // ─── Computers (agent hosts: Cumora Cloud + BYOA) ───
-  getComputers: () => http<ApiComputer[]>('/computers'),
+  getComputers: (signal?: AbortSignal) => http<ApiComputer[]>('/computers', { signal }),
   /** Start pairing a BYOA computer: returns a persistent token for the daemon.
    *  No computer is created until the daemon pairs and reports the machine's
    *  real hostname, so the UI just shows the command. */
@@ -1549,6 +1599,10 @@ export const api = {
   /** Settings page "models" tab. */
   getModelSettings: (signal?: AbortSignal) =>
     http<ApiModelSettings>('/settings/models', { signal }),
+  getModelRoutePreview: (role: ApiModelRole, purpose = 'preview', signal?: AbortSignal) =>
+    http<ApiModelRoutePreview>(`/settings/models/preview?role=${encodeURIComponent(role)}&purpose=${encodeURIComponent(purpose)}`, { signal }),
+  getModelGroups: (signal?: AbortSignal) =>
+    http<{ groups: ApiModelGroup[] }>('/settings/models/groups', { signal }),
   putModelSettings: (settings: Record<string, string | null>, signal?: AbortSignal) =>
     http<ApiSettingsWriteResult>('/settings/models', {
       signal,

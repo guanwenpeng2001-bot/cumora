@@ -546,3 +546,38 @@ test('T52: fallback schema is strict, embed excluded, configuration crosses Pod 
   const byoa = await pod.resolver.resolveRoleCall('company-a', 'byoa', 'brain', 'isolated')
   assert.equal(byoa.candidates.length, 0)
 })
+
+test('default and explicit ENV provenance survive bootstrap and refresh without exposing credentials', async () => {
+  const { main, config } = await bootstrap({ STEER_ENABLED: 'true' })
+  assert.equal(config.policy.sources.steer_enabled, 'env')
+  assert.equal(config.policy.sources.compaction_soft_ratio, 'default')
+  const pod = fixture(config, { STEER_ENABLED: 'false' })
+  await pod.settings.initializeManagedPodSettings()
+  const snapshot = pod.settings.getServerSettingsSnapshot()
+  assert.equal(snapshot.settings.steer_enabled, 'true')
+  assert.equal(snapshot.sources.steer_enabled, 'env')
+  assert.equal(snapshot.sources.compaction_soft_ratio, 'default')
+  const serialized = JSON.stringify(main.settings.getServerSettingsSnapshot())
+  for (const key of ['direct-text-key', 'direct-image-key', 'direct-embed-key', 'owner-openai', 'never-pod-admin']) {
+    assert.equal(serialized.includes(key), false)
+  }
+  for (const role of ['brain', 'support', 'compaction', 'image', 'audio', 'embed'] as const) {
+    const plan = await pod.resolver.resolveRoleCall('company-a', 'managed', role, 'preview')
+    assert.equal(plan.domain, 'managed')
+    assert.doesNotMatch(JSON.stringify(plan), /direct-text-key|direct-image-key|direct-embed-key|owner-openai|apiKey|baseURL/)
+  }
+})
+
+test('model provenance includes default models and inherited support env without value comparisons', async () => {
+  const main = fixture(undefined, { OPENAI_COMPACTION_MODEL: undefined as unknown as string })
+  await main.settings.loadServerSettings()
+  const snapshot = main.settings.getServerSettingsSnapshot()
+  assert.equal(snapshot.sources.compaction_model, 'env')
+  assert.equal(snapshot.sources.image_model, 'default')
+  assert.equal(snapshot.sources.agent_reasoning_effort, 'default')
+  assert.equal(snapshot.sources.compaction_fallback_models, 'default')
+  const explicit = fixture(undefined, { OPENAI_IMAGE_MODEL: 'gpt-image-2', CUMORA_REASONING_EFFORT: 'low' })
+  await explicit.settings.loadServerSettings()
+  assert.equal(explicit.settings.getServerSettingsSnapshot().sources.image_model, 'env')
+  assert.equal(explicit.settings.getServerSettingsSnapshot().sources.agent_reasoning_effort, 'env')
+})

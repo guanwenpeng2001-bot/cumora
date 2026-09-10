@@ -8,6 +8,7 @@ import { useEffect, useRef, useState } from 'react'
 import { api, type ApiModelCatalog, type ApiModelSettings } from '@/api/client'
 import { useT, useLocaleStore, type MessageKey } from '@/lib/i18n'
 import { ModelInput, FallbackChainEditor, CatalogStatus, EFFORT_OPTIONS, modelInteger } from '@/components/ModelFields'
+import { ModelRoutingPanel, SettingInfo, newerSettings } from './RuntimeSettingsPanel'
 import { cn } from '@/lib/utils'
 import { useAuth } from '@/stores/auth'
 import { useModelCatalog, catalogOptions } from '@/stores/modelCatalog'
@@ -57,7 +58,10 @@ function ModelsTabContent() {
   const catalog = catalogState.catalog
   const [draft, setDraft] = useState<Record<string, string> | null>(null)
   const [initial, setInitial] = useState<Record<string, string> | null>(null)
-  const [metadata, setMetadata] = useState<ApiModelSettings['metadata']>()
+  const isAdmin = useAuth(s => s.user?.isAdmin === true)
+  const [snapshot, setSnapshot] = useState<ApiModelSettings | null>(null)
+  const latestSnapshot = useRef<ApiModelSettings | null>(null)
+  const metadata = snapshot?.metadata
   const [inherited, setInherited] = useState<Set<string>>(new Set())
   const [forbidden, setForbidden] = useState(false)
   const [loadError, setLoadError] = useState<string | null>(null)
@@ -71,23 +75,25 @@ function ModelsTabContent() {
     && useAuth.getState().token === context.current.token && useAuth.getState().activeCompanyId === context.current.activeCompanyId
 
   useEffect(() => {
+    if (!isAdmin) return
     const controller = new AbortController()
     requests.current = controller
     void api.getModelSettings(controller.signal).then((s) => {
       if (!current()) return
       setDraft(s.settings)
       setInitial(s.settings)
-      setMetadata(s.metadata)
+      latestSnapshot.current = s
+      setSnapshot(s)
     }).catch((e) => {
       if (!current()) return
       if ((e as { status?: number })?.status === 403) setForbidden(true)
       else setLoadError(e instanceof Error ? e.message : String(e))
     })
     return () => controller.abort()
-  }, [])
+  }, [isAdmin])
 
   const dirty = draft !== null && initial !== null && Object.keys(dirtyModelSettings(draft, initial, inherited)).length > 0
-  if (forbidden) {
+  if (!isAdmin || forbidden) {
     return <div className="text-[12.5px] text-ink-500 italic">{t('me.models.adminOnly')}</div>
   }
   if (loadError) {
@@ -104,7 +110,7 @@ function ModelsTabContent() {
   }
 
   const save = async () => {
-    if (submitting.current || !current()) return
+    if (!isAdmin || submitting.current || !current()) return
     submitting.current = true
     setSaving(true)
     setSaveError(null)
@@ -123,11 +129,13 @@ function ModelsTabContent() {
       if (!current()) return
       // T3 returns the committed snapshot; older servers require a read after restore.
       const committed = result as typeof result & Partial<ApiModelSettings>
-      const snapshot = committed.settings ? committed : await api.getModelSettings(requests.current?.signal)
+      const resultSnapshot = committed.settings ? committed as ApiModelSettings : await api.getModelSettings(requests.current?.signal)
       if (!current()) return
+      const snapshot = newerSettings(latestSnapshot.current, resultSnapshot)
+      latestSnapshot.current = snapshot
       setDraft(snapshot.settings!)
       setInitial(snapshot.settings!)
-      setMetadata(snapshot.metadata)
+      setSnapshot(snapshot as ApiModelSettings)
       setInherited(new Set())
       setSavedTick(true)
       catalogState.refresh()
@@ -142,12 +150,15 @@ function ModelsTabContent() {
   return (
     <div className="space-y-6">
       <CatalogStatus {...catalogState} />
+      <p className="text-[12px] text-ink-500">{zh ? 'Managed 全局模型；保存后安装快照，下一次调用使用。在途 turn 不切换；BYOA 模型和凭据由本机管理。' : 'Managed global models. Saving installs a snapshot for subsequent calls; in-flight turns continue. BYOA models and credentials are managed locally.'}</p>
+      <p className="text-[12px]">{zh ? '快照版本' : 'Snapshot revision'}: {snapshot?.revision ?? '—'}</p>
       {saveError && <div role="alert" className="text-[12px] text-coral-deep">{saveError}</div>}
       <fieldset disabled={saving} className="space-y-6">
       {ROLES.map((role) => {
         const listId = `models-catalog-${role.key}`
         const options = catalogOptions(catalog, role.bucket)
-        const efforts = EFFORT_OPTIONS.filter((v) => !role.effortKey || !metadata?.[role.effortKey]?.allowedValues || metadata[role.effortKey]!.allowedValues!.includes(v))
+        const allowedEfforts = snapshot?.definitions?.find(d => d.key === role.effortKey)?.allowedValues ?? (role.effortKey ? metadata?.[role.effortKey]?.allowedValues : undefined)
+        const efforts = EFFORT_OPTIONS.filter(v => !allowedEfforts || allowedEfforts.includes(v))
         return (
           <div key={role.key} className="bg-cloud rounded-[14px] p-4 space-y-3"
             style={{ border: '1px solid var(--ink-100)' }}>
@@ -219,8 +230,12 @@ function ModelsTabContent() {
                 <div className="col-span-2 text-[11px] text-gold-deep italic">{t('me.models.embedWarn')}</div>
               )}
             </div>
+            {snapshot && <div className="space-y-2">{[role.modelKey, role.fallbackKey, role.effortKey, role.tokensKey, role.headroomKey].filter((k): k is string => !!k).map(key => <div key={key}>
+              <div className="text-[11px] font-mono break-all">{key}</div>
+              <SettingInfo snapshot={snapshot} settingKey={key} zh={zh} />
+            </div>)}</div>}
             <details className="text-[11px] text-ink-500">
-              <summary className="cursor-pointer">{zh ? '恢复继承（保存后生效）' : 'Restore inheritance (on save)'}</summary>
+              <summary className="cursor-pointer">{zh ? '恢复继承（保存后按调用边界应用）' : 'Restore inheritance (applies at call boundary after save)'}</summary>
               <div className="flex flex-wrap gap-3 mt-2">
               {[role.modelKey, role.fallbackKey, role.effortKey, role.tokensKey, role.headroomKey].filter((k): k is string => !!k).map((key) => <label key={key} className="flex items-center gap-1">
                 <input type="checkbox" checked={inherited.has(key)} onChange={(e) => setInherited((old) => {
@@ -243,9 +258,17 @@ function ModelsTabContent() {
           style={{ background: saving ? 'var(--ink-200)' : 'var(--skype)', boxShadow: '0 4px 12px -3px rgba(0, 168, 240, 0.5)' }}>
           {saving ? t('me.models.saving') : t('me.models.save')}
         </button>
-        {savedTick && <span className="text-[12px] text-skype-deep font-medium">{t('me.models.saved')}</span>}
+        {savedTick && <span className="text-[12px] text-skype-deep font-medium">{zh ? '快照已保存，实际调用按生效边界应用' : 'Snapshot saved; calls apply it at their boundary'}</span>}
 
       </div>
+      {snapshot && <ModelRoutingPanel snapshot={snapshot} onSaved={result => {
+        const next = newerSettings(latestSnapshot.current, result)
+        latestSnapshot.current = next
+        setSnapshot(next)
+        setInitial(next.settings)
+        setDraft(old => ({ ...next.settings, ...Object.fromEntries(MODEL_KEYS.filter(key => old?.[key] !== initial[key]).map(key => [key, old![key]])) }))
+        catalogState.refresh()
+      }} />}
     </div>
   )
 }
