@@ -41,6 +41,7 @@ import { mergeWakeTurnOptions, parseWakeData } from './wake-options.js'
 
 interface RunnerState {
   busy: boolean
+  inboxDeferred: { messageIds: string[]; retryAt: number } | null
   pendingRerun: boolean
   shuttingDown: boolean
   /** ms timestamp of the last activity (turn start or wake). Drives
@@ -56,6 +57,7 @@ interface RunnerState {
 }
 
 const state: RunnerState = {
+  inboxDeferred: null,
   busy: false, pendingRerun: false, shuttingDown: false,
   lastActivityAt: Date.now(),
   firstWakeReceived: false,
@@ -66,9 +68,37 @@ let activeTurnController: AbortController | null = null
 let pendingTurnOptions: AgentTurnOptions | null = null
 let inboxProbeTimer: NodeJS.Timeout | null = null
 let inboxProbeInFlight = false
+let inboxRetryTimer: NodeJS.Timeout | null = null
 
 function mergeTurnOptions(next: AgentTurnOptions | null): void {
   pendingTurnOptions = mergeWakeTurnOptions(pendingTurnOptions, next)
+}
+
+/** All wake sources pass this gate while holding the drain lock. A new
+ * message does not bypass the deadline while deferred messages remain unread.
+ * If those messages were read/removed elsewhere, the stale boundary is cleared. */
+async function admitInboxDrain(agentId: string): Promise<boolean> {
+  const deferred = state.inboxDeferred
+  if (!deferred) return true
+  if (Date.now() < deferred.retryAt) {
+    const inbox = await runtime.loadInbox(agentId)
+    const ids = new Set(deferred.messageIds)
+    if (inbox.some(row => ids.has(row.id))) return false
+  }
+  state.inboxDeferred = null
+  if (inboxRetryTimer) clearTimeout(inboxRetryTimer)
+  inboxRetryTimer = null
+  return true
+}
+
+function deferInboxDrain(agentId: string, deferred: { messageIds: string[]; retryAt: number }): void {
+  state.inboxDeferred = deferred
+  if (inboxRetryTimer) clearTimeout(inboxRetryTimer)
+  inboxRetryTimer = setTimeout(() => {
+    inboxRetryTimer = null
+    void drain(agentId)
+  }, Math.min(2_147_483_647, Math.max(1, deferred.retryAt - Date.now())))
+  inboxRetryTimer.unref?.()
 }
 
 async function drain(agentId: string, options: AgentTurnOptions | null = null): Promise<void> {
@@ -80,20 +110,27 @@ async function drain(agentId: string, options: AgentTurnOptions | null = null): 
   try {
     do {
       state.pendingRerun = false
+      if (!await admitInboxDrain(agentId)) break
       const turnOptions = pendingTurnOptions ?? {}
       pendingTurnOptions = null
       const started = Date.now()
       try {
         activeTurnController = new AbortController()
-        await runAgentTurn(agentId, { ...turnOptions, signal: activeTurnController.signal })
+        await runAgentTurn(agentId, { ...turnOptions, signal: activeTurnController.signal,
+          onInboxDeferred: deferred => { state.inboxDeferred = deferred } })
         console.log(`[pod-agent] turn ok · ${Date.now() - started}ms`)
       } catch (err) {
         console.error(`[pod-agent] turn failed (${Date.now() - started}ms):`,
           err instanceof Error ? err.message : String(err))
       }
       activeTurnController = null
+      // Schedule outside runAgentTurn's AsyncLocalStorage snapshot: the retry
+      // must capture the next revision, not inherit this turn's settings.
+      if (state.inboxDeferred) deferInboxDrain(agentId, state.inboxDeferred)
       state.lastActivityAt = Date.now()
     } while (state.pendingRerun && !state.shuttingDown)
+  } catch (err) {
+    console.warn('[pod-agent] inbox admission failed:', err instanceof Error ? err.message : String(err))
   } finally {
     state.busy = false
   }
@@ -251,6 +288,8 @@ function startIdleWatcher(
   // of crossing the threshold, but never busier than every 500ms.
   const tickMs = Math.min(5_000, Math.max(500, Math.floor(Math.min(idleMs, noWorkMs) / 10)))
   const tick = setInterval(() => {
+    // Keep the in-memory deferred boundary alive until its scheduled retry.
+    if (state.inboxDeferred) return
     const reason = decidePodExit(state, bootedAt, Date.now(), idleMs, noWorkMs)
     if (reason !== null) {
       clearInterval(tick)
@@ -268,6 +307,8 @@ async function gracefulExit(reason: string, finalStatus: 'resting' | null): Prom
   state.shuttingDown = true
   activeTurnController?.abort(new DOMException(`Pod stopping: ${reason}`, 'AbortError'))
   stopInboxProbe()
+  if (inboxRetryTimer) clearTimeout(inboxRetryTimer)
+  inboxRetryTimer = null
   console.log('[pod-agent] shutting down: ' + reason)
   // Wait for in-flight turn to finish, capped at 60s.
   const deadline = Date.now() + 60_000

@@ -342,7 +342,7 @@ test('[integration] provider connection failure: short retry can recover the tur
 // G. Image-strip retry on image_url fetch failure
 // ────────────────────────────────────────────────────────────────────────────
 
-test('[integration] turn hop retries each candidate before fallback and never replays committed output or cancellation', async t => {
+test('[integration] turn hop retries each candidate and private buffers before fallback; cancellation stops the chain', async t => {
   const { resolveRoleCall } = await import('../llm-resolver.js')
   const original = await resolveRoleCall(null, 'server', 'brain', 'agent-turn')
   const primary = original.candidates[0]!
@@ -392,7 +392,7 @@ test('[integration] turn hop retries each candidate before fallback and never re
     assert.equal(records[0].extras?.nextCandidateReason, 'upstream-http-401')
   })
   for (const boundary of ['output', 'tool', 'cancel'] as const) {
-    await t.test(boundary + ' prevents retries and fallback', async () => {
+    await t.test(boundary === 'cancel' ? 'cancellation prevents fallback' : `private ${boundary} allows retries and fallback`, async () => {
       let calls = 0
       const controller = new AbortController()
       const records: import('../agents/llm-ledger.js').LlmCallRecord[] = []
@@ -400,7 +400,7 @@ test('[integration] turn hop retries each candidate before fallback and never re
         responses: { create: async () => {
           calls++
           return (async function* () {
-            if (boundary === 'output') yield { type: 'response.output_text.delta', item_id: 'text', output_index: 0, content_index: 0, delta: 'visible' }
+            if (boundary === 'output') yield { type: 'response.output_text.delta', item_id: 'text', output_index: 0, content_index: 0, delta: 'private draft' }
             if (boundary === 'tool') yield { type: 'response.output_item.added', item: { id: 'tool', type: 'function_call', call_id: 'call', name: 'bash', arguments: '' } }
             if (boundary === 'cancel') controller.abort()
             throw Object.assign(new Error('Connection error.'), { code: 'ECONNRESET' })
@@ -409,9 +409,10 @@ test('[integration] turn hop retries each candidate before fallback and never re
       }) as unknown as Awaited<ReturnType<typeof import('../llm.js').getLlmClient>>)
       await assert.rejects(executeAgentTurnHop({ plan, context, input: [], instructions: '', tools: [],
         signal: controller.signal, record: async record => { records.push(record) } }))
-      assert.equal(calls, 1)
-      assert.equal(records.length, 1)
-      assert.equal(records[0].extras?.stopReason, boundary === 'cancel' ? 'cancelled' : 'output-committed')
+      assert.equal(calls, boundary === 'cancel' ? 1 : 6)
+      assert.equal(records.length, calls)
+      assert.equal(records[0].extras?.stopReason, boundary === 'cancel' ? 'cancelled' : 'advance')
+      assert.equal(records.at(-1)?.extras?.stopReason, boundary === 'cancel' ? 'cancelled' : 'exhausted')
     })
   }
 })

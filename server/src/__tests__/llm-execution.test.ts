@@ -16,7 +16,7 @@ const allowed = new Set([
   'llm-execution.ts', 'llm.ts', 'llm-resolver.ts', 'settings.ts', 'env.ts',
   'managed-pod-settings.ts', 'tenant-llm-context.ts', 'sub2api.ts', 'novita.ts',
   'model-pricing.ts', 'agents/llm-ledger.ts', 'agents/cost.ts', 'agents/token-usage.ts',
-  'agents/fallback.ts', 'agents/model-config.ts',
+  'agents/fallback.ts', 'agents/model-config.ts', 'agents/embeddings.ts',
 ])
 const root = new URL('../', import.meta.url)
 const pool = {
@@ -285,4 +285,137 @@ test('real raw SDK factory has no hidden application model chain',async()=>{
     await assert.rejects(client.responses.create({model:'same',input:'hi'},{maxRetries:0}))
     assert.equal(requests,1);assert.equal(inserts.length,0)
   } finally {globalThis.fetch=oldFetch}
+})
+
+const embeddingResponse = (usage: unknown = { prompt_tokens: 12, total_tokens: 12 }) => ({
+  model: 'embedding-actual', data: [{ embedding: Array(1536).fill(0.25) }], usage,
+})
+function embeddingClient() {
+  setSdkClientFactory(() => ({
+    embeddings: { create: async (args: any, opts: any) => {
+      sent.push({ args, opts })
+      return create(args, opts)
+    } },
+  }))
+}
+function embeddingStore() {
+  const writes: string[] = []
+  pool.connect = async () => ({
+    query: async (sql: string) => {
+      if (sql === 'SELECT key, value FROM server_settings') return {
+        rows: Object.entries(settings).map(([key, value]) => ({ key, value })),
+      }
+      writes.push(sql)
+      return { rows: [] }
+    },
+    release() {},
+  }) as never
+  return writes
+}
+test('embedding write, retrieval and backfill each create one measured ledger row', async () => {
+  embeddingClient()
+  create = async () => embeddingResponse()
+  const writes = embeddingStore()
+  const api = load('agents/embeddings.ts')
+  assert.equal(await api.embedAndStore('write', { agentId: 'a', purpose: 'memory.write' },
+    async (client: any) => client.query('STORE')), true)
+  assert.ok(await api.embedText('retrieve', { agentId: 'a', purpose: 'memory.retrieve' }))
+  const query = pool.query
+  pool.query = async (sql, values) => {
+    if (sql.includes('FROM pg_extension')) return { rows: [{ exists: true }] }
+    if (sql.includes('FROM agent_workspace')) return {
+      rows: [{ agent_id: 'a', company_id: null, path: 'memory/a', body: 'backfill' }],
+    }
+    return query(sql, values)
+  }
+  await api.backfillMemoryEmbeddings({ batchSize: 2, delayMs: 0 })
+  assert.equal(sent.length, 3)
+  assert.equal(inserts.length, 3)
+  assert.deepEqual(inserts.map(row => extras(row).embeddingPurpose),
+    ['memory.write', 'memory.retrieve', 'memory.backfill'])
+  for (const row of inserts) {
+    assert.equal(row[5], 'embedding')
+    assert.equal(row[2], 'a')
+    assert.equal(row[15], true)
+    assert.equal(row[8], 12)
+    assert.equal(row[11], 0)
+    assert.equal(extras(row).actualModel, 'embedding-actual')
+    assert.deepEqual(extras(row).rawUsage, { prompt_tokens: 12, total_tokens: 12 })
+    assert.equal(extras(row).nextCandidate, null)
+    assert.equal(extras(row).attempt, 1)
+  }
+  assert.ok(writes.some(sql => sql.includes('UPDATE agent_workspace')))
+  assert.ok(sent.every(request => request.opts.maxRetries === 0 && request.opts.timeout === 10_000))
+})
+for (const status of [401, 403, 429, 503]) test('embedding failure ' + status + ' records once and never falls back', async () => {
+  embeddingClient()
+  create = async () => { throw httpError(status) }
+  const api = load('agents/embeddings.ts')
+  for (const purpose of ['memory.write', 'memory.retrieve', 'memory.backfill']) {
+    assert.equal(await api.embedText('hello', { purpose }), null)
+  }
+  assert.equal(sent.length, 3)
+  assert.equal(inserts.length, 3)
+  for (const row of inserts) {
+    assert.notEqual(row[17], 'ok')
+    assert.equal(row[15], false)
+    assert.equal(extras(row).actualModel, null)
+    assert.equal(extras(row).nextCandidate, null)
+    assert.equal(extras(row).sdkMaxRetries, 0)
+  }
+})
+test('embedding missing or invalid usage stays unknown; measured zero stays measured', async () => {
+  embeddingClient()
+  const api = load('agents/embeddings.ts')
+  for (const usage of [null, {}, { total_tokens: 12 }, { prompt_tokens: -1 },
+    { prompt_tokens: 1.5 }, { prompt_tokens: 0, total_tokens: 0 }]) {
+    create = async () => embeddingResponse(usage)
+    assert.ok(await api.embedText('hello'))
+  }
+  assert.deepEqual(inserts.map(row => row[15]), [false, false, false, false, false, true])
+  assert.ok(inserts.every(row => row[17] === 'ok'))
+})
+test('invalid embedding vector records failed attempt with usage and prevents storage', async () => {
+  embeddingClient()
+  create = async () => ({ ...embeddingResponse(), data: [{ embedding: [1] }] })
+  const api = load('agents/embeddings.ts')
+  let stored = false
+  assert.equal(await api.embedAndStore('hello', {}, async () => { stored = true }), false)
+  assert.equal(stored, false)
+  assert.equal(sent.length, 1)
+  assert.equal(inserts.length, 1)
+  assert.equal(inserts[0][17], 'failed')
+  assert.equal(inserts[0][15], true)
+})
+test('embedding space change discards stale vector while keeping its request ledger row', async () => {
+  embeddingClient()
+  const writes = embeddingStore()
+  create = async () => { settings.embed_model = 'new-space'; return embeddingResponse() }
+  const api = load('agents/embeddings.ts')
+  let stored = false
+  assert.equal(await api.embedAndStore('hello', {}, async () => { stored = true }), false)
+  assert.equal(stored, false)
+  assert.ok(writes.includes('ROLLBACK'))
+  assert.equal(sent.length, 1)
+  assert.equal(inserts.length, 1)
+})
+
+test('real embedding SDK receives 429 once with no hidden retry or second model', async () => {
+  setSdkClientFactory(null)
+  let requests = 0
+  globalThis.fetch = async (_url, options) => {
+    requests++
+    const body = JSON.parse(options!.body as string)
+    assert.equal(body.model, 'text-embedding-3-small')
+    assert.equal(body.dimensions, 1536)
+    return new Response(JSON.stringify({ error: { message: 'rate limited' } }), {
+      status: 429, headers: { 'content-type': 'application/json' },
+    })
+  }
+  const api = load('agents/embeddings.ts')
+  assert.equal(await api.embedText('hello', { purpose: 'memory.retrieve' }), null)
+  assert.equal(requests, 1)
+  assert.equal(inserts.length, 1)
+  assert.equal(inserts[0][17], 'rate_limited')
+  assert.equal(extras(inserts[0]).nextCandidate, null)
 })

@@ -122,3 +122,122 @@ test('keeps running while NO_WORK_MS not yet crossed', () => {
   )
   assert.equal(r, null)
 })
+
+// Exercise the actual Pod drain and timers without booting main(), Redis or DB.
+import { readFileSync } from 'node:fs'
+import ts from 'typescript'
+import { AsyncLocalStorage } from 'node:async_hooks'
+import { mergeWakeTurnOptions } from '../agents/runtime/wake-options.js'
+
+function drainFixture() {
+  const source = readFileSync(new URL('../agents/runtime/pod-agent.ts', import.meta.url), 'utf8')
+  const start = source.indexOf('interface RunnerState')
+  const end = source.indexOf('// parseSseStream + SseEvent')
+  const ast = ts.createSourceFile('pod.ts', source, ts.ScriptTarget.Latest, true)
+  const idle = ast.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'startIdleWatcher')!
+  const output = ts.transpileModule(source.slice(start, end) + idle.getText(ast) + '\nexport { drain, state, startInboxProbe, startIdleWatcher }', {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+  }).outputText
+  let now = 1_000_000
+  let inbox = [{ id: 'old' }]
+  const contexts = new AsyncLocalStorage<string>()
+  const timers: Array<{ context: string | undefined; fn: () => void; ms: number; cleared: boolean; interval: boolean; unref: () => void }> = []
+  const timer = (fn: () => void, ms: number, interval: boolean) => {
+    const value = { context: contexts.getStore(), fn, ms, interval, cleared: false, unref() {} }
+    timers.push(value)
+    return value
+  }
+  const calls: any[] = []
+  let run: (options: any) => Promise<void> = async options => {
+    options.onInboxDeferred({ messageIds: ['old'], retryAt: now + 120_000 })
+  }
+  const deps = {
+    Date: { now: () => now }, mergeWakeTurnOptions, decidePodExit,
+    runtime: { loadInbox: async () => inbox },
+    runAgentTurn: async (_id: string, options: any) => { calls.push(options); await run(options) },
+    setTimeout: (fn: () => void, ms: number) => timer(fn, ms, false),
+    setInterval: (fn: () => void, ms: number) => timer(fn, ms, true),
+    clearTimeout: (value: typeof timers[number]) => { value.cleared = true },
+    clearInterval: (value: typeof timers[number]) => { value.cleared = true },
+  }
+  const pod: Record<string, any> = {}
+  new Function('exports', ...Object.keys(deps), output)(pod, ...Object.values(deps))
+  return { pod, calls, timers, contexts, advance: (ms: number) => { now += ms },
+    inbox: (rows: Array<{ id: string }>) => { inbox = rows },
+    run: (fn: typeof run) => { run = fn } }
+}
+const flushDrain = () => new Promise(resolve => setImmediate(resolve))
+
+test('Pod wake and 30s probe respect a 120s defer boundary; deadline retries without another wake', async () => {
+  const f = drainFixture()
+  await f.pod.drain('a')
+  assert.equal(f.calls.length, 1)
+  assert.deepEqual(f.pod.state.inboxDeferred.messageIds, ['old'])
+  f.advance(30_000)
+  f.inbox([{ id: 'old' }, { id: 'new' }])
+  await f.pod.drain('a', { trigger: 'message.new' })
+  f.pod.startInboxProbe('a')
+  const probe = f.timers.find(t => t.interval && t.ms === 30_000)!
+  probe.fn()
+  await flushDrain()
+  assert.equal(f.calls.length, 1, 'neither new messages nor probes bypass the deadline')
+  f.run(async () => {})
+  f.advance(90_000)
+  f.timers.find(t => !t.interval && !t.cleared)!.fn()
+  await flushDrain()
+  assert.equal(f.calls.length, 2)
+  assert.equal(f.calls[1].trigger, 'message.new')
+  assert.equal(f.pod.state.inboxDeferred, null)
+})
+
+test('Pod clears obsolete deferred messages after external acknowledgement and admits the new boundary', async () => {
+  const f = drainFixture()
+  await f.pod.drain('a')
+  f.inbox([{ id: 'new' }])
+  f.run(async () => {})
+  await f.pod.drain('a')
+  assert.equal(f.calls.length, 2)
+  assert.equal(f.pod.state.inboxDeferred, null)
+  assert.ok(f.timers[0].cleared)
+})
+
+test('Pod coalesces concurrent wakes and applies defer before a queued rerun', async () => {
+  const f = drainFixture()
+  let release!: () => void
+  const paused = new Promise<void>(resolve => { release = resolve })
+  f.run(async options => { await paused; options.onInboxDeferred({ messageIds: ['old'], retryAt: 1_120_000 }) })
+  const first = f.pod.drain('a')
+  await flushDrain()
+  await Promise.all([f.pod.drain('a'), f.pod.drain('a')])
+  release()
+  await first
+  assert.equal(f.calls.length, 1)
+  assert.equal(f.pod.state.busy, false)
+})
+
+test('Pod idle/no-work exit cannot erase an outstanding in-memory defer boundary', async () => {
+  const f = drainFixture()
+  await f.pod.drain('a')
+  let exits = 0
+  f.pod.startIdleWatcher('a', 1000, 1000, () => { exits++ })
+  f.advance(2000)
+  f.timers.find(t => t.interval)!.fn()
+  assert.equal(exits, 0)
+  f.inbox([])
+  f.run(async () => {})
+  await f.pod.drain('a')
+  f.advance(2000)
+  f.timers.find(t => t.interval)!.fn()
+  assert.equal(exits, 1)
+})
+
+
+test('Pod retry timer is scheduled outside the completed turn settings context', async () => {
+  const f = drainFixture()
+  f.run(async options => f.contexts.run('old-revision', async () => {
+    options.onInboxDeferred({ messageIds: ['old'], retryAt: 1_120_000 })
+  }))
+  await f.pod.drain('a')
+  const retry = f.timers.find(t => !t.interval && !t.cleared)!
+  assert.equal(retry.context, undefined, 'timer must not pin the old turn revision')
+})

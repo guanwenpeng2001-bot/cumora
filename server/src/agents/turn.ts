@@ -20,7 +20,7 @@
 import type { ResponseInputItem, ResponseStreamEvent } from 'openai/resources/responses/responses'
 import { env } from '../env.js'
 import type { AgentModelConfig } from './model-config.js'
-import { getBrainModel, getTurnBudgetPolicy, type TurnBudgetPolicy } from '../settings.js'
+import { getBrainModel, getTurnBudgetPolicy, getServerSettingsSnapshot, withServerSettingsSnapshot, type TurnBudgetPolicy } from '../settings.js'
 import { redis } from '../redis.js'
 import { readLocalMessageAttachment } from '../local-attachment-files.js'
 import { messageAttachmentStorageKey } from '../storage-keys.js'
@@ -126,6 +126,8 @@ import { mentionedAgentIds } from './scheduler.js'
 
 export interface AgentTurnOptions {
   signal?: AbortSignal
+  /** Private Pod drain feedback; deferred messages remain unread. */
+  onInboxDeferred?: (deferred: { messageIds: string[]; retryAt: number }) => void
   /** Why this turn was started. Message-driven turns remain the default. */
   trigger?: 'message.new' | 'idle' | 'manual' | 'background_scan' | 'poll.updated'
   /** Short scheduler note rendered only for idle synthetic wakes. */
@@ -1155,11 +1157,16 @@ async function executeAuxiliaryStream<T>(args: {
   const { executeLlmPlan } = await import('../llm-execution.js')
   const { getLlmCandidateClient } = await import('../llm.js')
   const { measuredUsage } = await import('./cost.js')
+  // The settings registry does not yet expose this compaction-domain key.
+  // Until it does, every auxiliary consumer still has a bounded default.
+  const configuredTimeout = Number(getServerSettingsSnapshot().settings.compaction_stream_timeout_ms)
+  const timeoutMs = Number.isSafeInteger(configuredTimeout) && configuredTimeout > 0 && configuredTimeout <= 2_147_483_647
+    ? configuredTimeout : 30_000
   const plan = await resolveRoleCall(args.companyId, args.companyId ? 'managed' : 'server',
     'compaction', args.purpose, { id: args.agentId })
   return executeLlmPlan({
     plan, context: { role: 'compaction', purpose: args.purpose, companyId: args.companyId,
-      agentId: args.agentId, extras: args.extras }, signal: args.signal,
+      agentId: args.agentId, extras: args.extras }, signal: args.signal, sdkMaxRetries: 0,
     prepare: async (candidate, state) => {
       if (!['responses', 'chat'].includes(candidate.protocol)) throw new Error('Non-text auxiliary LLM protocol')
       const client = await getLlmCandidateClient(plan, candidate)
@@ -1172,42 +1179,60 @@ async function executeAuxiliaryStream<T>(args: {
       state.protocol = useChat ? 'chat' : candidate.protocol
       state.usageProtocol = useChat ? 'chat' : 'responses'
       return async () => {
-        const stream = useChat
-          ? await client.chat.completions.create({
-            model, stream: true, stream_options: { include_usage: true },
-            messages: [{ role: 'system', content: args.instructions }, ...args.input.map(item => {
-              const message = item as { role: 'user'; content: Array<{ text: string }> }
-              return { role: message.role, content: message.content.map(part => part.text).join('\n') }
-            })], max_completion_tokens: maxTokens, ...(effort ? { reasoning_effort: effort } : {}),
-          } as Parameters<typeof client.chat.completions.create>[0], { signal: args.signal })
-          : await client.responses.create({
-            model, instructions: args.instructions, input: args.input, stream: true,
-            max_output_tokens: maxTokens, ...(effort ? { reasoning: { effort } } : {}),
-          } as Parameters<typeof client.responses.create>[0], { signal: args.signal })
-        let collected = ''
-        for await (const event of stream as unknown as AsyncIterable<Record<string, any>>) {
+        const requestController = new AbortController()
+        const signal = args.signal ? AbortSignal.any([args.signal, requestController.signal]) : requestController.signal
+        let stream: unknown
+        try {
+          stream = useChat
+            ? await client.chat.completions.create({
+              model, stream: true, stream_options: { include_usage: true },
+              messages: [{ role: 'system', content: args.instructions }, ...args.input.map(item => {
+                const message = item as { role: 'user'; content: Array<{ text: string }> }
+                return { role: message.role, content: message.content.map(part => part.text).join('\n') }
+              })], max_completion_tokens: maxTokens, ...(effort ? { reasoning_effort: effort } : {}),
+            } as Parameters<typeof client.chat.completions.create>[0], { signal, timeout: timeoutMs, maxRetries: 0 })
+            : await client.responses.create({
+              model, instructions: args.instructions, input: args.input, stream: true,
+              max_output_tokens: maxTokens, ...(effort ? { reasoning: { effort } } : {}),
+            } as Parameters<typeof client.responses.create>[0], { signal, timeout: timeoutMs, maxRetries: 0 })
+          let collected = ''
+          let completed = false
+          await consumeResponseStream(stream as AsyncIterable<Record<string, any>>, event => {
+            if (args.signal?.aborted) throw args.signal.reason ?? new Error('auxiliary stream aborted')
+            const response = useChat ? event : event.response
+            if (typeof response?.model === 'string') state.actualModel = response.model
+            if (response?.usage) {
+              state.rawUsage = response.usage
+              state.usage = measuredUsage(response.usage, useChat ? 'chat' : 'responses')
+              state.reasoningTokens = response.usage[useChat ? 'completion_tokens_details' : 'output_tokens_details']?.reasoning_tokens
+            }
+            if (event.type === 'error' || event.type === 'response.failed' || event.type === 'response.incomplete') {
+              const error = response?.error ?? event.error ?? event
+              throw Object.assign(new Error(error.message ?? 'Auxiliary response did not complete'),
+                { status: error.status ?? event.status, code: error.code })
+            }
+            if (useChat) {
+              collected += event.choices?.[0]?.delta?.content ?? ''
+              const finish = event.choices?.[0]?.finish_reason
+              if (finish === 'stop') completed = true
+              else if (finish != null) throw Object.assign(new Error(`Auxiliary chat ended with ${finish}`), { code: 'ECONNRESET' })
+            }
+            else if (event.type === 'response.completed') completed = true
+            else if (event.type === 'response.output_text.delta') collected += event.delta
+            else if (event.type === 'response.output_text.done') collected = event.text || collected
+          }, { signal, wallTimeoutMs: timeoutMs, idleTimeoutMs: timeoutMs,
+            abortRequest: reason => requestController.abort(reason) })
+          if (!completed) throw Object.assign(new Error('Auxiliary response stream ended before completion'), { code: 'ECONNRESET' })
           if (args.signal?.aborted) throw args.signal.reason ?? new Error('auxiliary stream aborted')
-          const response = useChat ? event : event.response
-          if (typeof response?.model === 'string') state.actualModel = response.model
-          if (response?.usage) {
-            state.rawUsage = response.usage
-            state.usage = measuredUsage(response.usage, useChat ? 'chat' : 'responses')
-            state.reasoningTokens = response.usage[useChat ? 'completion_tokens_details' : 'output_tokens_details']?.reasoning_tokens
-          }
-          if (event.type === 'error' || event.type === 'response.failed' || event.type === 'response.incomplete') {
-            const error = response?.error ?? event.error ?? event
-            throw Object.assign(new Error(error.message ?? 'Auxiliary response did not complete'),
-              { status: error.status ?? event.status, code: error.code })
-          }
-          if (useChat) collected += event.choices?.[0]?.delta?.content ?? ''
-          else if (event.type === 'response.output_text.delta') collected += event.delta
-          else if (event.type === 'response.output_text.done') collected = event.text || collected
+          const result = args.parse(collected)
+          // These private streams publish only the fully parsed result, never partial text.
+          state.committed = true
+          return result
+        } finally {
+          requestController.abort()
+          const streamController = (stream as { controller?: AbortController } | undefined)?.controller
+          streamController?.abort()
         }
-        if (args.signal?.aborted) throw args.signal.reason ?? new Error('auxiliary stream aborted')
-        const result = args.parse(collected)
-        // These private streams publish only the fully parsed result, never partial text.
-        state.committed = true
-        return result
       }
     },
   })
@@ -1578,8 +1603,9 @@ export async function executeAgentTurnHop(args: {
                 attempt.usage = measuredUsage(state.responseUsage, 'responses')
                 const reasoning = (state.responseUsage as { output_tokens_details?: { reasoning_tokens?: number } } | null)?.output_tokens_details?.reasoning_tokens
                 if (typeof reasoning === 'number' && Number.isSafeInteger(reasoning) && reasoning >= 0) attempt.reasoningTokens = reasoning
-                if (Array.from(state.responseTextByPart.values()).some(text => text.length > 0)
-                  || Object.keys(state.pendingTools).length > 0 || state.responseOutput.length > 0) attempt.committed = true
+                // Text and tool declarations remain private until this hop returns.
+                // Actual tool execution and reply publication happen outside the
+                // executor, so their failures cannot replay this candidate chain.
               }
             }, { signal: requestSignal, idleTimeoutMs: args.idleTimeoutMs, abortRequest: reason => requestController.abort(reason) })
             signal.throwIfAborted()
@@ -1600,18 +1626,20 @@ export async function executeAgentTurnHop(args: {
 }
 
 export async function runAgentTurn(agentId: string, options: AgentTurnOptions = {}): Promise<void> {
-  const policy = getTurnBudgetPolicy()
-  const controller = new AbortController()
-  const signal = options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal
-  const timer = policy.timeoutMs > 0
-    ? setTimeout(() => controller.abort(new DOMException('Managed turn deadline exceeded', 'TimeoutError')), policy.timeoutMs)
-    : undefined
-  timer?.unref()
-  try {
-    await runAgentTurnWithBudget(agentId, { ...options, signal }, policy)
-  } finally {
-    if (timer) clearTimeout(timer)
-  }
+  return withServerSettingsSnapshot(async () => {
+    const policy = getTurnBudgetPolicy()
+    const controller = new AbortController()
+    const signal = options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal
+    const timer = policy.timeoutMs > 0
+      ? setTimeout(() => controller.abort(new DOMException('Managed turn deadline exceeded', 'TimeoutError')), policy.timeoutMs)
+      : undefined
+    timer?.unref()
+    try {
+      await runAgentTurnWithBudget(agentId, { ...options, signal }, policy)
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
+  })
 }
 
 async function runAgentTurnWithBudget(agentId: string, options: AgentTurnOptions, turnPolicy: TurnBudgetPolicy): Promise<void> {
@@ -1958,6 +1986,11 @@ async function runAgentTurnWithBudget(agentId: string, options: AgentTurnOptions
         context: preloadedContext,
       }))
       const reason = verdict.reason.trim().slice(0, 500)
+      if (verdict.outcome === 'defer') {
+        const retryAt = typeof verdict.retryAt === 'number' && Number.isFinite(verdict.retryAt)
+          ? verdict.retryAt : Date.now() + Number(getServerSettingsSnapshot().settings.triage_backoff_base_ms || 30_000)
+        options.onInboxDeferred?.({ messageIds: inbox.map(row => row.id), retryAt })
+      }
       if (verdict.outcome !== 'execute') {
         finalStatus = 'skipped'
         finalSummary = verdict.outcome === 'defer'

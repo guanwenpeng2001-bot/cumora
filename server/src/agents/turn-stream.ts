@@ -83,7 +83,7 @@ export interface ConsumeStreamOptions {
   wallTimeoutMs?: number
 }
 
-function abortStream(stream: AsyncIterable<ResponseStreamEvent>): void {
+function abortStream(stream: AsyncIterable<unknown>): void {
   const maybeAbort = (stream as unknown as { controller?: { abort?: () => void } }).controller?.abort
   if (typeof maybeAbort === 'function') {
     try {
@@ -120,9 +120,9 @@ async function nextWithTimeout<T>(
   }
 }
 
-export async function consumeResponseStream(
-  stream: AsyncIterable<ResponseStreamEvent>,
-  onEvent: (event: ResponseStreamEvent) => void,
+export async function consumeResponseStream<T>(
+  stream: AsyncIterable<T>,
+  onEvent: (event: T) => void,
   opts: ConsumeStreamOptions = {},
 ): Promise<void> {
   const idleTimeoutMs = opts.idleTimeoutMs ?? RESPONSE_STREAM_IDLE_TIMEOUT_MS
@@ -144,7 +144,7 @@ export async function consumeResponseStream(
     }
     const waitMs = Math.min(idleTimeoutMs, remainingWallMs)
     const timeoutKind = waitMs === remainingWallMs ? 'wall' : 'idle'
-    let result: IteratorResult<ResponseStreamEvent>
+    let result: IteratorResult<T>
     try {
       result = await nextWithTimeout(iterator.next(), waitMs, timeoutKind, opts.signal)
     } catch (err) {
