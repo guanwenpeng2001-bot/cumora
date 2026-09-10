@@ -331,7 +331,8 @@ function dnsLabelValue(value: string): string {
   return value
 }
 
-interface InitialInboxTriage { triageNote: string; triageBoundary?: string }
+interface InitialInboxTriage { triageNote: string; triageBoundary?: string; contextBoundary?: string }
+type InitialInboxTriageArg = InitialInboxTriage | Promise<InitialInboxTriage | undefined>
 
 function podManifest(args: {
   initialTriage?: InitialInboxTriage
@@ -882,7 +883,7 @@ const ENSURE_POD_WATCHDOG_MS = 180_000
  *  Doesn't wait for the Pod to be Ready / SSE-attached. The scheduler
  *  is free to enqueue the wake event on the bus; the Pod, once it
  *  connects, drains its inbox unconditionally and catches up. */
-export async function ensurePod(agentId: string, initialTriage?: InitialInboxTriage): Promise<EnsurePodResult> {
+export async function ensurePod(agentId: string, initialTriage?: InitialInboxTriageArg): Promise<EnsurePodResult> {
   const existing = inFlight.get(agentId)
   if (existing) return existing
   const p = (async (): Promise<EnsurePodResult> => {
@@ -930,7 +931,7 @@ export async function ensurePod(agentId: string, initialTriage?: InitialInboxTri
   return p
 }
 
-async function ensurePodImpl(agentId: string, signal: AbortSignal, initialTriage?: InitialInboxTriage): Promise<EnsurePodResult> {
+async function ensurePodImpl(agentId: string, signal: AbortSignal, initialTriage?: InitialInboxTriageArg): Promise<EnsurePodResult> {
   const startedAt = Date.now()
   // This is the final authorization boundary for managed execution. Scheduler
   // lookups are advisory only: assignment/tier can change between a wake and
@@ -1108,13 +1109,16 @@ async function ensurePodImpl(agentId: string, signal: AbortSignal, initialTriage
     }
   }
 
+  const resolvedTriage = initialTriage && typeof (initialTriage as Promise<unknown>).then === 'function'
+    ? await (initialTriage as Promise<InitialInboxTriage | undefined>)
+    : initialTriage as InitialInboxTriage | undefined
   const manifest = podManifest({
     agentId,
     token,
     image: IMAGE,
     serverUrl: env.AGENT_RUNTIME_SERVER_URL,
     bootstrap,
-    initialTriage,
+    initialTriage: resolvedTriage,
     openaiKey: bootstrap.direct.text.apiKey,
     openaiBaseUrl: bootstrap.direct.text.baseURL,
     idleMs: automationNumber('pod_idle_ms'),

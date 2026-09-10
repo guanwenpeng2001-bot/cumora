@@ -11,7 +11,7 @@ function turnFixture(connect: (spec: McpConnectorSpec, opts: any) => Promise<Mcp
   const start = source.indexOf('  const seenMcpConnectorNames = new Set<string>()')
   const end = source.indexOf('  const plan = await resolveRoleCall', start)
   const closeStart = source.indexOf('    for (const client of mcpClients) {', end)
-  const closeEnd = source.indexOf('    await runtime.applyPendingResources', closeStart)
+  const closeEnd = source.indexOf('    if (turnExecuted) await runtime.applyPendingResources', closeStart)
   assert.ok(start > 0 && end > start && closeStart > end && closeEnd > closeStart)
   const body = `async function run(persona, options = {}) {
     const mcpClients = [], mcpToolDefs = [], events = []
@@ -25,8 +25,16 @@ function turnFixture(connect: (spec: McpConnectorSpec, opts: any) => Promise<Mcp
   }
   return run`
   const compiled = ts.transpileModule(body, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText
-  return new Function('connectMcpConnector', 'mcpToolToFunctionTool', 'mcpConnectorFailureCache', 'MCP_CONNECT_FAILURE_CACHE_MS', 'MCP_TOOL_SCHEMA_MAX_BYTES', 'errorText', compiled)(
-    connect, mcpToolToFunctionTool, new Map(), 30000, 8000, String,
+  return new Function('connectMcpConnector', 'mcpToolToFunctionTool', 'mcpConnectorFailureCache', 'MCP_CONNECT_FAILURE_CACHE_MS', 'MCP_FAILURE_CACHE_MAX', 'MCP_TOOL_SCHEMA_MAX_BYTES', 'errorText', 'capTtlMap', compiled)(
+    connect, mcpToolToFunctionTool, new Map(), 30000, 2048, 8000, String,
+    (map: Map<string, number>, max: number, expired: (value: number) => boolean) => {
+      for (const [key, value] of map) if (expired(value)) map.delete(key)
+      while (map.size >= max) {
+        const first = map.keys().next().value
+        if (first === undefined) break
+        map.delete(first)
+      }
+    },
   ) as (persona: any, options?: any) => Promise<any>
 }
 
@@ -103,8 +111,8 @@ for (const mode of ['failed', 'rejected', 'applied']) {
 for (const scenario of ['matching', 'changed', 'unclassified', 'ignore', 'defer']) {
   test(`turn: ${scenario} inbox preserves triage authority and acknowledgement semantics`, async () => {
     const source = readFileSync(new URL('../agents/turn.ts', import.meta.url), 'utf8')
-    const start = source.indexOf('    const hasCurrentTriage =')
-    const end = source.indexOf('    // Materialize the agent', start)
+    const start = source.indexOf('  const hasCurrentTriage =')
+    const end = source.indexOf('  const memoryQuery =', start)
     assert.ok(start > 0 && end > start)
     const inbox = [{ id: 'one', conversation_id: 'c' }, { id: 'two', conversation_id: 'c' }]
     const options = scenario === 'unclassified' ? {} : parseWakeData(JSON.stringify({

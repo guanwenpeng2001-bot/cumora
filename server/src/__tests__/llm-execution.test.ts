@@ -499,7 +499,7 @@ test('F04/F10: configured DashScope stays direct with gateway keys and records m
 })
 
 test('F04: visible but unsupported explicit gateway image candidates are unavailable', async () => {
-  gatewayFixture(['qwen-image-plus', 'wanx-v1', 'random-image'])
+  gatewayFixture(['qwen-image-plus', 'wanx-v1', 'random-image', 'gpt-image-2', 'grok-imagine-image'])
   for (const model of ['qwen-image-plus', 'wanx-v1', 'random-image', 'gpt-image-2', 'grok-imagine-image']) {
     settings.llm_config = JSON.stringify({ version: 1, routes: [{ id: 'gw', kind: 'gateway', platform: 'openai', protocol: 'images' }],
       models: [{ model, route: 'gw' }], roles: [{ role: 'image', models: [model] }] })
@@ -509,6 +509,103 @@ test('F04: visible but unsupported explicit gateway image candidates are unavail
     assert.equal(plan.candidates[0].available, supported)
     if (!supported) assert.equal(plan.candidates[0].diagnostic, 'gateway-image-model-unsupported')
   }
+})
+
+test('gateway image hop is unavailable when the group catalog has no image models', async () => {
+  gatewayFixture(['gpt-4.1', 'kimi-k2'])
+  settings.image_model = 'gpt-image-2'
+  settings.image_fallback_models = ''
+  await refreshServerSettings(true)
+  const plan = await load('llm-resolver.ts').resolveRoleCall('company-a', 'managed', 'image', 'agent-image')
+  assert.equal(plan.candidates[0].model, 'gpt-image-2')
+  assert.equal(plan.candidates[0].route.kind, 'gateway')
+  assert.equal(plan.candidates[0].available, false)
+  assert.equal(plan.candidates[0].diagnostic, 'gateway-image-group-unavailable')
+})
+
+test('pending discovery does not skip a gateway image hop', async () => {
+  const gateway = gatewayFixture(['gpt-4.1'])
+  gateway.sub.listKeyModelsWithStatus = () => new Promise(() => {})
+  settings.image_model = 'gpt-image-2'
+  settings.image_fallback_models = ''
+  await refreshServerSettings(true)
+  const plan = await load('llm-resolver.ts').resolveRoleCall('company-a', 'managed', 'image', 'agent-image')
+  assert.ok(plan.diagnostics.includes('discovery:pending'))
+  assert.equal(plan.candidates[0].available, true)
+  assert.equal(plan.candidates[0].diagnostic, undefined)
+})
+
+test('DashScope default image_model is qwen-image-max and stays direct', async t => {
+  const env = isolatedProcess.env as Record<string, string>
+  Object.assign(env, { OPENAI_IMAGE_PROVIDER: 'dashscope', OPENAI_IMAGE_API_KEY: 'dashscope-key', OPENAI_IMAGE_NATIVE_BASE_URL: 'https://dashscope.invalid/api/v1' })
+  t.after(() => { delete env.OPENAI_IMAGE_PROVIDER; delete env.OPENAI_IMAGE_API_KEY; delete env.OPENAI_IMAGE_NATIVE_BASE_URL })
+  gatewayFixture(['gpt-4.1'])
+  delete settings.image_model
+  delete settings.image_fallback_models
+  await refreshServerSettings(true)
+  const plan = await load('llm-resolver.ts').resolveRoleCall('company-a', 'managed', 'image', 'agent-image')
+  assert.equal(plan.candidates[0].requestModel, 'qwen-image-max')
+  assert.equal(plan.candidates[0].route.kind, 'direct')
+  assert.equal(plan.candidates[0].available, true)
+  assert.equal(plan.candidates.length, 1)
+})
+
+test('executeImage hops past a catalog-blocked gateway image hop onto DashScope', async t => {
+  const env = isolatedProcess.env as Record<string, string>
+  Object.assign(env, { OPENAI_IMAGE_PROVIDER: 'dashscope', OPENAI_IMAGE_API_KEY: 'dashscope-key', OPENAI_IMAGE_NATIVE_BASE_URL: 'https://dashscope.invalid/api/v1' })
+  t.after(() => { delete env.OPENAI_IMAGE_PROVIDER; delete env.OPENAI_IMAGE_API_KEY; delete env.OPENAI_IMAGE_NATIVE_BASE_URL })
+  gatewayFixture(['gpt-4.1'])
+  settings.image_model = 'gpt-image-2'
+  settings.image_fallback_models = 'qwen-image-max'
+  await refreshServerSettings(true)
+  setSdkClientFactory(options => ({ apiKey: options.apiKey, baseURL: options.baseURL }))
+  const urls: string[] = []
+  globalThis.fetch = async (url) => {
+    urls.push(String(url))
+    assert.match(String(url), /dashscope\.invalid/)
+    return new Response(JSON.stringify({ output: { choices: [{ message: { content: [{ image: 'https://image.invalid/generated.png' }] } }] }, usage: { input_tokens: 1, output_tokens: 1 } }))
+  }
+  const bytes = await load('llm.ts').executeImage({ companyId: 'company-a', purpose: 'agent-image' },
+    { prompt: 'portrait', size: '1024x1024' }, async (buffer: Buffer) => buffer.toString())
+  assert.equal(bytes, 'image-bytes')
+  assert.equal(urls.length, 1)
+  assert.match(urls[0], /multimodal-generation/)
+})
+
+test('gateway No available compatible accounts maps to a 4xx image business error', async () => {
+  settings.image_model = 'gpt-image-2'
+  settings.image_fallback_models = ''
+  await refreshServerSettings(true)
+  setSdkClientFactory(() => ({ images: { generate: async () => {
+    throw Object.assign(new Error('No available compatible accounts'), { status: 503 })
+  } } }))
+  const err = await load('llm.ts').executeImage({ companyId: null, purpose: 'agent-image' },
+    { prompt: 'portrait', size: '1024x1024' }, async () => { assert.fail('stored') }).then(() => null, (e: unknown) => e)
+  assert.equal(err.name, 'ImageGenerationError')
+  assert.equal(err.status, 409)
+  assert.match(err.message, /gateway group has no available accounts/)
+  assert.doesNotMatch(err.message, /image generation failed/)
+})
+
+test('no available image candidates map to the same gateway-account business error', async () => {
+  gatewayFixture(['gpt-4.1'])
+  settings.image_model = 'gpt-image-2'
+  settings.image_fallback_models = ''
+  await refreshServerSettings(true)
+  let gatewayCalls = 0
+  setSdkClientFactory(() => ({ images: { generate: async () => { gatewayCalls++; throw new Error('must not generate') } } }))
+  const err = await load('llm.ts').executeImage({ companyId: 'company-a', purpose: 'agent-image' },
+    { prompt: 'portrait', size: '1024x1024' }, async () => { assert.fail('stored') }).then(() => null, (e: unknown) => e)
+  assert.equal(err.name, 'ImageGenerationError')
+  assert.equal(err.status, 409)
+  assert.equal(gatewayCalls, 0)
+})
+
+test('default image model prefers qwen-image-max when DashScope is configured', () => {
+  const { defaultOpenAIImageModel } = load('env.ts')
+  assert.equal(defaultOpenAIImageModel({}), 'gpt-image-2')
+  assert.equal(defaultOpenAIImageModel({ OPENAI_IMAGE_PROVIDER: 'dashscope' }), 'qwen-image-max')
+  assert.equal(defaultOpenAIImageModel({ OPENAI_IMAGE_PROVIDER: 'dashscope', OPENAI_IMAGE_MODEL: 'gpt-image-2' }), 'gpt-image-2')
 })
 
 test('F10: Images usage survives storage failure; missing usage remains unknown', async () => {
@@ -564,6 +661,31 @@ test('F17: stale same-version routing returns immediately while discovery refres
   assert.equal(gateway.reads(), 1)
   assert.equal(await tenant.tenantRoutingSnapshot(context), first)
   assert.equal(requests, 2, 'refresh is deduplicated')
+})
+
+test('F17: warm catalog resolve does not start another discovery round-trip', async () => {
+  const gateway = gatewayFixture(['same'])
+  const tenant = load('tenant-llm-context.ts')
+  const context = await tenant.resolveTenantLlmContext('company-a')
+  await tenant.tenantModelSnapshot(context)
+  let requests = 0
+  gateway.sub.listKeyModelsWithStatus = () => { requests++; return new Promise(() => {}) }
+  const start = performance.now()
+  const plan = await load('llm-resolver.ts').resolveRoleCall('company-a', 'managed', 'support', 'palette')
+  assert.ok(performance.now() - start < 150)
+  assert.equal(plan.authorizationVersion, context.authorizationVersion)
+  assert.equal(requests, 0, 'warm snapshot must not hit /models')
+  assert.equal(gateway.reads(), 1)
+})
+
+test('F17: 401 fallback reuses bound tenant context without another owner lookup', async () => {
+  const gateway = gatewayFixture(['same'])
+  const plan = await load('llm-resolver.ts').resolveRoleCall('company-a', 'managed', 'support', 'palette')
+  assert.equal(gateway.reads(), 1)
+  const llm = load('llm.ts')
+  await llm.getLlmCandidateClient(plan, plan.candidates[0])
+  await llm.getLlmCandidateClient(plan, plan.candidates[1])
+  assert.equal(gateway.reads(), 1, 'candidate clients must reuse the plan-bound owner keys')
 })
 
 test('F17: cold owner lookup has its own small budget and never authorizes direct fallback on failure', async () => {
@@ -778,11 +900,36 @@ for (const disconnected of [false, true]) test('avatar HTTP cancellation reaches
       response.emit('close')
     })
   }
-  new Function('api', 'requireCompanyRole', 'generateAndPersistAvatar', 'HttpError', output)(
-    { post: (_path: string, fn: any) => { handler = fn } }, async () => ({ companyId: 'company-a' }), generate, Error,
+  new Function('api', 'requireCompanyRole', 'generateAndPersistAvatar', 'HttpError', 'ImageGenerationError', output)(
+    { post: (_path: string, fn: any) => { handler = fn } }, async () => ({ companyId: 'company-a' }), generate, Error, class ImageGenerationError extends Error {},
   )
   await handler({ params: { id: 'agent-a' } }, response)
   assert.equal(calls, disconnected ? 0 : 1)
   if (!disconnected) assert.equal(signal?.aborted, true)
   assert.equal(response.listenerCount('close'), 0)
+})
+
+test('avatar maps gateway image account errors to a 4xx business response', async () => {
+  const source = readFileSync(new URL('api/router.ts', root), 'utf8')
+  const start = source.indexOf("api.post('/agents/:id/avatar/generate'")
+  const block = source.slice(start, source.indexOf('\n})', start) + 3)
+  const output = ts.transpileModule(block, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText
+  const { ImageGenerationError, GATEWAY_IMAGE_NO_ACCOUNTS_MESSAGE } = load('llm.ts')
+  let handler: any
+  let status: number | undefined
+  let body: { error?: string } | undefined
+  const { EventEmitter } = nativeRequire('node:events')
+  const response = Object.assign(new EventEmitter(), {
+    writableEnded: false, destroyed: false,
+    json(payload: any) { body = payload },
+    status(code: number) { status = code; return this },
+  })
+  new Function('api', 'requireCompanyRole', 'generateAndPersistAvatar', 'HttpError', 'ImageGenerationError', output)(
+    { post: (_path: string, fn: any) => { handler = fn } }, async () => ({ companyId: 'company-a' }),
+    async () => { throw new ImageGenerationError() }, Error, ImageGenerationError,
+  )
+  await handler({ params: { id: 'agent-a' } }, response)
+  assert.equal(status, 409)
+  assert.equal(body?.error, GATEWAY_IMAGE_NO_ACCOUNTS_MESSAGE)
+  assert.doesNotMatch(body?.error ?? '', /image generation failed/)
 })

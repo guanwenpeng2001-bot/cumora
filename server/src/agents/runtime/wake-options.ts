@@ -48,6 +48,7 @@ export function parseWakeData(raw: string | undefined): ParsedWakeData {
       idleReason?: unknown
       triageNote?: unknown
       triageBoundary?: unknown
+      contextBoundary?: unknown
       backgroundBrief?: unknown
       pollBrief?: unknown
     }
@@ -74,6 +75,9 @@ export function parseWakeData(raw: string | undefined): ParsedWakeData {
       options.triageNote = parsed.triageNote.slice(0, 1800)
       if (typeof parsed.triageBoundary === 'string' && /^[a-f0-9]{64}$/.test(parsed.triageBoundary)) {
         options.triageBoundary = parsed.triageBoundary
+      }
+      if (typeof parsed.contextBoundary === 'string' && /^[a-f0-9]{64}$/.test(parsed.contextBoundary)) {
+        options.contextBoundary = parsed.contextBoundary
       }
     }
     if (reason === 'manual' || reason === 'background_scan') {
@@ -188,7 +192,9 @@ export function mergeWakeTurnOptions(
   }
   if (next.trigger === 'background_scan') return next
   // Notes and their approval boundaries must always travel as one pair.
-  if (next.triageNote !== undefined) next = { ...next, triageBoundary: next.triageBoundary }
+  if (next.triageNote !== undefined) {
+    next = { ...next, triageBoundary: next.triageBoundary, contextBoundary: next.contextBoundary }
+  }
   const backgroundBrief = mergeWakeBackgroundBriefs(
     current.backgroundBrief,
     next.backgroundBrief,

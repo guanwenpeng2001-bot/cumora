@@ -270,17 +270,30 @@ type AnyResponse = { usage?: unknown } & Record<string, unknown>
  *  enforced by `scripts/guard-llm-tracked.mjs` allowlist.
  */
 export async function getTrackedLlmClient(ctx: LlmCallContext): Promise<OpenAI> {
-  const raw = await getLlmClient(ctx.companyId)
+  // Cerebellum (non-stream text) goes through executeTrackedText → resolveRoleCall
+  // and never uses this client. Eager getLlmClient here was a wasted tenant SQL
+  // on every inbox-triage / routing / agenda / synthetic-gate call. Tests that
+  // stub the SDK still need the real client up front; stream/image paths lazy-load.
+  const testOverride = __isLlmTestOverrideActive()
+  let rawPromise: Promise<OpenAI> | undefined
+  const rawClient = () => rawPromise ??= getLlmClient(ctx.companyId)
+  const raw = testOverride ? await rawClient() : null
 
   const wrapAwaited = (
     api: 'responses' | 'chat',
-    boundCreate: (args: AnyArgs, opts?: unknown) => Promise<AnyResponse>,
+    boundCreate?: (args: AnyArgs, opts?: unknown) => Promise<AnyResponse>,
   ) => async (args: AnyArgs, opts?: unknown): Promise<AnyResponse> => {
     // Existing stream consumers own their records until their migration wave.
-    if (args.stream === true) return boundCreate(args, opts)
+    if (args.stream === true) {
+      const client = await rawClient()
+      if (api === 'chat') {
+        return (client.chat.completions.create as unknown as (a: AnyArgs, o?: unknown) => Promise<AnyResponse>)(args, opts)
+      }
+      return (client.responses.create as unknown as (a: AnyArgs, o?: unknown) => Promise<AnyResponse>)(args, opts)
+    }
     // Test seam: with a stubbed client there is no tenant to resolve, so skip
     // plan resolution and record the direct call like the legacy path did.
-    if (__isLlmTestOverrideActive()) {
+    if (testOverride && boundCreate) {
       const t0 = Date.now()
       const model = String(args.model ?? '<unknown>')
       const pricing = capturePricing()(model)
@@ -335,6 +348,21 @@ export async function getTrackedLlmClient(ctx: LlmCallContext): Promise<OpenAI> 
         throw err
       }
     }
+
+  const lazyImages = wrapImagesGenerate(async (args, opts) => {
+    const client = await rawClient()
+    return (client.images.generate as unknown as (a: AnyArgs, o?: unknown) => Promise<AnyResponse>)(args, opts)
+  })
+
+  // Non-test path: a stub with the three tracked entry points. Cerebellum
+  // never needs the rest of the SDK; stream/image calls lazy-load it.
+  if (!raw) {
+    return {
+      responses: { create: wrapAwaited('responses') },
+      chat: { completions: { create: wrapAwaited('chat') } },
+      images: { generate: lazyImages },
+    } as unknown as OpenAI
+  }
 
   // Layered Proxy: only the methods we care about are intercepted; everything
   // else (e.g. embeddings, audio, beta) passes through unwrapped so adding a

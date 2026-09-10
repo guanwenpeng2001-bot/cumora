@@ -17,6 +17,13 @@ function required(name: string, fallback?: string): string {
   return v
 }
 
+/** DashScope image when that provider is configured; otherwise the gateway gpt-image default. */
+export function defaultOpenAIImageModel(source: Record<string, string | undefined> = process.env): string {
+  const explicit = source.OPENAI_IMAGE_MODEL?.trim()
+  if (explicit) return explicit
+  return (source.OPENAI_IMAGE_PROVIDER ?? '').toLowerCase() === 'dashscope' ? 'qwen-image-max' : 'gpt-image-2'
+}
+
 const DEFAULT_MODEL = process.env.OPENAI_MODEL ?? 'gpt-5.5'
 // Cerebellum default — small/fast model used by JSON classifiers and one-shot
 // utilities that don't drive the agent's perceived intelligence (gender infer,
@@ -103,7 +110,7 @@ export const env = {
    */
   ALERT_DEDUPE_MS: Number(process.env.ALERT_DEDUPE_MS ?? 60_000),
   /** Image model for avatar generation. Override with OPENAI_IMAGE_MODEL. */
-  OPENAI_IMAGE_MODEL: process.env.OPENAI_IMAGE_MODEL ?? 'gpt-image-2',
+  OPENAI_IMAGE_MODEL: defaultOpenAIImageModel(),
   /** Background scanner cadence */
   SCANNER_INTERVAL_MS: Number(process.env.SCANNER_INTERVAL_MS ?? 90_000),
   /**

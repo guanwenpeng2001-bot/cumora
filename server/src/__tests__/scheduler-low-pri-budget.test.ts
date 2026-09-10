@@ -266,7 +266,8 @@ for (const code of ['capacity_denied', 'pod_apply_failed', 'watchdog_timeout']) 
     const f = schedulerFixture({ deliverWake: async () => 0,
       triageWakeRecipient: async () => { triages++; return { triageNote: 'single triage', triageBoundary: 'boundary' } },
       ensurePod: async (_id: string, options: any) => {
-        assert.equal(options.triageNote, 'single triage')
+        const triage = options && typeof options.then === 'function' ? await options : options
+        assert.equal(triage.triageNote, 'single triage')
         return { ok: false, created: false, code, reason: 'temporary failure' }
       } })
     await f.api.wakeOne('agent', 'message.new', 'convo', null, { placementTriage: true })
@@ -306,6 +307,34 @@ test('message claim renews across a long fan-out and cannot renew another owner'
   assert.equal(claim.until, now + 1)
   release(); await first
   assert.equal(timers[0].cleared, true)
+})
+
+test('message.new cold start overlaps inbox triage with ensurePod', async () => {
+  let triageStarted = false, ensureStarted = false
+  let releaseTriage!: () => void, releaseEnsure!: () => void
+  const triageGate = new Promise<void>(resolve => { releaseTriage = resolve })
+  const ensureGate = new Promise<void>(resolve => { releaseEnsure = resolve })
+  const f = schedulerFixture({
+    deliverWake: async () => 0,
+    triageWakeRecipient: async () => {
+      triageStarted = true
+      await triageGate
+      return { triageNote: 'n', triageBoundary: 'b' }
+    },
+    ensurePod: async () => {
+      ensureStarted = true
+      await ensureGate
+      return { ok: true, created: true }
+    },
+  })
+  const pending = f.api.wakeOne('agent', 'message.new', 'convo', null, { placementTriage: true })
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(triageStarted, true)
+  assert.equal(ensureStarted, true)
+  releaseTriage()
+  releaseEnsure()
+  await pending
+  assert.equal(f.wakes.length, 0)
 })
 
 test('a thrown host lookup is queued before runtime selection', async () => {

@@ -102,7 +102,7 @@ function fixture(bootstrap?: Managed.ManagedPodSettings, extraEnv: Record<string
   const tenant = load('tenant-llm-context') as typeof Tenant
   const resolver = load('llm-resolver') as typeof Resolver
   load('sub2api').listKeyModelsWithStatus = async (_base: string, key: string) => ({
-    models: new Set([key.replace('owner-', '') + '-model']), ok: true, status: 'ok',
+    models: new Set([key.replace('owner-', '') + '-model', 'gpt-image-a', 'gpt-image-b', 'gpt-image-2']), ok: true, status: 'success',
   })
   return { settings, env, managed, tenant, resolver, queries, messages, intervals, processEnv, load,
     advance(ms: number) { now += ms },
@@ -266,7 +266,17 @@ test('unchanged candidate client uses owner platform keys and direct credentials
   const exports: { getLlmCandidateClient?: (plan: unknown, candidate: unknown) => Promise<{ options: { apiKey: string; baseURL: string } }> } = {}
   runInNewContext(transpile(functionsFrom('llm', ['getLlmCandidateClient'])), {
     exports, testLlmOverride: null, SDK_MAX_RETRIES: 0, SDK_TIMEOUT_MS: 100,
+    CANDIDATE_CLIENT_TTL_MS: 6 * 60_000, CLIENT_CACHE_MAX: 2048, DIRECT_CLIENT_MAX: 256,
     candidateClients: new Map(), directCandidateClients: new Map(),
+    capTtlMap(map: Map<unknown, { mintedAt: number }>, max: number, expired: (value: { mintedAt: number }) => boolean) {
+      for (const [key, value] of map) if (expired(value)) map.delete(key)
+      while (map.size >= max) {
+        const first = map.keys().next().value
+        if (first === undefined) break
+        map.delete(first)
+      }
+    },
+    contextForRoleCallPlan: pod.tenant.contextForRoleCallPlan,
     resolveTenantLlmContext: pod.tenant.resolveTenantLlmContext, resolveDirectLlmEnv: pod.env.resolveDirectLlmEnv,
     OpenAI: class { constructor(public options: unknown) {} }, withProviderRouting: (client: unknown) => client,
   })
@@ -372,6 +382,7 @@ async function fallbackFixture(configValue: unknown, base: string, extraEnv: Rec
     openai: { default: OpenAI },
     './agents/cost.js': {
       captureCallPricing: async () => () => null,
+      capturePricing: () => () => null,
       measuredUsage: () => ({ input: 3, output: 2 }),
     },
     './agents/llm-ledger.js': {

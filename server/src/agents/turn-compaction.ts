@@ -77,12 +77,25 @@ export function estimateTokens(text: string): number {
 /** Sum token estimates across a history list. Serializes each item to
  *  JSON once — the same shape the wire bytes will take when sent to
  *  the upstream — so the estimate matches what the upstream tokenizer
- *  will actually see. */
+ *  will actually see. Identity-stable items reuse the last serialization. */
+const historyItemEstimateCache = new WeakMap<object, { json: string; tokens: number }>()
+
+function serializedHistoryItem(item: ResponseInputItem): { json: string; tokens: number } {
+  if (item && typeof item === 'object') {
+    const cached = historyItemEstimateCache.get(item)
+    if (cached) return cached
+    const json = JSON.stringify(item)
+    const estimated = { json, tokens: estimateTokens(json) }
+    historyItemEstimateCache.set(item, estimated)
+    return estimated
+  }
+  const json = JSON.stringify(item)
+  return { json, tokens: estimateTokens(json) }
+}
+
 export function estimateHistoryTokens(history: ResponseInputItem[]): number {
   let total = 0
-  for (const item of history) {
-    total += estimateTokens(JSON.stringify(item))
-  }
+  for (const item of history) total += serializedHistoryItem(item).tokens
   return total
 }
 
@@ -344,7 +357,7 @@ function compactHistoryInternal(
   for (let idx = 0; idx < dropEligible.length; idx++) {
     const cid = dropEligible[idx]
     const items = pairItems.get(cid) ?? []
-    for (const it of items) droppedItemBytes += Buffer.byteLength(JSON.stringify(it), 'utf8')
+    for (const it of items) droppedItemBytes += Buffer.byteLength(serializedHistoryItem(it).json, 'utf8')
     pairItems.delete(cid)
     droppedPairCount += 1
     const surviving: ResponseInputItem[] = []
@@ -385,7 +398,7 @@ async function summarizeAndSplice(
   let droppedItemBytes = 0
   for (const cid of dropEligible) {
     const items = pairItems.get(cid) ?? []
-    for (const it of items) droppedItemBytes += Buffer.byteLength(JSON.stringify(it), 'utf8')
+    for (const it of items) droppedItemBytes += Buffer.byteLength(serializedHistoryItem(it).json, 'utf8')
     itemsToDrop.push(...items)
   }
   const summaryText = await summarize(itemsToDrop)

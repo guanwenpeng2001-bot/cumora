@@ -29,8 +29,47 @@ const snapshots = new Map<string, TenantModelSnapshot>()
 const refreshes = new Map<string, { version: string; promise: Promise<TenantModelSnapshot> }>()
 const invalidators = new Set<(companyId: string) => void>()
 const SNAPSHOT_TTL_MS = 30_000
-const CONTEXT_TTL_MS = 1_000
+/** Same order as catalog snapshots. Key rotation still invalidates via generation. */
+const CONTEXT_TTL_MS = SNAPSHOT_TTL_MS
+const CONTEXT_MAX = 2_048
+const SNAPSHOT_MAX = 2_048
 const contexts = new Map<string, { context: TenantLlmContext; at: number }>()
+const planAuth = new WeakMap<object, TenantLlmContext>()
+
+function capTtlMap<K, V>(map: Map<K, V>, max: number, expired: (value: V) => boolean): void {
+  for (const [key, value] of map) if (expired(value)) map.delete(key)
+  while (map.size >= max) {
+    const first = map.keys().next().value
+    if (first === undefined) break
+    map.delete(first)
+  }
+}
+
+/** Freeze the resolved owner keys onto a plan object without putting credentials in the public DTO. */
+export function bindRoleCallAuth(plan: object, context: TenantLlmContext): void {
+  planAuth.set(plan, context)
+}
+
+/** Reuse the context resolved with this plan unless authorization has rotated. */
+export async function contextForRoleCallPlan(plan: {
+  companyId: string | null
+  authorizationVersion?: string
+}): Promise<TenantLlmContext> {
+  if (!plan.companyId) throw new Error('Missing tenant LLM route')
+  const bound = planAuth.get(plan)
+  if (bound
+    && bound.companyId === plan.companyId
+    && bound.authorizationVersion === plan.authorizationVersion
+    && bound.generation === (generations.get(plan.companyId) ?? 0)
+    && bound.baseURL === sub2apiOpenAIBaseURL()) {
+    return bound
+  }
+  const context = await resolveTenantLlmContext(plan.companyId)
+  if (plan.authorizationVersion && context.authorizationVersion !== plan.authorizationVersion) {
+    throw new Error('Tenant LLM authorization changed; resolve the plan again')
+  }
+  return context
+}
 
 /** Bound route preparation independently of a business call's model budget. */
 export function waitForLlmResolution<T>(promise: Promise<T>, timeoutMs: number, signal?: AbortSignal): Promise<T> {
@@ -72,8 +111,9 @@ export async function resolveTenantLlmContext(companyId: string, userId?: string
   const generation = generations.get(companyId) ?? 0
   generations.set(companyId, generation)
   const cached = contexts.get(companyId)
-  if (userId === undefined && cached && cached.context.generation === generation
-    && cached.context.baseURL === sub2apiOpenAIBaseURL() && Date.now() - cached.at < CONTEXT_TTL_MS) return cached.context
+  if (cached && Date.now() - cached.at >= CONTEXT_TTL_MS) contexts.delete(companyId)
+  else if (userId === undefined && cached && cached.context.generation === generation
+    && cached.context.baseURL === sub2apiOpenAIBaseURL()) return cached.context
   const { rows } = await waitForLlmResolution(pool.query<{ owner_user_id: string; sub2api_api_key: string | null; authorization_version: string }>(
     { text: `SELECT c.owner_user_id, u.sub2api_api_key, u.xmin::text AS authorization_version
        FROM companies c JOIN users u ON u.id = c.owner_user_id
@@ -90,7 +130,10 @@ export async function resolveTenantLlmContext(companyId: string, userId?: string
     authorizationVersion: `${row.owner_user_id}:${row.authorization_version}:${generation}:${sub2apiOpenAIBaseURL()}`,
     keys: parseApiKeyMap(row.sub2api_api_key), baseURL: sub2apiOpenAIBaseURL(),
   }
-  if (userId === undefined) contexts.set(companyId, { context, at: Date.now() })
+  if (userId === undefined) {
+    capTtlMap(contexts, CONTEXT_MAX, entry => Date.now() - entry.at >= CONTEXT_TTL_MS)
+    contexts.set(companyId, { context, at: Date.now() })
+  }
   return context
 }
 
@@ -131,6 +174,7 @@ export async function tenantModelSnapshot(context: TenantLlmContext, refresh = f
     const snapshot: TenantModelSnapshot = {
       authorizationVersion, platforms: Object.fromEntries(entries) as Record<string, PlatformSnapshot>, at: Date.now(),
     }
+    capTtlMap(snapshots, SNAPSHOT_MAX, entry => Date.now() - entry.at >= SNAPSHOT_TTL_MS * 4)
     snapshots.set(companyId, snapshot)
     return snapshot
   })()
@@ -145,6 +189,8 @@ export async function tenantRoutingSnapshot(context: TenantLlmContext, signal?: 
   signal?.throwIfAborted()
   const existing = snapshots.get(context.companyId)
   const previous = existing?.authorizationVersion === context.authorizationVersion ? existing : null
+  // Warm catalog: return the snapshot and do not start another /models round-trip.
+  if (previous && Date.now() - previous.at < SNAPSHOT_TTL_MS) return previous
   const refresh = tenantModelSnapshot(context)
   // Background discovery can fail after the caller has returned or cancelled.
   void refresh.catch(() => {})

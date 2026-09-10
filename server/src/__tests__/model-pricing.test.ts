@@ -49,7 +49,8 @@ function fixture(env: Record<string, unknown> = {}) {
   })
   const fallback = compile(read('../agents/fallback.ts'), { '../settings.js': {} })
   const execution = compile(read('../llm-execution.ts'), {
-    'node:crypto': { randomUUID }, './llm-resolver.js': {}, './llm.js': {}, './agents/cost.js': cost,
+    'node:crypto': { randomUUID }, './llm-resolver.js': {},
+    './llm.js': { getLlmCandidateClient: async () => ({}) }, './agents/cost.js': cost,
     './agents/llm-ledger.js': { ...recorder, classifyLlmCallError: () => 'failed' }, './agents/fallback.js': fallback, './settings.js': {},
   })
   const context = { companyId: 'company-a', purpose: 'agent-turn' }
@@ -125,7 +126,7 @@ test('in-flight edit affects the next call only, including returned model and ro
   assert.ok(f.calls.every(c => !/UPDATE llm_calls|DELETE/i.test(c.sql)))
 })
 
-test('failed attempt freezes its price; fallback is a new attempt with the edited price', async () => {
+test('failed attempt and fallback share the frozen price for one logical call', async () => {
   const f = fixture()
   await f.pricing.upsertModelPricing(priceInput())
   let sends = 0
@@ -137,8 +138,10 @@ test('failed attempt freezes its price; fallback is a new attempt with the edite
     }
     return 'ok'
   }, ['priced-model', 'priced-model'])
-  assert.deepEqual(f.ledger.map(r => r[13]), [2, 8])
+  assert.deepEqual(f.ledger.map(r => r[13]), [2, 2])
   assert.deepEqual(f.ledger.map(r => r[17]), ['failed', 'ok'])
+  await f.execute(async (_candidate: any, state: any) => async () => { state.usage = usage; return 'ok' }, ['priced-model'])
+  assert.equal(f.ledger[2][13], 8)
 })
 
 test('unknown/invalid usage and media are unpriced; measured zero remains distinguishable', async () => {
@@ -241,14 +244,24 @@ test('pricing menu exposes the same effective source, version and rates as accou
   assert.match(legacy.note, /兼容估算/)
 })
 
-test('first call waits for DB prices rather than freezing the cold env fallback', async () => {
+test('first call freezes seed prices without waiting for DB; refresh applies to the next call', async () => {
   const f = fixture({ 'priced-model': priceInput('priced-model', 7) })
   f.rows.set('priced-model', { model: 'priced-model', input_per_1m: 23, cached_input_per_1m: 0,
     cache_write_per_1m: 0, output_per_1m: 0, note: '[cumora-pricing:v1:admin]', source_url: null,
     priced_at: null, updated_at: '2026-09-10T00:00:00Z' })
+  let finish!: (value: any) => void
+  f.setSelect(() => new Promise(resolve => { finish = resolve }))
+  const started = Date.now()
   await f.execute(async (_candidate: any, state: any) => async () => { state.usage = usage; return 'ok' })
-  assert.equal(f.ledger[0][13], 23)
-  assert.equal(JSON.parse(f.ledger[0][19]).pricing.source, 'database')
+  assert.ok(Date.now() - started < 200, 'pricing SELECT must not block the candidate send')
+  assert.equal(f.ledger[0][13], 7)
+  assert.equal(JSON.parse(f.ledger[0][19]).pricing.source, 'env')
+  finish({ rows: [...f.rows.values()].map(r => ({ ...r })) })
+  f.setSelect(undefined)
+  await f.pricing.refreshModelPricing(true)
+  await f.execute(async (_candidate: any, state: any) => async () => { state.usage = usage; return 'ok' })
+  assert.equal(f.ledger[1][13], 23)
+  assert.equal(JSON.parse(f.ledger[1][19]).pricing.source, 'database')
 })
 
 test('cold upsert and concurrent refresh retain successful admin prices', async () => {

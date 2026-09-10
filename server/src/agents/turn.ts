@@ -58,6 +58,8 @@ import {
   applyResponseStreamEvent,
   consumeResponseStream,
   newResponseStreamState,
+  RESPONSE_STREAM_IDLE_TIMEOUT_MS,
+  RESPONSE_STREAM_WALL_TIMEOUT_MS,
   type ResponseStreamState,
 } from './turn-stream.js'
 import { compactHistory, compactHistoryWithSummary, DEFAULT_COMPACTION_POLICY, type CompactionPolicy, estimateHistoryTokens, estimateTokens, truncateChars, truncateUtf8 } from './turn-compaction.js'
@@ -143,6 +145,8 @@ export interface AgentTurnOptions {
   triageNote?: string
   /** Fingerprint of message IDs classified by the scheduler; only exact matches are reusable. */
   triageBoundary?: string
+  /** Fingerprint of context message IDs classified with the inbox; turn reuses the cached context on a hit. */
+  contextBoundary?: string
   /** Internal background brief rendered as a normal model input. */
   backgroundBrief?: {
     title: string
@@ -183,8 +187,9 @@ async function loadContext(
   companyId: string,
   conversationIds: string[],
   rc: AgentRuntimeClient = runtime,
+  opts?: { reuseBoundary?: string },
 ): Promise<ContextRow[]> {
-  return rc.loadContext(agentId, companyId, conversationIds)
+  return rc.loadContext(agentId, companyId, conversationIds, opts)
 }
 
 async function loadClimate(
@@ -850,10 +855,37 @@ async function loadFaces(companyId: string, participantIds: string[]): Promise<A
  * doesn't reply, and then 30s later sees a teammate's reply and decides to
  * chime in or react.
  */
-const lastCompletedInbox = new Map<string, string>()
+const INBOX_FINGERPRINT_TTL_MS = 24 * 60 * 60 * 1000
+const INBOX_FINGERPRINT_MAX = 4_096
+const lastCompletedInbox = new Map<string, { fingerprint: string; at: number }>()
 
 const MCP_CONNECT_FAILURE_CACHE_MS = 30_000
+const MCP_FAILURE_CACHE_MAX = 2_048
 const mcpConnectorFailureCache = new Map<string, number>()
+
+function capTtlMap<K, V>(map: Map<K, V>, max: number, expired: (value: V) => boolean): void {
+  for (const [key, value] of map) if (expired(value)) map.delete(key)
+  while (map.size >= max) {
+    const first = map.keys().next().value
+    if (first === undefined) break
+    map.delete(first)
+  }
+}
+
+function completedInboxMatches(agentId: string, fingerprint: string): boolean {
+  const entry = lastCompletedInbox.get(agentId)
+  if (!entry) return false
+  if (Date.now() - entry.at >= INBOX_FINGERPRINT_TTL_MS) {
+    lastCompletedInbox.delete(agentId)
+    return false
+  }
+  return entry.fingerprint === fingerprint
+}
+
+function rememberCompletedInbox(agentId: string, fingerprint: string): void {
+  capTtlMap(lastCompletedInbox, INBOX_FINGERPRINT_MAX, entry => Date.now() - entry.at >= INBOX_FINGERPRINT_TTL_MS)
+  lastCompletedInbox.set(agentId, { fingerprint, at: Date.now() })
+}
 
 /** Per-hop tool output bound before it is fed back to the model. This is not
  * the semantic compaction path; it is a last-mile safety valve so a single
@@ -905,23 +937,28 @@ function modelToolOutputPayload(value: unknown): string {
  *  already terse). At that point we break the loop and let the next
  *  wake start fresh — same as the old `CONTEXT_BUDGET_TOKENS` break,
  *  but it's now the rare failure rather than the common path. */
-/** Approximate context windows by model family. We pick the model's
- *  window dynamically so a smaller-context model (gpt-5.4-mini at 128K)
- *  compacts at the right point — a hardcoded 150K threshold on a 128K
- *  model would NEVER trigger and the turn would just hit the hard
- *  ceiling and die. Unknown / unspecified models fall back to 200K.
- *
- *  Numbers come from each model's published max input tokens. Slight
- *  underestimates (round-down) so we leave headroom for the response
- *  tokens that follow the prompt. */
-function contextWindowFor(model: string | null): number {
+/** Approximate context windows by model family. Catalog metadata wins
+ *  when present; family heuristics cover known OpenAI ids. Unknown models
+ *  still use 200K as a last-resort number but MUST log and mark the ledger
+ *  — they must not silently inherit a 200K window. */
+function resolveContextWindow(model: string | null, catalogWindow?: number): {
+  tokens: number
+  source: 'catalog' | 'family' | 'unknown-fallback'
+} {
+  if (typeof catalogWindow === 'number' && Number.isSafeInteger(catalogWindow) && catalogWindow > 0) {
+    return { tokens: catalogWindow, source: 'catalog' }
+  }
   const m = (model ?? '').toLowerCase()
-  if (m.includes('gpt-5.4-mini')) return 128_000
-  if (m.includes('gpt-5.4-nano')) return 64_000
-  if (m.includes('gpt-5')) return 200_000             // gpt-5.5, 5.4, 5.3, 5.2 — all ~200K input
-  if (m.includes('gpt-4o')) return 128_000
-  if (m.includes('gpt-4-turbo')) return 128_000
-  return 200_000
+  if (m.includes('gpt-5.4-mini')) return { tokens: 128_000, source: 'family' }
+  if (m.includes('gpt-5.4-nano')) return { tokens: 64_000, source: 'family' }
+  if (m.includes('gpt-5')) return { tokens: 200_000, source: 'family' }
+  if (m.includes('gpt-4o')) return { tokens: 128_000, source: 'family' }
+  if (m.includes('gpt-4-turbo')) return { tokens: 128_000, source: 'family' }
+  return { tokens: 200_000, source: 'unknown-fallback' }
+}
+
+function contextWindowFor(model: string | null): number {
+  return resolveContextWindow(model).tokens
 }
 
 /** Soft compaction threshold: defaults to 75% of the model's context window. Past
@@ -1160,8 +1197,6 @@ async function executeAuxiliaryStream<T>(args: {
   extras?: Record<string, unknown>
   parse: (text: string) => T
 }): Promise<T> {
-  // The settings registry does not yet expose this compaction-domain key.
-  // Until it does, every auxiliary consumer still has a bounded default.
   const configuredTimeout = Number(getServerSettingsSnapshot().settings.compaction_stream_timeout_ms)
   const timeoutMs = Number.isSafeInteger(configuredTimeout) && configuredTimeout > 0 && configuredTimeout <= 2_147_483_647
     ? configuredTimeout : 30_000
@@ -1256,45 +1291,37 @@ Use semantic judgment, not keyword rules. Read the actual conversation and the a
 Do not require this specific agent to repeat work already genuinely completed by another teammate in the visible context. Do require continuation when nobody has delivered the requested result or a clear user-visible failure/clarifying question.
 
 Reply ONLY as JSON: {"complete":boolean,"reason":"short factual reason","next_step":"what the agent should do next if incomplete, otherwise empty"}.`
-  const VERIFIER_TIMEOUT_MS = 10_000
-  const ctrl = new AbortController()
-  const timer = setTimeout(() => ctrl.abort(new Error('completion verifier timed out')), VERIFIER_TIMEOUT_MS)
-  try {
-    const result = await executeAuxiliaryStream({
-      purpose: 'completion-verify', companyId: args.tenant, agentId: args.agentId,
-      instructions, outputTokens: 500, signal: ctrl.signal,
-      input: [
-        {
-          role: 'user',
-          content: [
-            {
-              type: 'input_text',
-              text: [
-                'Conversation context visible to the agent:',
-                args.renderedContext.slice(0, 24_000),
-                '',
-                'Agent terminal status declaration:',
-                JSON.stringify(args.turnStatus, null, 2),
-                '',
-                'World side effects produced during this turn:',
-                verifierSideEffects(args.sideEffects),
-                '',
-                'May the runtime accept this terminal status, or must the same agent continue the turn?',
-              ].join('\n'),
-            },
-          ],
-        },
-      ],
-      parse: (collected) => {
-        const verdict = parseCompletionVerification(collected)
-        if (!verdict) throw new Error(`completion verifier returned invalid JSON: ${collected.slice(0, 500)}`)
-        return verdict
+  return executeAuxiliaryStream({
+    purpose: 'completion-verify', companyId: args.tenant, agentId: args.agentId,
+    instructions, outputTokens: 500,
+    input: [
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'input_text',
+            text: [
+              'Conversation context visible to the agent:',
+              args.renderedContext.slice(0, 24_000),
+              '',
+              'Agent terminal status declaration:',
+              JSON.stringify(args.turnStatus, null, 2),
+              '',
+              'World side effects produced during this turn:',
+              verifierSideEffects(args.sideEffects),
+              '',
+              'May the runtime accept this terminal status, or must the same agent continue the turn?',
+            ].join('\n'),
+          },
+        ],
       },
-    })
-    return result
-  } finally {
-    clearTimeout(timer)
-  }
+    ],
+    parse: (collected) => {
+      const verdict = parseCompletionVerification(collected)
+      if (!verdict) throw new Error(`completion verifier returned invalid JSON: ${collected.slice(0, 500)}`)
+      return verdict
+    },
+  })
 }
 
 /** Render a slice of ResponseInputItems into a flat human-readable
@@ -1482,18 +1509,10 @@ Style: ≤ 250 words, plain text, factual. Preserve direct asks ("please also do
 CRITICAL — each input message is tagged "@<author> in <conversation_id>". Your summary MUST preserve that conversation_id with every direct ask, e.g. "@yetone (in c-xyz) asks: …". Multiple conversations can be steered into the same batch; the agent needs to reply to each ask in its OWN conversation, not bunched into whichever conversation it was last working in.
 
 Treat the output as a private memo that will be appended to the agent's input. End with one short sentence telling the agent what to do next given everything you summarized — and if more than one conversation is represented, explicitly list the conversation_ids that need a reply.${draftBlock}`
-  // Bounded timeout so a hung summarizer (slow upstream, stalled
-  // stream) doesn't block the hop indefinitely. The hop loop is
-  // single-threaded — every second we wait here is a second the user
-  // waits for a response. 10s is roughly the budget for "≤ 250 word"
-  // output on a fast cheap model.
-  const SUMMARIZER_TIMEOUT_MS = 10_000
-  const ctrl = new AbortController()
-  const timer = setTimeout(() => ctrl.abort(new Error('steer summarizer timed out')), SUMMARIZER_TIMEOUT_MS)
   try {
     const result = await executeAuxiliaryStream({
       purpose: 'steer-summary', companyId: tenant, agentId, extras: { batchSize: batch.length, hadDraft: !!draft },
-      instructions, outputTokens: 600, signal: ctrl.signal,
+      instructions, outputTokens: 600,
       input: [
         {
           role: 'user',
@@ -1517,8 +1536,6 @@ Treat the output as a private memo that will be appended to the agent's input. E
     console.warn(`[turn] ${agentId} summarizeSteerBatch failed; falling back to TRUNCATED verbatim:`,
       err instanceof Error ? err.message : err)
     return renderSteerBatchTruncated(batch, draftAssistantText)
-  } finally {
-    clearTimeout(timer)
   }
 }
 
@@ -1539,9 +1556,14 @@ export async function executeAgentTurnHop(args: {
   const compactionPolicy = args.compactionPolicy ?? DEFAULT_COMPACTION_POLICY
   const controller = new AbortController()
   const signal = args.signal ? AbortSignal.any([args.signal, controller.signal]) : controller.signal
+  const wallTimeoutMs = args.wallTimeoutMs ?? RESPONSE_STREAM_WALL_TIMEOUT_MS
+  const idleTimeoutMs = args.idleTimeoutMs ?? RESPONSE_STREAM_IDLE_TIMEOUT_MS
   const timer = setTimeout(() => controller.abort(new DOMException('Model hop wall timeout', 'TimeoutError')),
-    args.wallTimeoutMs ?? 6 * 60_000)
+    wallTimeoutMs)
   let stripImages = false
+  const toolsJson = JSON.stringify(args.tools)
+  const toolsTokens = estimateTokens(toolsJson)
+  const instructionTokens = estimateTokens(args.instructions)
   try {
     return await executeLlmPlan({
       plan: args.plan, context: args.context, signal, sdkMaxRetries: 0, record: args.record,
@@ -1564,12 +1586,19 @@ export async function executeAgentTurnHop(args: {
         if (candidate.capabilities.tools === false && args.tools.length) throw new Error('Turn candidate does not support tools')
         let input = structuredClone(args.input)
         if (stripImages || candidate.capabilities.vision === false) input = stripImageInputs(input)
-        const overhead = estimateTokens(args.instructions) + estimateTokens(JSON.stringify(args.tools))
-        const window = candidate.parameters.contextWindow ?? contextWindowFor(candidate.model)
+        const overhead = instructionTokens + toolsTokens
+        const windowInfo = resolveContextWindow(candidate.model, candidate.parameters.contextWindow)
+        if (windowInfo.source === 'unknown-fallback') {
+          console.warn(`[turn] unknown context window for model ${candidate.model}; falling back to ${windowInfo.tokens}`)
+        }
+        const window = windowInfo.tokens
+        attempt.contextWindow = window
+        attempt.contextWindowSource = windowInfo.source
         const output = Math.min(candidate.parameters.maxOutputTokens ?? 4000, window - overhead - 1)
         const inputBudget = Math.min(hardLimitFor(candidate.model, window, compactionPolicy), window - overhead - output)
         if (output < 1 || inputBudget < 1) throw new Error('Turn candidate context budget exhausted')
-        if (estimateHistoryTokens(input) > inputBudget) input = compactHistory(input, n => n > inputBudget, compactionPolicy).newHistory
+        const inputTokens = estimateHistoryTokens(input)
+        if (inputTokens > inputBudget) input = compactHistory(input, n => n > inputBudget, compactionPolicy).newHistory
         if (estimateHistoryTokens(input) > inputBudget) throw new Error('Turn candidate input exceeds context budget')
         const shim = candidate.route.kind === 'direct' && ['novita', 'orcarouter'].includes(candidate.route.env ?? '')
         const useChat = candidate.protocol === 'chat' && !shim
@@ -1585,7 +1614,8 @@ export async function executeAgentTurnHop(args: {
         attempt.usageProtocol = 'responses'
         await args.requestEvent?.({ model: candidate.model, requestedModel: args.plan.candidates[0]?.model,
           requestModel: candidate.requestModel, actualModel: null, route: candidate.route.id,
-          inputItems: input.length, maxOutputTokens: output, contextWindow: window, imageStripRetryUsed: stripImages })
+          inputItems: input.length, maxOutputTokens: output, contextWindow: window,
+          contextWindowSource: windowInfo.source, imageStripRetryUsed: stripImages })
         return async () => {
           signal.throwIfAborted()
           const stream = useChat
@@ -1604,7 +1634,7 @@ export async function executeAgentTurnHop(args: {
                 // Actual tool execution and reply publication happen outside the
                 // executor, so their failures cannot replay this candidate chain.
               }
-            }, { signal: requestSignal, idleTimeoutMs: args.idleTimeoutMs, abortRequest: reason => requestController.abort(reason) })
+            }, { signal: requestSignal, idleTimeoutMs, wallTimeoutMs, abortRequest: reason => requestController.abort(reason) })
             signal.throwIfAborted()
             if (!state.completed) throw Object.assign(new Error('Response stream ended before completion'), { code: 'ECONNRESET' })
             state.actualModel ??= candidate.model
@@ -1681,6 +1711,120 @@ async function runAgentTurnWithBudget(agentId: string, options: AgentTurnOptions
       ? [options.pollBrief.conversationId]
       : []),
   ])]
+  let runCompanyId = inbox.find((m) => m.company_id)?.company_id ?? null
+  if (!runCompanyId && convoIds[0]) {
+    runCompanyId = await runtime.getConversationCompanyId(convoIds[0])
+  }
+  runCompanyId ??= persona.companyId
+  let triageNote = options.triageNote?.trim() ?? ''
+  let preloadedContext: ContextRow[] | null = null
+
+  // Skip the LLM if this agent already completed exactly this inbox in their
+  // previous wake. Failed turns do not update the fingerprint, so they remain
+  // retryable instead of disappearing into a silent skip.
+  if (completedInboxMatches(agentId, fingerprint)) return
+
+  // Reuse scheduler execute only for the exact classified inbox.
+  const hasCurrentTriage = Boolean(triageNote) &&
+    options.triageBoundary === inboxTriageBoundary(inbox)
+  if (hasCurrentTriage && options.contextBoundary) {
+    preloadedContext = await loadContext(agentId, persona.companyId, convoIds, runtime, { reuseBoundary: options.contextBoundary })
+  }
+  const shouldRunInboxTriage =
+    inbox.length > 0 &&
+    (options.trigger === undefined || options.trigger === 'message.new') &&
+    !isBriefedManualWake && !hasCurrentTriage
+  if (shouldRunInboxTriage) {
+    preloadedContext = await loadContext(agentId, persona.companyId, convoIds)
+    const verdict = triageDisposition(await classifyInboxTriage({
+      agentId,
+      companyId: runCompanyId,
+      persona,
+      inbox,
+      context: preloadedContext,
+    }))
+    const reason = verdict.reason.trim().slice(0, 500)
+    if (verdict.outcome === 'defer') {
+      const retryAt = typeof verdict.retryAt === 'number' && Number.isFinite(verdict.retryAt)
+        ? verdict.retryAt : Date.now() + Number(getServerSettingsSnapshot().settings.triage_backoff_base_ms || 30_000)
+      options.onInboxDeferred?.({ messageIds: inbox.map(row => row.id), retryAt })
+    }
+    if (verdict.outcome !== 'execute') {
+      if (verdict.outcome === 'ignore' && verdict.ackAllowed) {
+        const seen = new Map<string, string>()
+        for (const row of inbox) seen.set(row.conversation_id, row.id)
+        await Promise.all([...seen].map(([conversationId, upToMessageId]) =>
+          runtime.markConversationRead({ agentId, conversationId, upToMessageId })))
+      }
+      return
+    }
+    triageNote = [
+      `Small-brain inbox triage (relevant, ${verdict.source}): ${verdict.promptNote.trim()}`,
+      reason ? `Reason: ${reason}` : '',
+    ].filter(Boolean).join('\n')
+  }
+
+  const memoryQuery = ((isBackgroundScanWake || isBriefedManualWake)
+    ? [
+        options.backgroundBrief?.title ?? 'background scan',
+        options.backgroundBrief?.body ?? '',
+      ].join('\n')
+    : isIdleWake
+    ? [
+        'idle heartbeat',
+        options.idleReason ?? '',
+        'recent commitments, team context, people to follow up with, unresolved work',
+      ].join('\n')
+    : isPollUpdateWake
+    ? [
+        'poll update',
+        options.pollBrief?.question ?? '',
+        options.pollBrief?.phase === 'close' ? 'poll closed — summary' : 'votes coming in — nudge laggards if helpful',
+      ].join('\n')
+    : inbox
+        .slice(0, 12)
+        .map((m) => m.body ?? '')
+        .filter((s) => s.length > 0)
+        .join('\n')
+  ).slice(0, 4000)
+
+  // SYNTHETIC WAKE GATE — idle / background_scan / poll.updated are unprompted.
+  // Agenda wakes already passed classifyAgendaActionable; skip the second
+  // cerebellum call and inject the agenda focus as the triage note.
+  // Empty-agenda idle still goes through the gate (that is its only cerebellum).
+  const isAgendaWake = options.backgroundBrief?.source === 'agenda_scheduler'
+  if ((isIdleWake || isBackgroundScanWake || isPollUpdateWake) && isAgendaWake) {
+    const focus = options.backgroundBrief?.title?.trim()
+    if (focus && !triageNote) triageNote = `Agenda triage (actionable): ${focus}`
+  } else if (isIdleWake || isBackgroundScanWake || isPollUpdateWake) {
+    if (!preloadedContext && convoIds.length > 0) {
+      preloadedContext = await loadContext(agentId, persona.companyId, convoIds)
+    }
+    const recencyMemory = await loadMemory(agentId, memoryQuery, { semantic: 0, recent: 12, total: 12 }, runtime, { conversationIds: convoIds })
+    const signals = [
+      recencyMemory.slice(0, 12)
+        .map((m) => `• ${String((m as { body?: unknown }).body ?? '').replace(/\s+/g, ' ').slice(0, 200)}`)
+        .filter((s) => s.length > 2).join('\n'),
+      (preloadedContext ?? []).slice(-15)
+        .map((m) => `  ${m.is_self ? '▸YOU ' : ''}${m.author_name} (${m.author_kind ?? '?'}): ${(m.kind === 'system' ? '[system]' : m.body).replace(/\s+/g, ' ').slice(0, 200)}`)
+        .join('\n'),
+    ].filter(Boolean).join('\n')
+    const brief = isBackgroundScanWake
+      ? `${options.backgroundBrief?.title ?? ''} ${options.backgroundBrief?.body ?? ''}`.trim()
+      : isPollUpdateWake
+        ? `${options.pollBrief?.question ?? 'poll updated'} (${options.pollBrief?.phase ?? ''})`
+        : (options.idleReason ?? 'idle heartbeat')
+    const gate = await gateSyntheticWake({
+      companyId: runCompanyId,
+      agentId,
+      personaName: persona.name,
+      kind: options.trigger as 'idle' | 'background_scan' | 'poll.updated',
+      brief,
+      signals,
+    })
+    if (!gate.act) return
+  }
+
   // Drop a "thinking" claim on every convo we're about to process so
   // peer agents who run `cumora glance` can see we're composing. The
   // claim auto-expires (TTL 60s) — explicit cleanup happens in the
@@ -1689,11 +1833,6 @@ async function runAgentTurnWithBudget(agentId: string, options: AgentTurnOptions
   if (convoIds.length > 0) {
     void runtime.markThinking(agentId, convoIds, 60).catch(() => { /* logged inside */ })
   }
-  let runCompanyId = inbox.find((m) => m.company_id)?.company_id ?? null
-  if (!runCompanyId && convoIds[0]) {
-    runCompanyId = await runtime.getConversationCompanyId(convoIds[0])
-  }
-  runCompanyId ??= persona.companyId
   const runId = await runtime.createRun({
     agentId,
     companyId: runCompanyId,
@@ -1720,9 +1859,8 @@ async function runAgentTurnWithBudget(agentId: string, options: AgentTurnOptions
   let finalError: string | null = null
   let recentConvo: string | undefined
   let recentConvoCompanyId: string | undefined
-  let triageNote = options.triageNote?.trim() ?? ''
-  let preloadedContext: ContextRow[] | null = null
   let typingStarted = false
+  let turnExecuted = false
   let totalTokensThisTurn = 0
   // Cache-aware usage SUMMED across every model hop of this turn (totalTokensThisTurn
   // tracks only the last hop, for the budget guard; this is for the cost ledger).
@@ -1955,23 +2093,6 @@ async function runAgentTurnWithBudget(agentId: string, options: AgentTurnOptions
       stage: 'loading_inbox',
     })
 
-    // Skip the LLM if this agent already completed exactly this inbox in their
-    // previous wake. Failed turns do not update the fingerprint, so they remain
-    // retryable instead of disappearing into a silent skip.
-    if (lastCompletedInbox.get(agentId) === fingerprint) {
-      finalStatus = 'skipped'
-      finalSummary = 'Inbox unchanged since the last completed turn'
-      await runtime.recordEvent({
-        runId, agentId, companyId: runCompanyId,
-        kind: 'turn.skipped',
-        level: 'debug',
-        title: finalSummary,
-        data: { fingerprint },
-        stage: 'skipped',
-      })
-      return
-    }
-
     if (resourcesUnavailable) {
       await runtime.recordEvent({
         runId, agentId, companyId: runCompanyId,
@@ -1983,67 +2104,13 @@ async function runAgentTurnWithBudget(agentId: string, options: AgentTurnOptions
     }
 
     // Reuse scheduler execute only for the exact classified inbox.
-    const hasCurrentTriage = Boolean(triageNote) &&
-      options.triageBoundary === inboxTriageBoundary(inbox)
-    const shouldRunInboxTriage =
-      inbox.length > 0 &&
-      (options.trigger === undefined || options.trigger === 'message.new') &&
-      !isBriefedManualWake && !hasCurrentTriage
-    if (shouldRunInboxTriage) {
-      preloadedContext = await loadContext(agentId, persona.companyId, convoIds)
-      const verdict = triageDisposition(await classifyInboxTriage({
-        agentId,
-        companyId: runCompanyId,
-        persona,
-        inbox,
-        context: preloadedContext,
-      }))
-      const reason = verdict.reason.trim().slice(0, 500)
-      if (verdict.outcome === 'defer') {
-        const retryAt = typeof verdict.retryAt === 'number' && Number.isFinite(verdict.retryAt)
-          ? verdict.retryAt : Date.now() + Number(getServerSettingsSnapshot().settings.triage_backoff_base_ms || 30_000)
-        options.onInboxDeferred?.({ messageIds: inbox.map(row => row.id), retryAt })
-      }
-      if (verdict.outcome !== 'execute') {
-        finalStatus = 'skipped'
-        finalSummary = verdict.outcome === 'defer'
-          ? `Inbox triage deferred: ${reason}`
-          : `Inbox triage skipped wake: ${reason || 'not relevant'}`
-        if (verdict.outcome === 'ignore' && verdict.ackAllowed) {
-          const seen = new Map<string, string>()
-          for (const row of inbox) seen.set(row.conversation_id, row.id)
-          await Promise.all([...seen].map(([conversationId, upToMessageId]) =>
-            runtime.markConversationRead({ agentId, conversationId, upToMessageId })))
-        }
-        await runtime.recordEvent({
-          runId, agentId, companyId: runCompanyId,
-          kind: 'turn.skipped',
-          level: 'debug',
-          title: finalSummary,
-          data: { source: verdict.source, outcome: verdict.outcome, failureCategory: verdict.failureCategory, retryAt: verdict.retryAt, reason, inboxCount: inbox.length, conversationIds: convoIds },
-          stage: 'skipped',
-        })
-        return
-      }
-      triageNote = [
-        `Small-brain inbox triage (relevant, ${verdict.source}): ${verdict.promptNote.trim()}`,
-        reason ? `Reason: ${reason}` : '',
-      ].filter(Boolean).join('\n')
-      await runtime.recordEvent({
-        runId, agentId, companyId: runCompanyId,
-        kind: 'triage.passed',
-        title: 'Small-brain inbox triage passed',
-        data: { source: verdict.source, reason, inboxCount: inbox.length, conversationIds: convoIds },
-        stage: 'building_prompt',
-      })
-    }
-
     // Materialize the agent's workspace into a real on-disk directory
     // for the duration of this turn. The agent's bash + read_file /
     // write_file / edit_file tools all operate on this namespace; the
     // diff vs. its initial state is committed back to agent_workspace
     // in the `finally` below. See runtime/fs-namespace.ts.
     namespace = await hydrateFs(agentId, runId)
+    turnExecuted = true
     await runtime.recordEvent({
       runId, agentId, companyId: runCompanyId,
       kind: 'fs.hydrated',
@@ -2055,34 +2122,6 @@ async function runAgentTurnWithBudget(agentId: string, options: AgentTurnOptions
     // Pull the recent thread of every conversation that has unread items, so the
     // LLM can see what has already been said (including its own past replies)
     // and avoid repeating itself.
-  // Build the memory-retrieval query from what's actually waking the
-  // agent up. For message wakes, use newest unread bodies. For idle
-  // synthetic wakes, retrieve broad self/team memories without inventing
-  // a fake message.
-  const memoryQuery = ((isBackgroundScanWake || isBriefedManualWake)
-    ? [
-        options.backgroundBrief?.title ?? 'background scan',
-        options.backgroundBrief?.body ?? '',
-      ].join('\n')
-    : isIdleWake
-    ? [
-        'idle heartbeat',
-        options.idleReason ?? '',
-        'recent commitments, team context, people to follow up with, unresolved work',
-      ].join('\n')
-    : isPollUpdateWake
-    ? [
-        'poll update',
-        options.pollBrief?.question ?? '',
-        options.pollBrief?.phase === 'close' ? 'poll closed — summary' : 'votes coming in — nudge laggards if helpful',
-      ].join('\n')
-    : inbox
-        .slice(0, 12)
-        .map((m) => m.body ?? '')
-        .filter((s) => s.length > 0)
-        .join('\n')
-  ).slice(0, 4000)
-
   const [context, memory, climate, textExcerpts, skillsIndex] = await Promise.all([
     preloadedContext ? Promise.resolve(preloadedContext) : loadContext(agentId, persona.companyId, convoIds),
     loadMemory(agentId, memoryQuery, {}, runtime, { conversationIds: convoIds }),
@@ -2103,50 +2142,6 @@ async function runAgentTurnWithBudget(agentId: string, options: AgentTurnOptions
     },
     stage: 'building_prompt',
   })
-
-  // SYNTHETIC WAKE GATE — idle / background_scan / poll.updated are unprompted
-  // (no human waiting). Per the cost principle — EVERY big-brain wake passes a
-  // cerebellum judgment first; avoid the big brain whenever possible — gate them
-  // with the cheap small brain on the context+memory just loaded, DEFAULTING to
-  // skip. An unprompted wake with nothing concrete to do then costs only this
-  // gate, never the big brain. (Message/inbox wakes were already gated above.)
-  if (isIdleWake || isBackgroundScanWake || isPollUpdateWake) {
-    const signals = [
-      memory.slice(0, 12)
-        .map((m) => `• ${String((m as { body?: unknown }).body ?? '').replace(/\s+/g, ' ').slice(0, 200)}`)
-        .filter((s) => s.length > 2).join('\n'),
-      context.slice(-15)
-        .map((m) => `  ${m.is_self ? '▸YOU ' : ''}${m.author_name} (${m.author_kind ?? '?'}): ${(m.kind === 'system' ? '[system]' : m.body).replace(/\s+/g, ' ').slice(0, 200)}`)
-        .join('\n'),
-    ].filter(Boolean).join('\n')
-    const brief = isBackgroundScanWake
-      ? `${options.backgroundBrief?.title ?? ''} ${options.backgroundBrief?.body ?? ''}`.trim()
-      : isPollUpdateWake
-        ? `${options.pollBrief?.question ?? 'poll updated'} (${options.pollBrief?.phase ?? ''})`
-        : (options.idleReason ?? 'idle heartbeat')
-    const gate = await gateSyntheticWake({
-      companyId: runCompanyId,
-      agentId,
-      runId,
-      personaName: persona.name,
-      kind: options.trigger as 'idle' | 'background_scan' | 'poll.updated',
-      brief,
-      signals,
-    })
-    if (!gate.act) {
-      finalStatus = 'skipped'
-      finalSummary = `Cerebellum gate skipped ${options.trigger ?? 'synthetic'} wake: ${gate.reason || 'nothing concrete to act on'}`
-      await runtime.recordEvent({
-        runId, agentId, companyId: runCompanyId,
-        kind: 'turn.skipped',
-        level: 'debug',
-        title: finalSummary,
-        data: { source: 'synthetic-wake-gate', trigger: options.trigger, reason: gate.reason },
-        stage: 'skipped',
-      })
-      return
-    }
-  }
 
   const instructions = await runtime.buildSystemPrompt(agentId)
   if (!instructions) {
@@ -2578,6 +2573,7 @@ Mechanics:
       }
       continue
     }
+    capTtlMap(mcpConnectorFailureCache, MCP_FAILURE_CACHE_MAX, until => until <= Date.now())
     mcpConnectorFailureCache.set(runCompanyId + ':' + spec.name, Date.now() + MCP_CONNECT_FAILURE_CACHE_MS)
     await runtime.recordEvent({
       runId, agentId, companyId: runCompanyId,
@@ -2610,10 +2606,16 @@ Mechanics:
     // dump). In that case the next wake will start fresh, which IS the
     // ultimate compaction.
     const modelInUse = persona.model ?? getBrainModel()
-    const compactThreshold = compactThresholdFor(modelInUse, turnContextWindow, turnPolicy)
-    const hardLimit = hardLimitFor(modelInUse, turnContextWindow, turnPolicy)
-    if ((turnPolicy.autoEnabled && Math.max(totalTokensThisTurn, estimateHistoryTokens(history)) > compactThreshold)
-      || estimateHistoryTokens(history) > hardLimit) {
+    const catalogWindow = plan.candidates.find(candidate => candidate.available)?.parameters.contextWindow
+    const windowInfo = resolveContextWindow(modelInUse, turnContextWindow ?? catalogWindow)
+    if (windowInfo.source === 'unknown-fallback') {
+      console.warn(`[turn] ${agentId} unknown context window for model ${modelInUse}; falling back to ${windowInfo.tokens}`)
+    }
+    const compactThreshold = compactThresholdFor(modelInUse, windowInfo.tokens, turnPolicy)
+    const hardLimit = hardLimitFor(modelInUse, windowInfo.tokens, turnPolicy)
+    const estimatedHistoryTokens = estimateHistoryTokens(history)
+    if ((turnPolicy.autoEnabled && Math.max(totalTokensThisTurn, estimatedHistoryTokens) > compactThreshold)
+      || estimatedHistoryTokens > hardLimit) {
       // The compaction predicate runs against a CJK-aware token
       // estimate (estimateTokens), so Chinese/Japanese turns trigger
       // compaction at the right point — the old byte-count heuristic
@@ -2670,7 +2672,9 @@ Mechanics:
             hardLimit,
             model: modelInUse,
             historyItems: history.length,
-            estimatedHistoryTokens: estimateHistoryTokens(history),
+            estimatedHistoryTokens,
+            contextWindow: windowInfo.tokens,
+            contextWindowSource: windowInfo.source,
           },
           stage: 'compaction_no_op',
         }).catch(() => { /* observability best-effort */ })
@@ -2705,10 +2709,11 @@ Mechanics:
     try {
       const result = await executeAgentTurnHop({
         plan, context: { purpose: 'agent-turn', role: 'brain', companyId: runCompanyId, agentId, runId,
-          extras: { hop: hop + 1 } },
+          extras: { hop: hop + 1, contextWindow: windowInfo.tokens, contextWindowSource: windowInfo.source } },
         input: nextInput, instructions,
         tools: mcpToolDefs.length > 0 ? [...TOOL_DEFS_RESPONSES, ...mcpToolDefs] : TOOL_DEFS_RESPONSES,
         signal: options.signal, compactionPolicy: turnPolicy,
+        idleTimeoutMs: turnPolicy.streamIdleTimeoutMs, wallTimeoutMs: turnPolicy.streamWallTimeoutMs,
         retryEvent: async (kind, data) => { await runtime.recordEvent({
           runId, agentId, companyId: runCompanyId, kind, level: 'warn',
           title: kind === 'model.retry_no_images' ? 'Retrying model without images' : 'Retrying model provider connection',
@@ -3343,7 +3348,7 @@ Mechanics:
         stage: 'completed',
       }).catch(() => { /* observability best-effort */ })
     }
-    lastCompletedInbox.set(agentId, fingerprint)
+    rememberCompletedInbox(agentId, fingerprint)
     finalSummary ||= `Completed with ${toolCallCount} tool call${toolCallCount === 1 ? '' : 's'}`
 
     // Cross-conversation reply audit (observability-only — never blocks).
@@ -3513,7 +3518,7 @@ Mechanics:
       await client.close().catch((err) =>
         console.warn(`[turn] ${agentId} mcp close failed`, err instanceof Error ? err.message : err))
     }
-    await runtime.applyPendingResources(agentId).then(result => {
+    if (turnExecuted) await runtime.applyPendingResources(agentId).then(result => {
       if (result.status === 'failed') console.warn(`[turn] ${agentId} pending resources failed to apply`)
     }).catch(() => console.warn(`[turn] ${agentId} pending resources could not be confirmed`))
     if (typingStarted && recentConvo) {

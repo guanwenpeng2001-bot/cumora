@@ -156,8 +156,13 @@ test('scheduler triage note and exact inbox boundary survive wake parsing and co
   const boundary = inboxTriageBoundary([{ id: 'b' }, { id: 'a' }])
   assert.equal(boundary, inboxTriageBoundary([{ id: 'a' }, { id: 'b' }]))
   assert.notEqual(boundary, inboxTriageBoundary([{ id: 'a' }, { id: 'b' }, { id: 'c' }]))
-  const options = parseWakeData(JSON.stringify({ reason: 'message.new', triageNote: 'execute', triageBoundary: boundary })).options
-  assert.deepEqual(options, { trigger: 'message.new', triageNote: 'execute', triageBoundary: boundary })
+  const contextBoundary = inboxTriageBoundary([{ id: 'ctx-a' }, { id: 'ctx-b' }])
+  const options = parseWakeData(JSON.stringify({
+    reason: 'message.new', triageNote: 'execute', triageBoundary: boundary, contextBoundary,
+  })).options
+  assert.deepEqual(options, {
+    trigger: 'message.new', triageNote: 'execute', triageBoundary: boundary, contextBoundary,
+  })
   assert.equal(mergeWakeTurnOptions(options, { trigger: 'message.new' })?.triageBoundary, boundary)
   assert.equal(mergeWakeTurnOptions(options, { trigger: 'message.new', triageNote: 'unbound' })?.triageBoundary, undefined)
   assert.equal(parseWakeData(JSON.stringify({ reason: 'message.new', triageNote: 'execute', triageBoundary: 'invalid' })).options.triageBoundary, undefined)

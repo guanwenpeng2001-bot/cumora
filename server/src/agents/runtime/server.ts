@@ -363,8 +363,10 @@ runtimeRouter.post('/memory/query', withAgent(async (c, req, res) => {
 
 runtimeRouter.post('/context', withAgent(async (c, req, res) => {
   if (!c.companyId) { res.status(403).json({ error: 'companyId claim required' }); return }
-  const body = req.body as { conversationIds?: string[] } | undefined
-  const rows = await inprocClient.loadContext(c.sub, c.companyId, body?.conversationIds ?? [])
+  const body = req.body as { conversationIds?: string[]; reuseBoundary?: string } | undefined
+  const rows = await inprocClient.loadContext(c.sub, c.companyId, body?.conversationIds ?? [], {
+    reuseBoundary: typeof body?.reuseBoundary === 'string' ? body.reuseBoundary : undefined,
+  })
   res.json({ rows })
 }))
 

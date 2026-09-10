@@ -716,6 +716,7 @@ test('estimateHistoryTokens: sums estimates across all items', () => {
   // tokens per item (type, role, etc.).
   assert.ok(total > 0)
   assert.ok(total < 200, `expected < 200 tokens for trivial 3-item history, got ${total}`)
+  assert.equal(estimateHistoryTokens(history), total, 'identity-stable items reuse the serialized estimate')
 })
 
 test('estimateHistoryTokens: CJK content gets the right token count, not byte-count/3', () => {

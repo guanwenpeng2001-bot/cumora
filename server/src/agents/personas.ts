@@ -36,8 +36,10 @@ export interface Persona {
   companyId: string
 }
 
-/** id → Persona | null (null = looked up but not found / not an agent). */
-const personaCache = new Map<string, { value: Persona | null; expiresAt: number }>()
+/** id → Persona | null (null = looked up but not found / not an agent).
+ *  Positive hits are keyed by resourceVersion so a later turn sees new
+ *  MCP/skill bindings without a 5s blind TTL. Negative hits stay TTL'd. */
+const personaCache = new Map<string, { value: Persona | null; resourceVersion: string; expiresAt: number }>()
 let personaCacheGeneration = 0
 
 export function invalidatePersonaCache(id?: string): void {
@@ -47,11 +49,31 @@ export function invalidatePersonaCache(id?: string): void {
 }
 
 export async function getPersona(id: string): Promise<Persona | null> {
-  // Positive runtime reads must observe the next turn's resources even across replicas.
   const cached = personaCache.get(id)
   if (cached && cached.value === null && cached.expiresAt > Date.now()) return null
   const generation = personaCacheGeneration
   const loadedAt = Date.now()
+  const { rows: versionRows } = await pool.query<{ resource_version: string }>(
+    `SELECT md5(concat_ws(E'\\x1f',
+        p.name, COALESCE(p.role, ''), COALESCE(p.system_prompt, ''), COALESCE(p.model, ''),
+        COALESCE(p.model_config::text, ''), p.company_id,
+        (SELECT COALESCE(string_agg(connector_id, ',' ORDER BY connector_id), '')
+           FROM agent_mcp_connectors WHERE agent_id = p.id),
+        (SELECT COALESCE(string_agg(skill_id, ',' ORDER BY skill_id), '')
+           FROM agent_skills WHERE agent_id = p.id)
+      )) AS resource_version
+       FROM participants p
+      WHERE p.id = $1 AND p.kind = 'agent' AND p.departed_at IS NULL`,
+    [id],
+  )
+  const resourceVersion = versionRows[0]?.resource_version ?? ''
+  if (!resourceVersion) {
+    if (generation === personaCacheGeneration) {
+      personaCache.set(id, { value: null, resourceVersion: '', expiresAt: loadedAt + 5_000 })
+    }
+    return null
+  }
+  if (cached?.value && cached.resourceVersion === resourceVersion) return cached.value
   let connectorLoadFailed = false
   const { rows } = await pool.query<{
     id: string; name: string; role: string | null; style: string | null;
@@ -76,7 +98,7 @@ export async function getPersona(id: string): Promise<Persona | null> {
     }
   }
   if (!connectorLoadFailed && generation === personaCacheGeneration) {
-    personaCache.set(id, { value: persona, expiresAt: loadedAt + 5_000 })
+    personaCache.set(id, { value: persona, resourceVersion, expiresAt: loadedAt + 5_000 })
   }
   return persona
 }

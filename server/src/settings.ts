@@ -17,7 +17,7 @@
  */
 import type { PoolClient, QueryConfig } from 'pg'
 import { pool } from './db/pool.js'
-import { env, resolveDirectLlmEnv } from './env.js'
+import { env, resolveDirectLlmEnv, defaultOpenAIImageModel } from './env.js'
 import type { ByoaPolicyValues } from './agents/computer/runtime-policy.js'
 import type { CompactionPolicy } from './agents/turn-compaction.js'
 import { parseApiKeyMap, sub2apiOpenAIBaseURL } from './sub2api.js'
@@ -55,7 +55,7 @@ export const SETTING_DEFS: readonly SettingDef[] = [
   { key: 'support_fallback_models', pod: true, type: 'list', envValue: () => '' },
   { key: 'compaction_model', pod: true, type: 'model', required: true, envKeys: ['OPENAI_COMPACTION_MODEL', 'OPENAI_MODEL_SUPPORT'], envValue: () => env.OPENAI_COMPACTION_MODEL ?? '' },
   { key: 'compaction_fallback_models', pod: true, type: 'list', envValue: () => '' },
-  { key: 'image_model', pod: true, type: 'model', required: true, envKeys: ['OPENAI_IMAGE_MODEL'], envValue: () => env.OPENAI_IMAGE_MODEL ?? '' },
+  { key: 'image_model', pod: true, type: 'model', required: true, envKeys: ['OPENAI_IMAGE_MODEL'], envValue: () => defaultOpenAIImageModel() },
   { key: 'image_fallback_models', pod: true, type: 'list', envKeys: ['OPENAI_IMAGE_FALLBACK_MODELS'], envValue: () => process.env.OPENAI_IMAGE_FALLBACK_MODELS ?? '' },
   { key: 'audio_model', pod: true, type: 'model', required: true, envKeys: ['OPENAI_AUDIO_MODEL'], envValue: () => process.env.OPENAI_AUDIO_MODEL ?? '' },
   { key: 'audio_fallback_models', pod: true, type: 'list', envKeys: ['OPENAI_AUDIO_FALLBACK_MODELS'], envValue: () => process.env.OPENAI_AUDIO_FALLBACK_MODELS ?? '' },
@@ -74,9 +74,15 @@ export const SETTING_DEFS: readonly SettingDef[] = [
   { key: 'compaction_summary_max_chars', pod: true, defaultValue: '4000', type: 'integer', min: 1, scope: 'managed', effect: 'next-turn', unit: 'characters', envValue: () => '4000' },
   { key: 'agent_max_hops', pod: true, defaultValue: '200', type: 'integer', min: 1, scope: 'managed', effect: 'next-turn', unit: 'hops', envValue: () => '200', description: 'Main turn hops; fallback attempts do not consume additional hops.' },
   { key: 'agent_turn_timeout_ms', pod: true, defaultValue: '0', type: 'integer', min: 0, max: 2147483647, scope: 'managed', effect: 'next-turn', unit: 'milliseconds', envValue: () => '0', description: 'Managed turn only; 0 disables the turn deadline. BYOA retains its local CUMORA_TURN_TIMEOUT_MS and engine behavior.' },
+  { key: 'agent_stream_idle_timeout_ms', pod: true, defaultValue: '240000', type: 'integer', min: 1, max: 2147483647, scope: 'managed', effect: 'next-turn', unit: 'milliseconds', envKeys: ['CUMORA_AGENT_STREAM_IDLE_TIMEOUT_MS'], envValue: () => process.env.CUMORA_AGENT_STREAM_IDLE_TIMEOUT_MS ?? '240000', description: 'Maximum silence between main-hop stream events. Slow-thinking models need a higher value; short-SLA tenants a lower one. Independent of agent_turn_timeout_ms.' },
+  { key: 'agent_stream_wall_timeout_ms', pod: true, defaultValue: '360000', type: 'integer', min: 1, max: 2147483647, scope: 'managed', effect: 'next-turn', unit: 'milliseconds', envKeys: ['CUMORA_AGENT_STREAM_WALL_TIMEOUT_MS'], envValue: () => process.env.CUMORA_AGENT_STREAM_WALL_TIMEOUT_MS ?? '360000', description: 'Maximum wall-clock time for one main-hop stream, even if tokens keep arriving. Must be >= agent_stream_idle_timeout_ms.' },
   { key: 'idle_enabled', type: 'boolean', defaultValue: 'true', scope: 'server', effect: 'next-tick', envKeys: ['ENABLE_IDLE'], envValue: () => process.env.ENABLE_IDLE ?? 'true' },
   { key: 'idle_interval_ms', type: 'integer', defaultValue: '900000', min: 0, max: 2147483647, unit: 'milliseconds', scope: 'server', effect: 'next-tick', envKeys: ['IDLE_INTERVAL_MS'], envValue: () => process.env.IDLE_INTERVAL_MS ?? '900000' },
   { key: 'idle_min_quiet_min', type: 'integer', defaultValue: '25', min: 0, max: 525600, scope: 'server', effect: 'next-tick', envKeys: ['IDLE_MIN_QUIET_MIN'], envValue: () => process.env.IDLE_MIN_QUIET_MIN ?? '25' },
+  { key: 'stall_min_ms', type: 'integer', defaultValue: '300000', min: 0, max: 2147483647, unit: 'milliseconds', scope: 'server', effect: 'next-tick', envKeys: ['CUMORA_STALL_MIN_MS'], envValue: () => process.env.CUMORA_STALL_MIN_MS ?? '300000', description: 'A conversation is stalled only after this much silence. Must be <= stall_max_ms.' },
+  { key: 'stall_max_ms', type: 'integer', defaultValue: '21600000', min: 0, max: 2147483647, unit: 'milliseconds', scope: 'server', effect: 'next-tick', envKeys: ['CUMORA_STALL_MAX_MS'], envValue: () => process.env.CUMORA_STALL_MAX_MS ?? '21600000', description: 'Do not resurrect conversations quieter than this. Must be >= stall_min_ms.' },
+  { key: 'nudge_cooldown_ms', type: 'integer', defaultValue: '2700000', min: 0, max: 2147483647, unit: 'milliseconds', scope: 'server', effect: 'next-tick', envKeys: ['CUMORA_NUDGE_COOLDOWN_MS'], envValue: () => process.env.CUMORA_NUDGE_COOLDOWN_MS ?? '2700000', description: 'Cooldown between classified stall nudges to the same conversation.' },
+  { key: 'nudge_cooldown_fallback_ms', type: 'integer', defaultValue: '300000', min: 0, max: 2147483647, unit: 'milliseconds', scope: 'server', effect: 'next-tick', envKeys: ['CUMORA_NUDGE_COOLDOWN_FALLBACK_MS'], envValue: () => process.env.CUMORA_NUDGE_COOLDOWN_FALLBACK_MS ?? '300000', description: 'Shorter cooldown for deterministic-fallback stall nudges while the agenda classifier is down.' },
   { key: 'agenda_gate_enabled', type: 'boolean', defaultValue: 'true', scope: 'server', effect: 'next-gate', description: 'Disabled stops automatic agenda decisions; human messages, calendar delivery and manual briefs remain enabled.', envValue: () => 'true' },
   { key: 'agenda_error_mode', type: 'string', defaultValue: 'defer', allowedValues: ['defer'], scope: 'server', effect: 'next-gate', description: 'Classifier errors defer without a brain wake or acknowledgement.', envValue: () => 'defer' },
   { key: 'scanner_enabled', type: 'boolean', defaultValue: 'true', scope: 'server', effect: 'next-tick', envKeys: ['ENABLE_SCANNER'], envValue: () => process.env.ENABLE_SCANNER ?? 'true' },
@@ -230,6 +236,20 @@ function makeSnapshot(rows: { key: string; value: string }[], defaults?: Readonl
     settings.triage_backoff_base_ms = '30000'
     settings.triage_backoff_max_ms = '60000'
     sources.triage_backoff_base_ms = sources.triage_backoff_max_ms = 'default'
+  }
+  if (Number(settings.stall_min_ms) > Number(settings.stall_max_ms)) {
+    diagnostics.push('invalid-setting:stall-window')
+    console.warn('[settings] invalid stall window; using defaults')
+    settings.stall_min_ms = '300000'
+    settings.stall_max_ms = '21600000'
+    sources.stall_min_ms = sources.stall_max_ms = 'default'
+  }
+  if (Number(settings.agent_stream_idle_timeout_ms) > Number(settings.agent_stream_wall_timeout_ms)) {
+    diagnostics.push('invalid-setting:agent-stream-timeouts')
+    console.warn('[settings] invalid agent stream timeouts; using defaults')
+    settings.agent_stream_idle_timeout_ms = '240000'
+    settings.agent_stream_wall_timeout_ms = '360000'
+    sources.agent_stream_idle_timeout_ms = sources.agent_stream_wall_timeout_ms = 'default'
   }
   const definitions = Object.freeze(SETTING_DEFS.map(({ envValue: _envValue, envKeys: _envKeys, ...def }) => Object.freeze(def)))
   if (Number(settings.byoa_triage_backoff_base_ms) > Number(settings.byoa_triage_backoff_max_ms)) {
@@ -447,6 +467,8 @@ export function getEmbedModel(): string { return getServerSetting('embed_model')
 export interface TurnBudgetPolicy extends CompactionPolicy {
   readonly maxHops: number
   readonly timeoutMs: number
+  readonly streamIdleTimeoutMs: number
+  readonly streamWallTimeoutMs: number
   readonly revision: string
 }
 
@@ -458,7 +480,10 @@ export function getTurnBudgetPolicy(): Readonly<TurnBudgetPolicy> {
     outputBytes: Number(settings.compaction_output_bytes), keepRecentPairs: Number(settings.compaction_keep_recent_pairs),
     strategy: settings.compaction_strategy as CompactionPolicy['strategy'],
     summaryMaxChars: Number(settings.compaction_summary_max_chars),
-    maxHops: Number(settings.agent_max_hops), timeoutMs: Number(settings.agent_turn_timeout_ms), revision,
+    maxHops: Number(settings.agent_max_hops), timeoutMs: Number(settings.agent_turn_timeout_ms),
+    streamIdleTimeoutMs: Number(settings.agent_stream_idle_timeout_ms),
+    streamWallTimeoutMs: Number(settings.agent_stream_wall_timeout_ms),
+    revision,
   })
 }
 
@@ -657,6 +682,22 @@ export async function writeServerSettings(entries: Record<string, string | null>
       for (const [key, value] of rows) after[key] = value ?? SETTING_DEFS.find(d => d.key === key)!.envValue()
       if (!(Number(after.compaction_soft_ratio) < Number(after.compaction_hard_ratio))) {
         throw new InvalidServerSettingError('compaction ratios must satisfy 0 < soft < hard < 1')
+      }
+    }
+    if (rows.some(([key]) => key === 'stall_min_ms' || key === 'stall_max_ms')) {
+      const current = await client.query<{ key: string; value: string }>('SELECT key, value FROM server_settings')
+      const after = { ...makeSnapshot(current.rows).settings }
+      for (const [key, value] of rows) after[key] = value ?? settingEnvValue(SETTING_DEFS.find(d => d.key === key)!)
+      if (Number(after.stall_min_ms) > Number(after.stall_max_ms)) {
+        throw new InvalidServerSettingError('stall window must satisfy min <= max')
+      }
+    }
+    if (rows.some(([key]) => key === 'agent_stream_idle_timeout_ms' || key === 'agent_stream_wall_timeout_ms')) {
+      const current = await client.query<{ key: string; value: string }>('SELECT key, value FROM server_settings')
+      const after = { ...makeSnapshot(current.rows).settings }
+      for (const [key, value] of rows) after[key] = value ?? settingEnvValue(SETTING_DEFS.find(d => d.key === key)!)
+      if (Number(after.agent_stream_idle_timeout_ms) > Number(after.agent_stream_wall_timeout_ms)) {
+        throw new InvalidServerSettingError('agent stream timeouts must satisfy idle <= wall')
       }
     }
     if (rows.some(([key]) => ['embed_model', 'llm_config', 'sub2api_group_config'].includes(key))) {

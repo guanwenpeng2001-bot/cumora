@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { resolveRoleCall, type RoleCallPlan, type RoleCallCandidate } from './llm-resolver.js'
 import { getLlmCandidateClient } from './llm.js'
 import { fallbackReason, isLlmCancellation } from './agents/fallback.js'
-import { captureCallPricing, measuredUsage, type TokenUsage } from './agents/cost.js'
+import { capturePricing, measuredUsage, type TokenUsage } from './agents/cost.js'
 import { recordLlmCall, classifyLlmCallError, type LlmCallContext, type LlmCallRecord } from './agents/llm-ledger.js'
 import { getServerSettingsSnapshot, parseLlmConfig } from './settings.js'
 
@@ -13,6 +13,8 @@ export interface LlmAttemptState {
   protocol?: RoleCallCandidate['protocol']
   reasoningTokens?: number
   actualModel: string | null
+  contextWindow?: number
+  contextWindowSource?: 'catalog' | 'family' | 'unknown-fallback'
   /** Set before publishing output, executing a tool, or creating external state. */
   committed: boolean
 }
@@ -43,6 +45,12 @@ export async function executeLlmPlan<T>(options: LlmExecutionOptions<T>): Promis
   if (!candidates.length) throw new Error('LLM candidate chain has no available candidates')
   const logicalCallId = options.logicalCallId ?? randomUUID()
   const checkAbort = () => { if (signal?.aborted) throw signal.reason ?? new DOMException('Aborted', 'AbortError') }
+  // Freeze once per logical call. TTL expiry only kicks a background SELECT;
+  // a 401/403 hop must not wait on pricing or block the next candidate on ledger I/O.
+  const pricing = capturePricing()
+  for (const candidate of candidates) {
+    void getLlmCandidateClient(plan, candidate).catch(() => {})
+  }
   let retryCount = 0
   let attempt = 0
   let transportRetryCount = 0
@@ -50,8 +58,6 @@ export async function executeLlmPlan<T>(options: LlmExecutionOptions<T>): Promis
     checkAbort()
     const candidate = candidates[index]!
     const state: LlmAttemptState = { usage: null, rawUsage: null, actualModel: null, committed: false }
-    const pricing = await captureCallPricing()
-    checkAbort()
     const start = Date.now()
     let value: T | undefined
     let error: unknown
@@ -86,6 +92,7 @@ export async function executeLlmPlan<T>(options: LlmExecutionOptions<T>): Promis
       requestModel: candidate.requestModel, actualModel: state.actualModel,
       route: candidate.route.id, routeKind: candidate.route.kind, platform: candidate.route.platform ?? null,
       protocol: state.protocol ?? candidate.protocol, plannedProtocol: candidate.protocol, usageProtocol: state.usageProtocol ?? null, revision: plan.revision, authorizationVersion: plan.authorizationVersion ?? null,
+      contextWindow: state.contextWindow ?? null, contextWindowSource: state.contextWindowSource ?? null,
       status, failureStage: failed ? prepared ? 'execution' : 'prepare' : null, httpStatus: (error as { status?: number } | null)?.status ?? null,
       failureReason: cancelled ? 'cancelled' : reason ?? (failed ? 'non-fallbackable-error' : null),
       nextCandidate: next?.model ?? null, nextCandidateReason: retryReason ?? (next ? reason : null),

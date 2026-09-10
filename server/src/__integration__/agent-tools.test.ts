@@ -903,23 +903,17 @@ test('[integration] fingerprint dedup: same inbox twice in a row → second wake
   assert.equal(llm.responseCallCount(), 1, 'first wake calls the LLM once')
 
   // Second wake with the exact same inbox state — fingerprint matches.
-  // The fingerprint check (turn.ts:1187) short-circuits AFTER createRun
-  // fires but BEFORE the LLM is consulted, so the run row count keeps
-  // ticking up but the LLM call count stays at 1.
+  // Skip gates finish before createRun, so the second wake must not open
+  // a run row or consult the LLM.
   await runAgentTurn(agentId)
   assert.equal(llm.responseCallCount(), 1, 'second wake must NOT call the LLM again (fingerprint dedup)')
 
-  // Run rows: BOTH wakes open a run row (createRun fires before the
-  // fingerprint skip). The dedup's value is "skip the expensive LLM
-  // + tool work", not "skip observability". The skipped run is marked
-  // status='skipped' with a turn.skipped event.
   const { rows } = await pool.query<{ status: string }>(
     `SELECT status FROM agent_runs WHERE agent_id = $1 ORDER BY started_at`,
     [agentId],
   )
-  assert.equal(rows.length, 2, 'each wake opens a run row')
+  assert.equal(rows.length, 1, 'fingerprint skip must not open a second run row')
   assert.equal(rows[0].status, 'completed', 'first wake ran to completion')
-  assert.equal(rows[1].status, 'skipped', 'second wake skipped via fingerprint match')
 })
 
 test('[integration] conversation cursor advances after an explicit reply — inbox does not loop', async () => {

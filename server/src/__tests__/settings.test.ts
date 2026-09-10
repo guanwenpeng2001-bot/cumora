@@ -80,7 +80,11 @@ function fixture(clock?: { now: number; ticks: Array<() => void> }, processEnv: 
     require(name: string) {
       if (name === 'node:async_hooks') return { AsyncLocalStorage }
       if (name === './db/pool.js') return { pool }
-      if (name === './env.js') return { env }
+      if (name === './env.js') return {
+        env,
+        defaultOpenAIImageModel: () => env.OPENAI_IMAGE_MODEL ?? 'gpt-image-2',
+        resolveDirectLlmEnv: () => ({ configured: false, protocol: 'images' }),
+      }
       if (name === './sub2api.js') return {}
       if (name === './managed-pod-settings.js') return { getManagedPodSettings: () => null }
       throw new Error('unexpected dependency: ' + name)
@@ -311,7 +315,8 @@ test('turn budget defaults retain existing limits and expose managed next-turn s
   const policy = f.settings.getTurnBudgetPolicy()
   assert.deepEqual(JSON.parse(JSON.stringify(policy)), {
     autoEnabled: true, softRatio: 0.75, hardRatio: 0.95, outputBytes: 600,
-    keepRecentPairs: 2, strategy: 'summary', summaryMaxChars: 4000, maxHops: 200, timeoutMs: 0, revision: '0',
+    keepRecentPairs: 2, strategy: 'summary', summaryMaxChars: 4000, maxHops: 200, timeoutMs: 0,
+    streamIdleTimeoutMs: 240000, streamWallTimeoutMs: 360000, revision: '0',
   })
   assert.ok(Object.isFrozen(policy))
   const def = f.settings.SETTING_DEFS.find(d => d.key === 'agent_turn_timeout_ms')!
@@ -325,7 +330,8 @@ test('turn budget defaults retain existing limits and expose managed next-turn s
   const next = f.settings.getTurnBudgetPolicy()
   assert.deepEqual(JSON.parse(JSON.stringify(next)), {
     autoEnabled: false, softRatio: 0.6, hardRatio: 0.8, outputBytes: 321,
-    keepRecentPairs: 0, strategy: 'drop-and-marker', summaryMaxChars: 250, maxHops: 9, timeoutMs: 1000, revision: '1',
+    keepRecentPairs: 0, strategy: 'drop-and-marker', summaryMaxChars: 250, maxHops: 9, timeoutMs: 1000,
+    streamIdleTimeoutMs: 240000, streamWallTimeoutMs: 360000, revision: '1',
   })
   await f.settings.writeServerSettings({ agent_max_hops: null, agent_turn_timeout_ms: null })
   assert.equal(f.settings.getTurnBudgetPolicy().maxHops, 200)
@@ -340,6 +346,7 @@ test('turn budget rejects invalid values and validates partial ratio updates in 
     ['compaction_hard_ratio', '1'], ['compaction_soft_ratio', 'NaN'], ['compaction_output_bytes', '0'],
     ['compaction_summary_max_chars', '-1'], ['compaction_keep_recent_pairs', '1.5'],
     ['agent_max_hops', '0'], ['agent_turn_timeout_ms', '2147483648'],
+    ['agent_stream_idle_timeout_ms', '0'], ['agent_stream_wall_timeout_ms', '0'],
   ]) await assert.rejects(f.settings.writeServerSettings({ [key]: value }))
   assert.equal(f.connections, 0)
   await f.settings.writeServerSettings({ compaction_soft_ratio: '0.85', compaction_hard_ratio: '0.9' })
@@ -349,6 +356,10 @@ test('turn budget rejects invalid values and validates partial ratio updates in 
   assert.equal(f.data.has('agent_max_hops'), false)
   await f.settings.writeServerSettings({ compaction_hard_ratio: '0.99', compaction_soft_ratio: '0.97' })
   await assert.rejects(f.settings.writeServerSettings({ compaction_hard_ratio: null }), /soft < hard/)
+  await assert.rejects(f.settings.writeServerSettings({
+    agent_stream_idle_timeout_ms: '400000', agent_stream_wall_timeout_ms: '360000',
+  }), /idle <= wall/)
+  await assert.rejects(f.settings.writeServerSettings({ stall_min_ms: '400000', stall_max_ms: '300000' }), /min <= max/)
 })
 
 test('invalid stored ratio ordering produces a diagnostic and a valid fallback pair', async () => {
@@ -369,6 +380,7 @@ test('turn definitions publish all nine defaults alongside automation and cerebe
     auto_compaction_enabled: 'true', compaction_soft_ratio: '0.75', compaction_hard_ratio: '0.95',
     compaction_output_bytes: '600', compaction_keep_recent_pairs: '2', compaction_strategy: 'summary',
     compaction_summary_max_chars: '4000', agent_max_hops: '200', agent_turn_timeout_ms: '0',
+    agent_stream_idle_timeout_ms: '240000', agent_stream_wall_timeout_ms: '360000',
   }
   const snapshot = f.settings.getServerSettingsSnapshot()
   for (const [key, value] of Object.entries(defaults)) {
@@ -389,6 +401,7 @@ test('turn definitions publish all nine defaults alongside automation and cerebe
     'cloud_inbox_triage_timeout_ms', 'synthetic_gate_timeout_ms', 'byoa_triage_timeout_ms',
     'triage_backoff_base_ms', 'triage_backoff_max_ms', 'support_inbox_triage_output_tokens',
     'support_synthetic_gate_output_tokens', 'low_priority_wake_budget_per_minute', 'agent_turn_rate_per_minute',
+    'stall_min_ms', 'stall_max_ms', 'nudge_cooldown_ms', 'nudge_cooldown_fallback_ms',
   ]
   for (const key of otherKeys) assert.equal(snapshot.definitions!.filter(def => def.key === key).length, 1, key)
   await f.settings.writeServerSettings({ agent_max_hops: '12', idle_enabled: 'false', support_inbox_triage_output_tokens: '2500' })

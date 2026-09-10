@@ -71,6 +71,7 @@ type WakeOptions = Pick<AgentTurnOptions, 'idleReason' | 'backgroundBrief' | 'po
   recoveryProbe?: boolean
   triageDeferred?: TriageDisposition
   triageBoundary?: string
+  contextBoundary?: string
 }
 type WakeFailureClass = 'ensure_pod' | 'host_resolution' | 'triage' | 'delivery'
 
@@ -449,6 +450,7 @@ async function wakeOneCaptured(
   }
 
   let host: ResolvedAgentHost | null = null
+  let preEnsured: Awaited<ReturnType<typeof ensurePod>> | undefined
   if (options.placementTriage) {
     host = await resolveHostForWake()
     if (!host) return false
@@ -456,7 +458,24 @@ async function wakeOneCaptured(
     // wake or a new Pod; the flag is serialized into retries so recovery cannot
     // bypass the same placement + triage contract.
     if (!isByoaKind(host.kind) && reason === 'message.new') {
-      const verdict = await triageWakeRecipient(agentId, options.triageTarget ?? null)
+      const triagePromise = triageWakeRecipient(agentId, options.triageTarget ?? null)
+      // Cold start: overlap cerebellum with kubectl. Free-tier never gets a
+      // managed pod. Skip-triage still lets a started pod idle-exit.
+      const ensurePromise = host.tier === 'free'
+        ? undefined
+        : ensurePod(agentId, triagePromise.then(verdict =>
+            verdict?.triageNote
+              ? {
+                  triageNote: verdict.triageNote,
+                  triageBoundary: verdict.triageBoundary,
+                  contextBoundary: verdict.contextBoundary,
+                }
+              : undefined)).catch(err => ({
+            ok: false as const, created: false as const, code: 'pod_apply_failed' as const,
+            reason: err instanceof Error ? err.message : String(err),
+          }))
+      const [verdict, podResult] = await Promise.all([triagePromise, ensurePromise ?? Promise.resolve(undefined)])
+      if (podResult) preEnsured = podResult
       if (!verdict) return false
       options = { ...options, ...verdict }
       if (verdict.triageDeferred) {
@@ -474,7 +493,11 @@ async function wakeOneCaptured(
     ...(options.idleReason ? { idleReason: options.idleReason } : {}),
     ...(options.backgroundBrief ? { backgroundBrief: options.backgroundBrief } : {}),
     ...(options.pollBrief ? { pollBrief: options.pollBrief } : {}),
-    ...(options.triageNote ? { triageNote: options.triageNote, triageBoundary: options.triageBoundary } : {}),
+    ...(options.triageNote ? {
+      triageNote: options.triageNote,
+      triageBoundary: options.triageBoundary,
+      ...(options.contextBoundary ? { contextBoundary: options.contextBoundary } : {}),
+    } : {}),
   }
   let delivered: number
   try {
@@ -498,7 +521,7 @@ async function wakeOneCaptured(
   if (steerPayload && delivered > 0) {
     const busy = await isAgentBusy(agentId).catch(() => false)
     if (busy) {
-      // Per-agent rate limit: at most STEER_RATE_PER_MINUTE steers
+      // Per-agent rate limit: at most agent_turn_rate_per_minute steers
       // delivered in any rolling 60s window. Above that, fall through
       // to wake-only (message is still in DB → next wake picks it up).
       // Without this, a spam loop could saturate MAX_BATCHES_PER_TURN
@@ -574,12 +597,16 @@ async function wakeOneCaptured(
   // Paid (pro/max) managed agent — spin up a Pod. The Pod will catch up on first
   // connect via its initial drain(); we don't need to deliver the
   // event explicitly afterwards because the inbox IS the source of
-  // truth.
-  const r = await ensurePod(agentId, reason === 'message.new' && options.triageNote
-    ? { triageNote: options.triageNote, triageBoundary: options.triageBoundary } : undefined).catch(err => ({
+  // truth. message.new already overlapped ensurePod with triage above.
+  const r = (preEnsured ?? await ensurePod(agentId, reason === 'message.new' && options.triageNote
+    ? {
+        triageNote: options.triageNote,
+        triageBoundary: options.triageBoundary,
+        contextBoundary: options.contextBoundary,
+      } : undefined).catch(err => ({
       ok: false as const, created: false, code: 'pod_apply_failed',
       reason: err instanceof Error ? err.message : String(err),
-    }))
+    })))
   if (r.created) {
     console.log('[scheduler] ' + agentId + ' resting → spinning up pod (' + reason + ')')
     // Synthetic/message wakes are durable in the inbox. Only the explicit
@@ -710,17 +737,16 @@ export function _resetAuthorNameCacheForTests(): void {
 // hundreds of messages/sec at one agent. Even with MAX_BATCHES_PER_TURN
 // and MAX_BYTES_PER_TURN limiting in-pod consumption, the network +
 // Redis pub/sub bandwidth + the agent's hop budget would still burn.
-// Rate limit at the publish edge: at most STEER_RATE_PER_MINUTE steers
-// dispatched per agent in any rolling 60s window. Beyond that, fall
+// Rate limit at the publish edge: at most agent_turn_rate_per_minute
+// steers dispatched per agent in any rolling 60s window. Beyond that, fall
 // through to wake-only (message stays in DB → next wake handles).
-
-const STEER_RATE_PER_MINUTE = 30
 
 /** Attempts to consume one steer-rate token for the agent. Returns
  *  true if allowed, false if the rate limit is exceeded. Uses an
  *  atomic Lua-like INCR-and-check, which on first call sets a 60s
  *  TTL — so the counter naturally resets. Fail-open on Redis errors
- *  (steers continue; the wake path is correct anyway). */
+ *  (steers continue; the wake path is correct anyway). Shares
+ *  `agent_turn_rate_per_minute` with the wake publish edge. */
 async function consumeSteerRateToken(agentId: string): Promise<boolean> {
   try {
     const key = `cumora:steer-rate:${agentId}`
@@ -732,7 +758,7 @@ async function consumeSteerRateToken(agentId: string): Promise<boolean> {
     if (count === 1) {
       await redis.expire(key, 60).catch(() => { /* best-effort */ })
     }
-    return count <= STEER_RATE_PER_MINUTE
+    return count <= automationNumber('agent_turn_rate_per_minute')
   } catch {
     return true // fail-open
   }
@@ -1001,7 +1027,8 @@ export async function triageWakeRecipient(
     })
     const disposition = triageDisposition(verdict)
     const triageBoundary = inboxTriageBoundary(inbox)
-    if (disposition.outcome === 'defer') return { triageDeferred: disposition, triageBoundary }
+    const contextBoundary = inboxTriageBoundary(context)
+    if (disposition.outcome === 'defer') return { triageDeferred: disposition, triageBoundary, contextBoundary }
     if (disposition.outcome === 'ignore' && disposition.ackAllowed) {
       const seen = new Map<string, string>()
       for (const row of inbox) seen.set(row.conversation_id, row.id)
@@ -1010,7 +1037,7 @@ export async function triageWakeRecipient(
       console.log(`[scheduler] ${agentId} message.new skipped by inbox triage: ${verdict.reason}`)
       return null
     }
-    return { triageNote: renderTriageNote(verdict), triageBoundary }
+    return { triageNote: renderTriageNote(verdict), triageBoundary, contextBoundary }
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err)
     console.warn(`[scheduler] ${agentId} inbox triage unavailable; deferred: ${reason}`)

@@ -24,7 +24,7 @@
  * Provider routes are resolved from configuration before constructing a candidate client.
  * Request model strings cannot change a candidate's endpoint or credentials.
  */
-import { resolveTenantLlmContext, tenantRoutingSnapshot, invalidateTenantModelSnapshot, onTenantLlmInvalidated } from './tenant-llm-context.js'
+import { resolveTenantLlmContext, tenantRoutingSnapshot, invalidateTenantModelSnapshot, onTenantLlmInvalidated, contextForRoleCallPlan } from './tenant-llm-context.js'
 import OpenAI from 'openai'
 import { resolveDirectLlmEnv } from './env.js'
 export { resolveRoleCall } from './llm-resolver.js'
@@ -47,9 +47,21 @@ interface CachedClient {
 }
 
 const CACHE_TTL_MS = 5 * 60_000
+const CANDIDATE_CLIENT_TTL_MS = 6 * 60_000
+const CLIENT_CACHE_MAX = 2_048
+const DIRECT_CLIENT_MAX = 256
 const cache = new Map<string, CachedClient>()
-const candidateClients = new Map<string, { version: string; clients: Map<string, OpenAI> }>()
-const directCandidateClients = new Map<string, { apiKey: string; baseURL: string; client: OpenAI }>()
+const candidateClients = new Map<string, { version: string; mintedAt: number; clients: Map<string, OpenAI> }>()
+const directCandidateClients = new Map<string, { apiKey: string; baseURL: string; mintedAt: number; client: OpenAI }>()
+
+function capTtlMap<K, V>(map: Map<K, V>, max: number, expired: (value: V) => boolean): void {
+  for (const [key, value] of map) if (expired(value)) map.delete(key)
+  while (map.size >= max) {
+    const first = map.keys().next().value
+    if (first === undefined) break
+    map.delete(first)
+  }
+}
 
 /** Tolerance settings for both the sub2api-routed client AND the legacy
  *  fallback. Production has surfaced "all four agents 502'd at once →
@@ -95,13 +107,18 @@ export async function getLlmCandidateClient(plan: RoleCallPlan, candidate: RoleC
   if (!candidate.available) throw new Error(candidate.diagnostic ?? 'LLM candidate unavailable')
   if (candidate.route.kind === 'gateway') {
     if (!plan.companyId || !candidate.route.platform) throw new Error('Missing tenant LLM route')
-    const context = await resolveTenantLlmContext(plan.companyId)
-    if (context.authorizationVersion !== plan.authorizationVersion) throw new Error('Tenant LLM authorization changed; resolve the plan again')
+    const now = Date.now()
+    const existing = candidateClients.get(plan.companyId)
+    if (existing && (existing.version !== plan.authorizationVersion || now - existing.mintedAt >= CANDIDATE_CLIENT_TTL_MS)) {
+      candidateClients.delete(plan.companyId)
+    }
+    const context = await contextForRoleCallPlan(plan)
     const apiKey = context.keys[candidate.route.platform]
     if (!apiKey || !context.baseURL) throw new Error('Tenant LLM route is unavailable')
     let cached = candidateClients.get(plan.companyId)
     if (cached?.version !== context.authorizationVersion) {
-      cached = { version: context.authorizationVersion, clients: new Map() }
+      capTtlMap(candidateClients, CLIENT_CACHE_MAX, entry => Date.now() - entry.mintedAt >= CANDIDATE_CLIENT_TTL_MS)
+      cached = { version: context.authorizationVersion, mintedAt: Date.now(), clients: new Map() }
       candidateClients.set(plan.companyId, cached)
     }
     let client = cached.clients.get(candidate.route.platform)
@@ -116,7 +133,8 @@ export async function getLlmCandidateClient(plan: RoleCallPlan, candidate: RoleC
   const cacheKey = JSON.stringify([candidate.route.env, candidate.protocol,
     ['novita', 'orcarouter'].includes(candidate.route.env ?? '') ? candidate.requestModel : null])
   const cached = directCandidateClients.get(cacheKey)
-  if (cached?.apiKey === direct.apiKey && cached.baseURL === direct.baseURL) return cached.client
+  if (cached?.apiKey === direct.apiKey && cached.baseURL === direct.baseURL
+    && Date.now() - cached.mintedAt < CANDIDATE_CLIENT_TTL_MS) return cached.client
   let client = new OpenAI({ apiKey: direct.apiKey, baseURL: direct.baseURL, maxRetries: SDK_MAX_RETRIES, timeout: SDK_TIMEOUT_MS })
   if (candidate.route.env === 'novita' || candidate.route.env === 'orcarouter') {
     const baseClient = client
@@ -127,7 +145,8 @@ export async function getLlmCandidateClient(plan: RoleCallPlan, candidate: RoleC
       get(target, prop, receiver): unknown { return prop === 'responses' ? responses : Reflect.get(target, prop, receiver) },
     })
   }
-  directCandidateClients.set(cacheKey, { apiKey: direct.apiKey, baseURL: direct.baseURL, client })
+  capTtlMap(directCandidateClients, DIRECT_CLIENT_MAX, entry => Date.now() - entry.mintedAt >= CANDIDATE_CLIENT_TTL_MS)
+  directCandidateClients.set(cacheKey, { apiKey: direct.apiKey, baseURL: direct.baseURL, mintedAt: Date.now(), client })
   return client
 }
 
@@ -233,6 +252,7 @@ export async function getLlmClient(tenant: string | null, options: LlmClientOpti
   const client = keyedPlatforms(context.keys).length
     ? buildSub2apiClient(context.baseURL, context.keys, tenant)
     : legacyClient()
+  capTtlMap(cache, CLIENT_CACHE_MAX, entry => Date.now() - entry.mintedAt >= CACHE_TTL_MS)
   cache.set(tenant, { client, mintedAt: Date.now(), authorizationVersion: context.authorizationVersion })
   return prepareLlmClient(client, options)
 }
@@ -411,6 +431,36 @@ export function getImageClient(): OpenAI {
   return _imageClient
 }
 
+export const GATEWAY_IMAGE_NO_ACCOUNTS_MESSAGE =
+  'The current image model\'s gateway group has no available accounts. Change the image model in settings or configure a direct connection.'
+
+export class ImageGenerationError extends Error {
+  constructor(message = GATEWAY_IMAGE_NO_ACCOUNTS_MESSAGE, readonly status = 409) {
+    super(message)
+    this.name = 'ImageGenerationError'
+  }
+}
+
+export function isGatewayImageNoAccountsError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? '')
+  return /no available compatible accounts/i.test(message)
+}
+
+export function mapImageGenerationError(error: unknown, plan?: RoleCallPlan): unknown {
+  if (error instanceof ImageGenerationError) return error
+  if (isGatewayImageNoAccountsError(error)) return new ImageGenerationError()
+  if (error instanceof Error && error.message === 'LLM candidate chain has no available candidates') {
+    const blocked = plan?.candidates.some(candidate =>
+      candidate.diagnostic === 'gateway-image-group-unavailable'
+      || candidate.diagnostic === 'gateway-image-model-unsupported'
+      || candidate.diagnostic === 'gateway-unprovisioned')
+    if (plan?.role === 'image' && blocked && !plan.candidates.some(candidate => candidate.available)) {
+      return new ImageGenerationError()
+    }
+  }
+  return error
+}
+
 /** One image attempt includes generation, polling and delivery; external state forbids replay. */
 export async function executeImage<T>(context: LlmCallContext,
   args: { prompt: string; size: '1024x1024' | '1536x1024' | '1024x1536'; n?: number },
@@ -423,7 +473,8 @@ export async function executeImage<T>(context: LlmCallContext,
   let stage: 'generation' | 'poll' | 'download' | 'storage' = 'generation'
   let taskId: string | undefined
   let generationCompleted = false
-  return executeLlmPlan({ plan, context: { ...context, role: 'image' }, signal, sdkMaxRetries: 0,
+  try {
+    return await executeLlmPlan({ plan, context: { ...context, role: 'image' }, signal, sdkMaxRetries: 0,
     record: record => recordLlmCall({ ...record, extras: { ...record.extras,
       n: args.n ?? 1, size: args.size, unpriced: 'image-pricing-unavailable',
       imageStage: stage, failureStage: record.status === 'ok' ? null : stage,
@@ -470,6 +521,10 @@ export async function executeImage<T>(context: LlmCallContext,
       }
     },
   })
+  } catch (error) {
+    if (isLlmCancellation(error)) throw error
+    throw mapImageGenerationError(error, plan)
+  }
 }
 
 export const MAX_AUDIO_BYTES = 10 * 1024 * 1024

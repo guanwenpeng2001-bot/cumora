@@ -20,7 +20,7 @@
  *  (uncached) counts as the provider reports them: `inputTokens` excludes the
  *  cached portion; `cachedInputTokens` is the cache-READ portion (cheap);
  *  `cacheCreationTokens` is the cache-WRITE portion (a premium over input). */
-import { captureDbPricing, refreshModelPricing } from '../model-pricing.js'
+import { captureDbPricing } from '../model-pricing.js'
 import { createHash } from 'node:crypto'
 
 import type { TokenUsage } from './token-usage.js'
@@ -147,9 +147,10 @@ export function capturePricing(): (model: string | null | undefined, route?: str
   }
 }
 
-/** Calls wait for the initial/expired DB load before freezing a price menu. */
+/** Freeze the current menu without waiting on a pricing SELECT.
+ * Missing/stale DB rows kick a background refresh; this call uses the last
+ * good snapshot (or env/seed) so a candidate send is never blocked. */
 export async function captureCallPricing(): Promise<ReturnType<typeof capturePricing>> {
-  await refreshModelPricing()
   return capturePricing()
 }
 

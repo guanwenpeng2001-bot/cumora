@@ -32,7 +32,7 @@ function fixture(behavior: (request: any, signal?: AbortSignal) => AsyncIterable
     parseLlmConfig: JSON.parse, readLlmModelTarget: (model: string) => ({ requestModel: model }), LLM_ROLES: ['brain', 'support', 'compaction'] }
   const resolver = compile(read('../llm-resolver.ts'), {
     './settings.js': settings, './env.js': { resolveDirectLlmEnv: () => ({ configured: true, protocol }) },
-    './tenant-llm-context.js': {}, './sub2api.js': { sub2apiRoutingConfigured: () => false, sub2apiConfigured: () => false, keyedPlatforms: () => [], dashscopeMediaRole: () => null, supportsDashscopeChatAudio: () => false },
+    './tenant-llm-context.js': { bindRoleCallAuth: () => {} }, './sub2api.js': { sub2apiRoutingConfigured: () => false, sub2apiConfigured: () => false, keyedPlatforms: () => [], dashscopeMediaRole: () => null, supportsDashscopeChatAudio: () => false },
     './agents/model-config.js': { REASONING_EFFORTS: new Set(['none']), parseAgentModelConfig: () => null },
   })
   const fallback = compile(read('../agents/fallback.ts'), { '../settings.js': {} })
@@ -50,7 +50,7 @@ function fixture(behavior: (request: any, signal?: AbortSignal) => AsyncIterable
   })
   const source = read('../agents/turn.ts')
   const names = ['executeAuxiliaryStream', 'verifyTerminalCompletion', 'summarizeHistoryItems', 'summarizeSteerBatch',
-    'utf8Head', 'executeAgentTurnHop', 'contextWindowFor', 'hardLimitFor', 'stripImageInputs', 'isImageFetchFailure',
+    'utf8Head', 'executeAgentTurnHop', 'contextWindowFor', 'resolveContextWindow', 'hardLimitFor', 'stripImageInputs', 'isImageFetchFailure',
     'isModelProviderConnectionError', 'isModelProviderConnectionText', 'formatItemsForSummary', 'extractJsonObject', 'parseCompletionVerification', 'verifierSideEffects', 'renderSteerBatchTruncated', 'renderSteerBatchVerbatim']
   const ast = ts.createSourceFile('turn.ts', source, ts.ScriptTarget.Latest, true)
   const functions = ast.statements.filter(node => ts.isFunctionDeclaration(node) && names.includes(node.name?.text ?? '')).map(node => node.getText(ast)).join('\n')
@@ -214,6 +214,31 @@ test('turn budget: Chinese tool history fits a smaller fallback with automatic s
   for (const id of ['27', '28', '29']) assert.ok(calls.has(id))
   assert.deepEqual(f.records.map(r => r.extras.attempt), [1, 2])
   assert.ok(f.records.every(r => r.extras.hop === 1), 'fallback attempts stay within the same hop')
+})
+
+test('context window: catalog value wins; unknown models log and mark fallback', async () => {
+  const f = fixture(async function* () { yield { type: 'response.completed', response: { output: [] } } })
+  assert.equal(f.turn.contextWindowFor('gpt-5.4-mini'), 128_000)
+  assert.equal(f.turn.contextWindowFor('gpt-5.5'), 200_000)
+  assert.deepEqual(f.turn.resolveContextWindow('kimi-for-coding', 256_000), { tokens: 256_000, source: 'catalog' })
+  assert.deepEqual(f.turn.resolveContextWindow('gpt-5.4-mini'), { tokens: 128_000, source: 'family' })
+  const warnings: string[] = []
+  const old = console.warn
+  console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')) }
+  try {
+    assert.deepEqual(f.turn.resolveContextWindow('kimi-for-coding'), { tokens: 200_000, source: 'unknown-fallback' })
+    const plan = await f.resolver.resolveRoleCall(null, 'server', 'brain', 'agent-turn')
+    const unknown = { ...plan, candidates: [{
+      ...plan.candidates[0], model: 'kimi-for-coding', requestModel: 'kimi-for-coding',
+      parameters: { maxOutputTokens: 100 }, available: true, protocol: 'responses',
+      route: plan.candidates[0].route, capabilities: {},
+    }] }
+    await f.turn.executeAgentTurnHop({ plan: unknown, context: hopContext,
+      input: [{ role: 'user', content: 'hi' }], instructions: '', tools: [] })
+  } finally { console.warn = old }
+  assert.ok(warnings.some(text => /unknown context window for model kimi-for-coding/.test(text)))
+  assert.equal(f.records[0].extras.contextWindowSource, 'unknown-fallback')
+  assert.equal(f.records[0].extras.contextWindow, 200_000)
 })
 
 test('turn budget: configured hard ratio rejects input even when the physical window could fit it', async () => {
@@ -434,25 +459,21 @@ test('existing integration hop retry scenarios execute with isolated transport a
 
 test('turn defer reports exact unread message boundary and retryAt before returning without acknowledgement', async () => {
   const source = read('../agents/turn.ts')
-  const start = source.indexOf('      const reason = verdict.reason.trim()', source.indexOf('const shouldRunInboxTriage'))
-  const end = source.indexOf('      triageNote = [', start)
+  const start = source.indexOf('    const reason = verdict.reason.trim()', source.indexOf('const shouldRunInboxTriage'))
+  const end = source.indexOf('    triageNote = [', start)
   assert.ok(start > 0 && end > start)
-  const events: any[] = []
   const deferred: any[] = []
   const f = compile(`export async function report(options, verdict, inbox) {
-    let finalStatus, finalSummary
     const convoIds = ['c']
     ${source.slice(start, end)}
   }`, {}, {
-    runId: 'run', agentId: 'a', runCompanyId: 'company',
-    runtime: { recordEvent: async (event: any) => { events.push(event) },
-      markConversationRead: () => { assert.fail('defer must not acknowledge messages') } },
+    agentId: 'a',
+    runtime: { markConversationRead: () => { assert.fail('defer must not acknowledge messages') } },
   })
   await f.report({ onInboxDeferred: (value: any) => deferred.push(value) },
     { outcome: 'defer', reason: 'rate limited', retryAt: 1_120_000, source: 'rate-limited' },
     [{ id: 'one', conversation_id: 'c' }, { id: 'two', conversation_id: 'c' }])
   assert.deepEqual(deferred, [{ messageIds: ['one', 'two'], retryAt: 1_120_000 }])
-  assert.equal(events[0].data.retryAt, deferred[0].retryAt)
 })
 
 test('turn budget: a larger fallback recovers from preparation failure without sending the small model', async () => {

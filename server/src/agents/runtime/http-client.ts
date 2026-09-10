@@ -153,8 +153,11 @@ export class HttpRuntimeClient implements AgentRuntimeClient {
     _agentId: string,
     _companyId: string,
     conversationIds: string[],
+    opts?: { reuseBoundary?: string },
   ): Promise<ContextRow[]> {
-    const out = await this.call<{ rows: ContextRow[] }>('POST', '/context', { conversationIds })
+    const out = await this.call<{ rows: ContextRow[] }>('POST', '/context', {
+      conversationIds, reuseBoundary: opts?.reuseBoundary,
+    })
     return out.rows
   }
 

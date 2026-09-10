@@ -78,6 +78,15 @@ import type {
   WorklogEntry,
   WorkTaskType,
 } from './client.js'
+import { inboxTriageBoundary } from './wake-options.js'
+
+const CONTEXT_CACHE_TTL_MS = 15_000
+const CONTEXT_CACHE_MAX = 256
+const contextCache = new Map<string, { boundary: string; rows: ContextRow[]; at: number }>()
+
+function contextCacheKey(agentId: string, companyId: string, conversationIds: string[]): string {
+  return `${agentId}\0${companyId}\0${[...conversationIds].sort().join(',')}`
+}
 
 interface MemoryQueryRow {
   path: string
@@ -273,6 +282,7 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
     const semanticLimit = limits.semantic ?? 20
     const recentLimit = limits.recent ?? 10
     const totalLimit = limits.total ?? 40
+    const skipSemantic = semanticLimit <= 0
     const projectIds = await resolveMemoryScope(scope)
     const readScope = { projectIds }
     const scopePred = memoryScopeSql('meta', 'path', '$SCOPE')
@@ -280,7 +290,7 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
     const { hasPgVector, embedText } = await import('../embeddings.js')
     const { getServerSettingsSnapshot, writeInEmbeddingSpace } = await import('../../settings.js')
     const captured = getServerSettingsSnapshot()
-    const useSemantic = queryText.trim().length > 0 && (await hasPgVector())
+    const useSemantic = !skipSemantic && queryText.trim().length > 0 && (await hasPgVector())
     let queryVec: string | null = null
     if (useSemantic) {
       try {
@@ -379,8 +389,14 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
    *  agent's own past replies — real humans don't reason from a stripped
    *  slice, so neither should agents. Reactions get pre-aggregated as a
    *  JSON array so the prompt renderer doesn't need a second roundtrip. */
-  async loadContext(agentId: string, companyId: string, conversationIds: string[]): Promise<ContextRow[]> {
+  async loadContext(agentId: string, companyId: string, conversationIds: string[], opts?: { reuseBoundary?: string }): Promise<ContextRow[]> {
     if (conversationIds.length === 0) return []
+    const cacheKey = contextCacheKey(agentId, companyId, conversationIds)
+    const cached = contextCache.get(cacheKey)
+    if (cached && Date.now() - cached.at < CONTEXT_CACHE_TTL_MS
+      && (!opts?.reuseBoundary || cached.boundary === opts.reuseBoundary)) {
+      return cached.rows
+    }
     // conversationIds can come directly from an authenticated runtime caller.
     // They narrow the read but do not authorize it: bind every conversation to
     // the active agent's tenant and require current conversation membership.
@@ -489,6 +505,12 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
       [agentId, companyId, conversationIds],
     )
     await refreshAttachmentUrls(rows)
+    const boundary = inboxTriageBoundary(rows)
+    if (contextCache.size >= CONTEXT_CACHE_MAX) {
+      const first = contextCache.keys().next().value
+      if (first !== undefined) contextCache.delete(first)
+    }
+    contextCache.set(cacheKey, { boundary, rows, at: Date.now() })
     return rows
   }
 

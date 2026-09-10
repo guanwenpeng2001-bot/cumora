@@ -104,25 +104,26 @@ const CALENDAR_LOOKAHEAD_MS = 30 * 60_000
 const CALENDAR_LOOKBEHIND_MS = 15 * 60_000
 
 /** Stall window: a conversation counts as "stalled" only if its last message is
- *  at least STALL_MIN_MS old (give people time to reply naturally — don't nag)
- *  and at most STALL_MAX_MS old (don't resurrect ancient threads). Env-overridable. */
-const STALL_MIN_MS = Number(process.env.CUMORA_STALL_MIN_MS) || 5 * 60_000
-const STALL_MAX_MS = Number(process.env.CUMORA_STALL_MAX_MS) || 6 * 60 * 60_000
+ *  at least stall_min_ms old (give people time to reply naturally — don't nag)
+ *  and at most stall_max_ms old (don't resurrect ancient threads). Automation
+ *  settings, with CUMORA_STALL_* env fallback. */
+function stallMinMs(): number { return automationNumber('stall_min_ms') }
+function stallMaxMs(): number { return automationNumber('stall_max_ms') }
 /** Cooldown between nudges to the SAME conversation, across ALL agents. Keyed on
  *  conversation only (NOT last-message-id) — a nudge changes the last message, so
  *  a per-message key would re-arm 5min later and nag. This guarantees a stalled
- *  conversation is nudged at most ONCE per cooldown by exactly ONE agent. Env-
- *  overridable; set very large for "one nudge per stall episode, basically once". */
-const NUDGE_COOLDOWN_MS = Number(process.env.CUMORA_NUDGE_COOLDOWN_MS) || 45 * 60_000
+ *  conversation is nudged at most ONCE per cooldown by exactly ONE agent.
+ *  Set very large for "one nudge per stall episode, basically once". */
+function nudgeCooldownMs(): number { return automationNumber('nudge_cooldown_ms') }
 /** SHORTER cooldown for nudges driven by the DETERMINISTIC fallback
  *  (cerebellum unavailable). Rationale: the deterministic rule is conservative
  *  on input but doesn't know whether the WOKEN agent's big brain will actually
- *  decide to post — if it declines, the 45min cerebellum-grade cooldown locks
+ *  decide to post — if it declines, the classified cooldown locks
  *  out everyone else and a single "no" decides the stall's fate. A short TTL
  *  lets other members get a turn at the same stall with a different big-brain
- *  judgment. The 45min lock is right when the cerebellum SAID "yes nudge";
+ *  judgment. The classified lock is right when the cerebellum SAID "yes nudge";
  *  it's wrong as the only knob for an outage-time fallback. */
-const NUDGE_COOLDOWN_FALLBACK_MS = Number(process.env.CUMORA_NUDGE_COOLDOWN_FALLBACK_MS) || 5 * 60_000
+function nudgeCooldownFallbackMs(): number { return automationNumber('nudge_cooldown_fallback_ms') }
 
 /** Claim the right to nudge a stalled conversation. Returns true for the FIRST
  *  caller (across all member agents); everyone else — and the same agent on a
@@ -154,8 +155,8 @@ export async function claimStallNudge(
     if (declines >= 3) return false
   }
   const key = `cumora:nudge:${conversationId}`
-  const cooldownMs = opts?.source === 'fallback' ? NUDGE_COOLDOWN_FALLBACK_MS : NUDGE_COOLDOWN_MS
-  const ttlSec = Math.ceil(cooldownMs / 1000)
+  const cooldownMs = opts?.source === 'fallback' ? nudgeCooldownFallbackMs() : nudgeCooldownMs()
+  const ttlSec = Math.max(1, Math.ceil(cooldownMs / 1000))
   const res = await redis.set(key, '1', 'EX', ttlSec, 'NX').catch(() => null)
   if (res === 'OK' && opts?.source === 'fallback') {
     // Record the decline-attempt counter (TTL matches the stall window so
@@ -167,7 +168,7 @@ export async function claimStallNudge(
     const declineKey = `cumora:nudge-declines:${conversationId}`
     await redis.multi()
       .incr(declineKey)
-      .expire(declineKey, Math.ceil(NUDGE_COOLDOWN_MS / 1000))
+      .expire(declineKey, Math.max(1, Math.ceil(nudgeCooldownMs() / 1000)))
       .exec()
       .catch(() => null)
   }
@@ -232,7 +233,7 @@ async function loadDueEvents(agentId: string, companyId: string, now: Date): Pro
 }
 
 /** Conversations the agent is a member of whose LATEST text message sits in the
- *  stall window [STALL_MIN_MS, STALL_MAX_MS] of silence. The participant-led
+ *  stall window [stall_min_ms, stall_max_ms] of silence. The participant-led
  *  normalized membership index narrows the conversations first, then
  *  idx_messages_convo_created serves the LATERAL latest-message lookup. */
 async function loadStalledConversations(agentId: string, companyId: string): Promise<StalledConvo[]> {
@@ -281,7 +282,7 @@ async function loadStalledConversations(agentId: string, companyId: string): Pro
           AND m.created_at >= NOW() - ($4::double precision * INTERVAL '1 millisecond')
         ORDER BY m.created_at DESC
         LIMIT 10`,
-    [agentId, companyId, STALL_MIN_MS, STALL_MAX_MS],
+    [agentId, companyId, stallMinMs(), stallMaxMs()],
   )
   return rows.map((r) => ({
     conversationId: r.conversation_id,
