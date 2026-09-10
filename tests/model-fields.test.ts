@@ -62,11 +62,12 @@ function elements(node: any): any[] {
   return [node, ...elements(node.props?.children)]
 }
 const catalog = {
-  text: ['kimi-k3', 'deepseek-chat', 'gpt-5', 'grok-4', 'local-only'],
+  text: ['kimi-k3', 'deepseek-chat', 'gpt-5', 'grok-4', 'claude-sonnet-4-6', 'glm-4.6', 'local-only'],
   image: ['gpt-image'], audio: ['whisper'], embedding: ['embed'],
   platforms: Object.fromEntries([
     ['kimi', ['kimi-k3']], ['deepseek', ['deepseek-chat']],
     ['openai', ['gpt-5', 'gpt-image', 'whisper', 'embed']], ['grok', ['grok-4']],
+    ['anthropic', ['claude-sonnet-4-6']], ['zhipu', ['glm-4.6']],
   ].map(([platform, models]) => [platform, { status: 'success', models }])),
   byoa: [{ models: ['local-only'] }],
 }
@@ -84,11 +85,13 @@ test('primary and fallback offer the same full managed catalog, current and hist
   assert.deepEqual(primary.props.options, fallback.props.options)
   assert.equal(primary.props.allowCustom, true)
   const ids = Array.from(primary.props.options, (o: any) => o.value)
-  for (const id of ['kimi-k3', 'deepseek-chat', 'gpt-5', 'grok-4', 'gpt-image', 'whisper', 'embed', 'retired-primary', 'retired-fallback']) {
+  for (const id of ['kimi-k3', 'deepseek-chat', 'gpt-5', 'grok-4', 'claude-sonnet-4-6', 'glm-4.6', 'gpt-image', 'whisper', 'embed', 'retired-primary', 'retired-fallback']) {
     assert.ok(ids.includes(id), id)
   }
   assert.ok(!ids.includes('local-only'))
-  assert.match(primary.props.options.find((o: any) => o.value === 'gpt-5').hint, /openai/)
+  assert.match(primary.props.options.find((o: any) => o.value === 'gpt-5').hint, /OpenAI/)
+  assert.match(primary.props.options.find((o: any) => o.value === 'claude-sonnet-4-6').hint, /Anthropic/)
+  assert.match(primary.props.options.find((o: any) => o.value === 'glm-4.6').hint, /Zhipu/)
 })
 
 test('opening with a current value shows all platforms; only typing filters; reopening resets', () => {
@@ -120,11 +123,26 @@ test('empty or failed catalog allows committing an arbitrary model and shows pla
   tree = render()
   elements(tree).find((e) => e.props?.role === 'option').props.onClick()
   assert.equal(selected, 'custom-model')
-  const status = h.render(CatalogStatus, { catalog: { platforms: { grok: { status: 'timeout', stale: true } } }, error: 'offline', loading: false, refresh() {} })
+  const status = h.render(CatalogStatus, { catalog: { platforms: {
+    grok: { status: 'timeout', stale: true },
+    anthropic: { status: 'ready' },
+    zhipu: { status: 'success' },
+    minimax: { status: 'no-key' },
+  } }, error: 'offline', loading: false, refresh() {} })
   const text = JSON.stringify(status)
-  assert.match(text, /grok/)
+  assert.match(text, /Grok/)
+  assert.match(text, /Anthropic/)
+  assert.match(text, /Zhipu/)
+  assert.match(text, /MiniMax/)
   assert.match(text, /catalogTimeout/)
   assert.match(text, /offline/)
+  const arrayStatus = h.render(CatalogStatus, { catalog: { platforms: [
+    { platform: 'composite', status: 'ready' },
+    { platform: 'gemini', status: 'empty' },
+  ] }, error: null, loading: false, refresh() {} })
+  const arrayText = JSON.stringify(arrayStatus)
+  assert.match(arrayText, /Composite/)
+  assert.match(arrayText, /Gemini/)
 })
 
 test('ModelsTab wires all six roles to the full catalog and keeps embedding without fallback', () => {
@@ -152,7 +170,7 @@ test('ModelsTab wires all six roles to the full catalog and keeps embedding with
   assert.equal(primaries.length, 6)
   assert.equal(fallbacks.length, 5)
   for (const primary of primaries) {
-    for (const id of ['kimi-k3', 'deepseek-chat', 'gpt-5', 'grok-4', 'gpt-image', 'whisper', 'embed']) {
+    for (const id of ['kimi-k3', 'deepseek-chat', 'gpt-5', 'grok-4', 'claude-sonnet-4-6', 'glm-4.6', 'gpt-image', 'whisper', 'embed']) {
       assert.ok(primary.props.options.includes(id), `${primary.props.listId}: ${id}`)
     }
     const fallback = fallbacks.find((e) => e.props.listId === primary.props.listId)
