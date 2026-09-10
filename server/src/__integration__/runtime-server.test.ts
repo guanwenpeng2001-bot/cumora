@@ -1296,7 +1296,9 @@ test('[integration] runtime: /llm-calls atomically records multiple caller-owned
     assert.equal(row.extras.measurement, row.measured ? 'measured' : 'unknown')
     assert.ok(row.extras.pricing, 'each hop captures pricing provenance')
     assert.equal(row.extras.pricing.match, 'fallback')
-    assert.equal(row.extras.unpriced, row.measured ? undefined : 'usage-unavailable')
+    // Unknown models now record 'no-price' (fallback-priced hops are not real
+    // money); it precedes 'usage-unavailable' in the unpriced chain.
+    assert.equal(row.extras.unpriced, 'no-price')
     assert.deepEqual(row.extras.usage, row.measured ? {
       inputTokens: row.input_tokens, cachedInputTokens: row.cached_input_tokens,
       cacheCreationTokens: row.cache_creation_tokens, outputTokens: row.output_tokens,
