@@ -21,17 +21,34 @@
  * Only keys with confirmed integration ownership are managed here.
  */
 import { randomBytes, randomUUID } from 'node:crypto'
-import { env, normalizeLlmEndpoint } from './env.js'
-import { getServerSetting, parseGroupConfig, InvalidServerSettingError, type Sub2apiGroupConfig } from './settings.js'
+import { env, normalizeLlmEndpoint, readEnvTierPlatformGroups } from './env.js'
+import { getServerSetting, parseGroupConfig, InvalidServerSettingError, isSub2apiPlatformId, type Sub2apiGroupConfig } from './settings.js'
 
 export type Tier = 'free' | 'pro' | 'max'
 
-/** Platforms with their own sub2api account pools. `openai` doubles as
- *  the default/fallback platform: it anchors the quota subscription and
- *  serves anything no other platform claims (incl. DashScope, which is
- *  an openai-platform account upstream). */
-export type Platform = 'openai' | 'kimi' | 'deepseek' | 'grok'
-export const SUB2API_PLATFORMS: readonly Platform[] = ['openai', 'kimi', 'deepseek', 'grok']
+/** Gateway group platform id. Known values are hints / prefix-table keys;
+ *  discovery, config, and stored key maps accept any valid platform string. */
+export type Platform = string
+
+/** sub2api's ten group platforms (backend/internal/domain/constants.go). */
+export const KNOWN_SUB2API_PLATFORMS = [
+  'anthropic', 'openai', 'gemini', 'antigravity', 'grok',
+  'kimi', 'zhipu', 'deepseek', 'minimax', 'composite',
+] as const
+export type KnownPlatform = typeof KNOWN_SUB2API_PLATFORMS[number]
+export const SUB2API_PLATFORMS: readonly Platform[] = KNOWN_SUB2API_PLATFORMS
+
+/** Historical kimi/deepseek/grok may share the openai group when unmapped.
+ *  New platforms must be explicitly mapped — never silently minted there. */
+const LEGACY_OPENAI_FALLBACK_PLATFORMS = new Set<Platform>(['kimi', 'deepseek', 'grok'])
+
+export function isKnownSub2apiPlatform(value: string): boolean {
+  return (KNOWN_SUB2API_PLATFORMS as readonly string[]).includes(value)
+}
+
+export function keyedPlatforms(keys: ApiKeyMap): Platform[] {
+  return Object.keys(keys).filter((platform) => keys[platform])
+}
 
 /** Platform → key material for one provisioned user. */
 export type ApiKeyMap = Partial<Record<Platform, string>>
@@ -53,50 +70,38 @@ function legacyTierGroupId(tier: Tier): number {
   }
 }
 
-/** Read SUB2API_TIER_<TIER>_GROUP_<PLATFORM> from env. */
-function envTierPlatformGroup(tier: Tier, platform: Platform): number {
-  const table: Record<Tier, Record<Platform, number>> = {
-    free: {
-      openai:   env.SUB2API_TIER_FREE_GROUP_OPENAI,
-      kimi:     env.SUB2API_TIER_FREE_GROUP_KIMI,
-      deepseek: env.SUB2API_TIER_FREE_GROUP_DEEPSEEK,
-      grok:     env.SUB2API_TIER_FREE_GROUP_GROK,
-    },
-    pro: {
-      openai:   env.SUB2API_TIER_PRO_GROUP_OPENAI,
-      kimi:     env.SUB2API_TIER_PRO_GROUP_KIMI,
-      deepseek: env.SUB2API_TIER_PRO_GROUP_DEEPSEEK,
-      grok:     env.SUB2API_TIER_PRO_GROUP_GROK,
-    },
-    max: {
-      openai:   env.SUB2API_TIER_MAX_GROUP_OPENAI,
-      kimi:     env.SUB2API_TIER_MAX_GROUP_KIMI,
-      deepseek: env.SUB2API_TIER_MAX_GROUP_DEEPSEEK,
-      grok:     env.SUB2API_TIER_MAX_GROUP_GROK,
-    },
-  }
-  return table[tier][platform]
-}
-
-/** Resolve a tier to its per-platform group ids. An unconfigured
- *  platform falls back to the tier's openai group, which itself falls
- *  back to the legacy single-value SUB2API_TIER_<TIER>_GROUP_ID. All
- *  zero when nothing is configured (provision without group access —
- *  the staged-rollout posture). */
+/** Resolve a tier to its per-platform group ids.
+ *
+ *  openai is the subscription anchor (config → env → legacy GROUP_ID).
+ *  kimi/deepseek/grok still fall back to the openai group when unmapped
+ *  (deprecated compatibility). Every other platform is included only when
+ *  explicitly mapped in sub2api_group_config or SUB2API_TIER_*_GROUP_*. */
 export function tierGroups(tier: Tier): Record<Platform, number> {
-  const configured = parseGroupConfig(getServerSetting('sub2api_group_config'))[tier]
+  const configured = parseGroupConfig(getServerSetting('sub2api_group_config'))[tier] ?? {}
+  const fromEnv = readEnvTierPlatformGroups(tier)
   const valid = (id: number) => {
     if (Number.isSafeInteger(id) && id >= 0) return id
     console.warn('[sub2api] invalid env group reference', tier)
     return 0
   }
-  const openai = configured?.openai ?? (valid(envTierPlatformGroup(tier, 'openai')) || valid(legacyTierGroupId(tier)))
-  return {
-    openai,
-    kimi: configured?.kimi ?? (valid(envTierPlatformGroup(tier, 'kimi')) || openai),
-    deepseek: configured?.deepseek ?? (valid(envTierPlatformGroup(tier, 'deepseek')) || openai),
-    grok: configured?.grok ?? (valid(envTierPlatformGroup(tier, 'grok')) || openai),
+  const openai = configured.openai ?? (valid(fromEnv.openai ?? 0) || valid(legacyTierGroupId(tier)))
+  const out: Record<Platform, number> = { openai }
+  for (const platform of LEGACY_OPENAI_FALLBACK_PLATFORMS) {
+    out[platform] = configured[platform] ?? (valid(fromEnv[platform] ?? 0) || openai)
   }
+  for (const [platform, id] of Object.entries(configured)) {
+    if (platform === 'openai' || LEGACY_OPENAI_FALLBACK_PLATFORMS.has(platform)) continue
+    if (typeof id === 'number' && id > 0) out[platform] = id
+  }
+  for (const [platform, id] of Object.entries(fromEnv)) {
+    if (platform in out) continue
+    if (id > 0) out[platform] = valid(id)
+  }
+  return out
+}
+
+function mappedPlatforms(groups: Record<Platform, number>): Platform[] {
+  return Object.keys(groups).filter((platform) => Number.isSafeInteger(groups[platform]) && groups[platform]! > 0)
 }
 
 /** Primary group for quota/subscription purposes: the tier's
@@ -116,14 +121,13 @@ export function parseApiKeyMap(raw: string | null | undefined): ApiKeyMap {
     try {
       const parsed = JSON.parse(trimmed) as Record<string, unknown>
       if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') throw new Error('invalid key map')
-      for (const provider of Object.keys(parsed)) {
-        if (!SUB2API_PLATFORMS.includes(provider as Platform)) console.warn('[sub2api] unknown key provider', provider)
-      }
       const out: ApiKeyMap = {}
-      for (const platform of SUB2API_PLATFORMS) {
-        const v = parsed[platform]
-        if (typeof v === 'string' && v.trim()) out[platform] = v.trim()
-        else if (v != null) console.warn('[sub2api] invalid API key value for platform', platform)
+      for (const [provider, value] of Object.entries(parsed)) {
+        const platform = provider.trim().toLowerCase()
+        if (!platform) continue
+        if (!isKnownSub2apiPlatform(platform)) console.warn('[sub2api] unknown key provider', provider)
+        if (typeof value === 'string' && value.trim()) out[platform] = value.trim()
+        else if (value != null) console.warn('[sub2api] invalid API key value for platform', provider)
       }
       return out
     } catch {
@@ -137,10 +141,10 @@ export function parseApiKeyMap(raw: string | null | undefined): ApiKeyMap {
 /** Serialize for users.sub2api_api_key. Single openai-only maps stay
  *  bare strings so the row shape doesn't churn for legacy-style setups. */
 export function serializeApiKeyMap(keys: ApiKeyMap): string {
-  const platforms = SUB2API_PLATFORMS.filter((p) => keys[p])
+  const platforms = keyedPlatforms(keys)
   if (platforms.length === 0) return ''
   if (platforms.length === 1 && platforms[0] === 'openai') return keys.openai ?? ''
-  return JSON.stringify(keys)
+  return JSON.stringify(Object.fromEntries(platforms.map((platform) => [platform, keys[platform]])))
 }
 
 /** True when env is wired enough that we should actually try to talk
@@ -248,8 +252,9 @@ export interface ReconcileSub2apiArgs {
 
 /** External work only; the consumer checkpoints progress after its intent commits. */
 export async function reconcileSub2apiUser(args: ReconcileSub2apiArgs): Promise<ProvisionResult> {
-  const groupIds = [...new Set(Object.values(args.groups))]
-  if (groupIds.some(id => !Number.isSafeInteger(id) || id <= 0)) throw new Error('unconfigured_group')
+  const platforms = mappedPlatforms(args.groups)
+  const groupIds = [...new Set(platforms.map((platform) => args.groups[platform]!))]
+  if (platforms.length === 0 || groupIds.some(id => !Number.isSafeInteger(id) || id <= 0)) throw new Error('unconfigured_group')
   const groupRows = new Map<number, IntegrationGroup>()
   for (const id of groupIds) {
     const group = await adminFetch<IntegrationGroup>(`/api/v1/admin/groups/${id}`)
@@ -258,10 +263,11 @@ export async function reconcileSub2apiUser(args: ReconcileSub2apiArgs): Promise<
     }
     groupRows.set(id, group)
   }
-  for (const platform of SUB2API_PLATFORMS) {
-    const group = groupRows.get(args.groups[platform])!
-    // Preserve the established primary-group fallback for unconfigured platforms.
-    if (group.platform !== platform && !(args.groups[platform] === args.groups.openai && group.platform === 'openai')) {
+  for (const platform of platforms) {
+    const group = groupRows.get(args.groups[platform]!)!
+    const openaiFallback = LEGACY_OPENAI_FALLBACK_PLATFORMS.has(platform)
+      && args.groups[platform] === args.groups.openai && group.platform === 'openai'
+    if (group.platform !== platform && !openaiFallback) {
       throw new Error('group_platform_mismatch')
     }
   }
@@ -334,13 +340,13 @@ export async function reconcileSub2apiUser(args: ReconcileSub2apiArgs): Promise<
     && (!key.expires_at || Date.parse(key.expires_at) > Date.now())
     && (!(Number(key.quota) > 0) || Number(key.quota_used) < Number(key.quota))
   const apiKeys: ApiKeyMap = {}
-  for (const platform of SUB2API_PLATFORMS) {
-    const target = args.groups[platform]
+  for (const platform of platforms) {
+    const target = args.groups[platform]!
     let managed = args.managedKeys[platform]
     if (!managed) {
       const legacy = listed.find(key => key.key === args.existingKeys[platform] && valid(key)
         && (key.name?.startsWith('cumora · ') || key.name?.startsWith(`cumora:${args.cumoraUserId}:`))
-        && !Object.values(args.managedKeys).some(entry => entry.id === key.id))
+        && !Object.values(args.managedKeys).some(entry => entry?.id === key.id))
       managed = { mintGroup: target, idempotencyKey: `${args.intentId}:${platform}:${randomUUID()}`,
         ...(legacy ? { id: legacy.id, key: legacy.key } : {}) }
       args.managedKeys[platform] = managed
@@ -362,7 +368,7 @@ export async function reconcileSub2apiUser(args: ReconcileSub2apiArgs): Promise<
     if (key.group_id !== target) {
       if (key.group_id == null) throw new Error('managed_key_group_missing')
       const old = await adminFetch<IntegrationGroup>(`/api/v1/admin/groups/${key.group_id}`)
-      if (!SUB2API_PLATFORMS.includes(old.platform as Platform)) throw new Error('unknown_group_platform')
+      if (typeof old.platform !== 'string' || !isSub2apiPlatformId(old.platform)) throw new Error('unknown_group_platform')
       await adminFetch(`/api/v1/admin/api-keys/${key.id}`, { method: 'PUT', body: JSON.stringify({ group_id: target }) })
     }
     apiKeys[platform] = key.key
@@ -374,11 +380,11 @@ export async function reconcileSub2apiUser(args: ReconcileSub2apiArgs): Promise<
     }
   }
   const finalKeys = await listKeys()
-  for (const platform of SUB2API_PLATFORMS) {
+  for (const platform of platforms) {
     if (!finalKeys.some(key => key.id === args.managedKeys[platform]?.id && key.group_id === args.groups[platform]
       && key.key === apiKeys[platform] && valid(key))) throw new Error('managed_key_verification_failed')
   }
-  return { sub2apiUserId: user.id, apiKeys, groupId: args.groups.openai }
+  return { sub2apiUserId: user.id, apiKeys, groupId: args.groups.openai ?? 0 }
 }
 
 export async function provisionUser(args: {
@@ -439,8 +445,7 @@ const TIER_SUBSCRIPTION_NOTES = 'cumora auto-provision'
 function configuredTierGroupIds(): Set<number> {
   const ids = new Set<number>()
   for (const tier of ['free', 'pro', 'max'] as const) {
-    for (const platform of SUB2API_PLATFORMS) {
-      const id = tierGroups(tier)[platform]
+    for (const id of Object.values(tierGroups(tier))) {
       if (id > 0) ids.add(id)
     }
     const legacy = legacyTierGroupId(tier)
@@ -524,10 +529,68 @@ export function supportsDashscopeChatAudio(model: string): boolean {
   return /^qwen3-asr-flash(?:-\d{4}-\d{2}-\d{2})?$/i.test(model.trim())
 }
 
-export const MODEL_PLATFORM_PRIORITY: readonly Platform[] = ['kimi', 'deepseek', 'grok', 'openai']
+/** Membership order: native concrete platforms, then openai, then composite. */
+export const MODEL_PLATFORM_PRIORITY: readonly Platform[] = [
+  'anthropic', 'gemini', 'kimi', 'zhipu', 'deepseek', 'minimax', 'grok', 'antigravity', 'openai',
+]
+
+/** Aligns with sub2api DetectModelPlatform (composite_platform.go) plus
+ *  cumora's kimi k\\d+ and DashScope/Qwen→openai pool. Antigravity does
+ *  not steal claude-/gemini- prefixes. */
+export function detectNativePlatform(model: string): Platform | undefined {
+  let id = model.trim().toLowerCase()
+  if (!id) return undefined
+  if (id.startsWith('models/')) id = id.slice('models/'.length)
+  if (id === 'gemini-pro-agent' || id === 'tab_flash_lite_preview' || id.startsWith('gpt-oss-120b')) return 'antigravity'
+  if (/^(dashscope|qwen)(?:$|[-/\d])/.test(id)) return 'openai'
+  const slash = id.indexOf('/')
+  if (slash > 0) {
+    const provider = id.slice(0, slash).trim()
+    const rest = id.slice(slash + 1).trim()
+    const fromProvider: Record<string, Platform> = {
+      anthropic: 'anthropic', claude: 'anthropic',
+      openai: 'openai', chatgpt: 'openai',
+      google: 'gemini', 'google-ai-studio': 'gemini', gemini: 'gemini',
+      xai: 'grok', 'x-ai': 'grok', grok: 'grok',
+      kimi: 'kimi', moonshot: 'kimi',
+      zhipu: 'zhipu', glm: 'zhipu', bigmodel: 'zhipu',
+      deepseek: 'deepseek',
+      minimax: 'minimax',
+    }
+    if (fromProvider[provider]) return fromProvider[provider]
+    if (rest) id = rest.startsWith('models/') ? rest.slice('models/'.length) : rest
+  }
+  if (id.startsWith('anthropic.claude-') || id.startsWith('claude-')) return 'anthropic'
+  if (
+    id.startsWith('gpt-') || id.startsWith('chatgpt-') || id.startsWith('codex-')
+    || id.startsWith('text-embedding-') || id.startsWith('text-moderation-')
+    || id.startsWith('omni-moderation-') || id.startsWith('dall-e-')
+    || id.startsWith('gpt-image-') || id.startsWith('tts-') || id.startsWith('whisper-')
+    || /^(o[1345])(?:$|-)/.test(id)
+  ) return 'openai'
+  if (id.startsWith('gemini-') || id.startsWith('learnlm-')) return 'gemini'
+  if (id === 'grok' || id.startsWith('grok-')) return 'grok'
+  if (
+    id === 'k3' || id === 'k3-256k' || id.startsWith('kimi-') || id.startsWith('moonshot-')
+    || /^(kimi|moonshot)(?:$|[-/])/.test(id) || /^k\d+(?:$|[.-])/.test(id)
+  ) return 'kimi'
+  if (id.startsWith('glm-')) return 'zhipu'
+  if (/^deepseek(?:$|[-/])/.test(id)) return 'deepseek'
+  if (id.startsWith('minimax-') || id.startsWith('abab5') || id.startsWith('abab6') || id.startsWith('abab7')) return 'minimax'
+  return undefined
+}
+
+function catalogContains(
+  modelsByPlatform: Partial<Record<Platform, ReadonlySet<string>>>,
+  platform: Platform,
+  id: string,
+): boolean {
+  return [...modelsByPlatform[platform] ?? []].some((known) => known.trim().toLowerCase() === id)
+}
 
 /** Prefer recognized native pools even while discovery is cold or stale.
  *  DashScope/Qwen use the existing OpenAI-platform pool, not a separate key.
+ *  Directory membership beats openai fallback; composite is never first hop.
  *  Explicit route overrides are handled by the resolver before this helper. */
 export function pickPlatformForModel(
   modelsByPlatform: Partial<Record<Platform, ReadonlySet<string>>>,
@@ -535,17 +598,27 @@ export function pickPlatformForModel(
   available: readonly Platform[],
 ): Platform {
   const id = model.trim().toLowerCase()
-  const native: Platform | undefined = /^(kimi|moonshot)(?:$|[-/])|^k\d+(?:$|[.-])/.test(id) ? 'kimi'
-    : /^deepseek(?:$|[-/])/.test(id) ? 'deepseek'
-    : /^grok(?:$|[-/])/.test(id) ? 'grok'
-    : /^(dashscope|qwen)(?:$|[-/\d])/.test(id) ? 'openai' : undefined
+  const native = detectNativePlatform(model)
   if (native && available.includes(native)) return native
-  for (const platform of MODEL_PLATFORM_PRIORITY) {
-    if (!available.includes(platform)) continue
-    if ([...modelsByPlatform[platform] ?? []].some(known => known.trim().toLowerCase() === id)) return platform
+
+  const seen = new Set<Platform>()
+  const order: Platform[] = []
+  const push = (platform: Platform) => {
+    if (platform === 'composite' || seen.has(platform) || !available.includes(platform)) return
+    seen.add(platform)
+    order.push(platform)
   }
+  for (const platform of MODEL_PLATFORM_PRIORITY) push(platform)
+  for (const platform of available) push(platform)
+  if (available.includes('composite')) order.push('composite')
+  for (const platform of order) {
+    if (catalogContains(modelsByPlatform, platform, id)) return platform
+  }
+
+  if (native && !available.includes(native) && !LEGACY_OPENAI_FALLBACK_PLATFORMS.has(native)) return native
   if (available.includes('openai')) return 'openai'
-  return available[0] ?? 'openai'
+  const concrete = available.filter((platform) => platform !== 'composite')
+  return concrete[0] ?? available[0] ?? 'openai'
 }
 
 /** Fetch the model ids a user key can call (gateway /v1/models is
@@ -578,7 +651,11 @@ export async function listKeyModelsWithStatus(baseUrl: string, apiKey: string): 
       return { models: new Set(), ok: false, status: 'unavailable', diagnostic: 'invalid-format' }
     }
     const models = new Set<string>(data.map((m) => m.id))
-    return { models, ok: true, status: models.size ? 'success' : 'empty' }
+    if (models.size === 0) {
+      console.warn('[sub2api] model discovery returned empty catalog')
+      return { models, ok: false, status: 'empty' }
+    }
+    return { models, ok: true, status: 'success' }
   } catch (e) {
     const timeout = e instanceof Error && (e.name === 'TimeoutError' || e.name === 'AbortError')
     return { models: new Set(), ok: false, status: timeout ? 'timeout' : 'unavailable', diagnostic: timeout ? undefined : 'network-error' }
@@ -609,13 +686,16 @@ export async function discoverSub2apiGroups(): Promise<Sub2apiGroupChoice[]> {
   if (!Array.isArray(rows)) throw new Error('invalid sub2api group discovery response')
   const out: Sub2apiGroupChoice[] = []
   for (const row of rows) {
-    if (!row || !Number.isSafeInteger(row.id) || row.id <= 0 || typeof row.name !== 'string') throw new Error('invalid sub2api group discovery row')
-    if (!SUB2API_PLATFORMS.includes(row.platform)) {
-      console.warn('[sub2api] unsupported group platform')
+    if (!row || typeof row !== 'object') throw new Error('invalid sub2api group discovery row')
+    const rec = row as Record<string, unknown>
+    if (!Number.isSafeInteger(rec.id) || (rec.id as number) <= 0 || typeof rec.name !== 'string') throw new Error('invalid sub2api group discovery row')
+    const platform = typeof rec.platform === 'string' ? rec.platform.trim().toLowerCase() : ''
+    if (!isSub2apiPlatformId(platform)) {
+      console.warn('[sub2api] invalid group platform')
       continue
     }
-    if (row.status !== undefined && row.status !== 'active') continue
-    out.push({ id: row.id, name: row.name, platform: row.platform })
+    if (rec.status !== undefined && rec.status !== 'active') continue
+    out.push({ id: rec.id as number, name: rec.name, platform })
   }
   return out
 }

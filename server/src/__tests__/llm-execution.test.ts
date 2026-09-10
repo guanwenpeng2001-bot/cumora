@@ -730,7 +730,7 @@ test('pre-aborted image makes no model requests or ledger attempts', async () =>
   assert.equal(inserts.length, 0)
 })
 
-for (const [model, platform] of [['k3','kimi'], ['kimi-for-coding','kimi'], ['grok-4','grok']] as const)
+for (const [model, platform] of [['k3','kimi'], ['kimi-for-coding','kimi'], ['grok-4','grok'], ['glm-4.6','zhipu'], ['claude-sonnet-4-6','anthropic']] as const)
   test('cold resolver uses the native credential for ' + model, async () => {
     const gateway = gatewayFixture()
     const query = pool.query
@@ -747,6 +747,7 @@ for (const [model, platform] of [['k3','kimi'], ['kimi-for-coding','kimi'], ['gr
     gateway.sub.listKeyModelsWithStatus = () => new Promise(() => {})
     const plan = await load('llm-resolver.ts').resolveRoleCall('company-a','managed','support','palette')
     assert.equal(plan.candidates[0].route.platform, platform)
+    assert.equal(plan.candidates[0].protocol, platform === 'zhipu' ? 'chat' : 'responses')
     let credential: string | undefined
     setSdkClientFactory(options => { credential = options.apiKey; return {} })
     await load('llm.ts').getLlmCandidateClient(plan,plan.candidates[0])

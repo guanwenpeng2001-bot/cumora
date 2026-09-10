@@ -35,7 +35,7 @@ import { fetchImageBytes } from './agents/image-fetcher.js'
 import { measuredUsage } from './agents/cost.js'
 import { createChatResponsesShim } from './novita.js'
 import { fallbackReason, isLlmCancellation } from './agents/fallback.js'
-import { sub2apiRoutingConfigured, pickPlatformForModel, SUB2API_PLATFORMS, type Platform, type ApiKeyMap } from './sub2api.js'
+import { sub2apiRoutingConfigured, pickPlatformForModel, keyedPlatforms, type Platform, type ApiKeyMap } from './sub2api.js'
 
 interface CachedClient {
   authorizationVersion: string
@@ -131,18 +131,24 @@ export async function getLlmCandidateClient(plan: RoleCallPlan, candidate: RoleC
   return client
 }
 
+function sameKeyMap(a: ApiKeyMap, b: ApiKeyMap): boolean {
+  const platforms = new Set([...Object.keys(a), ...Object.keys(b)])
+  for (const platform of platforms) if (a[platform] !== b[platform]) return false
+  return true
+}
+
 async function routePlatformForModel(
   baseURL: string,
   keys: ApiKeyMap,
   tenant: string,
   model: string | undefined,
 ): Promise<Platform> {
-  const available = SUB2API_PLATFORMS.filter((p) => keys[p])
+  const available = keyedPlatforms(keys)
   const fallback: Platform = available.includes('openai') ? 'openai' : available[0] ?? 'openai'
   if (!model || available.length <= 1) return fallback
   const context = await resolveTenantLlmContext(tenant)
   // A client already handed to a caller must never use a newer key's discovery.
-  if (context.baseURL !== baseURL || SUB2API_PLATFORMS.some((p) => context.keys[p] !== keys[p])) {
+  if (context.baseURL !== baseURL || !sameKeyMap(context.keys, keys)) {
     throw new Error('Tenant LLM authorization changed; resolve the client again')
   }
   const snapshot = await tenantRoutingSnapshot(context)
@@ -150,7 +156,7 @@ async function routePlatformForModel(
   if (snapshot.authorizationVersion !== context.authorizationVersion) {
     throw new Error('Tenant LLM authorization changed; resolve the client again')
   }
-  return pickPlatformForModel(Object.fromEntries(SUB2API_PLATFORMS.map((p) => [p, snapshot.platforms[p].models])), model, available)
+  return pickPlatformForModel(Object.fromEntries(Object.entries(snapshot.platforms).map(([p, s]) => [p, s.models])), model, available)
 }
 
 /** Build the sub2api client for a tenant. Single-key users get a plain
@@ -158,7 +164,7 @@ async function routePlatformForModel(
  *  routes responses.create / chat.completions.create to the platform
  *  whose group claims the requested model, at call time. */
 function buildSub2apiClient(baseURL: string, keys: ApiKeyMap, tenant: string): OpenAI {
-  const available = SUB2API_PLATFORMS.filter((p) => keys[p])
+  const available = keyedPlatforms(keys)
   const fallback: Platform = available.includes('openai') ? 'openai' : available[0] ?? 'openai'
   const mk = (p: Platform) => new OpenAI({
     apiKey: keys[p]!,
@@ -224,7 +230,7 @@ export async function getLlmClient(tenant: string | null, options: LlmClientOpti
   if (cached && cached.authorizationVersion === context.authorizationVersion && Date.now() - cached.mintedAt < CACHE_TTL_MS) {
     return prepareLlmClient(cached.client, options)
   }
-  const client = SUB2API_PLATFORMS.some((p) => context.keys[p])
+  const client = keyedPlatforms(context.keys).length
     ? buildSub2apiClient(context.baseURL, context.keys, tenant)
     : legacyClient()
   cache.set(tenant, { client, mintedAt: Date.now(), authorizationVersion: context.authorizationVersion })

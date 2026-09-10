@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { api, type ApiComputer, type ApiModelGroup, type ApiModelRole, type ApiModelRoutePreview, type ApiModelSettings, type ApiSettingDefinition } from '@/api/client'
+import { modelPlatformLabel } from '@/lib/modelPlatforms'
 import { useAuth } from '@/stores/auth'
 import { translate, useLocaleStore } from '@/lib/i18n'
 
@@ -250,8 +251,8 @@ export function ModelRoutingPanel({ snapshot, onSaved }: { snapshot: ApiModelSet
     {groupError && <p role="alert" className="text-coral-deep text-[12px]">{translate(zh ? 'zh-CN' : 'en', 'settings.unableToValidate')}{groupError}</p>}
     {invalidGroups && <p role="alert">{translate(zh ? 'zh-CN' : 'en', 'settings.invalidGroupConfiguration')}</p>}
     {!invalidGroups && !selection.length && <p className="text-[12px]">{translate(zh ? 'zh-CN' : 'en', 'settings.noExplicitGroupOverridesDeploymentGroupSettingsAreInherited')}</p>}
-    {selection.map(g => <p key={`${g.tier}:${g.platform}`} className="text-[12px]">{g.tier} / {g.platform} / {g.id}: {groups === null ? (translate(zh ? 'zh-CN' : 'en', 'settings.notVerified')) : groups.some(c => c.id === g.id && c.platform === g.platform) ? (translate(zh ? 'zh-CN' : 'en', 'settings.valid')) : (translate(zh ? 'zh-CN' : 'en', 'settings.unavailableOrPlatformMismatch'))}</p>)}
-    {groups && <details><summary className="text-[12px] cursor-pointer">{translate(zh ? 'zh-CN' : 'en', 'settings.availableGroups')} ({groups.length})</summary>{groups.map(g => <p key={`${g.platform}:${g.id}`} className="text-[12px]">{g.platform} / {g.id} / {g.name}</p>)}</details>}
+    {selection.map(g => <p key={`${g.tier}:${g.platform}`} className="text-[12px]">{g.tier} / {modelPlatformLabel(g.platform)} / {g.id}: {groups === null ? (translate(zh ? 'zh-CN' : 'en', 'settings.notVerified')) : groups.some(c => c.id === g.id && c.platform === g.platform) ? (translate(zh ? 'zh-CN' : 'en', 'settings.valid')) : (translate(zh ? 'zh-CN' : 'en', 'settings.unavailableOrPlatformMismatch'))}</p>)}
+    {groups && <details><summary className="text-[12px] cursor-pointer">{translate(zh ? 'zh-CN' : 'en', 'settings.availableGroups')} ({groups.length})</summary>{groups.map(g => <p key={`${g.platform}:${g.id}`} className="text-[12px]">{modelPlatformLabel(g.platform)} / {g.id} / {g.name}</p>)}</details>}
     <details className="space-y-3"><summary className="font-semibold cursor-pointer">{translate(zh ? 'zh-CN' : 'en', 'settings.advancedRoutePlatformGroupSettings')}</summary>
       <p className="text-[12px] text-ink-500">{translate(zh ? 'zh-CN' : 'en', 'settings.explicitLlmConfigRolesOverrideTheModelFieldsAbove')}</p>
       <SettingFields snapshot={snapshot} definitions={snapshot.definitions?.filter(d => ['llm_config', 'sub2api_group_config'].includes(d.key)) ?? []} onSaved={onSaved} />

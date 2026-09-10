@@ -1,6 +1,6 @@
 import { pool } from './db/pool.js'
 import { SETTING_DEFS, getServerSetting, getServerSettingList, getServerSettingsSnapshot, parseLlmConfig } from './settings.js'
-import { SUB2API_PLATFORMS, type Platform, type KeyModelsResult } from './sub2api.js'
+import type { Platform, KeyModelsResult } from './sub2api.js'
 import { TenantLlmAccessError, resolveTenantLlmContext, tenantModelSnapshot, invalidateTenantModelSnapshot } from './tenant-llm-context.js'
 
 export interface ModelCatalog {
@@ -89,8 +89,7 @@ export async function availableModels(userId: string, refresh: boolean, companyI
     for (const target of targets) buckets[target].add(model)
   }
   const buckets: Record<Bucket, Set<string>> = { text: new Set(), image: new Set(), audio: new Set(), embedding: new Set() }
-  for (const platform of SUB2API_PLATFORMS) {
-    const result = snapshot.platforms[platform]
+  for (const [platform, result] of Object.entries(snapshot.platforms)) {
     catalog.platforms![platform] = { status: result.status, stale: result.stale, models: [...result.models].sort(), diagnostic: result.diagnostic }
     if (result.ok || result.stale) catalog.gateway = true
     for (const model of result.models) addModel(model)

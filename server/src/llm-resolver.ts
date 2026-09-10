@@ -1,7 +1,7 @@
 import { getServerSettingsSnapshot, parseLlmConfig, readLlmModelTarget, LLM_ROLES, type LlmRole, type LlmProtocol, type ServerSettingsSnapshot } from './settings.js'
 import { resolveDirectLlmEnv, type DirectLlmSlot } from './env.js'
 import { resolveTenantLlmContext, tenantRoutingSnapshot, waitForLlmResolution } from './tenant-llm-context.js'
-import { sub2apiRoutingConfigured, sub2apiConfigured, pickPlatformForModel, supportsGatewayImages, dashscopeMediaRole, supportsDashscopeChatAudio, SUB2API_PLATFORMS, type Platform } from './sub2api.js'
+import { sub2apiRoutingConfigured, sub2apiConfigured, pickPlatformForModel, supportsGatewayImages, dashscopeMediaRole, supportsDashscopeChatAudio, keyedPlatforms, type Platform } from './sub2api.js'
 import { parseAgentModelConfig, REASONING_EFFORTS } from './agents/model-config.js'
 
 export interface RoleCallAgent { id?: string; model?: string | null; modelConfig?: unknown; model_config?: unknown }
@@ -56,20 +56,21 @@ export async function resolveRoleCall(company: string | null, domain: RoleCallPl
   const models = primary ? [...new Set([primary, ...(role === 'embed' ? [] : fallbacks)].map(m => m.trim()).filter(Boolean))] : []
   if (!primary) diagnostics.push(`missing-primary:${role}`)
   const context = company && sub2apiRoutingConfigured() ? await waitForLlmResolution(resolveTenantLlmContext(company), 500, signal) : null
-  const discovery = role !== 'embed' && context && SUB2API_PLATFORMS.some(p => context.keys[p]) ? await tenantRoutingSnapshot(context, signal) : null
+  const discovery = role !== 'embed' && context && keyedPlatforms(context.keys).length ? await tenantRoutingSnapshot(context, signal) : null
   if (context && discovery && context.authorizationVersion !== discovery.authorizationVersion) {
     return resolveRoleCall(company, domain, role, purpose, agent, snapshot, signal)
   }
   if (context && !discovery && role !== 'embed') diagnostics.push('discovery:pending')
+  const available = context ? keyedPlatforms(context.keys) : []
   if (discovery) {
-    for (const platform of SUB2API_PLATFORMS.filter(p => context?.keys[p])) {
+    for (const platform of available) {
       const status = discovery.platforms[platform]
+      if (!status) continue
       if (!status.ok || status.stale) diagnostics.push(`discovery:${platform}:${status.status}${status.stale ? ':stale' : ''}`)
     }
   }
   plan.authorizationVersion = discovery?.authorizationVersion ?? context?.authorizationVersion
-  const available = context ? SUB2API_PLATFORMS.filter(p => context.keys[p]) : []
-  const modelsByPlatform = discovery ? Object.fromEntries(SUB2API_PLATFORMS.map(p => [p, discovery.platforms[p].models])) : {}
+  const modelsByPlatform = discovery ? Object.fromEntries(Object.entries(discovery.platforms).map(([p, s]) => [p, s.models])) : {}
   const readInteger = (key: string, fallback: number, min: number) => {
     const raw = snapshot.settings[key] ?? ''
     const n = Number(raw)
@@ -89,7 +90,7 @@ export async function resolveRoleCall(company: string | null, domain: RoleCallPl
     const dashscope = dashscopeMediaRole(translated.requestModel) === role
     const kind = explicit?.kind ?? (dashscope ? 'direct' : role === 'embed' ? direct.configured || !sub2apiRoutingConfigured() ? 'direct' : 'gateway' : available.length ? 'gateway' : 'direct')
     const platform = kind === 'gateway' ? explicit?.platform ?? (role === 'embed' ? 'openai' : pickPlatformForModel(modelsByPlatform, model, available)) : undefined
-    const protocol = translated.protocol ?? explicit?.protocol ?? (kind === 'direct' ? direct.protocol as LlmProtocol : role === 'image' ? 'images' : role === 'audio' ? 'chat' : role === 'embed' ? 'embeddings' : 'responses')
+    const protocol = translated.protocol ?? explicit?.protocol ?? (kind === 'direct' ? direct.protocol as LlmProtocol : role === 'image' ? 'images' : role === 'audio' ? 'chat' : role === 'embed' ? 'embeddings' : platform === 'zhipu' ? 'chat' : 'responses')
     const gatewaySupported = role !== 'image' || kind !== 'gateway' || protocol === 'images' && supportsGatewayImages(translated.requestModel)
     // Native ASR families must not be sent to the incompatible Chat endpoint.
     const audioSupported = role !== 'audio' || !dashscope || supportsDashscopeChatAudio(translated.requestModel)

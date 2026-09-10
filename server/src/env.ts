@@ -355,10 +355,11 @@ export const env = {
   SUB2API_TIER_FREE_GROUP_ID: Number(process.env.SUB2API_TIER_FREE_GROUP_ID ?? 0),
   SUB2API_TIER_PRO_GROUP_ID:  Number(process.env.SUB2API_TIER_PRO_GROUP_ID  ?? 0),
   SUB2API_TIER_MAX_GROUP_ID:  Number(process.env.SUB2API_TIER_MAX_GROUP_ID  ?? 0),
-  // Per-tier, per-platform group mapping. sub2api groups are platform-scoped
-  // (an account only serves its own platform), while cumora tiers span all
-  // platforms — so each tier maps onto one group per platform. Unset
-  // platform falls back to the tier's OPENAI group, then the legacy value.
+  // Per-tier, per-platform group mapping. Pattern is
+  // SUB2API_TIER_<TIER>_GROUP_<PLATFORM> (uppercase platform name → lowercase
+  // platform id). Named aliases below cover the historical four; additional
+  // platforms (anthropic/gemini/antigravity/zhipu/minimax/composite/…) are
+  // picked up by readEnvTierPlatformGroups() with no code change.
   SUB2API_TIER_FREE_GROUP_OPENAI:   Number(process.env.SUB2API_TIER_FREE_GROUP_OPENAI   ?? 0),
   SUB2API_TIER_FREE_GROUP_KIMI:     Number(process.env.SUB2API_TIER_FREE_GROUP_KIMI     ?? 0),
   SUB2API_TIER_FREE_GROUP_DEEPSEEK: Number(process.env.SUB2API_TIER_FREE_GROUP_DEEPSEEK ?? 0),
@@ -491,6 +492,26 @@ export const env = {
    *  Keep it OUT of git — configure it as a server secret only. */
   FCM_SERVICE_ACCOUNT_JSON: process.env.FCM_SERVICE_ACCOUNT_JSON ?? '',
   FCM_SERVICE_ACCOUNT_PATH: process.env.FCM_SERVICE_ACCOUNT_PATH ?? '',
+}
+
+const TIER_PLATFORM_GROUP_ENV = /^SUB2API_TIER_(FREE|PRO|MAX)_GROUP_([A-Z][A-Z0-9]*)$/
+
+/** Scan SUB2API_TIER_<TIER>_GROUP_<PLATFORM> from process.env and the live
+ *  `env` object (tests mutate the latter). Suffix `ID` is the legacy
+ *  single-value mapping, not a platform. */
+export function readEnvTierPlatformGroups(tier: 'free' | 'pro' | 'max'): Record<string, number> {
+  const wanted = tier.toUpperCase()
+  const out: Record<string, number> = {}
+  const ingest = (key: string, raw: unknown) => {
+    const match = TIER_PLATFORM_GROUP_ENV.exec(key)
+    if (!match || match[1] !== wanted || match[2] === 'ID') return
+    const id = typeof raw === 'number' ? raw : Number(raw ?? 0)
+    if (!Number.isSafeInteger(id) || id < 0) return
+    out[match[2].toLowerCase()] = id
+  }
+  for (const [key, value] of Object.entries(process.env)) ingest(key, value)
+  for (const [key, value] of Object.entries(env)) ingest(key, value)
+  return out
 }
 
 // Production-secret gate: refuse to boot in production while any security

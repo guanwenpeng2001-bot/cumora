@@ -4,8 +4,9 @@ import assert from 'node:assert/strict'
 import { env } from '../env.js'
 import {
   getUserQuota, sub2apiOpenAIBaseURL, tierGroups, parseApiKeyMap, serializeApiKeyMap,
-  pickPlatformForModel,
+  pickPlatformForModel, listKeyModelsWithStatus,
 } from '../sub2api.js'
+import { parseGroupConfig, parseLlmConfig } from '../settings.js'
 
 mock.method(pool, 'query', async () => ({ rows: [], rowCount: 0 }))
 after(async () => { await pool.end(); mock.restoreAll() })
@@ -103,8 +104,9 @@ function ok(data: unknown): Response {
 
 test('tierGroups: per-platform var wins, then tier openai group, then legacy value', () => {
   configureSub2apiTestEnv()
+  const previousAnthropic = process.env.SUB2API_TIER_PRO_GROUP_ANTHROPIC
   try {
-    // legacy only → every platform falls back to the legacy id
+    // legacy only → historical platforms fall back to the legacy id
     assert.deepEqual(tierGroups('pro'), { openai: 3, kimi: 3, deepseek: 3, grok: 3 })
     // openai platform var overrides legacy; others fall back to it
     env.SUB2API_TIER_PRO_GROUP_OPENAI = 30
@@ -113,10 +115,17 @@ test('tierGroups: per-platform var wins, then tier openai group, then legacy val
     env.SUB2API_TIER_PRO_GROUP_KIMI = 31
     env.SUB2API_TIER_PRO_GROUP_GROK = 32
     assert.deepEqual(tierGroups('pro'), { openai: 30, kimi: 31, deepseek: 30, grok: 32 })
-    // nothing configured → all zero (provision without group access)
+    // new platforms are included only when explicitly mapped — no openai fallback
+    process.env.SUB2API_TIER_PRO_GROUP_ANTHROPIC = '50'
+    assert.deepEqual(tierGroups('pro'), { openai: 30, kimi: 31, deepseek: 30, grok: 32, anthropic: 50 })
+    delete process.env.SUB2API_TIER_PRO_GROUP_ANTHROPIC
+    assert.equal('anthropic' in tierGroups('pro'), false)
+    // nothing configured → historical four stay zero (provision without group access)
     env.SUB2API_TIER_MAX_GROUP_ID = 0
     assert.deepEqual(tierGroups('max'), { openai: 0, kimi: 0, deepseek: 0, grok: 0 })
   } finally {
+    if (previousAnthropic === undefined) delete process.env.SUB2API_TIER_PRO_GROUP_ANTHROPIC
+    else process.env.SUB2API_TIER_PRO_GROUP_ANTHROPIC = previousAnthropic
     restoreSub2apiTestState()
   }
 })
@@ -130,16 +139,17 @@ test('parseApiKeyMap reads legacy bare strings as the openai key', () => {
   assert.deepEqual(parseApiKeyMap('not-json{'), { openai: 'not-json{' })
 })
 
-test('parseApiKeyMap reads JSON maps and drops unknown platforms', () => {
+test('parseApiKeyMap reads JSON maps and keeps unknown platform string keys', () => {
   assert.deepEqual(
-    parseApiKeyMap('{"openai":"sk-o","kimi":"sk-k","bogus":"sk-x"}'),
-    { openai: 'sk-o', kimi: 'sk-k' },
+    parseApiKeyMap('{"openai":"sk-o","kimi":"sk-k","bogus":"sk-x","anthropic":"sk-a"}'),
+    { openai: 'sk-o', kimi: 'sk-k', bogus: 'sk-x', anthropic: 'sk-a' },
   )
 })
 
-test('serializeApiKeyMap keeps openai-only maps as bare strings', () => {
+test('serializeApiKeyMap keeps openai-only maps as bare strings and preserves extra keys', () => {
   assert.equal(serializeApiKeyMap({ openai: 'sk-o' }), 'sk-o')
   assert.equal(serializeApiKeyMap({ openai: 'sk-o', grok: 'sk-g' }), '{"openai":"sk-o","grok":"sk-g"}')
+  assert.equal(serializeApiKeyMap({ openai: 'sk-o', anthropic: 'sk-a' }), '{"openai":"sk-o","anthropic":"sk-a"}')
   assert.equal(serializeApiKeyMap({}), '')
 })
 
@@ -207,4 +217,61 @@ test('native model families route with cold or reseller-only catalogs; Qwen shar
   }
   assert.equal(pickPlatformForModel({kimi:new Set(['Custom-ID'])}, ' custom-id ', platforms), 'kimi')
   assert.equal(pickPlatformForModel({}, 'kimi-for-coding', ['openai']), 'openai')
+})
+
+test('DetectModelPlatform prefixes pick native groups; membership beats openai; composite is last', () => {
+  const withNative = ['openai', 'anthropic', 'gemini', 'zhipu', 'minimax', 'antigravity', 'composite']
+  assert.equal(pickPlatformForModel({}, 'claude-sonnet-4-6', withNative), 'anthropic')
+  assert.equal(pickPlatformForModel({}, 'anthropic/claude-opus-4', withNative), 'anthropic')
+  assert.equal(pickPlatformForModel({}, 'gemini-2.5-pro', withNative), 'gemini')
+  assert.equal(pickPlatformForModel({}, 'glm-4.6', withNative), 'zhipu')
+  assert.equal(pickPlatformForModel({}, 'MiniMax-M3', withNative), 'minimax')
+  assert.equal(pickPlatformForModel({}, 'abab6.5s-chat', withNative), 'minimax')
+  assert.equal(pickPlatformForModel({}, 'gemini-pro-agent', withNative), 'antigravity')
+  // recognized new-platform model without a key is not silently sent to openai
+  assert.equal(pickPlatformForModel({}, 'claude-sonnet-4-6', ['openai', 'kimi']), 'anthropic')
+  assert.equal(pickPlatformForModel({}, 'glm-4', ['openai']), 'zhipu')
+  // antigravity membership can claim claude/gemini when the native group is absent
+  assert.equal(pickPlatformForModel(
+    { antigravity: new Set(['claude-sonnet-4-6']), openai: new Set(['claude-sonnet-4-6']) },
+    'claude-sonnet-4-6',
+    ['openai', 'antigravity'],
+  ), 'antigravity')
+  // membership beats openai fallback for custom ids; composite is not first hop
+  assert.equal(pickPlatformForModel(
+    { composite: new Set(['custom-id']), grok: new Set(['custom-id']) },
+    'custom-id',
+    ['openai', 'grok', 'composite'],
+  ), 'grok')
+  assert.equal(pickPlatformForModel(
+    { composite: new Set(['only-composite']) },
+    'only-composite',
+    ['openai', 'composite'],
+  ), 'composite')
+})
+
+test('parseGroupConfig and llm_config accept discovered platform ids', () => {
+  const groups = parseGroupConfig('{"free":{"openai":1,"anthropic":2,"zhipu":3}}', true)
+  assert.deepEqual(groups.free, { openai: 1, anthropic: 2, zhipu: 3 })
+  const config = parseLlmConfig(JSON.stringify({
+    version: 1,
+    routes: [{ id: 'gw', kind: 'gateway', platform: 'zhipu', protocol: 'chat' }],
+    models: [], roles: [],
+  }), true)
+  assert.equal(config.routes[0].platform, 'zhipu')
+})
+
+test('empty model catalogs are not treated as success', async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (async () => new Response(JSON.stringify({ data: [] }), {
+    status: 200, headers: { 'content-type': 'application/json' },
+  })) as typeof fetch
+  try {
+    const result = await listKeyModelsWithStatus('https://gateway.invalid/v1', 'sk-test')
+    assert.equal(result.ok, false)
+    assert.equal(result.status, 'empty')
+    assert.equal(result.models.size, 0)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
 })

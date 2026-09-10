@@ -1,6 +1,6 @@
 import { getManagedPodSettings } from './managed-pod-settings.js'
 import { pool } from './db/pool.js'
-import { parseApiKeyMap, listKeyModelsWithStatus, SUB2API_PLATFORMS, sub2apiOpenAIBaseURL, sub2apiRoutingConfigured, type ApiKeyMap, type Platform, type KeyModelsResult } from './sub2api.js'
+import { parseApiKeyMap, listKeyModelsWithStatus, keyedPlatforms, sub2apiOpenAIBaseURL, sub2apiRoutingConfigured, type ApiKeyMap, type KeyModelsResult } from './sub2api.js'
 
 export class TenantLlmAccessError extends Error {
   readonly status = 403
@@ -20,7 +20,7 @@ export interface PlatformSnapshot extends KeyModelsResult {
 }
 export interface TenantModelSnapshot {
   authorizationVersion: string
-  platforms: Record<Platform, PlatformSnapshot>
+  platforms: Record<string, PlatformSnapshot>
   at: number
 }
 
@@ -114,13 +114,11 @@ export async function tenantModelSnapshot(context: TenantLlmContext, refresh = f
   const running = refreshes.get(companyId)
   if (running?.version === authorizationVersion) return running.promise
   const promise = (async () => {
-    const entries = await Promise.all(SUB2API_PLATFORMS.map(async (platform) => {
-      const key = context.keys[platform]
-      const result: KeyModelsResult = !key
-        ? { models: new Set<string>(), ok: false, status: 'no-key' }
-        : !sub2apiRoutingConfigured()
-          ? { models: new Set<string>(), ok: false, status: 'unavailable', diagnostic: 'gateway-unconfigured' }
-          : await listKeyModelsWithStatus(context.baseURL, key)
+    const entries = await Promise.all(keyedPlatforms(context.keys).map(async (platform) => {
+      const key = context.keys[platform]!
+      const result: KeyModelsResult = !sub2apiRoutingConfigured()
+        ? { models: new Set<string>(), ok: false, status: 'unavailable', diagnostic: 'gateway-unconfigured' }
+        : await listKeyModelsWithStatus(context.baseURL, key)
       const old = previous?.platforms[platform]
       const stale = !result.ok && result.status !== 'no-key' && !!old && (old.ok || old.stale)
       return [platform, { ...result, models: stale ? old.models : result.models, stale }] as const
@@ -131,7 +129,7 @@ export async function tenantModelSnapshot(context: TenantLlmContext, refresh = f
       throw new TenantLlmAccessError('Tenant LLM authorization changed during discovery')
     }
     const snapshot: TenantModelSnapshot = {
-      authorizationVersion, platforms: Object.fromEntries(entries) as Record<Platform, PlatformSnapshot>, at: Date.now(),
+      authorizationVersion, platforms: Object.fromEntries(entries) as Record<string, PlatformSnapshot>, at: Date.now(),
     }
     snapshots.set(companyId, snapshot)
     return snapshot

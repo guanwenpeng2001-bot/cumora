@@ -33,7 +33,9 @@ test('T32 durable reconciliation and appended migration', { skip: !integrationUr
   const { requestSub2apiSync, reconcileSub2apiSync, getSub2apiSyncStatus, enqueueSub2apiSync, runSub2apiSyncTick } = await import('../sub2api-sync.js')
   const { tierGroups, parseApiKeyMap, SUB2API_PLATFORMS } = await import('../sub2api.js')
   const groups = Object.fromEntries(SUB2API_PLATFORMS.map((p, i) => [p, i + 1]))
-  for (const [tier, offset] of [['FREE', 0], ['PRO', 10], ['MAX', 20]] as const) {
+  const platformCount = SUB2API_PLATFORMS.length
+  const platformForGroupId = (id: number) => SUB2API_PLATFORMS[(id - 1) % platformCount]
+  for (const [tier, offset] of [['FREE', 0], ['PRO', platformCount], ['MAX', platformCount * 2]] as const) {
     for (const [platform, id] of Object.entries(groups)) {
       ;(env as unknown as Record<string, unknown>)[`SUB2API_TIER_${tier}_GROUP_${platform.toUpperCase()}`] = id + offset
     }
@@ -52,7 +54,7 @@ test('T32 durable reconciliation and appended migration', { skip: !integrationUr
     if ((match = p.match(/\/groups\/(\d+)$/))) {
       if (groupUnavailable) throw new Error('group lookup unavailable')
       const id = Number(match[1])
-      return { id, platform: SUB2API_PLATFORMS[(id % 10) - 1], status: 'active', subscription_type: zeroBalance ? 'standard' : 'subscription' }
+      return { id, platform: platformForGroupId(id), status: 'active', subscription_type: zeroBalance ? 'standard' : 'subscription' }
     }
     if (p === '/api/v1/admin/users' && method === 'GET') return { items: remote.users.filter(u => u.email === url.searchParams.get('search')), pages: 1 }
     if (p === '/api/v1/admin/users' && method === 'POST') {
@@ -105,7 +107,7 @@ test('T32 durable reconciliation and appended migration', { skip: !integrationUr
     if (req.url?.startsWith('/v1/')) {
       const key = remote.keys.find(k => req.headers.authorization === 'Bearer ' + k.key)
       if (!key) { res.statusCode = 401; res.end('{}'); return }
-      const platform = SUB2API_PLATFORMS[(key.group_id % 10) - 1]
+      const platform = platformForGroupId(key.group_id)
       res.setHeader('content-type', 'application/json')
       if (req.url === '/v1/models') {
         res.end(JSON.stringify({ data: [{ id: platform + '-test-model' }] }))
@@ -142,7 +144,7 @@ test('T32 durable reconciliation and appended migration', { skip: !integrationUr
     for (const p of SUB2API_PLATFORMS) {
       assert.ok(remote.keys.some(k => k.user_id === Number(local.sub2api_user_id) && k.key === keys[p] && k.group_id === tierGroups(tier)[p]))
     }
-    assert.equal(remote.keys.filter(k => k.user_id === Number(local.sub2api_user_id) && k.name.startsWith('cumora:')).length, 4)
+    assert.equal(remote.keys.filter(k => k.user_id === Number(local.sub2api_user_id) && k.name.startsWith('cumora:')).length, platformCount)
   }
   try {
     await t.test('empty migration, repeat, existing v11 upgrade, repeat SQL', async () => {
@@ -300,7 +302,7 @@ test('T32 durable reconciliation and appended migration', { skip: !integrationUr
       await check('other', 'free')
       assert.notDeepEqual(parseApiKeyMap((await state('race')).sub2api_api_key), parseApiKeyMap((await state('other')).sub2api_api_key))
     })
-    await t.test('real LLM client authenticates two users across four fake platforms', async () => {
+    await t.test('real LLM client authenticates two users across mapped fake platforms', async () => {
       const { getLlmClient } = await import('../llm.js')
       for (const owner of ['race', 'other']) {
         const company = 'company-' + owner

@@ -43,7 +43,7 @@ docker compose -f docker-compose.yml config --services
 - `SUB2API_ADMIN_PASSWORD`、`SUB2API_JWT_SECRET`、`SUB2API_TOTP_ENCRYPTION_KEY`:可选层的三个必填引导变量。现有部署保留原值;新环境使用独立强随机机密。
 - `SUB2API_INTERNAL_URL`、`SUB2API_PUBLIC_URL`:按上述 server/Pod 网络语义填写。
 - `SUB2API_ADMIN_KEY`:通过合法管理流程获得的管理 API key,用于用户开通及管理调用。
-- `SUB2API_TIER_<FREE|PRO|MAX>_GROUP_<OPENAI|KIMI|DEEPSEEK|GROK>`:已配置平台分组。兼容变量见 `.env.example`,实际组类型和额度沿用已授权配置。
+- `SUB2API_TIER_<FREE|PRO|MAX>_GROUP_<PLATFORM>`:已配置平台分组,PLATFORM 支持 sub2api 全部组平台(OPENAI/KIMI/DEEPSEEK/GROK/ANTHROPIC/GEMINI/ANTIGRAVITY/ZHIPU/MINIMAX/COMPOSITE),新增平台零代码。只给显式映射的平台铸 key。兼容变量见 `.env.example`,实际组类型和额度沿用已授权配置。
 - 图片主控和目录 scheduler 变量:见下节。
 
 Cumora 的 provider API key 留空,包括 `OPENAI_API_KEY`、`OPENAI_IMAGE_API_KEY`、`OPENAI_AUDIO_API_KEY`、`OPENAI_EMBED_API_KEY`、`NOVITA_API_KEY`、`ORCAROUTER_API_KEY`;凭据保留在网关账号和受管租户身份中。角色模型和协议仍需配置,网关目录可见不等于账号已获能力授权。

@@ -733,7 +733,7 @@ export type LlmProtocol = 'responses' | 'chat' | 'images' | 'dashscope-image' | 
 export interface LlmRouteConfig {
   id: string
   kind: 'gateway' | 'direct'
-  platform?: 'openai' | 'kimi' | 'deepseek' | 'grok'
+  platform?: string
   env?: 'text' | 'image' | 'audio' | 'embed' | 'novita' | 'orcarouter'
   protocol?: LlmProtocol
 }
@@ -779,7 +779,7 @@ export function parseLlmConfig(raw: string, strict = false): LlmConfig {
       check(nonempty(r.id) && !ids.has(r.id)); ids.add(r.id)
       check(['gateway', 'direct'].includes(r.kind))
       check(r.protocol === undefined || protocols.includes(r.protocol))
-      check(r.kind === 'gateway' ? r.env === undefined && (r.platform === undefined || ['openai', 'kimi', 'deepseek', 'grok'].includes(r.platform))
+      check(r.kind === 'gateway' ? r.env === undefined && (r.platform === undefined || isSub2apiPlatformId(r.platform))
         : r.platform === undefined && ['text', 'image', 'audio', 'embed', 'novita', 'orcarouter'].includes(r.env!))
     }
     const models = new Set<string>()
@@ -831,7 +831,12 @@ export function readLlmModelTarget(model: string, config: LlmConfig, target?: Ll
   return { requestModel: model, route: undefined, protocol: metadata?.protocol, metadata }
 }
 
-export type Sub2apiGroupConfig = Partial<Record<'free' | 'pro' | 'max', Partial<Record<'openai' | 'kimi' | 'deepseek' | 'grok', number>>>>
+/** Lowercase platform id: known sub2api groups plus any discovered string. */
+export function isSub2apiPlatformId(value: string): boolean {
+  return /^[a-z][a-z0-9_-]*$/.test(value)
+}
+
+export type Sub2apiGroupConfig = Partial<Record<'free' | 'pro' | 'max', Partial<Record<string, number>>>>
 export function parseGroupConfig(raw: string, strict = false): Sub2apiGroupConfig {
   if (!raw.trim()) return {}
   try {
@@ -840,7 +845,7 @@ export function parseGroupConfig(raw: string, strict = false): Sub2apiGroupConfi
     for (const [tier, groups] of Object.entries(value)) {
       if (!['free', 'pro', 'max'].includes(tier) || !object(groups)) throw new Error('schema')
       for (const [platform, id] of Object.entries(groups)) {
-        if (!['openai', 'kimi', 'deepseek', 'grok'].includes(platform) || typeof id !== 'number' || !Number.isSafeInteger(id) || id <= 0) throw new Error('schema')
+        if (!isSub2apiPlatformId(platform) || typeof id !== 'number' || !Number.isSafeInteger(id) || id <= 0) throw new Error('schema')
       }
     }
     return value as Sub2apiGroupConfig

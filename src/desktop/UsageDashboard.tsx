@@ -9,6 +9,7 @@ import {ApiError, type ApiUsageMetadata,
   type ApiUsageTrendPoint, 
   api, resolveAssetUrl,
 } from '@/api/client'
+import { modelPlatformLabel } from '@/lib/modelPlatforms'
 import { translate, useLocale, useT } from '@/lib/i18n'
 import { useAuth } from '@/stores/auth'
 
@@ -382,7 +383,7 @@ function UsageDashboardContent() {
                   <tr key={JSON.stringify([r.model, r.route, r.platform, r.source])} className="border-t border-ink-100">
                     <td className={cn(td, 'font-mono')}>
                       {r.model}
-                      <div className="text-[10px] whitespace-normal">{t('settings.route')}: {r.route ?? unknown} · {t('settings.platform')}: {r.platform ?? unknown} · {t('adminobs.colSource')}: {r.source ?? unknown}</div>
+                      <div className="text-[10px] whitespace-normal">{t('settings.route')}: {r.route ?? unknown} · {t('settings.platform')}: {r.platform ? modelPlatformLabel(r.platform) : unknown} · {t('adminobs.colSource')}: {r.source ?? unknown}</div>
                       <div className="text-[10px] whitespace-normal">{translate(locale, 'settings.unmeasuredUnpricedUnknownQuality')}: {r.unknownRequests ?? unknown} / {r.unpricedRequests ?? unknown} / {r.qualityUnknownRequests ?? unknown}</div>
                     </td>
                     <td className={td}>{r.provider}</td>
@@ -439,7 +440,7 @@ function UsageDashboardContent() {
                       <summary className="cursor-pointer">{translate(locale, 'settings.attemptDetails')} · #{r.attempt ?? unknown}</summary>
                       <div>{translate(locale, 'settings.requestedModel')}: {r.requestedModel || r.model || unknown}</div>
                       <div>{translate(locale, 'settings.actualModel')}: {r.actualModel || unknown}</div>
-                      <div>{t('settings.route')}: {r.route ?? unknown} · {t('settings.platform')}: {r.platform ?? unknown}</div>
+                      <div>{t('settings.route')}: {r.route ?? unknown} · {t('settings.platform')}: {r.platform ? modelPlatformLabel(r.platform) : unknown}</div>
                       <div>{t('adminobs.colSource')}: {r.source || unknown} · {t('settings.provider')}: {r.provider || unknown}</div>
                       <div>{t('settings.purpose')}: {r.purpose || unknown}</div>
                       <div>{t('settings.callId')}: {r.callId ?? unknown} · {t('settings.attempt')}: {r.attempt ?? unknown}</div>

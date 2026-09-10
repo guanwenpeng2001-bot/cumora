@@ -8,6 +8,8 @@ import type {
   Message, RecurrenceRule, Status,
 } from '@/types'
 
+export { API_MODEL_PLATFORM_LABELS, modelPlatformLabel } from '@/lib/modelPlatforms'
+
 const DEVTOOLS_KEY = 'cumora.devtools.enabled'
 const SERVER_URL_KEY = 'cumora.serverUrl'
 
@@ -216,12 +218,13 @@ export interface ApiModelCatalog {
   embedding: string[]
   gateway: boolean
   models?: ApiCatalogModel[]
-  platforms?: ApiCatalogPlatformStatus[]
+  /** Server returns a Record keyed by platform; older payloads used an array. */
+  platforms?: Record<string, ApiCatalogPlatformEntry> | ApiCatalogPlatformStatus[]
   fetchedAt?: string
 }
 
 export type ApiModelRole = 'brain' | 'support' | 'compaction' | 'image' | 'audio' | 'embed'
-export type ApiModelPlatform = 'openai' | 'kimi' | 'deepseek' | 'grok'
+export type ApiModelPlatform = string
 
 export interface ApiCatalogModel {
   id: string
@@ -233,11 +236,17 @@ export interface ApiCatalogModel {
   selectable?: boolean
 }
 
-export interface ApiCatalogPlatformStatus {
-  platform: ApiModelPlatform
-  status?: 'ready' | 'unconfigured' | 'unprovisioned' | 'failed'
+export interface ApiCatalogPlatformEntry {
+  status?: string
+  stale?: boolean
+  models?: string[]
+  diagnostic?: string
   errorCode?: string | null
   fetchedAt?: string | null
+}
+
+export interface ApiCatalogPlatformStatus extends ApiCatalogPlatformEntry {
+  platform: ApiModelPlatform
 }
 
 export interface ApiSettingMetadata {

@@ -136,6 +136,18 @@ test('bootstrap includes every runtime policy, six direct slots and only the own
   assert.doesNotMatch(JSON.stringify(config.policy), /owner-openai|direct-text-key/)
 })
 
+test('bootstrap keeps extra owner platform keys that are not in the historical four', async () => {
+  const main = fixture()
+  main.setOwner({
+    owner_user_id: 'owner-a', authorization_version: '101',
+    sub2api_api_key: JSON.stringify({ openai: 'owner-openai', anthropic: 'owner-anthropic', bogus: 'owner-bogus' }),
+  })
+  const config = await main.settings.createManagedPodBootstrap('agent-a', 'company-a', value => value)
+  assert.equal(config.gateway.keys.openai, 'owner-openai')
+  assert.equal(config.gateway.keys.anthropic, 'owner-anthropic')
+  assert.equal(config.gateway.keys.bogus, 'owner-bogus')
+})
+
 test('first turn uses a complete bootstrap during DB failure and cannot seed or write', async () => {
   const { config } = await bootstrap()
   const pod = fixture(config, { OPENAI_MODEL: 'wrong-env', OPENAI_API_KEY: 'wrong-direct' })

@@ -7,6 +7,7 @@
 import { useRef, useState } from 'react'
 import { Combobox } from '@/components/Combobox'
 import { translate, useLocaleStore } from '@/lib/i18n'
+import { modelPlatformLabel } from '@/lib/modelPlatforms'
 import { catalogOptions, catalogPlatforms, catalogSource, type Catalog } from '@/stores/modelCatalog'
 import { useT, type MessageKey } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
@@ -247,7 +248,7 @@ export function CatalogStatus({ catalog, error, loading, refresh }: {
     {loading && <div>{translate(zh ? 'zh-CN' : 'en', 'settings.loadingModelCatalog')}</div>}
     {error && <div className="text-coral-deep">{translate(zh ? 'zh-CN' : 'en', 'settings.catalogFailedManualEntryRemainsAvailableRetainedCatalogIs')}{error}</div>}
     {catalogPlatforms(catalog).map((p) => <div key={p.platform}>
-      {p.platform}: {labels[p.status ?? ''] ?? p.status ?? (translate(zh ? 'zh-CN' : 'en', 'settings.unknownStatus'))}
+      {modelPlatformLabel(p.platform)}: {labels[p.status ?? ''] ?? p.status ?? (translate(zh ? 'zh-CN' : 'en', 'settings.unknownStatus'))}
       {p.stale && (translate(zh ? 'zh-CN' : 'en', 'settings.staleSnapshot'))}
       {(p.diagnostic || p.errorCode) && ` · ${p.diagnostic || p.errorCode}`}
     </div>)}

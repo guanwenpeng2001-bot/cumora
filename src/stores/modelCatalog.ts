@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { api, type ApiModelCatalog } from '@/api/client'
+import { modelPlatformLabel } from '@/lib/modelPlatforms'
 import { useAuth } from '@/stores/auth'
 
 export interface CatalogPlatform {
@@ -11,8 +12,7 @@ export interface CatalogPlatform {
   errorCode?: string | null
 }
 
-export type Catalog = Omit<ApiModelCatalog, 'platforms'> & {
-  platforms?: CatalogPlatform[] | Record<string, Omit<CatalogPlatform, 'platform'>>
+export type Catalog = ApiModelCatalog & {
   byoa?: Array<{ companyId: string; computerId: string; engine: string; models: string[] }>
 }
 
@@ -32,7 +32,7 @@ export function catalogOptions(catalog: Catalog | null, bucket: 'text' | 'image'
 
 export function catalogSource(catalog: Catalog | null, id: string): string {
   const platforms = catalogPlatforms(catalog).filter((p) => p.models?.includes(id))
-  if (platforms.length) return platforms.map((p) => `${p.platform} · ${p.stale ? 'stale' : 'live'}`).join(' / ')
+  if (platforms.length) return platforms.map((p) => `${modelPlatformLabel(p.platform)} · ${p.stale ? 'stale' : 'live'}`).join(' / ')
   return catalog?.models?.find((m) => m.id === id)?.source ?? 'configured / history'
 }
 

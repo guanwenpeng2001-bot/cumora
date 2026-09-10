@@ -21,7 +21,7 @@ function loadUsage(query: (sql: string, params: unknown[]) => Promise<unknown> =
   })
   return exports
 }
-const { providerForModel, parseUsageRange, parseUsagePagination, UsageInputError } = loadUsage()
+const { providerForModel, usageProvider, parseUsageRange, parseUsagePagination, UsageInputError } = loadUsage()
 
 test('providerForModel: prefix relays win over family names', () => {
   assert.equal(providerForModel('novita/deepseek-v4-flash'), 'Novita')
@@ -33,6 +33,7 @@ test('providerForModel: family labels', () => {
   assert.equal(providerForModel('kimi-for-coding'), 'Kimi')
   assert.equal(providerForModel('deepseek-v4-pro'), 'DeepSeek')
   assert.equal(providerForModel('qwen-image-max'), 'DashScope')
+  assert.equal(providerForModel('qwen3-asr-flash'), 'DashScope')
   assert.equal(providerForModel('gpt-5.5'), 'OpenAI')
   assert.equal(providerForModel('claude-sonnet-4-6'), 'Anthropic')
   assert.equal(providerForModel('gemini-3.1-pro-high'), 'Google')
@@ -41,6 +42,16 @@ test('providerForModel: family labels', () => {
   assert.equal(providerForModel('text-embedding-v4'), 'other')
   assert.equal(providerForModel(null), 'unknown')
   assert.equal(providerForModel(''), 'unknown')
+})
+
+test('providerForModel: prefixes cover new versions and CN families', () => {
+  assert.equal(providerForModel('gpt-5.6'), 'OpenAI')
+  assert.equal(providerForModel('claude-opus-4-9'), 'Anthropic')
+  assert.equal(providerForModel('gemini-3.2-pro'), 'Google')
+  assert.equal(providerForModel('glm-4.6'), 'Zhipu')
+  assert.equal(providerForModel('MiniMax-M3'), 'MiniMax')
+  assert.equal(providerForModel('minimax-m2.5'), 'MiniMax')
+  assert.equal(providerForModel('abab6.5s-chat'), 'MiniMax')
 })
 
 test('parseUsageRange: defaults to today, clamps future end, caps 92 days back', () => {
@@ -63,9 +74,22 @@ test('parseUsageRange: explicit ISO range passes through; garbage is rejected', 
 })
 
 test('providerForModel: similar IDs never inherit a provider by substring', () => {
-  for (const model of ['not-deepseek-v4-pro', 'my-moonshot', 'gpt-5.5-impostor', 'k30', 'claudeish', 'qwenish', 'unknown/gpt-5.5']) {
+  for (const model of ['not-deepseek-v4-pro', 'my-moonshot', 'k30', 'claudeish', 'qwenish', 'unknown/gpt-5.5']) {
     assert.equal(providerForModel(model), 'other', model)
   }
+})
+
+test('usageProvider: ledger platform wins over family; unknown keys stay as-is', () => {
+  assert.equal(usageProvider('claude-sonnet-4-6', 'anthropic'), 'Anthropic')
+  assert.equal(usageProvider('claude-sonnet-4-6', 'antigravity'), 'Antigravity')
+  assert.equal(usageProvider('gemini-2.5-pro', 'gemini'), 'Gemini')
+  assert.equal(usageProvider('glm-4.6', 'zhipu'), 'Zhipu')
+  assert.equal(usageProvider('MiniMax-M3', 'minimax'), 'MiniMax')
+  assert.equal(usageProvider('k3', 'composite'), 'Composite')
+  assert.equal(usageProvider('grok-4', 'grok'), 'Grok')
+  assert.equal(usageProvider('weird-model', 'custom-vendor'), 'custom-vendor')
+  assert.equal(usageProvider('glm-4.6', null), 'Zhipu')
+  assert.equal(usageProvider('gpt-5.5', 'openai'), 'OpenAI')
 })
 
 test('range uses UTC, accepts offsets, rejects ambiguous and reversed windows, caps duration at 92 days', () => {
@@ -112,6 +136,16 @@ test('non-hour-aligned trend retains returned values and fills UTC bucket bounda
     .usageTrend('tenant', { from: new Date('2026-09-01T23:17:00+08:00'), to: new Date('2026-09-02T01:43:00+08:00') }, 'day')
   assert.equal(day.length, 1)
   assert.equal(day[0].costUsd, 7)
+})
+
+test('provider aggregation labels ledger platforms and does not family-override them', async () => {
+  const usage = loadUsage(async () => ({ rows: [
+    { model: 'claude-sonnet-4-6', platform: 'antigravity', requests: '1', input_tokens: '1', output_tokens: '1', cost_usd: '0.1', cost_estimated: false, unknown_calls: '0', unpriced_calls: '0', quality_unknown_calls: '0', route: null, source: 'cloud' },
+    { model: 'glm-4.6', platform: 'zhipu', requests: '2', input_tokens: '2', output_tokens: '2', cost_usd: '0.2', cost_estimated: false, unknown_calls: '0', unpriced_calls: '0', quality_unknown_calls: '0', route: null, source: 'cloud' },
+    { model: 'weird', platform: 'custom-vendor', requests: '3', input_tokens: '3', output_tokens: '3', cost_usd: '0.3', cost_estimated: false, unknown_calls: '0', unpriced_calls: '0', quality_unknown_calls: '0', route: null, source: 'cloud' },
+  ] }))
+  const rows = await usage.usageByProvider('tenant', { from: new Date(0), to: new Date(1) })
+  assert.deepEqual(rows.map((r: { provider: string }) => r.provider), ['custom-vendor', 'Zhipu', 'Antigravity'])
 })
 
 test('model aggregation uses one model group across routes and sources', async () => {
