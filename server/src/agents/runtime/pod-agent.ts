@@ -65,7 +65,10 @@ const state: RunnerState = {
 
 let activeTurnController: AbortController | null = null
 
-let pendingTurnOptions: AgentTurnOptions | null = null
+// Consumed once by the first drain, including cold-start inbox catch-up.
+// Inbox changes invalidate the scheduler decision inside runAgentTurn.
+let pendingTurnOptions: AgentTurnOptions | null = parseWakeData(process.env.CUMORA_AGENT_INITIAL_WAKE).options
+delete process.env.CUMORA_AGENT_INITIAL_WAKE
 let inboxProbeTimer: NodeJS.Timeout | null = null
 let inboxProbeInFlight = false
 let inboxRetryTimer: NodeJS.Timeout | null = null

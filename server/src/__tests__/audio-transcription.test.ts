@@ -47,7 +47,7 @@ function fixture(statuses: (number | Error)[] = [], gateway = false, content: un
   const source = read('../llm.ts')
   const audio = compile(source.slice(source.indexOf('export const MAX_AUDIO_BYTES')), {
     './llm-resolver.js': resolver, './llm-execution.js': execution, './agents/cost.js': cost,
-  }, { getLlmCandidateClient, fallbackReason: fallback.fallbackReason, isLlmCancellation: fallback.isLlmCancellation })
+  }, { ...resolver, ...execution, ...cost, getLlmCandidateClient, fallbackReason: fallback.fallbackReason, isLlmCancellation: fallback.isLlmCancellation })
   return { audio, records, requests, logs, tenants }
 }
 function wav(size = 48) {

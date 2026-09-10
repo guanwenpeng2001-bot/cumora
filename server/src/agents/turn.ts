@@ -19,6 +19,12 @@
  */
 import type { ResponseInputItem, ResponseStreamEvent } from 'openai/resources/responses/responses'
 import { env } from '../env.js'
+import { storage, UPLOAD_DIR } from '../storage.js'
+import { resolveRoleCall, type RoleCallPlan } from '../llm-resolver.js'
+import { executeLlmPlan, responsesToChat } from '../llm-execution.js'
+import { getLlmCandidateClient } from '../llm.js'
+import { chatResponseStream } from '../novita.js'
+import { fallbackReason } from './fallback.js'
 import type { AgentModelConfig } from './model-config.js'
 import { getBrainModel, getTurnBudgetPolicy, getServerSettingsSnapshot, withServerSettingsSnapshot, type TurnBudgetPolicy } from '../settings.js'
 import { redis } from '../redis.js'
@@ -41,6 +47,7 @@ import {
 } from './tools-shared.js'
 import { hydrate as hydrateFs, commit as commitFs, teardown as teardownFs, type FsNamespace } from './runtime/fs-namespace.js'
 import type { PollWakeBrief } from './runtime/wake-bus.js'
+import { inboxTriageBoundary } from './runtime/wake-options.js'
 import { runtime } from './runtime/select.js'
 import type { AgentRuntimeClient } from './runtime/client.js'
 import { BUSY_STATUS_HEARTBEAT_MS } from '../status.js'
@@ -53,9 +60,9 @@ import {
   newResponseStreamState,
   type ResponseStreamState,
 } from './turn-stream.js'
-import { compactHistoryWithSummary, DEFAULT_COMPACTION_POLICY, type CompactionPolicy, estimateHistoryTokens, estimateTokens, truncateChars, truncateUtf8 } from './turn-compaction.js'
-import { addUsage, EMPTY_USAGE, type TokenUsage } from './cost.js'
-import { recordLlmCall } from './llm-ledger.js'
+import { compactHistory, compactHistoryWithSummary, DEFAULT_COMPACTION_POLICY, type CompactionPolicy, estimateHistoryTokens, estimateTokens, truncateChars, truncateUtf8 } from './turn-compaction.js'
+import { measuredUsage, addUsage, EMPTY_USAGE, type TokenUsage } from './cost.js'
+import { recordLlmCall, type LlmCallContext, type LlmCallRecord } from './llm-ledger.js'
 import { resolveDeclaredAutoRelayTarget } from './auto-relay.js'
 import {
   canDrainSteer,
@@ -134,6 +141,8 @@ export interface AgentTurnOptions {
   idleReason?: string
   /** Server-side support-model triage note for ordinary message wakes. */
   triageNote?: string
+  /** Fingerprint of message IDs classified by the scheduler; only exact matches are reusable. */
+  triageBoundary?: string
   /** Internal background brief rendered as a normal model input. */
   backgroundBrief?: {
     title: string
@@ -421,7 +430,6 @@ async function trustedAttachmentSource(att: InboxAttachment): Promise<TrustedAtt
   const key = messageAttachmentStorageKey(att, env.R2_PUBLIC_BASE)
   if (!key) return null
   try {
-    const { storage } = await import('../storage.js')
     return { key, url: await storage.publicUrl(key), mode: storage.mode }
   } catch {
     return null
@@ -748,7 +756,6 @@ async function readTextAttachment(att: InboxAttachment): Promise<TextExcerpt | n
   if (source.mode === 'local') {
     // Local-mode file — read straight from disk to avoid a needless HTTP hop.
     // The helper resolves physical paths so an in-root symlink cannot escape.
-    const { UPLOAD_DIR } = await import('../storage.js')
     buf = await readLocalMessageAttachment(UPLOAD_DIR, source.key)
   } else {
     // R2 URL was minted from the validated key above. Reject redirects so a
@@ -1153,10 +1160,6 @@ async function executeAuxiliaryStream<T>(args: {
   extras?: Record<string, unknown>
   parse: (text: string) => T
 }): Promise<T> {
-  const { resolveRoleCall } = await import('../llm-resolver.js')
-  const { executeLlmPlan } = await import('../llm-execution.js')
-  const { getLlmCandidateClient } = await import('../llm.js')
-  const { measuredUsage } = await import('./cost.js')
   // The settings registry does not yet expose this compaction-domain key.
   // Until it does, every auxiliary consumer still has a bounded default.
   const configuredTimeout = Number(getServerSettingsSnapshot().settings.compaction_stream_timeout_ms)
@@ -1520,8 +1523,8 @@ Treat the output as a private memo that will be appended to the agent's input. E
 }
 
 export async function executeAgentTurnHop(args: {
-  plan: import('../llm-resolver.js').RoleCallPlan
-  context: import('./llm-ledger.js').LlmCallContext
+  plan: RoleCallPlan
+  context: LlmCallContext
   input: ResponseInputItem[]
   instructions: string
   tools: unknown[]
@@ -1531,15 +1534,9 @@ export async function executeAgentTurnHop(args: {
   idleTimeoutMs?: number
   retryEvent?: (kind: string, data: Record<string, unknown>) => Promise<void>
   requestEvent?: (data: Record<string, unknown>) => Promise<void>
-  record?: (record: import('./llm-ledger.js').LlmCallRecord) => Promise<void>
+  record?: (record: LlmCallRecord) => Promise<void>
 }): Promise<{ state: ResponseStreamState; input: ResponseInputItem[] }> {
-  const { executeLlmPlan, responsesToChat } = await import('../llm-execution.js')
-  const { getLlmCandidateClient } = await import('../llm.js')
-  const { compactHistory, DEFAULT_COMPACTION_POLICY } = await import('./turn-compaction.js')
   const compactionPolicy = args.compactionPolicy ?? DEFAULT_COMPACTION_POLICY
-  const { measuredUsage } = await import('./cost.js')
-  const { chatResponseStream } = await import('../novita.js')
-  const { fallbackReason } = await import('./fallback.js')
   const controller = new AbortController()
   const signal = args.signal ? AbortSignal.any([args.signal, controller.signal]) : controller.signal
   const timer = setTimeout(() => controller.abort(new DOMException('Model hop wall timeout', 'TimeoutError')),
@@ -1643,8 +1640,11 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
 }
 
 async function runAgentTurnWithBudget(agentId: string, options: AgentTurnOptions, turnPolicy: TurnBudgetPolicy): Promise<void> {
-  const resources = await runtime.applyPendingResources(agentId)
-  if (resources.status !== 'applied') throw new Error('Pending resources failed to apply')
+  const resources = await runtime.applyPendingResources(agentId).catch(() => ({
+    status: 'failed' as const, version: '', error: 'resource_application_unconfirmed',
+  }))
+  const resourcesUnavailable = resources.status !== 'applied'
+  if (resourcesUnavailable) console.warn(`[turn] ${agentId} pending resources unavailable; continuing with existing workspace`)
   const persona = await runtime.loadPersona(agentId)
   if (!persona) return
 
@@ -1972,10 +1972,23 @@ async function runAgentTurnWithBudget(agentId: string, options: AgentTurnOptions
       return
     }
 
+    if (resourcesUnavailable) {
+      await runtime.recordEvent({
+        runId, agentId, companyId: runCompanyId,
+        kind: 'resources.unavailable', level: 'warn',
+        title: 'Pending resources unavailable; continuing with existing workspace',
+        data: { version: resources.version, error: resources.error ?? 'resource_application_failed' },
+        stage: 'loading_inbox',
+      }).catch(() => { /* Resource telemetry must not abort the conversation. */ })
+    }
+
+    // Reuse scheduler execute only for the exact classified inbox.
+    const hasCurrentTriage = Boolean(triageNote) &&
+      options.triageBoundary === inboxTriageBoundary(inbox)
     const shouldRunInboxTriage =
       inbox.length > 0 &&
       (options.trigger === undefined || options.trigger === 'message.new') &&
-      !isBriefedManualWake
+      !isBriefedManualWake && !hasCurrentTriage
     if (shouldRunInboxTriage) {
       preloadedContext = await loadContext(agentId, persona.companyId, convoIds)
       const verdict = triageDisposition(await classifyInboxTriage({
@@ -2271,7 +2284,7 @@ ${skillsIndex.length === 0
   ? '  (no skills installed yet)'
   : skillsIndex.map((s) => `  - ${s.name} — ${s.description}`).join('\n')}
 
-${triageNote ? `Triage note:\n${triageNote}\n\n` : ''}${peerWorkBlock}${wakeContext}
+${triageNote ? `Triage note:\n${triageNote}\n\n` : ''}${resourcesUnavailable ? 'Pending resource updates are unavailable this turn. Use the existing workspace and available tools; do not assume the new resources were installed. ' : ''}${peerWorkBlock}${wakeContext}
 
 Now decide — like a real teammate would. World actions use bash(); turn state uses set_turn_status():
   bash("cumora glance <convo_id>")                       — peek at the latest messages + who else is currently composing in this convo. Use this RIGHT BEFORE replying to a 📣 broadcast — peers may have just posted while you were thinking.
@@ -2576,6 +2589,11 @@ Mechanics:
     }).catch(() => { /* observability best-effort */ })
   }
 
+  const plan = await resolveRoleCall(runCompanyId, 'managed', 'brain', 'agent-turn', {
+    id: agentId, model: persona.model ? enforceModelPolicy(realTaskModel(persona.model), 'agent-turn') : undefined,
+    modelConfig: agentMc,
+  }, getServerSettingsSnapshot(), options.signal)
+
   for (let hop = 0; hop < turnPolicy.maxHops; hop++) {
     options.signal?.throwIfAborted()
     // Auto-compaction: when the previous hop's reported usage crosses the
@@ -2684,11 +2702,6 @@ Mechanics:
     // response item shape so the wire format matches what /v1/responses
     // wants back. Reasoning / text items are intentionally NOT collected.
     const assistantOutputItems: ResponseInputItem[] = []
-    const { resolveRoleCall } = await import('../llm-resolver.js')
-    const plan = await resolveRoleCall(runCompanyId, 'managed', 'brain', 'agent-turn', {
-      id: agentId, model: persona.model ? enforceModelPolicy(realTaskModel(persona.model), 'agent-turn') : undefined,
-      modelConfig: agentMc,
-    })
     try {
       const result = await executeAgentTurnHop({
         plan, context: { purpose: 'agent-turn', role: 'brain', companyId: runCompanyId, agentId, runId,

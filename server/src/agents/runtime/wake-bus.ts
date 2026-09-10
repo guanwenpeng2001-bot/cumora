@@ -100,6 +100,8 @@ interface WakeKindWake {
   idleReason?: string
   /** Server-side support-model triage note for ordinary message wakes. */
   triageNote?: string
+  /** Fingerprint of the inbox approved by scheduler triage. */
+  triageBoundary?: string
   /** Internal background brief rendered as a normal model input. */
   backgroundBrief?: {
     title: string

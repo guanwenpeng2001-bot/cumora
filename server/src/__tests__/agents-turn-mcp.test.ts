@@ -2,13 +2,14 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
 import ts from 'typescript'
+import { inboxTriageBoundary, parseWakeData } from '../agents/runtime/wake-options.js'
 import { mcpToolToFunctionTool, type McpClientHandle, type McpConnectorSpec } from '../agents/mcp.js'
 
 // Execute the actual turn connection/cleanup blocks without database or model I/O.
 function turnFixture(connect: (spec: McpConnectorSpec, opts: any) => Promise<McpClientHandle>) {
   const source = readFileSync(new URL('../agents/turn.ts', import.meta.url), 'utf8')
   const start = source.indexOf('  const seenMcpConnectorNames = new Set<string>()')
-  const end = source.indexOf('  for (let hop = 0;', start)
+  const end = source.indexOf('  const plan = await resolveRoleCall', start)
   const closeStart = source.indexOf('    for (const client of mcpClients) {', end)
   const closeEnd = source.indexOf('    await runtime.applyPendingResources', closeStart)
   assert.ok(start > 0 && end > start && closeStart > end && closeEnd > closeStart)
@@ -59,3 +60,78 @@ test('turn: cancellation reaches connections and closes successful siblings', as
   await assert.rejects(run({ mcpConnectors: [{ name: 'healthy' }, { name: 'pending' }] }, { signal: controller.signal }), /abort/i)
   assert.equal(closed, 1)
 })
+
+
+function runBlock(body: string, dependencies: Record<string, unknown>) {
+  const compiled = ts.transpileModule(body, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText
+  return new Function(...Object.keys(dependencies), compiled)(...Object.values(dependencies))
+}
+
+for (const mode of ['failed', 'rejected', 'applied']) {
+  test(`turn: resources ${mode} do not abort inbox processing, even when telemetry fails`, async () => {
+    const source = readFileSync(new URL('../agents/turn.ts', import.meta.url), 'utf8')
+    const start = source.indexOf('  const resources = await runtime.applyPendingResources')
+    const end = source.indexOf('  const persona =', start)
+    const eventStart = source.indexOf('    if (resourcesUnavailable) {', end)
+    const eventEnd = source.indexOf('    // Reuse scheduler execute', eventStart)
+    assert.ok(start > 0 && end > start && eventStart > end && eventEnd > eventStart)
+    const events: any[] = []
+    const run = runBlock(`return async function() {
+      ${source.slice(start, end)}
+      await runtime.loadInbox(agentId)
+      ${source.slice(eventStart, eventEnd)}
+      return { continued: true, resourcesUnavailable }
+    }`, {
+      agentId: 'a', runId: 'run', runCompanyId: 'company',
+      runtime: {
+        applyPendingResources: async () => {
+          if (mode === 'rejected') throw Error('transport failed')
+          return { status: mode, version: 'v2', error: mode === 'failed' ? 'skill_conflict' : undefined }
+        },
+        loadInbox: async () => [{ id: 'unread' }],
+        recordEvent: async (event: any) => { events.push(event); throw Error('telemetry offline') },
+      },
+    })
+    const result = await run()
+    assert.equal(result.continued, true)
+    assert.equal(result.resourcesUnavailable, mode !== 'applied')
+    assert.equal(events.length, mode === 'applied' ? 0 : 1)
+    if (events.length) assert.equal(events[0].kind, 'resources.unavailable')
+  })
+}
+
+for (const scenario of ['matching', 'changed', 'unclassified', 'ignore', 'defer']) {
+  test(`turn: ${scenario} inbox preserves triage authority and acknowledgement semantics`, async () => {
+    const source = readFileSync(new URL('../agents/turn.ts', import.meta.url), 'utf8')
+    const start = source.indexOf('    const hasCurrentTriage =')
+    const end = source.indexOf('    // Materialize the agent', start)
+    assert.ok(start > 0 && end > start)
+    const inbox = [{ id: 'one', conversation_id: 'c' }, { id: 'two', conversation_id: 'c' }]
+    const options = scenario === 'unclassified' ? {} : parseWakeData(JSON.stringify({
+      reason: 'message.new', triageNote: 'scheduler execute',
+      triageBoundary: inboxTriageBoundary(scenario === 'matching' ? [...inbox].reverse() : [{ id: 'one' }]),
+    })).options
+    let calls = 0
+    const reads: any[] = [], deferred: any[] = []
+    const run = runBlock(`return async function(options) {
+      let triageNote = options.triageNote || '', preloadedContext, finalStatus, finalSummary
+      ${source.slice(start, end)}
+      return 'continue to brain'
+    }`, {
+      inbox, inboxTriageBoundary, isBriefedManualWake: false, agentId: 'a', runId: 'run',
+      runCompanyId: 'company', persona: { companyId: 'company' }, convoIds: ['c'],
+      loadContext: async () => [], triageDisposition: (v: any) => v,
+      classifyInboxTriage: async () => {
+        calls++
+        return { outcome: scenario === 'ignore' || scenario === 'defer' ? scenario : 'execute',
+          ackAllowed: scenario === 'ignore', source: 'classifier', promptNote: 'work', reason: 'classified', retryAt: 12345 }
+      },
+      runtime: { markConversationRead: async (args: any) => { reads.push(args) }, recordEvent: async () => {} },
+    })
+    const result = await run({ ...options, onInboxDeferred: (value: any) => deferred.push(value) })
+    assert.equal(calls, scenario === 'matching' ? 0 : 1)
+    assert.equal(result, scenario === 'ignore' || scenario === 'defer' ? undefined : 'continue to brain')
+    assert.deepEqual(reads, scenario === 'ignore' ? [{ agentId: 'a', conversationId: 'c', upToMessageId: 'two' }] : [])
+    assert.deepEqual(deferred, scenario === 'defer' ? [{ messageIds: ['one', 'two'], retryAt: 12345 }] : [])
+  })
+}

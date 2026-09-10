@@ -16,9 +16,9 @@ test('isFallbackableError: 402/429/5xx and transport errors advance the chain', 
   assert.equal(isFallbackableError(new Error('ECONNRESET')), true)
 })
 
-test('isFallbackableError: 400/404 surface immediately; 401/403 advance (P2-2)', () => {
+test('isFallbackableError: 400 surfaces immediately; 401/403/404 advance (P2-2)', () => {
   assert.equal(isFallbackableError(Object.assign(new Error('bad request'), { status: 400 })), false)
-  assert.equal(isFallbackableError(Object.assign(new Error('not found'), { status: 404 })), false)
+  assert.equal(isFallbackableError(Object.assign(new Error('not found'), { status: 404 })), true)
   // P2-2: upstream auth failures try the next candidate (e.g. a different
   // provider key); the reason is recorded per attempt in the ledger.
   assert.equal(isFallbackableError(Object.assign(new Error('unauthorized'), { status: 401 })), true)

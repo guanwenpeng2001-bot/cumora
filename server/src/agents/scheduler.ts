@@ -22,6 +22,7 @@
  */
 import { pool } from '../db/pool.js'
 import { env } from '../env.js'
+import { inboxTriageBoundary } from './runtime/wake-options.js'
 import { CH_MESSAGE_NEW, CH_POLLS, CH_TYPING, publish, redis, sub, type MessageNewEvent, type PollUpdatedEvent } from '../redis.js'
 import { notifyAlert } from '../alerting.js'
 import { ensurePod } from './runtime/orchestrator.js'
@@ -449,7 +450,7 @@ async function wakeOneCaptured(
     ...(options.idleReason ? { idleReason: options.idleReason } : {}),
     ...(options.backgroundBrief ? { backgroundBrief: options.backgroundBrief } : {}),
     ...(options.pollBrief ? { pollBrief: options.pollBrief } : {}),
-    ...(options.triageNote ? { triageNote: options.triageNote } : {}),
+    ...(options.triageNote ? { triageNote: options.triageNote, triageBoundary: options.triageBoundary } : {}),
   }
   const delivered = await deliverWake(agentId, wakePayload)
 
@@ -543,7 +544,8 @@ async function wakeOneCaptured(
   // connect via its initial drain(); we don't need to deliver the
   // event explicitly afterwards because the inbox IS the source of
   // truth.
-  const r = await ensurePod(agentId)
+  const r = await ensurePod(agentId, reason === 'message.new' && options.triageNote
+    ? { triageNote: options.triageNote, triageBoundary: options.triageBoundary } : undefined)
   if (r.created) {
     console.log('[scheduler] ' + agentId + ' resting → spinning up pod (' + reason + ')')
     // Synthetic/message wakes are durable in the inbox. Only the explicit
@@ -954,7 +956,7 @@ export async function triageWakeRecipient(
       context,
     })
     const disposition = triageDisposition(verdict)
-    const triageBoundary = JSON.stringify(inbox.map((row) => row.id).sort())
+    const triageBoundary = inboxTriageBoundary(inbox)
     if (disposition.outcome === 'defer') return { triageDeferred: disposition, triageBoundary }
     if (disposition.outcome === 'ignore' && disposition.ackAllowed) {
       const seen = new Map<string, string>()

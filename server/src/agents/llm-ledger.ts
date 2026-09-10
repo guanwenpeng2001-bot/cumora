@@ -213,7 +213,9 @@ export async function recordLlmCallsBatch(
 export function classifyLlmCallError(err: unknown): LlmCallStatus {
   const status = (err as { status?: number } | null)?.status
   const msg = err instanceof Error ? err.message : String(err)
-  if (status === 429 || status === 503 || /rate.?limit|quota|too many requests|overload/i.test(msg)) return 'rate_limited'
+  if (status === 429) return 'rate_limited'
+  if (typeof status === 'number' && status >= 500 && status <= 599) return 'failed'
+  if (/rate.?limit|quota|too many requests/i.test(msg)) return 'rate_limited'
   if ((err as { name?: string } | null)?.name === 'AbortError' || /timeout|aborted|ETIMEDOUT|deadline/i.test(msg)) return 'timeout'
   return 'failed'
 }

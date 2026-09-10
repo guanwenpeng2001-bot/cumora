@@ -83,6 +83,7 @@ interface DbRow {
 
 let snapshot: Map<string, Readonly<ModelPrice>> | null = null
 let snapshotAt = 0
+let retryAfter = 0
 let refreshSequence = 0
 let installedSequence = 0
 let editRevision = 0
@@ -105,7 +106,7 @@ function dbRowPrice(r: DbRow): Readonly<ModelPrice> {
 
 /** Refresh failures and stale SELECTs cannot replace a newer edit or snapshot. */
 export async function refreshModelPricing(force = false): Promise<void> {
-  if (!force && snapshot && Date.now() - snapshotAt < REFRESH_MS) return
+  if (!force && (Date.now() < retryAfter || (snapshot && Date.now() - snapshotAt < REFRESH_MS))) return
   if (!force && pendingRefresh) return pendingRefresh
   const sequence = ++refreshSequence
   const revision = editRevision
@@ -117,7 +118,9 @@ export async function refreshModelPricing(force = false): Promise<void> {
       snapshot = next
       installedSequence = sequence
       snapshotAt = Date.now()
+      retryAfter = 0
     } catch (e) {
+      if (sequence === refreshSequence) retryAfter = Date.now() + REFRESH_MS
       console.warn('[pricing] refresh failed; serving previous snapshot', e instanceof Error ? e.message : e)
     }
   })()
@@ -204,7 +207,7 @@ export async function upsertModelPricing(input: Omit<ModelPricingRow, 'updatedAt
     )
     const price = dbRowPrice(rows[0]!)
     editRevision++
-    snapshot = new Map(snapshot).set(row.model, price)
+    snapshot = new Map(snapshot ?? []).set(row.model, price)
   })
   pendingEdit = edit.catch(() => {})
   await edit

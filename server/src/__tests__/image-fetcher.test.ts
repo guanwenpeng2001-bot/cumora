@@ -185,3 +185,23 @@ test('enforces content type, declared size, streamed size, and timeout centrally
   })
   assert.deepEqual(timedOut, { ok: false, reason: 'timeout' })
 })
+
+test('caller cancellation aborts image body download and closes the response', async () => {
+  const controller = new AbortController()
+  let transportSignal: AbortSignal | undefined
+  let cancelled = 0
+  const result = await _fetchImageBytesForTest('https://images.example/image.png', {signal:controller.signal}, {
+    lookup: async () => [{address:'93.184.216.34',family:4}],
+    request: async (_target, signal) => {
+      transportSignal = signal
+      return {status:200, headers:{'content-type':'image/png'}, cancel:()=>{cancelled++},
+        body: { [Symbol.asyncIterator]: () => ({ next: () => {
+          controller.abort()
+          return new Promise<IteratorResult<Uint8Array>>(() => {})
+        } }) } }
+    },
+  })
+  assert.equal(result.ok, false)
+  assert.equal(transportSignal?.aborted, true)
+  assert.equal(cancelled, 1)
+})

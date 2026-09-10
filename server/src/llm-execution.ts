@@ -39,25 +39,28 @@ export async function executeLlmPlan<T>(options: LlmExecutionOptions<T>): Promis
   const { plan, context, signal } = options
   if (context.companyId !== plan.companyId || context.purpose !== plan.purpose) throw new Error('LLM plan context mismatch')
   if (!plan.candidates.length) throw new Error('LLM candidate chain is empty')
+  const candidates = plan.candidates.filter(candidate => candidate.available)
+  if (!candidates.length) throw new Error('LLM candidate chain has no available candidates')
   const logicalCallId = options.logicalCallId ?? randomUUID()
   const checkAbort = () => { if (signal?.aborted) throw signal.reason ?? new DOMException('Aborted', 'AbortError') }
   let retryCount = 0
   let attempt = 0
   let transportRetryCount = 0
-  for (let index = 0; index < plan.candidates.length; index++) {
+  for (let index = 0; index < candidates.length; index++) {
     checkAbort()
-    const candidate = plan.candidates[index]!
-    if (!candidate.available) throw new Error(candidate.diagnostic ?? 'LLM candidate unavailable')
+    const candidate = candidates[index]!
     const state: LlmAttemptState = { usage: null, rawUsage: null, actualModel: null, committed: false }
-    const send = await options.prepare(candidate, state)
-    checkAbort()
     const pricing = await captureCallPricing()
     checkAbort()
     const start = Date.now()
     let value: T | undefined
     let error: unknown
     let failed = false
+    let prepared = false
     try {
+      const send = await options.prepare(candidate, state)
+      checkAbort()
+      prepared = true
       value = await send()
       if (options.consume) value = await options.consume(value, state)
       checkAbort()
@@ -66,16 +69,16 @@ export async function executeLlmPlan<T>(options: LlmExecutionOptions<T>): Promis
       error = err
     }
     const cancelled = signal?.aborted || isLlmCancellation(error)
-    const transport = failed && !cancelled && options.transportRetry?.shouldRetry(error)
-    const reason = failed && !cancelled ? fallbackReason(error) ?? (transport ? 'transport:provider-connection' : null) : null
-    const imageRetry = failed && !state.committed && !cancelled && options.retry
+    const transport = failed && prepared && !cancelled && options.transportRetry?.shouldRetry(error)
+    const reason = failed && !cancelled ? (!prepared ? 'prepare-failed' : fallbackReason(error)) ?? (transport ? 'transport:provider-connection' : null) : null
+    const imageRetry = failed && prepared && !state.committed && !cancelled && options.retry
       && retryCount < options.retry.maxRetries
       && options.retry.shouldRetry(error, candidate)
     const transportRetry = failed && !state.committed && !cancelled && transport
       && transportRetryCount < (options.transportRetry?.maxRetries ?? 0)
     const retryReason = imageRetry ? 'retry-without-images' : transportRetry ? 'retry-provider-connection' : null
     const retry = retryReason !== null
-    const next = retry ? candidate : failed && reason && !state.committed && !cancelled ? plan.candidates[index + 1] : undefined
+    const next = retry ? candidate : failed && reason && !state.committed && !cancelled ? candidates[index + 1] : undefined
     const status = failed ? classifyLlmCallError(error) : 'ok'
     const extras = {
       ...context.extras, logicalCallId, attempt: ++attempt,
@@ -83,19 +86,22 @@ export async function executeLlmPlan<T>(options: LlmExecutionOptions<T>): Promis
       requestModel: candidate.requestModel, actualModel: state.actualModel,
       route: candidate.route.id, routeKind: candidate.route.kind, platform: candidate.route.platform ?? null,
       protocol: state.protocol ?? candidate.protocol, plannedProtocol: candidate.protocol, usageProtocol: state.usageProtocol ?? null, revision: plan.revision, authorizationVersion: plan.authorizationVersion ?? null,
-      status, httpStatus: (error as { status?: number } | null)?.status ?? null,
+      status, failureStage: failed ? prepared ? 'execution' : 'prepare' : null, httpStatus: (error as { status?: number } | null)?.status ?? null,
       failureReason: cancelled ? 'cancelled' : reason ?? (failed ? 'non-fallbackable-error' : null),
       nextCandidate: next?.model ?? null, nextCandidateReason: retryReason ?? (next ? reason : null),
       stopReason: !failed ? 'completed' : cancelled ? 'cancelled' : state.committed ? 'output-committed' : next ? 'advance' : !reason ? 'non-fallbackable-error' : 'exhausted',
       usage: state.usage, rawUsage: state.rawUsage, measurement: state.usage ? 'measured' : 'unknown',
       sdkMaxRetries: options.sdkMaxRetries ?? null, sdkRetryPolicy: options.sdkMaxRetries === undefined ? 'client-default' : 'request-override', sdkRetriesIndividuallyObservable: false,
     }
-    await (options.record ?? recordLlmCall)({
+    const record: LlmCallRecord = {
       ...context, model: state.actualModel ?? candidate.model, usage: state.usage,
       pricing: pricing(state.actualModel ?? candidate.model, candidate.route.id),
       reasoningTokens: state.reasoningTokens, latencyMs: Date.now() - start, status,
       error: failed ? (error instanceof Error ? error.message : String(error)) : null, extras,
-    })
+    }
+    // Snapshot the attempt now; persistence must not hold up the next hop or response.
+    void Promise.resolve().then(() => (options.record ?? recordLlmCall)(record))
+      .catch(error => { console.warn('[llm-execution] recorder failed', error instanceof Error ? error.message : String(error)) })
     const log = options.log ?? ((event: Record<string, unknown>) => { if (failed) console.warn('[llm-execution]', JSON.stringify(event)) })
     log(extras)
     if (!failed) return value as T

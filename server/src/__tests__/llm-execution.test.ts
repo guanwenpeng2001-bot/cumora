@@ -127,15 +127,35 @@ test('401 -> 403 exhaustion has exactly two rows and rethrows the final error', 
   assert.equal(extras(inserts[1]).stopReason,'exhausted')
   assert.equal(extras(inserts[1]).nextCandidate,null)
 })
-test('empty plan, validation and client preparation failures create no invented rows', async () => {
+test('empty and entirely unavailable plans make no requests or rows', async () => {
   await assert.rejects(execute(()=>{}, {plan:plan([])}),/empty/)
-  await assert.rejects(execute(()=>{}, {prepare:async()=>{throw httpError(401)}}))
-  const unavailable=plan(); unavailable.candidates[0].available=false
-  await assert.rejects(execute(()=>{}, {plan:unavailable}),/unavailable/)
+  const unavailable = plan()
+  unavailable.candidates.forEach(c => { c.available = false })
+  await assert.rejects(execute(()=>{}, {plan:unavailable}), /no available/)
   assert.equal(inserts.length,0); assert.equal(sent.length,0)
 })
+test('unavailable first and middle candidates are skipped; nextCandidate is executable', async () => {
+  const selected = plan(['skip-first', 'a', 'skip-middle', 'b'])
+  selected.candidates[0].available = false
+  selected.candidates[2].available = false
+  assert.equal(await execute(c => { if (c.model === 'a') throw httpError(404); return 'ok' }, {plan:selected}), 'ok')
+  assert.deepEqual(sent, ['a', 'b'])
+  assert.equal(inserts.length, 2)
+  assert.equal(extras(inserts[0]).nextCandidate, 'b')
+})
+test('prepare failures are recorded and advance without sending the failed candidate', async () => {
+  assert.equal(await execute(()=>{}, {prepare:async (c: any) => {
+    if (c.model !== 'c') throw new Error('candidate lacks tools or context budget')
+    return async () => { sent.push(c.model); return 'ok' }
+  }}), 'ok')
+  assert.deepEqual(sent, ['c'])
+  assert.equal(inserts.length, 3)
+  assert.deepEqual(inserts.map(row => extras(row).attempt), [1, 2, 3])
+  assert.equal(extras(inserts[0]).failureStage, 'prepare')
+  assert.equal(extras(inserts[0]).failureReason, 'prepare-failed')
+})
 test('programming, local request and arbitrary no-status errors do not advance', async () => {
-  for(const err of [new TypeError('bug'),new Error('oops'),new SyntaxError('JSON'),httpError(400),httpError(404),Object.assign(new Error('cancel'),{name:'APIUserAbortError'})]) {
+  for(const err of [new TypeError('bug'),new Error('oops'),new SyntaxError('JSON'),httpError(400),Object.assign(new Error('cancel'),{name:'APIUserAbortError'})]) {
     const count=inserts.length
     await assert.rejects(execute(()=>{throw err}),e=>e===err)
     assert.equal(inserts.length,count+1)
@@ -155,10 +175,11 @@ test('pre-aborted signal creates zero rows; abort during failed send prevents ne
   assert.equal(inserts.length,1); assert.equal(sent.length,1)
   assert.equal(extras(inserts[0]).stopReason,'cancelled')
 })
-test('cancel while preparing next candidate issues no next request or row', async () => {
+test('cancel while preparing next candidate records cancellation without sending', async () => {
   const abort=new AbortController()
   await assert.rejects(execute(()=>{}, {signal:abort.signal, prepare:async (c: any)=> {if(c.model==='b')abort.abort();return async()=>{sent.push(c.model);throw httpError(429)}}}))
-  assert.deepEqual(sent,['a']); assert.equal(inserts.length,1)
+  assert.deepEqual(sent,['a']); assert.equal(inserts.length,2)
+  assert.equal(extras(inserts[1]).stopReason, 'cancelled')
 })
 test('consumption failure before output can advance; committed output cannot replay and retains partial usage', async () => {
   let consumed=0
@@ -233,16 +254,19 @@ test('ledger insert failure preserves success and increments the health counter 
   const before=getLlmLedgerHealth().droppedCalls
   pool.query=async()=>{throw new Error('fake insert failure')}
   await execute(async()=> 'ok', {plan:plan(['a'])})
+  await new Promise(resolve => setImmediate(resolve))
   assert.equal(getLlmLedgerHealth().droppedCalls,before+1)
   assert.ok(getLlmLedgerHealth().lastDropAt)
   assert.equal(sent.length,1)
 })
 test('Responses-to-Chat rejects unportable state before sending and translates JSON schema',async()=>{
-  settings.llm_config=JSON.stringify({version:1,models:[{model:'same',protocol:'chat'}]})
+  settings.llm_config=JSON.stringify({version:1,models:[{model:'same',protocol:'chat'}],roles:[{role:'support',models:['same']}]})
   await refreshServerSettings(true)
   const client=await getTrackedLlmClient(ctx)
   await assert.rejects(client.responses.create({model:'same',input:'hi',previous_response_id:'old'}),/Stateful/)
-  assert.equal(sent.length,0);assert.equal(inserts.length,0)
+  assert.equal(sent.length,0);assert.equal(inserts.length,1)
+  assert.equal(extras(inserts[0]).failureStage, 'prepare')
+  inserts = []
   create=async()=>({choices:[{message:{tool_calls:[{id:'c',function:{name:'tool',arguments:'{}'}}]}}]})
   const result=await client.responses.create({model:'same',input:'hi',text:{format:{type:'json_schema',name:'answer',schema:{type:'object'},strict:true}}})
   assert.equal(sent[0].args.response_format.json_schema.name,'answer')
@@ -254,11 +278,12 @@ test('purpose configuration overrides the legacy default model and invalid token
   await refreshServerSettings(true)
   const client=await getTrackedLlmClient(ctx)
   await assert.rejects(client.responses.create({model:'same',input:'hi',max_output_tokens:-1}),/budget/)
-  assert.equal(sent.length,0);assert.equal(inserts.length,0)
+  assert.equal(sent.length,0);assert.equal(inserts.length,2)
+  assert.ok(inserts.every(row => extras(row).failureStage === 'prepare'))
   await client.responses.create({model:'same',input:'hi'})
   assert.equal(sent[0].args.model,'palette-main')
 })
-for(const status of [401,403,429]) test(`real SDK with in-memory fetch: ${status} -> success records exactly two requests`,async()=>{
+for(const status of [401,403,404,429,503]) test(`real SDK with in-memory fetch: ${status} -> success records exactly two requests`,async()=>{
   setSdkClientFactory(null)
   const oldFetch=globalThis.fetch
   const requests: any[]=[]
@@ -613,4 +638,150 @@ for (const discovery of ['cold', 'empty', 'reseller-only'] as const) test('fix-i
   await refreshServerSettings(true)
   const explicit = await resolver.resolveRoleCall('company-a', 'managed', 'support', 'palette')
   assert.equal(explicit.candidates[0].route.platform, 'openai', 'explicit operator routes remain authoritative')
+})
+
+for (const status of [500, 502, 503, 504, 599]) test('5xx is failed even with quota/overload wording: ' + status, () => {
+  const classify = load('agents/llm-ledger.ts').classifyLlmCallError
+  assert.equal(classify(Object.assign(new Error('rate limit quota overload timeout'), { status })), 'failed')
+  assert.equal(classify(httpError(429)), 'rate_limited')
+})
+test('a pending recorder never delays success or fallback; rejection is handled', async () => {
+  const records: any[] = []
+  const record = async (row: any) => { records.push(row); if (row.status === 'ok') throw new Error('recorder unavailable'); await new Promise(() => {}) }
+  assert.equal(await execute(c => { if (c.model === 'a') throw httpError(503); return 'ok' }, {record}), 'ok')
+  assert.deepEqual(sent, ['a', 'b'])
+  assert.equal(records.length, 2)
+  await new Promise(resolve => setImmediate(resolve))
+})
+test('pgvector transient failure retries and then caches the successful probe', async () => {
+  let probes = 0
+  pool.query = async () => { if (++probes === 1) throw new Error('starting'); return { rows: [{ exists: true }] } }
+  const api = load('agents/embeddings.ts')
+  assert.equal(await api.hasPgVector(), false)
+  assert.equal(await api.hasPgVector(), true)
+  assert.equal(await api.hasPgVector(), true)
+  assert.equal(probes, 2)
+})
+test('image SDK receives caller signal; cancellation prevents storage and fallback', async () => {
+  settings.image_model = 'gpt-image-2'
+  settings.image_fallback_models = 'gpt-image-1'
+  await refreshServerSettings(true)
+  const controller = new AbortController()
+  let calls = 0, stores = 0
+  setSdkClientFactory(() => ({ images: { generate: async (_args: any, options: any) => {
+    calls++
+    assert.equal(options.signal, controller.signal)
+    controller.abort()
+    options.signal.throwIfAborted()
+  } } }))
+  await assert.rejects(load('llm.ts').executeImage({ companyId: null, purpose: 'agent-image' },
+    { prompt: 'image', size: '1024x1024' }, async () => { stores++ }, {signal: controller.signal}), {name:'AbortError'})
+  assert.equal(calls, 1); assert.equal(stores, 0)
+  assert.equal(extras(inserts[0]).stopReason, 'cancelled')
+})
+for (const model of ['qwen-image-plus', 'wanx-v1']) test('DashScope image cancellation reaches fetch: ' + model, async t => {
+  const env = isolatedProcess.env as Record<string, string>
+  Object.assign(env, { OPENAI_IMAGE_PROVIDER: 'dashscope', OPENAI_IMAGE_API_KEY: 'key', OPENAI_IMAGE_NATIVE_BASE_URL: 'https://dashscope.invalid/api/v1' })
+  t.after(() => { delete env.OPENAI_IMAGE_PROVIDER; delete env.OPENAI_IMAGE_API_KEY; delete env.OPENAI_IMAGE_NATIVE_BASE_URL })
+  settings.image_model = model
+  await refreshServerSettings(true)
+  const controller = new AbortController()
+  let requests = 0
+  globalThis.fetch = async (_url, options) => {
+    requests++
+    controller.abort()
+    assert.equal(options!.signal!.aborted, true)
+    throw options!.signal!.reason
+  }
+  setSdkClientFactory(options => ({apiKey:options.apiKey,baseURL:options.baseURL}))
+  await assert.rejects(load('llm.ts').executeImage({companyId:null,purpose:'agent-image'},
+    {prompt:'image',size:'1024x1024'}, async () => { assert.fail('cancelled image stored') }, {signal:controller.signal}), {name:'AbortError'})
+  assert.equal(requests, 1)
+})
+
+test('DashScope cancellation during polling delay sends no poll and stores no image', async t => {
+  const env = isolatedProcess.env as Record<string, string>
+  Object.assign(env, { OPENAI_IMAGE_PROVIDER: 'dashscope', OPENAI_IMAGE_API_KEY: 'key', OPENAI_IMAGE_NATIVE_BASE_URL: 'https://dashscope.invalid/api/v1' })
+  t.after(() => { delete env.OPENAI_IMAGE_PROVIDER; delete env.OPENAI_IMAGE_API_KEY; delete env.OPENAI_IMAGE_NATIVE_BASE_URL })
+  settings.image_model = 'wanx-v1'
+  await refreshServerSettings(true)
+  const controller = new AbortController()
+  let requests = 0
+  globalThis.fetch = async () => {
+    requests++
+    setImmediate(() => controller.abort())
+    return new Response(JSON.stringify({output:{task_id:'cancelled-task'}}))
+  }
+  setSdkClientFactory(options => ({apiKey:options.apiKey,baseURL:options.baseURL}))
+  const start = performance.now()
+  await assert.rejects(load('llm.ts').executeImage({companyId:null,purpose:'agent-image'},
+    {prompt:'image',size:'1024x1024'}, async () => { assert.fail('cancelled image stored') }, {signal:controller.signal}), {name:'AbortError'})
+  assert.ok(performance.now() - start < 1_000)
+  assert.equal(requests, 1)
+  assert.equal(extras(inserts[0]).taskId, 'cancelled-task')
+  assert.equal(extras(inserts[0]).stopReason, 'cancelled')
+})
+test('pre-aborted image makes no model requests or ledger attempts', async () => {
+  const controller = new AbortController()
+  controller.abort()
+  await assert.rejects(load('llm.ts').executeImage({companyId:null,purpose:'agent-image'},
+    {prompt:'image',size:'1024x1024'}, async () => { assert.fail('cancelled image stored') }, {signal:controller.signal}), {name:'AbortError'})
+  assert.equal(sent.length, 0)
+  assert.equal(inserts.length, 0)
+})
+
+for (const [model, platform] of [['k3','kimi'], ['kimi-for-coding','kimi'], ['grok-4','grok']] as const)
+  test('cold resolver uses the native credential for ' + model, async () => {
+    const gateway = gatewayFixture()
+    const query = pool.query
+    pool.query = async (sql: any, values?: any[]) => {
+      const result = await query(sql, values)
+      if (typeof sql === 'object' && sql.text.includes('owner_user_id')) {
+        result.rows[0].sub2api_api_key = JSON.stringify({openai:'gateway-key',[platform]:'native-key'})
+      }
+      return result
+    }
+    settings.support_model = model
+    settings.support_fallback_models = ''
+    await refreshServerSettings(true)
+    gateway.sub.listKeyModelsWithStatus = () => new Promise(() => {})
+    const plan = await load('llm-resolver.ts').resolveRoleCall('company-a','managed','support','palette')
+    assert.equal(plan.candidates[0].route.platform, platform)
+    let credential: string | undefined
+    setSdkClientFactory(options => { credential = options.apiKey; return {} })
+    await load('llm.ts').getLlmCandidateClient(plan,plan.candidates[0])
+    assert.equal(credential,'native-key')
+  })
+
+for (const disconnected of [false, true]) test('avatar HTTP cancellation reaches generation; already disconnected: ' + disconnected, async () => {
+  const source = readFileSync(new URL('api/router.ts', root), 'utf8')
+  const start = source.indexOf("api.post('/agents/:id/avatar/generate'")
+  const block = source.slice(start, source.indexOf('\n})', start) + 3)
+  assert.ok(start > 0)
+  const output = ts.transpileModule(block, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText
+  let handler: any
+  let signal: AbortSignal | undefined
+  let calls = 0
+  const { EventEmitter } = nativeRequire('node:events')
+  const response = Object.assign(new EventEmitter(), {
+    writableEnded: false, destroyed: disconnected,
+    json: () => assert.fail('disconnected response written'),
+    status: () => assert.fail('disconnected response status written'),
+  })
+  const generate = async (args: { signal: AbortSignal }) => {
+    calls++
+    signal = args.signal
+    return new Promise((_resolve, reject) => {
+      signal!.addEventListener('abort', () => reject(signal!.reason), { once: true })
+      response.destroyed = true
+      response.emit('close')
+    })
+  }
+  new Function('api', 'requireCompanyRole', 'generateAndPersistAvatar', 'HttpError', output)(
+    { post: (_path: string, fn: any) => { handler = fn } }, async () => ({ companyId: 'company-a' }), generate, Error,
+  )
+  await handler({ params: { id: 'agent-a' } }, response)
+  assert.equal(calls, disconnected ? 0 : 1)
+  if (!disconnected) assert.equal(signal?.aborted, true)
+  assert.equal(response.listenerCount('close'), 0)
 })

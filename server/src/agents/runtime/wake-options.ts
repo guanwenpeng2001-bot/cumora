@@ -1,4 +1,9 @@
+import { createHash } from 'node:crypto'
 import type { AgentTurnOptions } from '../turn.js'
+
+export function inboxTriageBoundary(inbox: readonly { id: string }[]): string {
+  return createHash('sha256').update(JSON.stringify(inbox.map(row => row.id).sort())).digest('hex')
+}
 
 const MAX_WAKE_PAYLOAD_CHARS = 16_384
 const MAX_BRIEF_TITLE_CHARS = 200
@@ -42,6 +47,7 @@ export function parseWakeData(raw: string | undefined): ParsedWakeData {
       at?: unknown
       idleReason?: unknown
       triageNote?: unknown
+      triageBoundary?: unknown
       backgroundBrief?: unknown
       pollBrief?: unknown
     }
@@ -66,6 +72,9 @@ export function parseWakeData(raw: string | undefined): ParsedWakeData {
     }
     if (reason === 'message.new' && typeof parsed.triageNote === 'string') {
       options.triageNote = parsed.triageNote.slice(0, 1800)
+      if (typeof parsed.triageBoundary === 'string' && /^[a-f0-9]{64}$/.test(parsed.triageBoundary)) {
+        options.triageBoundary = parsed.triageBoundary
+      }
     }
     if (reason === 'manual' || reason === 'background_scan') {
       const backgroundBrief = parseWakeBackgroundBrief(parsed.backgroundBrief)
@@ -178,6 +187,8 @@ export function mergeWakeTurnOptions(
     }
   }
   if (next.trigger === 'background_scan') return next
+  // Notes and their approval boundaries must always travel as one pair.
+  if (next.triageNote !== undefined) next = { ...next, triageBoundary: next.triageBoundary }
   const backgroundBrief = mergeWakeBackgroundBriefs(
     current.backgroundBrief,
     next.backgroundBrief,

@@ -57,7 +57,7 @@ function fixture(behavior: (request: any, signal?: AbortSignal) => AsyncIterable
   const turn = compile(functions + '\nexport { ' + names.join(', ') + ' }', {
     '../llm-resolver.js': resolver, '../llm-execution.js': execution, '../llm.js': llm, './cost.js': cost,
     './turn-compaction.js': compaction, './fallback.js': fallback, '../novita.js': {},
-  }, { ...compaction, ...streams, getServerSettingsSnapshot: settings.getServerSettingsSnapshot,
+  }, { ...compaction, ...streams, ...resolver, ...execution, ...llm, ...cost, ...fallback, getServerSettingsSnapshot: settings.getServerSettingsSnapshot,
     traceResponseOutputItem: () => ({}), errorText: (error: unknown) => String(error) })
   return { turn, records, requests, resolver, settings, snapshots,
     setClient: (factory: () => Promise<any>) => { clientOverride = factory },
@@ -172,7 +172,7 @@ async function budgetPlan(f: ReturnType<typeof fixture>, windows: number[]) {
 }
 const hopContext = { companyId: null, role: 'brain', purpose: 'agent-turn', extras: { hop: 1 } }
 
-test('turn budget: smaller fallback rejects irreducible input before sending or recording an attempt', async () => {
+test('turn budget: smaller fallback rejects irreducible input before sending and records preparation failure', async () => {
   const f = fixture(/** biome-ignore lint/correctness/useYield: fake upstream rejection */ async function* () {
     throw Object.assign(new Error('primary unavailable'), { status: 503 })
   })
@@ -182,7 +182,10 @@ test('turn budget: smaller fallback rejects irreducible input before sending or 
     compactionPolicy: { ...compaction.DEFAULT_COMPACTION_POLICY, autoEnabled: false },
   }), /input exceeds context budget/)
   assert.equal(f.requests.length, 1)
-  assert.equal(f.records.length, 1, 'no fictional attempt for a locally rejected candidate')
+  assert.equal(f.records.length, 2)
+  assert.equal(f.records[1].extras.failureStage, 'prepare')
+  assert.equal(f.records[1].status, 'failed')
+  assert.equal(f.records[1].usage, null)
 })
 
 test('turn budget: Chinese tool history fits a smaller fallback with automatic summaries disabled', async () => {
@@ -221,7 +224,9 @@ test('turn budget: configured hard ratio rejects input even when the physical wi
     compactionPolicy: { ...compaction.DEFAULT_COMPACTION_POLICY, softRatio: 0.4, hardRatio: 0.5 },
   }), /input exceeds context budget/)
   assert.equal(f.requests.length, 0)
-  assert.equal(f.records.length, 0)
+  assert.equal(f.records.length, 1)
+  assert.equal(f.records[0].extras.failureStage, 'prepare')
+  assert.equal(f.records[0].extras.stopReason, 'exhausted')
 })
 
 
@@ -448,4 +453,20 @@ test('turn defer reports exact unread message boundary and retryAt before return
     [{ id: 'one', conversation_id: 'c' }, { id: 'two', conversation_id: 'c' }])
   assert.deepEqual(deferred, [{ messageIds: ['one', 'two'], retryAt: 1_120_000 }])
   assert.equal(events[0].data.retryAt, deferred[0].retryAt)
+})
+
+test('turn budget: a larger fallback recovers from preparation failure without sending the small model', async () => {
+  const f = fixture(async function* () {
+    yield {type:'response.completed',response:{model:'brain-backup',output:[],usage:{input_tokens:1000,output_tokens:1}}}
+  })
+  const plan = await budgetPlan(f, [500, 10_000])
+  const result = await f.turn.executeAgentTurnHop({plan,context:hopContext,
+    input:[{role:'user',content:'中文'.repeat(500)}],instructions:'',tools:[],
+    compactionPolicy:{...compaction.DEFAULT_COMPACTION_POLICY,autoEnabled:false},
+  })
+  assert.equal(result.state.actualModel, 'brain-backup')
+  assert.deepEqual(f.requests.map(r => r.model), ['brain-backup'])
+  assert.deepEqual(f.records.map(r => r.status), ['failed', 'ok'])
+  assert.equal(f.records[0].extras.failureStage, 'prepare')
+  assert.equal(f.records[0].extras.nextCandidate, 'brain-backup')
 })

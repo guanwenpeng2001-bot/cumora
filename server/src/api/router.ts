@@ -3480,6 +3480,7 @@ api.delete('/agents/:id', async (req, res) => {
 export async function generateAndPersistAvatar(args: {
   agentId: string
   tenant: string
+  signal?: AbortSignal
 }): Promise<{ url: string }> {
   const { agentId: id, tenant } = args
   const { rows } = await pool.query<{
@@ -3569,7 +3570,7 @@ export async function generateAndPersistAvatar(args: {
       const { invalidatePersonaCache } = await import('../agents/personas.js')
       invalidatePersonaCache(id)
       return { url }
-    })
+    }, { signal: args.signal })
 }
 
 api.post('/agents/:id/avatar/generate', async (req, res) => {
@@ -3577,13 +3578,21 @@ api.post('/agents/:id/avatar/generate', async (req, res) => {
   // member could re-roll every agent's portrait in a loop and run up the
   // bill / consume the per-tenant image quota.
   const { companyId: tenant } = await requireCompanyRole(req)
+  const controller = new AbortController()
+  const disconnect = () => { if (!res.writableEnded) controller.abort() }
+  res.once('close', disconnect)
+  if (res.destroyed) disconnect()
   try {
-    const { url } = await generateAndPersistAvatar({ agentId: req.params.id, tenant })
-    res.json({ url })
+    controller.signal.throwIfAborted()
+    const { url } = await generateAndPersistAvatar({ agentId: req.params.id, tenant, signal: controller.signal })
+    if (!controller.signal.aborted) res.json({ url })
   } catch (e) {
+    if (controller.signal.aborted) return
     if (e instanceof HttpError) { res.status(e.status).json({ error: e.message }); return }
     const msg = e instanceof Error ? e.message : String(e)
     res.status(502).json({ error: `image generation failed: ${msg}` })
+  } finally {
+    res.off('close', disconnect)
   }
 })
 

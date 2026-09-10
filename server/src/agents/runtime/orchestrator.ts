@@ -322,7 +322,10 @@ function dnsLabelValue(value: string): string {
   return value
 }
 
+interface InitialInboxTriage { triageNote: string; triageBoundary?: string }
+
 function podManifest(args: {
+  initialTriage?: InitialInboxTriage
   agentId: string
   token: string
   image: string
@@ -423,7 +426,9 @@ spec:
       value: ${yamlQuote(String(args.noWorkMs))}
     - name: CUMORA_PERSONA_DIR
       value: "/workspace"
-    - name: CUMORA_AGENT_RUNTIME_TOKEN
+${args.initialTriage ? `    - name: CUMORA_AGENT_INITIAL_WAKE
+      value: ${yamlQuote(JSON.stringify({ reason: 'message.new', ...args.initialTriage }))}
+` : ''}    - name: CUMORA_AGENT_RUNTIME_TOKEN
       value: |-
 ${indent(args.token)}
 ${args.bootstrap ? `    - name: CUMORA_MANAGED_POD_BOOTSTRAP
@@ -856,7 +861,7 @@ const ENSURE_POD_WATCHDOG_MS = 180_000
  *  Doesn't wait for the Pod to be Ready / SSE-attached. The scheduler
  *  is free to enqueue the wake event on the bus; the Pod, once it
  *  connects, drains its inbox unconditionally and catches up. */
-export async function ensurePod(agentId: string): Promise<EnsurePodResult> {
+export async function ensurePod(agentId: string, initialTriage?: InitialInboxTriage): Promise<EnsurePodResult> {
   const existing = inFlight.get(agentId)
   if (existing) return existing
   const p = (async (): Promise<EnsurePodResult> => {
@@ -880,7 +885,7 @@ export async function ensurePod(agentId: string): Promise<EnsurePodResult> {
       watchdogTimer.unref?.()
     })
     try {
-      const result = await Promise.race([ensurePodImpl(agentId, controller.signal), watchdog])
+      const result = await Promise.race([ensurePodImpl(agentId, controller.signal, initialTriage), watchdog])
       if (watchdogFired) {
         // Alert because this means something hung BELOW the per-call
         // timeouts — a real bug we want to know about, not just a
@@ -901,7 +906,7 @@ export async function ensurePod(agentId: string): Promise<EnsurePodResult> {
   return p
 }
 
-async function ensurePodImpl(agentId: string, signal: AbortSignal): Promise<EnsurePodResult> {
+async function ensurePodImpl(agentId: string, signal: AbortSignal, initialTriage?: InitialInboxTriage): Promise<EnsurePodResult> {
   const startedAt = Date.now()
   // This is the final authorization boundary for managed execution. Scheduler
   // lookups are advisory only: assignment/tier can change between a wake and
@@ -1066,6 +1071,7 @@ async function ensurePodImpl(agentId: string, signal: AbortSignal): Promise<Ensu
     image: IMAGE,
     serverUrl: env.AGENT_RUNTIME_SERVER_URL,
     bootstrap,
+    initialTriage,
     openaiKey: bootstrap.direct.text.apiKey,
     openaiBaseUrl: bootstrap.direct.text.baseURL,
     idleMs: automationNumber('pod_idle_ms'),

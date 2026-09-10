@@ -62,6 +62,7 @@ export interface ImageBytesOk {
 export type ImageBytesResult = ImageBytesOk | ImageFetchFailure
 
 export interface ImageFetchOptions {
+  signal?: AbortSignal
   maxBytes?: number
   timeoutMs?: number
   maxRedirects?: number
@@ -92,6 +93,7 @@ interface ImageFetchDependencies {
 }
 
 interface RequiredImageFetchOptions {
+  signal?: AbortSignal
   maxBytes: number
   timeoutMs: number
   maxRedirects: number
@@ -354,10 +356,11 @@ async function fetchImageBytesWithDependencies(
 
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), options.timeoutMs)
+  const signal = options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal
   try {
     for (let redirects = 0; ; redirects += 1) {
-      const target = await resolveImageTarget(current, controller.signal, dependencies.lookup)
-      const response = await abortable(dependencies.request(target, controller.signal), controller.signal)
+      const target = await resolveImageTarget(current, signal, dependencies.lookup)
+      const response = await abortable(dependencies.request(target, signal), signal)
       const location = headerValue(response.headers, 'location')
 
       if (isRedirect(response.status) && location) {
@@ -394,7 +397,7 @@ async function fetchImageBytesWithDependencies(
 
       let buffer: Buffer | null
       try {
-        buffer = await readBodyWithCap(response, options.maxBytes, controller.signal)
+        buffer = await readBodyWithCap(response, options.maxBytes, signal)
       } catch (error) {
         response.cancel()
         throw error
@@ -409,7 +412,7 @@ async function fetchImageBytesWithDependencies(
       }
     }
   } catch (error) {
-    if (controller.signal.aborted) return { ok: false, reason: 'timeout' }
+    if (signal.aborted) return { ok: false, reason: 'timeout' }
     if (error instanceof BlockedImageUrlError) return { ok: false, reason: 'blocked' }
     return { ok: false, reason: 'error' }
   } finally {
@@ -427,6 +430,7 @@ export async function fetchImageBytes(
 ): Promise<ImageBytesResult> {
   if (imageFetchOverrideForTesting) return await imageFetchOverrideForTesting(url, options)
   return await fetchImageBytesWithDependencies(url, {
+    signal: options.signal,
     maxBytes: options.maxBytes ?? MAX_IMAGE_BYTES,
     timeoutMs: options.timeoutMs ?? FETCH_TIMEOUT_MS,
     maxRedirects: options.maxRedirects ?? MAX_REDIRECTS,
@@ -465,6 +469,7 @@ export async function _fetchImageBytesForTest(
   dependencies: ImageFetchDependencies,
 ): Promise<ImageBytesResult> {
   return await fetchImageBytesWithDependencies(url, {
+    signal: options.signal,
     maxBytes: options.maxBytes ?? MAX_IMAGE_BYTES,
     timeoutMs: options.timeoutMs ?? FETCH_TIMEOUT_MS,
     maxRedirects: options.maxRedirects ?? MAX_REDIRECTS,

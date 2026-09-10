@@ -526,18 +526,23 @@ export function supportsDashscopeChatAudio(model: string): boolean {
 
 export const MODEL_PLATFORM_PRIORITY: readonly Platform[] = ['kimi', 'deepseek', 'grok', 'openai']
 
-/** Prefer the native DeepSeek pool even while discovery is cold or stale.
- *  Other model ids use discovered ownership, then the historical fallback.
+/** Prefer recognized native pools even while discovery is cold or stale.
+ *  DashScope/Qwen use the existing OpenAI-platform pool, not a separate key.
  *  Explicit route overrides are handled by the resolver before this helper. */
 export function pickPlatformForModel(
   modelsByPlatform: Partial<Record<Platform, ReadonlySet<string>>>,
   model: string,
   available: readonly Platform[],
 ): Platform {
-  if (/^deepseek-/i.test(model.trim()) && available.includes('deepseek')) return 'deepseek'
+  const id = model.trim().toLowerCase()
+  const native: Platform | undefined = /^(kimi|moonshot)(?:$|[-/])|^k\d+(?:$|[.-])/.test(id) ? 'kimi'
+    : /^deepseek(?:$|[-/])/.test(id) ? 'deepseek'
+    : /^grok(?:$|[-/])/.test(id) ? 'grok'
+    : /^(dashscope|qwen)(?:$|[-/\d])/.test(id) ? 'openai' : undefined
+  if (native && available.includes(native)) return native
   for (const platform of MODEL_PLATFORM_PRIORITY) {
     if (!available.includes(platform)) continue
-    if (modelsByPlatform[platform]?.has(model)) return platform
+    if ([...modelsByPlatform[platform] ?? []].some(known => known.trim().toLowerCase() === id)) return platform
   }
   if (available.includes('openai')) return 'openai'
   return available[0] ?? 'openai'

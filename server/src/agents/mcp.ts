@@ -202,13 +202,30 @@ export interface McpClientHandle {
   close(): Promise<void>
 }
 
+/** Only connector-declared credentials cross the stdio boundary. */
+export function stdioEnvironment(explicit: Record<string, string> = {}, inherited: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const allowed = new Set([
+    'PATH', 'HOME', 'USER', 'LOGNAME', 'LANG', 'LANGUAGE', 'LC_ALL', 'LC_CTYPE',
+    'TMPDIR', 'TMP', 'TEMP', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT',
+    'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'APPDATA', 'LOCALAPPDATA',
+  ])
+  const childEnv: NodeJS.ProcessEnv = {}
+  // Windows env names are case insensitive. Avoid duplicate Path/PATH keys.
+  const normalize = (key: string) => process.platform === 'win32' ? key.toUpperCase() : key
+  for (const [key, value] of Object.entries(inherited)) {
+    if (value !== undefined && allowed.has(normalize(key))) childEnv[normalize(key)] = value
+  }
+  for (const [key, value] of Object.entries(explicit)) childEnv[normalize(key)] = value
+  return childEnv
+}
+
 /** stdio transport: spawn the command with cwd pinned to the agent
  *  workspace; newline-delimited JSON-RPC on stdout. */
 function connectStdio(spec: McpConnectorSpec, cwd: string): { pump: RpcPump; child: ChildProcess; close: () => Promise<void> } {
   const pump = new RpcPump()
   const child = spawn(spec.command ?? '', spec.args ?? [], {
     cwd,
-    env: { ...process.env, ...(spec.env ?? {}) },
+    env: stdioEnvironment(spec.env),
     stdio: ['pipe', 'pipe', 'pipe'],
     windowsHide: true,
     detached: process.platform !== 'win32',

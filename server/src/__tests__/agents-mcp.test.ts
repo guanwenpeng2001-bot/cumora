@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   prefixedToolName, splitPrefixedToolName, mcpToolToFunctionTool,
-  mcpResultToText, connectMcpConnector,
+  mcpResultToText, connectMcpConnector, stdioEnvironment,
 } from '../agents/mcp.js'
 
 // ── prefixedToolName / splitPrefixedToolName ─────────────────────────────
@@ -288,4 +288,25 @@ test('stdio cancellation affects one RPC, preserving the connection and original
   await cancelled
   const result = await client.callTool(prefixedToolName('echo_', 'echo'), { text: 'still alive' })
   assert.equal(result.text, 'still alive')
+})
+
+
+test('stdio env excludes ambient credentials and runtime/bootstrap/loader settings', () => {
+  const childEnv = stdioEnvironment({ CONNECTOR_TOKEN: 'connector-only', LANG: 'C.UTF-8' }, {
+    PATH: '/bin', HOME: '/home/agent', LANG: 'C', SYSTEMROOT: 'C:/Windows',
+    DATABASE_URL: 'db-secret', REDIS_URL: 'redis-secret', OPENAI_API_KEY: 'provider-secret',
+    NOVITA_API_KEY: 'novita-secret', ORCAROUTER_API_KEY: 'router-secret',
+    CUMORA_AGENT_RUNTIME_TOKEN: 'jwt', CUMORA_MANAGED_POD_BOOTSTRAP: 'all-the-keys',
+    NODE_OPTIONS: '--require malicious-loader', HTTPS_PROXY: 'http://proxy-with-credentials',
+  })
+  assert.deepEqual(childEnv, { PATH: '/bin', HOME: '/home/agent', LANG: 'C.UTF-8',
+    SYSTEMROOT: 'C:/Windows', CONNECTOR_TOKEN: 'connector-only' })
+})
+
+test('stdio env permits only explicitly supplied connector credentials', () => {
+  assert.deepEqual(stdioEnvironment({ OPENAI_API_KEY: 'connector-key' }, { OPENAI_API_KEY: 'server-key' }),
+    { OPENAI_API_KEY: 'connector-key' })
+  if (process.platform === 'win32') {
+    assert.deepEqual(stdioEnvironment({ PATH: 'explicit' }, { Path: 'inherited' }), { PATH: 'explicit' })
+  }
 })

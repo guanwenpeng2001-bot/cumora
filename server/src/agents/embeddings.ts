@@ -110,7 +110,8 @@ export async function hasPgVector(): Promise<boolean> {
     )
     pgvectorAvailable = !!rows[0]?.exists
   } catch {
-    pgvectorAvailable = false
+    // A failed probe says nothing about extension availability; retry next time.
+    return false
   }
   return pgvectorAvailable
 }

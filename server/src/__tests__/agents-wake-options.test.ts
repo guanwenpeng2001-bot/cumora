@@ -11,6 +11,7 @@ import {
   mergeWakeBackgroundBriefs,
   mergeWakeTurnOptions,
   parseWakeData,
+  inboxTriageBoundary,
   wakeHasActionableInput,
 } from '../agents/runtime/wake-options.js'
 
@@ -148,4 +149,16 @@ test('malformed or oversized wake payloads cannot manufacture work', () => {
   }))
   assert.equal(emptyBrief.options.backgroundBrief, undefined)
   assert.equal(wakeHasActionableInput(false, { title: '', body: '' }), false)
+})
+
+
+test('scheduler triage note and exact inbox boundary survive wake parsing and coalescing', () => {
+  const boundary = inboxTriageBoundary([{ id: 'b' }, { id: 'a' }])
+  assert.equal(boundary, inboxTriageBoundary([{ id: 'a' }, { id: 'b' }]))
+  assert.notEqual(boundary, inboxTriageBoundary([{ id: 'a' }, { id: 'b' }, { id: 'c' }]))
+  const options = parseWakeData(JSON.stringify({ reason: 'message.new', triageNote: 'execute', triageBoundary: boundary })).options
+  assert.deepEqual(options, { trigger: 'message.new', triageNote: 'execute', triageBoundary: boundary })
+  assert.equal(mergeWakeTurnOptions(options, { trigger: 'message.new' })?.triageBoundary, boundary)
+  assert.equal(mergeWakeTurnOptions(options, { trigger: 'message.new', triageNote: 'unbound' })?.triageBoundary, undefined)
+  assert.equal(parseWakeData(JSON.stringify({ reason: 'message.new', triageNote: 'execute', triageBoundary: 'invalid' })).options.triageBoundary, undefined)
 })

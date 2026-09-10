@@ -248,3 +248,31 @@ test('first call waits for DB prices rather than freezing the cold env fallback'
   assert.equal(f.ledger[0][13], 23)
   assert.equal(JSON.parse(f.ledger[0][19]).pricing.source, 'database')
 })
+
+test('cold upsert and concurrent refresh retain successful admin prices', async () => {
+  const f = fixture()
+  let finish!: (value: any) => void
+  f.setSelect(() => new Promise(resolve => { finish = resolve }))
+  const refresh = f.pricing.refreshModelPricing()
+  assert.equal(f.pricing.captureDbPricing()('missing'), null)
+  await f.pricing.upsertModelPricing(priceInput('cold-edit', 12))
+  assert.equal(f.pricing.captureDbPricing()('cold-edit').inPer1M, 12)
+  finish({rows:[]})
+  await refresh
+  assert.equal(f.pricing.captureDbPricing()('cold-edit').inPer1M, 12)
+})
+test('refresh failures are throttled even without a snapshot; forced refresh can recover', async () => {
+  const f = fixture()
+  let selects = 0
+  f.setSelect(async () => { selects++; throw new Error('starting') })
+  await f.pricing.refreshModelPricing()
+  for (let i = 0; i < 3; i++) {
+    await f.pricing.refreshModelPricing()
+    assert.equal(f.pricing.captureDbPricing()('missing'), null)
+  }
+  assert.equal(selects, 1)
+  f.setSelect(undefined)
+  await f.pricing.upsertModelPricing(priceInput())
+  await f.pricing.refreshModelPricing(true)
+  assert.equal(f.pricing.captureDbPricing()('priced-model').inPer1M, 2)
+})

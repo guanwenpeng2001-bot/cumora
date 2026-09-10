@@ -90,6 +90,7 @@ function fixture(bootstrap?: Managed.ManagedPodSettings, extraEnv: Record<string
         if (dep === 'node:crypto') return { randomBytes, randomUUID }
         const target = posix.normalize(posix.join(posix.dirname(name), dep)).replace(/\.js$/, '')
         if (target === 'db/pool') return { pool }
+        if (target === 'agents/image-fetcher') return { fetchImageBytes: async () => { throw new Error('Unexpected image download in inline-image fixture') } }
         return load(target)
       },
     })
@@ -455,7 +456,7 @@ test('T52: gateway exhaustion reaches real direct HTTP with one plan, budget and
     requests.length = 0
     const f = await fallbackFixture(fallbackConfig(), base, { OPENAI_API_KEY: '' })
     await assert.rejects(f.execution.executeTrackedText({ companyId: 'company-a', purpose: 'isolated', role: 'brain' },
-      'responses', { input: 'hello' }, { maxRetries: 0 }), /direct-unconfigured/)
+      'responses', { input: 'hello' }, { maxRetries: 0 }), /isolated gateway failure/)
     assert.equal(requests.length, 2)
     assert.ok(requests.every(r => r.path.startsWith('/gateway/')))
   })

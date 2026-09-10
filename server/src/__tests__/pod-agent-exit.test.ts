@@ -127,7 +127,7 @@ test('keeps running while NO_WORK_MS not yet crossed', () => {
 import { readFileSync } from 'node:fs'
 import ts from 'typescript'
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { mergeWakeTurnOptions } from '../agents/runtime/wake-options.js'
+import { mergeWakeTurnOptions, parseWakeData } from '../agents/runtime/wake-options.js'
 
 function drainFixture() {
   const source = readFileSync(new URL('../agents/runtime/pod-agent.ts', import.meta.url), 'utf8')
@@ -152,7 +152,8 @@ function drainFixture() {
     options.onInboxDeferred({ messageIds: ['old'], retryAt: now + 120_000 })
   }
   const deps = {
-    Date: { now: () => now }, mergeWakeTurnOptions, decidePodExit,
+    Date: { now: () => now }, mergeWakeTurnOptions, parseWakeData, decidePodExit,
+    process: { env: {} },
     runtime: { loadInbox: async () => inbox },
     runAgentTurn: async (_id: string, options: any) => { calls.push(options); await run(options) },
     setTimeout: (fn: () => void, ms: number) => timer(fn, ms, false),

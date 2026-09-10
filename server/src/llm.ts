@@ -28,7 +28,11 @@ import { resolveTenantLlmContext, tenantRoutingSnapshot, invalidateTenantModelSn
 import OpenAI from 'openai'
 import { resolveDirectLlmEnv } from './env.js'
 export { resolveRoleCall } from './llm-resolver.js'
-import type { RoleCallPlan, RoleCallCandidate } from './llm-resolver.js'
+import { resolveRoleCall, type RoleCallPlan, type RoleCallCandidate } from './llm-resolver.js'
+import { executeLlmPlan } from './llm-execution.js'
+import { recordLlmCall, type LlmCallContext } from './agents/llm-ledger.js'
+import { fetchImageBytes } from './agents/image-fetcher.js'
+import { measuredUsage } from './agents/cost.js'
 import { createChatResponsesShim } from './novita.js'
 import { fallbackReason, isLlmCancellation } from './agents/fallback.js'
 import { sub2apiRoutingConfigured, pickPlatformForModel, SUB2API_PLATFORMS, type Platform, type ApiKeyMap } from './sub2api.js'
@@ -296,8 +300,9 @@ interface DashscopeTaskResponse {
   }
 }
 
-function dashscopeImageClient(apiKey: string, base: string, progress?: (stage: 'poll', taskId?: string) => void): OpenAI {
+function dashscopeImageClient(apiKey: string, base: string, progress?: (stage: 'poll', taskId?: string) => void, signal?: AbortSignal): OpenAI {
   base = base.replace(/\/$/, '')
+  const requestSignal = (timeout: number) => AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(timeout)])
 
   function dashscopeHttpError(message: string, status: number): Error & { status: number } {
     return Object.assign(new Error(message), { status })
@@ -314,7 +319,7 @@ function dashscopeImageClient(apiKey: string, base: string, progress?: (stage: '
         input: { messages: [{ role: 'user', content: [{ text: prompt }] }] },
         parameters: { size: (size ?? '1024x1024').replace('x', '*'), n: n ?? 1 },
       }),
-      signal: AbortSignal.timeout(180_000),
+      signal: requestSignal(180_000),
     })
     if (!resp.ok) throw dashscopeHttpError(`dashscope multimodal-generation failed: ${resp.status} ${await resp.text()}`, resp.status)
     progress?.('poll')
@@ -340,7 +345,7 @@ function dashscopeImageClient(apiKey: string, base: string, progress?: (stage: '
         input: { prompt },
         parameters: { size: (size ?? '1024x1024').replace('x', '*'), n: n ?? 1 },
       }),
-      signal: AbortSignal.timeout(30_000),
+      signal: requestSignal(30_000),
     })
     if (!create.ok) throw dashscopeHttpError(`dashscope task create failed: ${create.status} ${await create.text()}`, create.status)
     progress?.('poll')
@@ -351,10 +356,15 @@ function dashscopeImageClient(apiKey: string, base: string, progress?: (stage: '
     progress?.('poll', taskId)
     const deadline = Date.now() + 180_000
     for (;;) {
-      await new Promise((r) => setTimeout(r, 2000))
+      signal?.throwIfAborted()
+      await new Promise<void>((resolve, reject) => {
+        const onAbort = () => { clearTimeout(timer); reject(signal!.reason) }
+        const timer = setTimeout(() => { signal?.removeEventListener('abort', onAbort); resolve() }, 2000)
+        signal?.addEventListener('abort', onAbort, { once: true })
+      })
       const poll = await fetch(`${base}/tasks/${taskId}`, {
         headers: { Authorization: `Bearer ${apiKey}` },
-        signal: AbortSignal.timeout(30_000),
+        signal: requestSignal(30_000),
       })
       if (!poll.ok) throw dashscopeHttpError(`dashscope task poll failed: ${poll.status}`, poll.status)
       const status = (await poll.json()) as DashscopeTaskResponse
@@ -396,21 +406,18 @@ export function getImageClient(): OpenAI {
 }
 
 /** One image attempt includes generation, polling and delivery; external state forbids replay. */
-export async function executeImage<T>(context: import('./agents/llm-ledger.js').LlmCallContext,
+export async function executeImage<T>(context: LlmCallContext,
   args: { prompt: string; size: '1024x1024' | '1536x1024' | '1024x1536'; n?: number },
-  store: (buffer: Buffer) => Promise<T>): Promise<T> {
-  const { resolveRoleCall } = await import('./llm-resolver.js')
-  const { executeLlmPlan } = await import('./llm-execution.js')
-  const { recordLlmCall } = await import('./agents/llm-ledger.js')
-  const { fetchImageBytes } = await import('./agents/image-fetcher.js')
-  const { measuredUsage } = await import('./agents/cost.js')
+  store: (buffer: Buffer) => Promise<T>, options: { signal?: AbortSignal } = {}): Promise<T> {
+  const { signal } = options
+  signal?.throwIfAborted()
   if (!args.prompt.trim()) throw new Error('Image prompt is empty')
   const plan = await resolveRoleCall(context.companyId, context.domain ?? (context.companyId ? 'managed' : 'server'),
-    'image', context.purpose, { id: context.agentId ?? undefined })
+    'image', context.purpose, { id: context.agentId ?? undefined }, undefined, signal)
   let stage: 'generation' | 'poll' | 'download' | 'storage' = 'generation'
   let taskId: string | undefined
   let generationCompleted = false
-  return executeLlmPlan({ plan, context: { ...context, role: 'image' }, sdkMaxRetries: 0,
+  return executeLlmPlan({ plan, context: { ...context, role: 'image' }, signal, sdkMaxRetries: 0,
     record: record => recordLlmCall({ ...record, extras: { ...record.extras,
       n: args.n ?? 1, size: args.size, unpriced: 'image-pricing-unavailable',
       imageStage: stage, failureStage: record.status === 'ok' ? null : stage,
@@ -428,9 +435,9 @@ export async function executeImage<T>(context: import('./agents/llm-ledger.js').
           // Synchronous success also commits, but has no polling phase.
           if (!candidate.requestModel.startsWith('qwen-image')) stage = nextStage
           if (id) taskId = id
-        }) : routed
+        }, signal) : routed
       return async () => {
-        const response = await client.images.generate({ ...args, model: candidate.requestModel }, { maxRetries: 0 })
+        const response = await client.images.generate({ ...args, model: candidate.requestModel }, { maxRetries: 0, signal })
         state.committed = true
         state.rawUsage = response.usage ?? null
         state.usage = measuredUsage(response.usage, 'responses')
@@ -440,15 +447,18 @@ export async function executeImage<T>(context: import('./agents/llm-ledger.js').
         const first = response.data?.[0]
         if (!first?.b64_json && !first?.url) throw new Error('image API returned no image')
         generationCompleted = true
+        signal?.throwIfAborted()
         stage = 'download'
         let buffer: Buffer
         if (first.b64_json) buffer = Buffer.from(first.b64_json, 'base64')
         else {
-          const fetched = await fetchImageBytes(first.url!, { maxBytes: 20 * 1024 * 1024, timeoutMs: 30_000 })
+          const fetched = await fetchImageBytes(first.url!, { maxBytes: 20 * 1024 * 1024, timeoutMs: 30_000, signal })
+          signal?.throwIfAborted()
           if (!fetched.ok) throw new Error(`image API download failed (${fetched.reason})`)
           buffer = fetched.buffer
         }
         if (!buffer.length) throw new Error('image API returned empty image')
+        signal?.throwIfAborted()
         stage = 'storage'
         return store(buffer)
       }
@@ -493,9 +503,6 @@ export async function transcribeAudio(audioBase64: unknown, format: unknown = 'w
   const signal = AbortSignal.any([...(options.signal ? [options.signal] : []), AbortSignal.timeout(remaining)])
   signal.throwIfAborted()
   if (!remaining) throw new DOMException('Audio deadline expired', 'TimeoutError')
-  const { resolveRoleCall } = await import('./llm-resolver.js')
-  const { executeLlmPlan } = await import('./llm-execution.js')
-  const { measuredUsage } = await import('./agents/cost.js')
   const context = { companyId, purpose: 'audio-transcription' as const, role: 'audio' as const }
   const plan = await resolveRoleCall(companyId, companyId ? 'managed' : 'server', 'audio', context.purpose, undefined, undefined, signal)
   return executeLlmPlan({ plan, context, signal, sdkMaxRetries: 0,

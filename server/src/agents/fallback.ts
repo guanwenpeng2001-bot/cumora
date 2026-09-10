@@ -4,7 +4,7 @@
  * Every model role resolves to an ordered chain: primary + fallback
  * routes (server_settings, env fallback). A call that fails with a
  * fallbackable error advances to the next hop. Only upstream authentication,
- * quota, rate-limit, server and identified transport failures can advance.
+ * quota, missing-model, rate-limit, server and identified transport failures can advance.
  * Cancellation, local validation and programming errors surface immediately.
  *
  * Embedding deliberately has NO chain: embedding models define
@@ -29,7 +29,7 @@ export function fallbackReason(e: unknown): string | null {
   const err = e as LlmError | null
   const status = err?.status
   if (typeof status === 'number') {
-    return [401, 402, 403, 429].includes(status) || (status >= 500 && status <= 599)
+    return [401, 402, 403, 404, 429].includes(status) || (status >= 500 && status <= 599)
       ? `upstream-http-${status}` : null
   }
   if (err?.name === 'APIConnectionError' || err?.name === 'APIConnectionTimeoutError' || err?.name === 'TimeoutError') {

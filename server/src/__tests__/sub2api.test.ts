@@ -197,3 +197,14 @@ test('DeepSeek routing survives cold, empty and reseller-only discovery without 
   assert.equal(pickPlatformForModel({}, 'deepseekish-model', ['openai', 'deepseek']), 'openai')
   assert.equal(pickPlatformForModel({ grok: new Set(['custom-model']) }, 'custom-model', ['openai', 'deepseek', 'grok']), 'grok')
 })
+
+test('native model families route with cold or reseller-only catalogs; Qwen shares OpenAI', () => {
+  const platforms = ['openai', 'kimi', 'deepseek', 'grok'] as const
+  for (const [model, expected] of [['k3','kimi'], ['k2.7','kimi'], ['kimi-for-coding','kimi'], ['moonshot-v1','kimi'],
+    ['grok-4','grok'], [' Grok-imagine-image ','grok'], ['deepseek-v4-pro','deepseek'], ['dashscope/qwen-max','openai'],
+    ['qwen3-max','openai'], ['unknown','openai']] as const) {
+    for (const catalog of [{}, { openai: new Set([model]) }]) assert.equal(pickPlatformForModel(catalog, model, platforms), expected)
+  }
+  assert.equal(pickPlatformForModel({kimi:new Set(['Custom-ID'])}, ' custom-id ', platforms), 'kimi')
+  assert.equal(pickPlatformForModel({}, 'kimi-for-coding', ['openai']), 'openai')
+})
