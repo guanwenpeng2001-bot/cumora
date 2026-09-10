@@ -33,6 +33,7 @@ import {
 import { deliver as deliverWake, deliverSteer, type PollWakeBrief } from './runtime/wake-bus.js'
 import { inprocClient, isAgentBusy } from './runtime/inproc-client.js'
 import { classifyInboxTriage, type InboxTriageVerdict } from './inbox-triage.js'
+import { triageDisposition, deferTriage, type TriageDisposition } from './triage-core.js'
 import type { AgentTurnOptions } from './turn.js'
 import { recipientsForRoute, routeMessage } from './routing.js'
 import { Semaphore } from '../concurrency.js'
@@ -64,8 +65,10 @@ type WakeOptions = Pick<AgentTurnOptions, 'idleReason' | 'backgroundBrief' | 'po
   triageTarget?: { conversationId: string; messageId: string }
   /** Message fan-out must resolve placement before delivering to a live runtime. */
   placementTriage?: boolean
+  triageDeferred?: TriageDisposition
+  triageBoundary?: string
 }
-type WakeFailureClass = 'ensure_pod' | 'host_resolution'
+type WakeFailureClass = 'ensure_pod' | 'host_resolution' | 'triage'
 
 interface WakeRetryJob {
   id: string
@@ -106,7 +109,7 @@ export function _shouldRetryWakeFailure(
   failureReason: string,
   failureClass: WakeFailureClass,
 ): boolean {
-  if (failureClass === 'host_resolution') return true
+  if (failureClass === 'host_resolution' || failureClass === 'triage') return true
   return _shouldRetryEnsurePodFailure(reason, failureReason)
 }
 
@@ -126,7 +129,7 @@ async function postWakeRetryExhaustedNotice(
       conversationId,
       agentId,
       noticeKind: 'ensure_pod_retry_exhausted',
-      text: 'Managed agent Pod could not start after ' + Math.max(0, attempt - 1) +
+      text: 'Managed agent wake could not complete after ' + Math.max(0, attempt - 1) +
         ' retries. The message remains in the inbox; please try again later or contact an administrator. ' +
         'Last error: ' + failureReason.slice(0, 300),
       dedupeKey: 'ensure_pod_retry_exhausted:' + agentId + ':' + conversationId,
@@ -152,7 +155,7 @@ async function scheduleWakeRetry(
   failureClass: WakeFailureClass = 'ensure_pod',
 ): Promise<void> {
   if (!_shouldRetryWakeFailure(reason, failureReason, failureClass)) return
-  const id = wakeRetryId(agentId, reason, conversationId)
+  const id = wakeRetryId(agentId, reason, options.triageBoundary ? null : conversationId) + (options.triageBoundary ? `:${options.triageBoundary}` : '')
   const maxAttempts = reason === 'message.new'
     ? MESSAGE_WAKE_RETRY_MAX_ATTEMPTS
     : WAKE_RETRY_MAX_ATTEMPTS
@@ -168,14 +171,20 @@ async function scheduleWakeRetry(
     })
     return
   }
-  const dueAt = Date.now() + _wakeRetryDelayMs(attempt) + Math.floor(Math.random() * 1_000)
+  const dueAt = Math.max(Date.now() + _wakeRetryDelayMs(attempt), options.triageDeferred?.retryAt ?? 0) + Math.floor(Math.random() * 1_000)
   const job: WakeRetryJob = {
-    id, agentId, reason, conversationId, steerPayload, options,
+    id, agentId, reason, conversationId, steerPayload,
+    options: { ...options, triageNote: undefined, triageDeferred: undefined },
     attempt,
     lastFailure: failureReason,
   }
-  await redis.hset(WAKE_RETRY_JOB_KEY, id, JSON.stringify(job))
-  await redis.zadd(WAKE_RETRY_DUE_KEY, dueAt, id)
+  const queued = await redis.eval(`
+    if redis.call('HEXISTS', KEYS[1], ARGV[1]) == 1 then return 0 end
+    redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
+    redis.call('ZADD', KEYS[2], ARGV[3], ARGV[1])
+    return 1
+  `, 2, WAKE_RETRY_JOB_KEY, WAKE_RETRY_DUE_KEY, id, JSON.stringify(job), dueAt)
+  if (queued !== 1) return
   console.warn(`[scheduler] ${agentId} ${reason} wake retry scheduled in ${Math.round((dueAt - Date.now()) / 1000)}s after ${failureClass}: ${failureReason}`)
 }
 
@@ -409,10 +418,15 @@ async function wakeOne(
     // BYOA daemons triage locally. Managed Agents are gated before a live-pod
     // wake or a new Pod; the flag is serialized into retries so recovery cannot
     // bypass the same placement + triage contract.
-    if (!isByoaKind(host.kind) && reason === 'message.new' && !options.triageNote) {
+    if (!isByoaKind(host.kind) && reason === 'message.new') {
       const verdict = await triageWakeRecipient(agentId, options.triageTarget ?? null)
       if (!verdict) return false
       options = { ...options, ...verdict }
+      if (verdict.triageDeferred) {
+        await scheduleWakeRetry(agentId, reason, conversationId, steerPayload, options,
+          retryAttempt + 1, verdict.triageDeferred.reason, 'triage')
+        return false
+      }
     }
   }
 
@@ -929,19 +943,22 @@ export async function triageWakeRecipient(
       inbox,
       context,
     })
-    if (!verdict.actionable) {
+    const disposition = triageDisposition(verdict)
+    const triageBoundary = JSON.stringify(inbox.map((row) => row.id).sort())
+    if (disposition.outcome === 'defer') return { triageDeferred: disposition, triageBoundary }
+    if (disposition.outcome === 'ignore' && disposition.ackAllowed) {
+      const seen = new Map<string, string>()
+      for (const row of inbox) seen.set(row.conversation_id, row.id)
+      await Promise.all([...seen].map(([conversationId, upToMessageId]) =>
+        inprocClient.markConversationRead({ agentId, conversationId, upToMessageId })))
       console.log(`[scheduler] ${agentId} message.new skipped by inbox triage: ${verdict.reason}`)
       return null
     }
-    return { triageNote: renderTriageNote(verdict) }
+    return { triageNote: renderTriageNote(verdict), triageBoundary }
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err)
-    console.warn(`[scheduler] ${agentId} inbox triage unavailable; waking fail-open: ${reason}`)
-    return {
-      triageNote:
-        `Small-brain inbox triage failed in the scheduler, so this wake is fail-open. ` +
-        `Read the inbox/context yourself and do not reply unless the new messages concern you. Reason: ${reason.slice(0, 500)}`,
-    }
+    console.warn(`[scheduler] ${agentId} inbox triage unavailable; deferred: ${reason}`)
+    return { triageDeferred: deferTriage('fail-open', reason, 'payload-unavailable') }
   }
 }
 

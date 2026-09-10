@@ -21,6 +21,7 @@ import { publicBodyParserError } from '../../body-parser-errors.js'
 import { AGENDA_CLASSIFIER_ERROR, claimStallNudge, classifyAgendaActionable, gatherAgentAgenda, renderAgendaBrief } from '../agenda.js'
 import { runCli } from '../cli.js'
 import { buildTriageRequest, gatherClaimsByConvo } from '../inbox-triage.js'
+import { deferTriage } from '../triage-core.js'
 import {
   createAgentRun,
   finishAgentRunForOwner,
@@ -242,21 +243,6 @@ runtimeRouter.get('/inbox-triage/payload', withAgent(async (c, _req, res) => {
   }
   const inbox = await inprocClient.loadInbox(c.sub)
   const convoIds = [...new Set(inbox.map((m) => m.conversation_id))]
-  // Content-blind cost floor (NOT a loop decision). The daemon self-polls every
-  // 20s, bypassing the scheduler's fan-out rate limit, so a runaway could spin
-  // the local model unbounded. Bound it by the agent's activation budget — same
-  // counter the cloud fan-out uses. Whether to reply is still 100% the small
-  // model's call (it sees "thread heat" and goes quiet on agent-only threads);
-  // this only stops cost from running away if the model fails to.
-  if (convoIds.length > 0 && !(await consumeAgentTurnToken(c.sub))) {
-    res.json({ verdict: {
-      actionable: false,
-      reason: 'turn-rate floor: over activation budget this minute — deferring (the next minute or a human revives it)',
-      promptNote: '',
-      source: 'rate-limited',
-    } })
-    return
-  }
   const context = await inprocClient.loadContext(c.sub, c.companyId, convoIds)
   // Authoritative "real work here" signal (active worklog claims per
   // convo) — lets the gate suppress unclaimed agent-only chatter from FACT, and
@@ -276,7 +262,13 @@ runtimeRouter.get('/inbox-triage/payload', withAgent(async (c, _req, res) => {
   // while Cloud answered. Same model, DIFFERENT prompt → different behavior. Drop
   // strict so BYOA runs the EXACT same gate prompt as Cloud. Cost is still bounded by
   // the per-minute activation rate floor above, not by an aggressive prompt.
-  res.json(buildTriageRequest({ agentId: c.sub, persona, inbox, context, claimsByConvo, humanActiveInCompany }))
+  const request = buildTriageRequest({ agentId: c.sub, persona, inbox, context, claimsByConvo, humanActiveInCompany })
+  const messageIds = inbox.map((row) => row.id)
+  if ((!request.verdict || request.verdict.source === 'dm-agent-engage') && !(await consumeAgentTurnToken(c.sub))) {
+    res.json({ messageIds, verdict: deferTriage('rate-limited', 'turn-rate floor: over activation budget this minute', 'rate-limited') })
+    return
+  }
+  res.json({ ...request, messageIds })
 }))
 
 // BOARD-AWARENESS for BYOA: the daemon has no DB, so the server gathers this

@@ -46,7 +46,7 @@ import {
   wakeHasActionableInput,
 } from '../runtime/wake-options.js'
 import { SKYPE_EMOTICONS_GUIDE } from '../skype-emoticons.js'
-import { finalizeTriage, isRateLimited, parseTriage } from '../triage-core.js'
+import { finalizeTriage, isRateLimited, parseTriage, triageDisposition, deferTriage, type InboxTriageVerdict } from '../triage-core.js'
 import { type ActionSurface, actionSurfaceFor, actionSurfaceText, calendarExampleText, postingMechanicsText } from './prompt-surface.js'
 import { allowUnsandboxedByoa, detectEnginesWithStatus, ENGINE_IDS, type DetectedEngineSnapshot, type EngineHopReport, type EngineId, type EngineRunResult, type EngineSession, type EngineUsage, enrichDetectedEngines, evaluateRunnableEngines, getAdapter, runEngineDoctor, type RunnableEngineEvaluation, snapshotDetectedEngines } from './engine.js'
 
@@ -543,7 +543,7 @@ export function renderInboxDigest(
   return lines.join('\n')
 }
 
-interface RuntimeInboxTriageResponse {
+interface RuntimeInboxTriageResponse extends Partial<Pick<InboxTriageVerdict, 'outcome' | 'ackAllowed' | 'failureCategory' | 'retryAt'>> {
   actionable?: boolean
   reason?: string
   promptNote?: string
@@ -553,13 +553,12 @@ interface RuntimeInboxTriageResponse {
 /** `/inbox-triage/payload`: either a verdict the server decided without a model
  *  (hard rule / empty inbox), or the prompt for the daemon's LOCAL small brain. */
 interface RuntimeTriagePayload {
+  messageIds?: string[]
   verdict?: RuntimeInboxTriageResponse
   instructions?: string
   input?: string
-  /** Direction-aware fail mode: TRUE when the wake is purely agent-to-agent
-   *  (no human in the unread set) → a LOCAL triage failure fails CLOSED
-   *  (suppress) instead of open, so a flaky local model can't amplify a loop.
-   *  Absent/false → fail open (a human is present; never leave them hanging). */
+  /** Legacy direction hint for the source/actionable projection. Both failure
+   *  modes defer execution and prohibit acknowledgement until classification recovers. */
   failClosed?: boolean
 }
 
@@ -2112,11 +2111,17 @@ class AgentRunner {
    *  engine's cheap fast model (Claude Haiku), NOT a cloud call. The server only
    *  builds the prompt (it has the DB for inbox+context); inference is 100%
    *  local: no network model hop, no sub2api quota (429/503), no big brain. */
-  private async inboxTriage(token: string): Promise<RuntimeInboxTriageResponse | null> {
+  private async inboxTriage(token: string, seen: Map<string, string>): Promise<RuntimeInboxTriageResponse> {
     const payload = await runtimeGet<RuntimeTriagePayload>(this.cfg.serverUrl, '/inbox-triage/payload', token)
-    if (!payload) return null
-    if (payload.verdict) return payload.verdict // hard rule / empty inbox — no model needed
-    if (!payload.instructions || !payload.input) return null
+    if (!payload) return deferTriage('fail-closed', 'triage payload unavailable', 'payload-unavailable')
+    if (payload.messageIds !== undefined && (!Array.isArray(payload.messageIds) ||
+        [...seen.values()].some((id) => !payload.messageIds!.includes(id)))) {
+      return deferTriage('fail-closed', 'triage snapshot no longer covers the unread boundary', 'invalid-result')
+    }
+    if (payload.verdict) return triageDisposition(payload.verdict)
+    if (typeof payload.instructions !== 'string' || !payload.instructions || typeof payload.input !== 'string' || !payload.input) {
+      return deferTriage('fail-closed', 'invalid triage payload', 'invalid-result')
+    }
 
     // Triage concurrency gate + deterministic spawn pacer. Pacer is shared
     // with the big-brain path (same Anthropic/OpenAI account quota, same
@@ -2145,52 +2150,17 @@ class AgentRunner {
       triageSem.release()
     }
 
-    if (res.error || !res.text.trim()) {
+    if (res.error || !res.text.trim() || controller.signal.aborted) {
       const errText = res.error ?? 'no output'
-      // CRITICAL: a rate-limited small model must NOT fail-open. Fail-open wakes
-      // the expensive big brain to "decide" — which on a 429/quota/overload just
-      // burns more of the user's quota and trips the big brain's own limit too
-      // (the runaway that drained accounts). Fail CLOSED: skip, don't wake the
-      // engine, don't ack — the caller backs off and retries when the limit lifts.
-      // A TIMEOUT counts too: a triage that runs past the ceiling is almost always
-      // the engine retrying a throttled provider, so treat it as a back-off signal
-      // rather than fail-open into the big brain.
-      if (controller.signal.aborted || isRateLimited(errText)) {
-        console.warn(`[computer] ${this.agent.id} local triage RATE-LIMITED${controller.signal.aborted ? ' (timed out)' : ''} — backing off, NOT waking the big brain: ${errText.slice(0, 160)}`)
-        return {
-          actionable: false,
-          reason: `triage rate-limited (${errText.slice(0, 120)}); backing off`,
-          promptNote: '',
-          source: 'rate-limited',
-        }
-      }
-      if (payload.failClosed) {
-        // Purely agent-to-agent wake: a flaky local model must NOT fail open, or
-        // every triage error wakes the big brain and amplifies the very loop the
-        // gate exists to stop. A missed agent↔agent reply is cheap and self-heals
-        // on the next real event.
-        console.warn(`[computer] ${this.agent.id} local triage failed: ${errText.slice(0, 200)} — fail CLOSED (agent-only, no human waiting)`)
-        return {
-          actionable: false,
-          reason: `local triage failed (${errText.slice(0, 120)}); fail closed (agent-only)`,
-          promptNote: '',
-          source: 'fail-closed',
-        }
-      }
-      console.warn(`[computer] ${this.agent.id} local triage failed: ${errText.slice(0, 200)} — fail open`)
-      return {
-        actionable: true,
-        reason: `local triage failed (${errText.slice(0, 120)}); fail open`,
-        promptNote:
-          'Local small-brain triage failed; read the inbox/context yourself and respond only if a human needs you. ' +
-          'Do not silently ack unread human messages unless the thread clearly shows they are irrelevant or already handled.',
-        source: 'fail-open',
-      }
+      const limited = isRateLimited(errText)
+      return deferTriage(limited || controller.signal.aborted ? 'rate-limited' : payload.failClosed ? 'fail-closed' : 'fail-open',
+        `local triage failed (${errText.slice(0, 120)}); deferred`,
+        controller.signal.aborted ? 'timeout' : limited ? 'rate-limited' : res.error ? 'classifier-error' : 'invalid-result')
     }
     const parsed = parseTriage(res.text)
     // A valid "don't reply" verdict (actionable:false) legitimately has no
-    // promptNote — accept it so the gate actually gates. Only a verdict we
-    // couldn't even recover `actionable` from (parsed === null) fails open.
+    // promptNote — accept it so the gate actually gates. Partial output carries
+    // a defer outcome even when its legacy actionable field can be recovered.
     if (parsed) {
       const verdict = finalizeTriage(parsed, 'support-model-local')
       // Record the gate's cache-aware cost (fire-and-forget). A BYOA triage runs
@@ -2200,22 +2170,8 @@ class AgentRunner {
       void this.recordTriageUsage(token, verdict.actionable, verdict.reason, res.usage, res.model)
       return verdict
     }
-    if (payload.failClosed) {
-      console.warn(`[computer] ${this.agent.id} local triage unparseable: ${res.text.slice(0, 200)} — fail CLOSED (agent-only, no human waiting)`)
-      return {
-        actionable: false,
-        reason: 'local triage produced no usable verdict; fail closed (agent-only)',
-        promptNote: '',
-        source: 'fail-closed',
-      }
-    }
-    console.warn(`[computer] ${this.agent.id} local triage unparseable: ${res.text.slice(0, 200)} — fail open`)
-    return {
-      actionable: true,
-      reason: 'local triage produced no usable verdict; fail open',
-      promptNote: 'Local small-brain triage gave no clear verdict; read the inbox/context yourself and respond only if a human needs you.',
-      source: 'fail-open',
-    }
+    return deferTriage(payload.failClosed ? 'fail-closed' : 'fail-open',
+      'local triage produced no usable verdict; deferred', 'invalid-result')
   }
 
   /** Triage model id for pricing, honoring the agent pin then CUMORA_TRIAGE_MODEL. Cursor,
@@ -2754,7 +2710,7 @@ class AgentRunner {
         // so we neither hammer a broken/throttled triage nor burn the big brain.
         // The poll just no-ops until the window passes; unread messages are
         // untouched and get triaged then.
-        if (Date.now() < this.triageBackoffUntil) {
+        if (!this.pendingBackgroundBrief && Date.now() < this.triageBackoffUntil) {
           const leftS = Math.round((this.triageBackoffUntil - Date.now()) / 1000)
           console.log(`[computer] ${this.agent.id} skip (${reason}): triage backoff, ${leftS}s left`)
           break
@@ -2815,37 +2771,21 @@ class AgentRunner {
         // A deliberate manual brief is already actionable, just like the cloud
         // `briefedManual` path. Only ordinary inbox wakes need the small-brain
         // triage decision.
-        const triage = activeBackgroundBrief ? null : await this.inboxTriage(token)
+        const triage = activeBackgroundBrief ? null : triageDisposition(await this.inboxTriage(token, seen).catch((err) =>
+          deferTriage('fail-closed', err instanceof Error ? err.message : String(err), 'payload-unavailable')))
         const triageMs = Date.now() - turnStart // ensureToken + snapshot + triage
-        // Triage was rate-limited → STOP. Do NOT retry, do NOT wake the big brain,
-        // do NOT ack (the message is retried after the cooldown). Back off
-        // exponentially so a throttled model can't be hammered into burning the
-        // user's quota. This is the guard against the infinite-retry runaway.
-        if (triage?.source === 'rate-limited') {
+        if (triage?.outcome === 'defer') {
           this.triageTroubleStreak += 1
-          const backoff = Math.min(10 * 60_000, 30_000 * 2 ** (this.triageTroubleStreak - 1))
-          this.triageBackoffUntil = Date.now() + backoff
-          console.warn(`[computer] ${this.agent.id} triage RATE-LIMITED (#${this.triageTroubleStreak}, triage ${triageMs}ms) — backing off ${Math.round(backoff / 1000)}s, NOT waking the big brain, not acking`)
-          await runtimeBest(this.cfg.serverUrl, '/status', token, { status: 'avail' })
-          break
-        }
-        // FAIL-OPEN is a triage FAILURE, not a confirmed real task — so it must
-        // NEVER wake the expensive big brain (that escalation was the leak that
-        // burned quota). Treat it like a rate-limit: skip, do NOT ack (retry next
-        // poll once triage recovers), and back off so a persistently-broken triage
-        // isn't re-hit — and never spends opus — every poll.
-        if (triage?.source === 'fail-open') {
-          this.triageTroubleStreak += 1
-          const backoff = Math.min(10 * 60_000, 30_000 * 2 ** (this.triageTroubleStreak - 1))
-          this.triageBackoffUntil = Date.now() + backoff
-          console.warn(`[computer] ${this.agent.id} triage FAIL-OPEN (#${this.triageTroubleStreak}, triage ${triageMs}ms) — NOT waking the big brain, backing off ${Math.round(backoff / 1000)}s, not acking`)
+          const backoff = Math.min(10 * 60_000, 30_000 * 2 ** Math.min(5, this.triageTroubleStreak - 1))
+          this.triageBackoffUntil = Math.max(Date.now() + backoff, triage.retryAt ?? 0)
+          console.warn(`[computer] ${this.agent.id} triage deferred (${triage.failureCategory}, triage ${triageMs}ms), not waking or acking`)
           await runtimeBest(this.cfg.serverUrl, '/status', token, { status: 'avail' })
           break
         }
         // A clean, usable triage clears any prior backoff.
         this.triageTroubleStreak = 0
         this.triageBackoffUntil = 0
-        if (triage?.actionable === false) {
+        if (triage?.outcome === 'ignore' && triage.ackAllowed) {
           const skipReason = typeof triage.reason === 'string' ? triage.reason : 'not relevant'
           // Only log a MEANINGFUL skip. An empty inbox is the idle steady state
           // (every INBOX_POLL_MS tick × every agent) — logging it floods the

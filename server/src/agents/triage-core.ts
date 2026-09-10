@@ -32,6 +32,10 @@ import type { ContextRow, InboxRow, PersonaRow, WorklogEntry } from './runtime/c
 export type ResponseMode = 'me' | 'each' | 'one-of-us'
 
 export interface InboxTriageVerdict {
+  outcome?: 'execute' | 'ignore' | 'defer'
+  ackAllowed?: boolean
+  failureCategory?: TriageFailureCategory
+  retryAt?: number
   actionable: boolean
   reason: string
   promptNote: string
@@ -40,7 +44,46 @@ export interface InboxTriageVerdict {
    *  in-turn by reading the room — but it's kept as part of the gate's reasoning
    *  and the wire shape, identical across cloud and BYOA. */
   responseMode?: ResponseMode
-  source: 'empty-inbox' | 'system-only' | 'rate-limited' | 'loop-cap' | 'support-model' | 'support-model-local' | 'fail-open' | 'human-dm' | 'human-group' | 'dm-agent-engage' | 'calendar-due'
+  source: 'empty-inbox' | 'system-only' | 'rate-limited' | 'loop-cap' | 'support-model' | 'support-model-local' | 'fail-open' | 'fail-closed' | 'human-dm' | 'human-group' | 'dm-agent-engage' | 'calendar-due'
+}
+
+export type TriageFailureCategory = 'payload-unavailable' | 'invalid-result' | 'rate-limited' | 'timeout' | 'classifier-error'
+export type TriageDisposition = InboxTriageVerdict & {
+  outcome: 'execute' | 'ignore' | 'defer'
+  ackAllowed: boolean
+}
+
+export function deferTriage(
+  source: 'fail-open' | 'fail-closed' | 'rate-limited',
+  reason: string,
+  failureCategory: TriageFailureCategory = 'classifier-error',
+  now = Date.now(),
+): TriageDisposition {
+  return {
+    actionable: source === 'fail-open', reason, promptNote: '', source,
+    outcome: 'defer', ackAllowed: false, failureCategory, retryAt: now + 30_000,
+  }
+}
+
+/** Interpret both current and legacy wire results before any execution or ack. */
+export function triageDisposition(value: unknown, now = Date.now()): TriageDisposition {
+  if (!value || typeof value !== 'object') {
+    return deferTriage('fail-closed', 'triage payload unavailable', 'payload-unavailable', now)
+  }
+  const v = value as InboxTriageVerdict
+  const failureSource = v.source === 'fail-open' || v.source === 'fail-closed' || v.source === 'rate-limited'
+  if (failureSource || v.outcome === 'defer' || v.ackAllowed === false) {
+    const deferred = deferTriage(failureSource ? v.source as 'fail-open' | 'fail-closed' | 'rate-limited' : 'fail-closed',
+      typeof v.reason === 'string' ? v.reason : 'triage deferred',
+      v.failureCategory ?? (v.source === 'rate-limited' ? 'rate-limited' : 'classifier-error'), now)
+    return { ...deferred, retryAt: typeof v.retryAt === 'number' && Number.isFinite(v.retryAt) ? v.retryAt : deferred.retryAt }
+  }
+  if (typeof v.actionable !== 'boolean' || typeof v.reason !== 'string' ||
+      typeof v.promptNote !== 'string' || typeof v.source !== 'string' ||
+      (v.outcome !== undefined && v.outcome !== (v.actionable ? 'execute' : 'ignore'))) {
+    return deferTriage('fail-closed', 'invalid triage verdict', 'invalid-result', now)
+  }
+  return { ...v, outcome: v.actionable ? 'execute' : 'ignore', ackAllowed: true }
 }
 
 /** Parse a SYSTEM message's wire payload (the JSON envelope the server itself
@@ -76,12 +119,8 @@ export interface TriageRequest {
   verdict?: InboxTriageVerdict
   instructions?: string
   input?: string
-  /** Direction-aware fail mode for the daemon's LOCAL triage (model-call path
-   *  only). TRUE when this wake is purely AGENT-to-AGENT (no human in the unread
-   *  set): a triage FAILURE must then fail CLOSED (suppress), because failing
-   *  open wakes the big brain on every flaky-local-model error and AMPLIFIES the
-   *  very loop the gate exists to stop. A human in the unread set → FALSE (fail
-   *  open; never leave a human hanging). */
+  /** Legacy direction hint for the source/actionable projection. Both failure
+   *  modes defer execution and prohibit acknowledgement until classification recovers. */
   failClosed?: boolean
 }
 
@@ -131,7 +170,7 @@ function extractJsonObject(raw: string): string {
 export function parseTriage(raw: string): Omit<InboxTriageVerdict, 'source'> | null {
   try {
     const parsed = JSON.parse(extractJsonObject(raw)) as { actionable?: unknown; reason?: unknown; promptNote?: unknown; prompt_note?: unknown; responseMode?: unknown; response_mode?: unknown }
-    if (typeof parsed.actionable !== 'boolean') return salvageTriage(raw)
+    if (!parsed || typeof parsed.actionable !== 'boolean') return salvageTriage(raw)
     return {
       actionable: parsed.actionable,
       reason: String(parsed.reason ?? '').slice(0, 500),
@@ -154,6 +193,7 @@ function salvageTriage(raw: string): Omit<InboxTriageVerdict, 'source'> | null {
   return {
     actionable: m[1].toLowerCase() === 'true',
     reason: 'recovered from a partial/truncated triage output',
+    outcome: 'defer', ackAllowed: false, failureCategory: 'invalid-result', retryAt: Date.now() + 30_000,
     responseMode: parseResponseMode(rm?.[1]),
     promptNote: pn ? pn[1].replace(/\\"/g, '"').slice(0, 1200) : '',
   }
@@ -170,7 +210,7 @@ export function finalizeTriage(
   const promptNote = parsed.promptNote.trim() || (parsed.actionable
     ? 'Reply appropriately to the unread message addressed to you or the group.'
     : '')
-  return { ...parsed, promptNote, source }
+  return triageDisposition({ ...parsed, promptNote, source })
 }
 
 function buildTriageInstructions(personaName: string): string {
@@ -314,7 +354,7 @@ function buildTriageInput(args: { agentId: string; persona: PersonaRow; inbox: I
  *  deterministic backstop: a 30/min rate floor limits the RATE but never STOPS a
  *  slow loop, so the count cap halts a runaway the model failed to end. The cap
  *  is two-tier — high for a claimed thread, low for unclaimed chatter. */
-export function buildTriageRequest(args: {
+function buildTriageRequestCore(args: {
   agentId: string
   persona: PersonaRow
   inbox: InboxRow[]
@@ -494,4 +534,9 @@ export function buildTriageRequest(args: {
     // the loop); a human present → fail open (never leave a human hanging).
     failClosed: !args.inbox.some((m) => m.kind !== 'system' && m.author_kind === 'human'),
   }
+}
+
+export function buildTriageRequest(args: Parameters<typeof buildTriageRequestCore>[0]): TriageRequest {
+  const request = buildTriageRequestCore(args)
+  return request.verdict ? { ...request, verdict: triageDisposition(request.verdict) } : request
 }

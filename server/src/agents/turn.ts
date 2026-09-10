@@ -26,6 +26,7 @@ import { redis } from '../redis.js'
 import { readLocalMessageAttachment } from '../local-attachment-files.js'
 import { messageAttachmentStorageKey } from '../storage-keys.js'
 import { classifyInboxTriage, gateSyntheticWake } from './inbox-triage.js'
+import { triageDisposition } from './triage-core.js'
 import { GLANCE_YIELD_RULES } from './glance-protocol.js'
 import { TOOL_DEFS_RESPONSES, executePodTool } from './runtime/pod-tools.js'
 import { connectMcpConnector, mcpToolToFunctionTool, splitPrefixedToolName, type McpClientHandle } from './mcp.js'
@@ -1975,26 +1976,34 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
     const shouldRunInboxTriage =
       inbox.length > 0 &&
       (options.trigger === undefined || options.trigger === 'message.new') &&
-      !triageNote
+      !isBriefedManualWake
     if (shouldRunInboxTriage) {
       preloadedContext = await loadContext(agentId, persona.companyId, convoIds)
-      const verdict = await classifyInboxTriage({
+      const verdict = triageDisposition(await classifyInboxTriage({
         agentId,
         companyId: runCompanyId,
         persona,
         inbox,
         context: preloadedContext,
-      })
+      }))
       const reason = verdict.reason.trim().slice(0, 500)
-      if (!verdict.actionable) {
+      if (verdict.outcome !== 'execute') {
         finalStatus = 'skipped'
-        finalSummary = `Inbox triage skipped wake: ${reason || 'not relevant'}`
+        finalSummary = verdict.outcome === 'defer'
+          ? `Inbox triage deferred: ${reason}`
+          : `Inbox triage skipped wake: ${reason || 'not relevant'}`
+        if (verdict.outcome === 'ignore' && verdict.ackAllowed) {
+          const seen = new Map<string, string>()
+          for (const row of inbox) seen.set(row.conversation_id, row.id)
+          await Promise.all([...seen].map(([conversationId, upToMessageId]) =>
+            runtime.markConversationRead({ agentId, conversationId, upToMessageId })))
+        }
         await runtime.recordEvent({
           runId, agentId, companyId: runCompanyId,
           kind: 'turn.skipped',
           level: 'debug',
           title: finalSummary,
-          data: { source: verdict.source, reason, inboxCount: inbox.length, conversationIds: convoIds },
+          data: { source: verdict.source, outcome: verdict.outcome, failureCategory: verdict.failureCategory, retryAt: verdict.retryAt, reason, inboxCount: inbox.length, conversationIds: convoIds },
           stage: 'skipped',
         })
         return

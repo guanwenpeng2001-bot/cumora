@@ -4,7 +4,7 @@ import { getSupportModel } from '../settings.js'
 import { env } from '../env.js'
 import { getTrackedLlmClient } from './llm-ledger.js'
 import { inprocClient } from './runtime/inproc-client.js'
-import { buildTriageRequest, parseTriage, finalizeTriage, isRateLimited, type InboxTriageVerdict, type ClaimsByConvo } from './triage-core.js'
+import { buildTriageRequest, parseTriage, finalizeTriage, isRateLimited, deferTriage, type InboxTriageVerdict, type ClaimsByConvo } from './triage-core.js'
 import { recordTriage } from './observability.js'
 import { usageFromOpenAI } from './cost.js'
 
@@ -61,16 +61,16 @@ export async function classifyInboxTriage(args: {
   // alongside its agent_triages row, so spend rollups by purpose see this too.
   const deadline = Date.now() + 8_000
   const signal = AbortSignal.timeout(8_000)
-  const client = await getTrackedLlmClient({
-    role: 'support',
-    purpose: 'inbox-triage',
-    runId: args.runId,
-    companyId: args.companyId,
-    agentId: args.agentId,
-    extras: { inboxCount: args.inbox.length },
-  })
-
   try {
+    const client = await getTrackedLlmClient({
+      role: 'support',
+      purpose: 'inbox-triage',
+      runId: args.runId,
+      companyId: args.companyId,
+      agentId: args.agentId,
+      extras: { inboxCount: args.inbox.length },
+    })
+
     const r = await client.responses.create({
       model: getSupportModel(),
       instructions: req.instructions,
@@ -115,17 +115,11 @@ export async function classifyInboxTriage(args: {
     // stays unread and is retried on the next wake/scan once the limit lifts.
     if (status === 429 || status === 503 || isRateLimited(msg)) {
       console.warn('[inbox-triage] classifier RATE-LIMITED — failing CLOSED (not waking the big brain):', msg)
-      return { actionable: false, reason: `triage rate-limited (${msg.slice(0, 120)}); backing off`, promptNote: '', source: 'rate-limited' }
+      return deferTriage('rate-limited', `triage rate-limited (${msg.slice(0, 120)}); backing off`, 'rate-limited')
     }
     console.warn('[inbox-triage] classifier failed', msg)
-    return {
-      actionable: true,
-      reason: 'classifier failed; fail open so the main brain can decide',
-      promptNote:
-        'Small-brain inbox triage failed, so fail open: read the inbox/context yourself. ' +
-        'Do not silently ack unread human messages unless the thread clearly shows they are irrelevant or already handled.',
-      source: 'fail-open',
-    }
+    return deferTriage('fail-open', 'classifier failed; deferred without acknowledging the inbox',
+      msg.startsWith('invalid triage JSON:') ? 'invalid-result' : signal.aborted ? 'timeout' : 'classifier-error')
   }
 }
 
