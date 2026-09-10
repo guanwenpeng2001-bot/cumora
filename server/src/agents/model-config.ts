@@ -25,26 +25,66 @@ export interface AgentModelConfig {
   fallbackModels?: string[]
 }
 
-/** Lenient parse of the JSONB column / API payload. Unknown keys and
- *  wrong-typed values are dropped; returns null when nothing valid remains
- *  (so callers can store null instead of an empty object). */
-export function parseAgentModelConfig(raw: unknown): AgentModelConfig | null {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+export const MAX_CONTEXT_WINDOW = 2_000_000
+export const MAX_OUTPUT_TOKENS = 1_000_000
+export const REASONING_EFFORTS = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh'])
+
+export class InvalidAgentModelConfigError extends Error {}
+
+function normalizeAgentModelConfig(raw: unknown, strict: boolean): AgentModelConfig | null {
+  const invalid = (path: string) => {
+    if (strict) throw new InvalidAgentModelConfigError(`invalid modelConfig: ${path}`)
+    console.warn('[model-config:invalid-history]', { path })
+  }
+  if (raw == null) return null
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    invalid('modelConfig must be an object or null')
+    return null
+  }
   const b = raw as Record<string, unknown>
   const out: AgentModelConfig = {}
-  if (typeof b.effort === 'string' && b.effort.trim()) out.effort = b.effort.trim() as ReasoningEffort
-  if (typeof b.contextWindow === 'number' && Number.isFinite(b.contextWindow) && b.contextWindow > 0) {
-    out.contextWindow = Math.floor(b.contextWindow)
+  for (const key of Object.keys(b)) {
+    if (!['effort', 'contextWindow', 'maxOutputTokens', 'thinking', 'fallbackModels'].includes(key)) {
+      invalid('unknown field')
+    }
   }
-  if (typeof b.maxOutputTokens === 'number' && Number.isFinite(b.maxOutputTokens) && b.maxOutputTokens > 0) {
-    out.maxOutputTokens = Math.floor(b.maxOutputTokens)
+  if (b.effort !== undefined) {
+    const effort = typeof b.effort === 'string' ? b.effort.trim().toLowerCase() : ''
+    if (REASONING_EFFORTS.has(effort)) out.effort = effort as ReasoningEffort
+    else invalid('effort must be none/minimal/low/medium/high/xhigh')
   }
-  if (typeof b.thinking === 'boolean') out.thinking = b.thinking
-  if (Array.isArray(b.fallbackModels)) {
-    const list = b.fallbackModels.filter((m): m is string => typeof m === 'string' && m.trim().length > 0)
-    if (list.length > 0) out.fallbackModels = [...new Set(list.map((m) => m.trim()))]
+  for (const [key, max] of [['contextWindow', MAX_CONTEXT_WINDOW], ['maxOutputTokens', MAX_OUTPUT_TOKENS]] as const) {
+    const value = b[key]
+    if (value === undefined) continue
+    if (typeof value === 'number' && Number.isSafeInteger(value) && value > 0 && value <= max) out[key] = value
+    else invalid(`${key} must be an integer between 1 and ${max}`)
   }
-  return Object.keys(out).length > 0 ? out : null
+  if (b.thinking !== undefined) {
+    if (typeof b.thinking === 'boolean') out.thinking = b.thinking
+    else invalid('thinking must be a boolean')
+  }
+  if (b.fallbackModels !== undefined) {
+    if (!Array.isArray(b.fallbackModels)) invalid('fallbackModels must be an ordered array')
+    else {
+      const list: string[] = []
+      for (const [index, model] of b.fallbackModels.entries()) {
+        if (typeof model !== 'string' || !model.trim()) invalid(`fallbackModels[${index}] must be a nonempty string`)
+        else if (!list.includes(model.trim())) list.push(model.trim())
+      }
+      if (list.length) out.fallbackModels = list
+    }
+  }
+  return Object.keys(out).length ? out : null
+}
+
+/** Strict new writes; null/empty objects and empty chains restore inheritance. */
+export function validateAgentModelConfig(raw: unknown): AgentModelConfig | null {
+  return normalizeAgentModelConfig(raw, true)
+}
+
+/** Historical JSONB stays readable; discarded fields emit diagnostic markers. */
+export function parseAgentModelConfig(raw: unknown): AgentModelConfig | null {
+  return normalizeAgentModelConfig(raw, false)
 }
 
 /** The agent turn's fallback chain. An explicit agent chain wins outright;

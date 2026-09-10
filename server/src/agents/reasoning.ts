@@ -6,17 +6,18 @@
  *  settings page take effect without a restart. */
 import type { ReasoningEffort } from 'openai/resources/shared.js'
 import { getServerSetting } from '../settings.js'
+import { MAX_OUTPUT_TOKENS, REASONING_EFFORTS } from './model-config.js'
 
 export type ConfiguredReasoningEffort = Exclude<ReasoningEffort, null>
-
-const REASONING_EFFORTS = new Set<ConfiguredReasoningEffort>(['none', 'minimal', 'low', 'medium', 'high', 'xhigh'])
 
 function readReasoningEffort(key: string, fallback: ConfiguredReasoningEffort): ConfiguredReasoningEffort {
   const value = getServerSetting(key)?.trim().toLowerCase() ?? ''
   if (!value) return fallback
-  return REASONING_EFFORTS.has(value as ConfiguredReasoningEffort)
-    ? value as ConfiguredReasoningEffort
-    : fallback
+  if (!REASONING_EFFORTS.has(value)) {
+    console.warn(`[settings] invalid reasoning effort for ${key}: ${JSON.stringify(value)} — using fallback ${fallback}`)
+    return fallback
+  }
+  return value as ConfiguredReasoningEffort
 }
 
 export function agentReasoningEffort(): ConfiguredReasoningEffort {
@@ -24,8 +25,7 @@ export function agentReasoningEffort(): ConfiguredReasoningEffort {
 }
 
 export function agentMaxOutputTokens(): number {
-  const value = Number(getServerSetting('agent_max_output_tokens'))
-  return Number.isFinite(value) && value > 0 ? value : 4000
+  return readTokenBudget('agent_max_output_tokens', 4000, 1)
 }
 
 export function supportReasoningEffort(): ConfiguredReasoningEffort {
@@ -33,7 +33,8 @@ export function supportReasoningEffort(): ConfiguredReasoningEffort {
 }
 
 export function reasoningOptions(effort: ConfiguredReasoningEffort): { reasoning?: { effort: ReasoningEffort } } {
-  return effort === 'none' ? {} : { reasoning: { effort: effort as ReasoningEffort } }
+  if (!REASONING_EFFORTS.has(effort)) throw new Error('invalid reasoning effort')
+  return effort === 'none' ? {} : { reasoning: { effort } }
 }
 
 export function supportReasoningOptions(): { reasoning?: { effort: ReasoningEffort } } {
@@ -44,6 +45,16 @@ export function supportReasoningOptions(): { reasoning?: { effort: ReasoningEffo
  *  reasoning doesn't eat the entire output budget. Each call site keeps its
  *  own base budget and adds this on top. */
 export function supportReasoningHeadroom(): number {
-  const value = Number(getServerSetting('support_reasoning_headroom'))
-  return Number.isFinite(value) && value >= 0 ? value : 0
+  return readTokenBudget('support_reasoning_headroom', 0, 0)
+}
+
+function readTokenBudget(key: string, fallback: number, min: number): number {
+  const raw = getServerSetting(key)?.trim()
+  if (!raw) return fallback
+  const value = Number(raw)
+  if (!Number.isSafeInteger(value) || value < min || value > MAX_OUTPUT_TOKENS) {
+    console.warn(`[settings] invalid token budget for ${key}: ${JSON.stringify(raw)} — using fallback ${fallback}`)
+    return fallback
+  }
+  return value
 }

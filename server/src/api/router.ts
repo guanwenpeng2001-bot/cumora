@@ -12,7 +12,7 @@ import { collectDocumentStorageKeys, evictDocumentRoom } from '../documents/room
 import { createPoll, castVote, closePoll, PollError } from '../polls.js'
 import { env } from '../env.js'
 import { getImageModel, getSupportModel } from '../settings.js'
-import { parseAgentModelConfig } from '../agents/model-config.js'
+import { parseAgentModelConfig, validateAgentModelConfig, InvalidAgentModelConfigError, type AgentModelConfig } from '../agents/model-config.js'
 import { publicBodyParserError } from '../body-parser-errors.js'
 import { startConvene } from '../agents/convene.js'
 import { ensureDirectConversation } from '../agents/private_chat.js'
@@ -2719,6 +2719,7 @@ api.get('/participants', async (req, res) => {
     status: string; statusUpdatedAt: string | null
     bio: string | null; tools: string[] | null
     systemPrompt: string | null; model: string | null
+    modelConfig: AgentModelConfig | null
     email: string | null; companySlug: string | null
     departedAt: string | null
     computerId: string | null; engine: string | null; fastModel: string | null
@@ -2763,6 +2764,7 @@ api.get('/participants', async (req, res) => {
   // address that WILL be used.
   const { computeAgentAddress } = await import('../email.js')
   const finalRows = rows.map((r) => {
+    r.modelConfig = parseAgentModelConfig(r.modelConfig)
     if (r.email || r.kind !== 'agent' || !r.companySlug) {
       const { companySlug: _drop, ...rest } = r
       return rest
@@ -3179,7 +3181,7 @@ function readAgentBody(b: AgentBody): {
   model?: string | null
   /** small-brain model override; same semantics as `model` */
   fastModel?: string | null
-  /** Advanced model settings (validated via parseAgentModelConfig); null clears. */
+  /** Advanced model settings (validated via validateAgentModelConfig); null clears. */
   modelConfig?: unknown
   tools?: string[] | null
 } {
@@ -3198,7 +3200,14 @@ function readAgentBody(b: AgentBody): {
   if (b.fastModel === null)               out.fastModel = null
   else if (typeof b.fastModel === 'string') out.fastModel = b.fastModel.trim() || null
   if (b.modelConfig === null)             out.modelConfig = null
-  else if (b.modelConfig !== undefined)   out.modelConfig = parseAgentModelConfig(b.modelConfig)
+  else if (b.modelConfig !== undefined) {
+    try {
+      out.modelConfig = validateAgentModelConfig(b.modelConfig)
+    } catch (error) {
+      if (error instanceof InvalidAgentModelConfigError) throw new HttpError(400, error.message)
+      throw error
+    }
+  }
   if (Array.isArray(b.tools))             out.tools = b.tools.map((x) => String(x))
   return out as ReturnType<typeof readAgentBody>
 }

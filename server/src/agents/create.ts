@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import { pool } from '../db/pool.js'
+import { validateAgentModelConfig, InvalidAgentModelConfigError } from './model-config.js'
 import {
   cloudComputerId,
   type ComputerKind,
@@ -85,7 +86,7 @@ function normalizeRequestId(value: string | null | undefined): string | null {
   return requestId
 }
 
-function creationRequestHash(input: CreateAgentRecordInput): string {
+function creationRequestHash(input: CreateAgentRecordInput, legacy = false): string {
   const canonical = JSON.stringify({
     name: input.name,
     role: input.role ?? '',
@@ -95,6 +96,7 @@ function creationRequestHash(input: CreateAgentRecordInput): string {
     avatarBg: input.avatarBg ?? '',
     model: input.model ?? null,
     fastModel: input.fastModel ?? null,
+    ...(!legacy ? { modelConfig: input.modelConfig ?? null } : {}),
     tools: input.tools ?? ['bash'],
     computerId: input.computerId ?? null,
     engine: input.engine ?? null,
@@ -115,6 +117,18 @@ function creationRequestHash(input: CreateAgentRecordInput): string {
 export async function createAgentRecord(
   input: CreateAgentRecordInput,
 ): Promise<CreateAgentRecordResult> {
+  const legacyInput = input
+  try {
+    input = {
+      ...input,
+      model: input.model?.trim() || null,
+      fastModel: input.fastModel?.trim() || null,
+      modelConfig: validateAgentModelConfig(input.modelConfig),
+    }
+  } catch (error) {
+    if (error instanceof InvalidAgentModelConfigError) throw new AgentCreationError(400, error.message)
+    throw error
+  }
   const requestId = normalizeRequestId(input.requestId)
   const requestHash = requestId ? creationRequestHash(input) : null
   const client = await pool.connect()
@@ -130,12 +144,13 @@ export async function createAgentRecord(
       const { rows } = await client.query<{
         id: string
         creation_request_hash: string | null
+        model_config: unknown
         computer_id: string | null
         engine: EngineId | null
         engine_inherit: boolean
         kind: ComputerKind | null
       }>(
-        `SELECT p.id, p.creation_request_hash, p.computer_id, p.engine,
+        `SELECT p.id, p.creation_request_hash, p.model_config, p.computer_id, p.engine,
                 p.engine_inherit, c.kind
            FROM participants p
            LEFT JOIN computers c
@@ -148,7 +163,15 @@ export async function createAgentRecord(
       const existing = rows[0]
       if (existing) {
         if (existing.creation_request_hash !== requestHash) {
-          throw new AgentCreationError(409, 'requestId was already used with different agent data')
+          let legacyMatches = false
+          if (existing.creation_request_hash === creationRequestHash(legacyInput, true)) {
+            try {
+              legacyMatches = JSON.stringify(validateAgentModelConfig(existing.model_config)) === JSON.stringify(input.modelConfig)
+            } catch (error) {
+              if (!(error instanceof InvalidAgentModelConfigError)) throw error
+            }
+          }
+          if (!legacyMatches) throw new AgentCreationError(409, 'requestId was already used with different agent data')
         }
         await client.query('COMMIT')
         return {
