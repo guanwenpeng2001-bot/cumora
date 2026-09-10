@@ -25,9 +25,9 @@
 import { type ChildProcess, execFile, execFileSync, spawn as nodeSpawn, type SpawnOptions } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { existsSync, renameSync, rmSync, writeFileSync } from 'node:fs'
-import { access, lstat, mkdir, mkdtemp, readdir, rename, rm, writeFile } from 'node:fs/promises'
+import { access, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
-import { basename, dirname, join, delimiter as PATH_DELIMITER } from 'node:path'
+import { basename, dirname, join, resolve, delimiter as PATH_DELIMITER } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 import { stripLoneSurrogates } from '../text-safety.js'
 import { isCustomAnthropicEndpoint, readClaudeUserSettings, withClaudeUserSettingsEnv } from './claude-user-settings.js'
@@ -536,7 +536,7 @@ export interface EnginePersona {
   /** Company-library skills the operator enabled for this agent. Engines
    *  with a native skills dir (Claude `.claude/skills`, Cursor
    *  `.cursor/skills`) get the files written there on seed; AGENTS.md-only
-   *  engines get a name+description index appended to the persona file. */
+   *  engines get full files plus a path index appended to the persona file. */
   skills?: EngineSkill[]
   /** Operator-registered MCP connectors enabled for this agent. Injected
    *  per engine: Claude secure merges them into the daemon-built
@@ -1167,45 +1167,113 @@ function unsafeEngineArgs(envVar: string): string[] {
   return allowUnsandboxedByoa() ? extraArgs(envVar) : []
 }
 
-/** Write operator-enabled company-library skills into an engine's native
- *  skills dir (`<skillsDir>/<name>/<file>`). Skill names and file paths are
- *  validated against traversal (`..`, absolute, separators in the name) —
- *  content comes from the operator, but a bad row must never escape the
- *  agent's home. Stale skill dirs (disabled since the last seed) are removed. */
-export async function seedEngineSkills(home: string, skillsDir: string, skills: EngineSkill[]): Promise<void> {
-  const root = join(home, skillsDir)
-  const wanted = new Set<string>()
-  for (const skill of skills) {
-    if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(skill.name)) continue
-    wanted.add(skill.name)
-    const dir = join(root, skill.name)
-    await ensureAgentDirectory(dir, true)
-    for (const f of skill.files) {
-      if (typeof f.path !== 'string' || typeof f.body !== 'string') continue
-      if (f.path.startsWith('/') || f.path.startsWith('./') || f.path.includes('..') || f.path.includes('//') || /[\\:*?<>"|]/.test(f.path)) continue
-      const target = join(dir, f.path)
-      await ensureAgentDirectory(dirname(target), true)
-      await atomicAgentWrite(target, f.body)
-    }
-  }
-  let existing: string[] = []
-  try {
-    existing = (await readdir(root, { withFileTypes: true }))
-      .filter((e) => e.isDirectory())
-      .map((e) => e.name)
-  } catch { /* dir may not exist yet */ }
-  for (const name of existing) {
-    if (!wanted.has(name)) await rm(join(root, name), { recursive: true, force: true })
+const SKILL_MANAGED_FILES = '.cumora-managed-files.json'
+
+function safeSkillPath(path: string): boolean {
+  return typeof path === 'string' && path.length > 0 && path.length <= 265
+    && !/[\\:*?<>"|\x00-\x1f]/.test(path) && !path.includes('..')
+    && path.split('/').every((part) => part && part !== '.' && !/[. ]$/.test(part)
+      && !/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(part))
+}
+
+async function skillPathStat(path: string): Promise<Awaited<ReturnType<typeof lstat>> | undefined> {
+  try { return await lstat(path) }
+  catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
+    return undefined
   }
 }
 
-/** Progressive-disclosure index for engines without a native skills dir:
- *  name + description inline in the persona file. Engines with one get the
- *  real files via seedEngineSkills instead. */
-function skillsIndexText(skills: EngineSkill[]): string {
+/** Check every ancestor, including Windows junctions, before touching files. */
+async function skillDirectory(path: string, create: boolean): Promise<boolean> {
+  const parent = dirname(path)
+  if (parent !== path && !(await skillDirectory(parent, create))) return false
+  const info = await skillPathStat(path)
+  if (info) {
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`Unsafe skill directory: ${path}`)
+  } else {
+    if (!create) return false
+    await ensureAgentDirectory(path)
+  }
+  return true
+}
+
+/** Materialize full skills; the journal owns files, never entire directories. */
+export async function seedEngineSkills(home: string, skillsDir: string, skills: EngineSkill[]): Promise<void> {
+  if (!safeSkillPath(skillsDir)) throw new Error('Unsafe skills directory')
+  const wanted = new Map<string, string>()
+  const folded = new Set<string>()
+  const names = new Set<string>()
+  for (const skill of skills) {
+    if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(skill.name) || !safeSkillPath(skill.name)
+        || names.has(skill.name)) throw new Error('Unsafe or duplicate skill name')
+    names.add(skill.name)
+    for (const file of skill.files) {
+      if (!safeSkillPath(file.path) || file.path.length > 200 || typeof file.body !== 'string') throw new Error('Unsafe skill file')
+      const path = `${skill.name}/${file.path}`
+      if (folded.has(path.toLowerCase())) throw new Error('Duplicate skill file')
+      folded.add(path.toLowerCase())
+      wanted.set(path, file.body)
+    }
+  }
+  for (const path of folded) {
+    const parts = path.split('/')
+    for (let i = 1; i < parts.length; i++) {
+      if (folded.has(parts.slice(0, i).join('/'))) throw new Error('Skill file/directory conflict')
+    }
+  }
+  const root = resolve(home, skillsDir)
+  await skillDirectory(root, true)
+  const manifest = join(root, SKILL_MANAGED_FILES)
+  const manifestInfo = await skillPathStat(manifest)
+  let previous: string[] = []
+  if (manifestInfo) {
+    if (!manifestInfo.isFile() || manifestInfo.isSymbolicLink()) throw new Error('Unsafe skill ownership manifest')
+    const saved = JSON.parse(await readFile(manifest, 'utf8')) as { version?: unknown; files?: unknown }
+    if (saved?.version !== 1 || !Array.isArray(saved.files)
+        || saved.files.some((path: unknown) => typeof path !== 'string' || !safeSkillPath(path)
+          || !/^[a-z0-9][a-z0-9-]{0,63}\//.test(path))
+        || new Set(saved.files.map((path: string) => path.toLowerCase())).size !== saved.files.length) {
+      throw new Error('Invalid skill ownership manifest')
+    }
+    previous = saved.files
+  }
+  const owned = new Set(previous)
+  // Preflight both writes and removals, so an unsafe old path cannot be hidden by an update.
+  for (const path of new Set([...previous, ...wanted.keys()])) {
+    const target = join(root, path)
+    if (!(await skillDirectory(dirname(target), false))) continue
+    const info = await skillPathStat(target)
+    if (info && (!info.isFile() || info.isSymbolicLink())) throw new Error(`Unsafe skill file: ${path}`)
+    if (info && wanted.has(path) && !owned.has(path)) throw new Error(`Refusing to overwrite unowned skill file: ${path}`)
+  }
+  // Persist intent first: a failed write/cleanup remains owned and can be retried.
+  const journal = [...new Set([...previous, ...wanted.keys()])]
+  if (new Set(journal.map((path) => path.toLowerCase())).size !== journal.length) {
+    throw new Error('Skill update changes file casing; remove the old binding first')
+  }
+  await atomicAgentWrite(manifest, JSON.stringify({ version: 1, files: journal }))
+  for (const [path, body] of wanted) {
+    const target = join(root, path)
+    await skillDirectory(dirname(target), true)
+    await atomicAgentWrite(target, body)
+  }
+  for (const path of previous) {
+    if (wanted.has(path)) continue
+    const target = join(root, path)
+    if (!(await skillDirectory(dirname(target), false))) continue
+    const info = await skillPathStat(target)
+    if (!info) continue
+    if (!info.isFile() || info.isSymbolicLink()) throw new Error(`Unsafe stale skill file: ${path}`)
+    await rm(target)
+  }
+  await atomicAgentWrite(manifest, JSON.stringify({ version: 1, files: [...wanted.keys()] }))
+}
+
+function skillsIndexText(skills: EngineSkill[], skillsDir: string): string {
   if (skills.length === 0) return ''
-  const lines = skills.map((s) => `- **${s.name}** — ${s.description}`).join('\n')
-  return `\n## Skills (enabled by your operator)\n${lines}\n`
+  const lines = skills.map((s) => `- **${s.name}** — ${s.description} — read \`${skillsDir.replace(/\/$/, '')}/${s.name}/SKILL.md\``).join('\n')
+  return `\n## Skills (enabled by your operator)\nPaths are relative to this agent home. Read the full SKILL.md before using a skill; resolve its attachments relative to that file's directory.\n${lines}\n`
 }
 
 const PERSONA_HEADER = (
@@ -1227,7 +1295,7 @@ const PERSONA_HEADER = (
   `  \`memory/MEMORY.md\` (and the files it points to) to recall what you know.\n` +
   `- \`notes/\` — scratch notes and drafts.\n` +
   `- \`${skillsDir}\` — your skills.\n` +
-  skillsIndexText(p.skills ?? []) +
+  skillsIndexText(p.skills ?? [], skillsDir) +
   `- \`workspace/\` — **put all project files and scratch here**: git clones, builds,\n` +
   `  downloads, temp files. Always \`cd workspace\` (or use \`workspace/…\` paths) for\n` +
   `  that work — do NOT clutter your home root with project files.\n\n` +
@@ -1709,8 +1777,6 @@ class ClaudeAdapter implements EngineAdapter {
 
   async seedHome(home: string, persona: EnginePersona): Promise<void> {
     await ensureCommonHome(home)
-    await ensureAgentDirectory(join(home, '.claude'))
-    await ensureAgentDirectory(join(home, '.claude', 'skills'))
     await seedEngineSkills(home, '.claude/skills', persona.skills ?? [])
     // Compat mode reads <home>/.mcp.json natively; secure mode ignores it
     // (connectors arrive via --mcp-config instead, see claudeSecureMcpConfig).
@@ -2366,8 +2432,9 @@ class CodexAdapter implements EngineAdapter {
 
   async seedHome(home: string, persona: EnginePersona): Promise<void> {
     await ensureCommonHome(home)
+    await seedEngineSkills(home, '.agents/skills', persona.skills ?? [])
     // See ClaudeAdapter.seedHome: system-owned, safe to overwrite every start.
-    await atomicAgentWrite(join(home, 'AGENTS.md'), PERSONA_HEADER(persona))
+    await atomicAgentWrite(join(home, 'AGENTS.md'), PERSONA_HEADER(persona, { personaFile: 'AGENTS.md', skillsDir: '.agents/skills/' }))
   }
 
   run(args: EngineRunArgs): Promise<EngineRunResult> {
@@ -2827,8 +2894,8 @@ class GrokAdapter implements EngineAdapter {
 
   async seedHome(home: string, persona: EnginePersona): Promise<void> {
     await ensureCommonHome(home)
-    const agentsMd = join(home, 'AGENTS.md')
-    if (!(await exists(agentsMd))) await writeFile(agentsMd, PERSONA_HEADER(persona), 'utf8')
+    await seedEngineSkills(home, '.agents/skills', persona.skills ?? [])
+    await atomicAgentWrite(join(home, 'AGENTS.md'), PERSONA_HEADER(persona, { personaFile: 'AGENTS.md', skillsDir: '.agents/skills/' }))
   }
 
   run(args: EngineRunArgs): Promise<EngineRunResult> {
@@ -3178,7 +3245,6 @@ class CursorAdapter implements EngineAdapter {
 
   async seedHome(home: string, persona: EnginePersona): Promise<void> {
     await ensureCommonHome(home)
-    await mkdir(join(home, '.cursor', 'skills'), { recursive: true })
     await seedEngineSkills(home, '.cursor/skills', persona.skills ?? [])
     // Always rewrite AGENTS.md so persona edits land without requiring a fresh
     // home (matches Claude and Codex). Cursor discovers AGENTS.md from its cwd.
@@ -3585,7 +3651,7 @@ class OpenCodeAdapter implements EngineAdapter {
 
   async seedHome(home: string, persona: EnginePersona): Promise<void> {
     await ensureCommonHome(home)
-    await mkdir(join(home, '.opencode', 'skills'), { recursive: true })
+    await seedEngineSkills(home, '.opencode/skills', persona.skills ?? [])
     await writeFile(
       join(home, 'AGENTS.md'),
       PERSONA_HEADER(persona, { personaFile: 'AGENTS.md', skillsDir: '.opencode/skills/' }),
@@ -4169,7 +4235,7 @@ class PiAdapter implements EngineAdapter {
 
   async seedHome(home: string, persona: EnginePersona): Promise<void> {
     await ensureCommonHome(home)
-    await mkdir(join(home, '.pi', 'skills'), { recursive: true })
+    await seedEngineSkills(home, '.pi/skills', persona.skills ?? [])
     // Always rewrite AGENTS.md so persona edits land without requiring a fresh
     // home (matches Claude and Codex). pi discovers AGENTS.md from its cwd
     // natively; skills are loaded explicitly via --skill (see startSession) since
@@ -4636,7 +4702,7 @@ class GeminiAdapter implements EngineAdapter {
 
   async seedHome(home: string, persona: EnginePersona): Promise<void> {
     await ensureCommonHome(home)
-    await mkdir(join(home, '.gemini', 'skills'), { recursive: true })
+    await seedEngineSkills(home, '.gemini/skills', persona.skills ?? [])
     await writeFile(
       join(home, 'GEMINI.md'),
       PERSONA_HEADER(persona, { personaFile: 'GEMINI.md', skillsDir: '.gemini/skills/' }),
@@ -4814,7 +4880,7 @@ class QwenAdapter implements EngineAdapter {
 
   async seedHome(home: string, persona: EnginePersona): Promise<void> {
     await ensureCommonHome(home)
-    await mkdir(join(home, '.qwen', 'skills'), { recursive: true })
+    await seedEngineSkills(home, '.qwen/skills', persona.skills ?? [])
     await writeFile(
       join(home, 'QWEN.md'),
       PERSONA_HEADER(persona, { personaFile: 'QWEN.md', skillsDir: '.qwen/skills/' }),
@@ -5246,7 +5312,7 @@ class AntigravityAdapter implements EngineAdapter {
 
   async seedHome(home: string, persona: EnginePersona): Promise<void> {
     await ensureCommonHome(home)
-    await mkdir(join(home, '.agents', 'skills'), { recursive: true })
+    await seedEngineSkills(home, '.agents/skills', persona.skills ?? [])
     await writeFile(
       join(home, 'AGENTS.md'),
       PERSONA_HEADER(persona, { personaFile: 'AGENTS.md', skillsDir: '.agents/skills/' }),
