@@ -74,10 +74,11 @@ RUN npm run build
 
 # ─── stage 3: kubectl ──────────────────────────────────────────────
 FROM debian:bookworm-slim AS kubectl-build
+ARG KUBECTL_VERSION=v1.32.2
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates curl \
   && curl -fsSL -o /out-kubectl \
-       "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/$(dpkg --print-architecture)/kubectl" \
+       "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/$(dpkg --print-architecture)/kubectl" \
   && chmod +x /out-kubectl
 
 # ─── stage 4: runtime ───────────────────────────────────────────────

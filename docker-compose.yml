@@ -65,7 +65,7 @@ services:
     volumes:
       # Container-reachable kubeconfig copy (see header). Read-only mount;
       # kubectl in the container runs as root and auto-detects this path.
-      - ${USERPROFILE}/.kube/config-docker:/root/.kube/config:ro
+      - ${KUBECONFIG_DOCKER:-${USERPROFILE:-${HOME}}/.kube/config-docker}:/root/.kube/config:ro
     ports:
       - "5181:5181"
     depends_on:

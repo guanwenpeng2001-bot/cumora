@@ -50,6 +50,7 @@ jobs:
               - 'server/docker/agent-computer.Dockerfile'
               - 'server/docker/agent-computer.Dockerfile.dockerignore'
               - 'server/docker/agent-computer-cumora.sh'
+              - 'server/docker/agent-computer-cumora-web.sh'
               - 'server/docker/agent-computer-entrypoint.sh'
               - 'agent-fuse/**'
               - '.github/workflows/build.yml'
@@ -134,7 +135,7 @@ jobs:
       - name: Lint (Biome)
         run: npm run lint
       - name: Static safety guards
-        run: npm run guard:big-brain && npm run guard:llm-tracked
+        run: npm run guard:big-brain && npm run guard:llm-tracked && npm run guard:engine-registry
       - name: Unit tests
         run: npm test --silent
       - name: Enable pgvector extension

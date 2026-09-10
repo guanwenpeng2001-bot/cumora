@@ -20,7 +20,7 @@ sub2api 继续复用 db 内独立的 `sub2api` 数据库及 Redis 逻辑库 1。
 ## 前提和地址语义
 
 1. 仓库根 `.env` 为本地私密配置,可参考 `.env.example`,绝不提交。Compose 从它读取插值,server/migrate 继续通过 `env_file` 接收运行配置;容器内 `DATABASE_URL` / `REDIS_URL` 仍由 Compose 覆盖为 db/redis 服务名。`--env-file` 只改变插值来源,不会替换服务的 `env_file: .env`。
-2. 沿用外部卷和可用的 K8s 集群。`${USERPROFILE}/.kube/config-docker` 挂到 server 的 `/root/.kube/config`,副本中的 API endpoint 必须从 server 容器可达。保留 CA 校验,需要时设置与证书 SAN 匹配的 `tls-server-name`;实际 endpoint/端口由部署填写。
+2. 沿用外部卷和可用的 K8s 集群。`${KUBECONFIG_DOCKER:-${USERPROFILE:-${HOME}}/.kube/config-docker}` 挂到 server 的 `/root/.kube/config`,副本中的 API endpoint 必须从 server 容器可达。保留 CA 校验,需要时设置与证书 SAN 匹配的 `tls-server-name`;实际 endpoint/端口由部署填写。非 Windows 主机用 `KUBECONFIG_DOCKER` 显式指定该副本路径。
 3. 浏览器入口、server 内部地址和 Pod 地址分别验证。`SUB2API_INTERNAL_URL` 是 server 的网关根 URL(不附 `/v1`),本 Compose 网络内可使用 `http://sub2api:8080`。实际值由 `.env` 提供,可选层不硬编码运行地址。
 4. 当前 Pod URL 转换会把上述内部前缀替换为 `SUB2API_PUBLIC_URL`,因此该变量虽然名为 PUBLIC,也必须是 **Pod 可达的集群/内部根 URL**。Compose 服务 DNS 不自动跨入 K8s;不要给 Pod 仅在 Compose 内可解析的地址。优先使用 Pod 可达的内部服务或内部入口,避免带短请求超时的公网 Ingress。浏览器管理入口若另有地址,单独记录,不能拿它替代 Pod 可达性验证。
 5. T36 启动快照及后续刷新沿用映射后的 gateway 地址与租户凭据;管理 key 不应传入 Pod。纯 env 的各 direct endpoint 同样必须从 server/Pod 可达。Pod 访问 Cumora server 的地址也需按实际集群网络核验。
@@ -54,6 +54,14 @@ docker compose -f docker-compose.yml -f docker-compose.gateway.yml config --serv
 ```
 
 预期在五个基础服务之外增加 sub2api。缺少任一引导变量时应明确解析失败,基础层不受影响。管理员初始邮箱仍为 `admin@cumora.local`,管理入口为宿主机发布的 8082 端口。各平台账号、分组及开通状态先准备完成,再做模型链路验收;开通失败由持久同步意图重试,不把它当作自动使用全局 key 的承诺。存量账号补开通属于独立运维动作,不要在配置验证中执行。
+
+注意:显式使用 `-f` 文件列表时,Compose **不会**自动叠加 `docker-compose.override.yml`。本机网络 workaround(DNS/MTU/skillhub 等,已 gitignore)若需要生效,必须显式追加为最后一个 `-f`:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.gateway.yml -f docker-compose.override.yml config --quiet
+```
+
+反之不带 `-f` 直接 `docker compose up` 时,override 会被自动叠加,但它不应声明基础层没有的服务名。
 
 ## 形态三:网关 + env 后备
 
