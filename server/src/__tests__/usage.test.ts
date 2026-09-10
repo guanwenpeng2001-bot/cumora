@@ -261,16 +261,27 @@ test('dashboard renders unknown actual model in both log cell and details while 
   }
   visit(ast)
   assert.ok(cell, 'render the real actual-model cell including its details')
-  const js = ts.transpileModule(`exports.render = (r) => (${cell.getText(ast)})`, {
+  // The cell delegates the <details> block to the LogAttemptDetails component
+  // (lazy on toggle); pull its real source in too and force the toggle open so
+  // static markup includes the rows under test.
+  let detailFn: ts.FunctionDeclaration | undefined
+  function visit2(node: ts.Node) {
+    if (ts.isFunctionDeclaration(node) && node.name?.getText(ast) === 'LogAttemptDetails') detailFn = node
+    ts.forEachChild(node, visit2)
+  }
+  visit2(ast)
+  assert.ok(detailFn, 'LogAttemptDetails component source')
+  const js = ts.transpileModule(`${detailFn.getText(ast)}\nexports.render = (r) => (${cell.getText(ast)})`, {
     fileName: 'cell.tsx', compilerOptions: { jsx: ts.JsxEmit.ReactJSX, module: ts.ModuleKind.CommonJS },
   }).outputText
   const jsx = await import('react/jsx-runtime')
   const { renderToStaticMarkup } = await import('react-dom/server')
   const labels: Record<string, string> = { 'settings.actualModel': '实际模型', 'settings.requestedModel': '请求模型' }
   const exports: Record<string, any> = {}
-  new Function('exports', 'require', 'unknown', 'translate', 't', 'locale', 'cn', 'td', js)(
+  new Function('exports', 'require', 'unknown', 'translate', 't', 'locale', 'cn', 'td', 'useState', 'modelPlatformLabel', js)(
     exports, () => jsx, '未知', (_locale: string, key: string) => labels[key] ?? key,
     (key: string) => key, 'zh', (...args: string[]) => args.join(' '), '',
+    () => [true, () => {}], (p: string) => p,
   )
   for (const actualModel of [null, undefined, '']) {
     const html = renderToStaticMarkup(exports.render({ actualModel, requestedModel: 'requested-only', model: 'legacy-only' }))

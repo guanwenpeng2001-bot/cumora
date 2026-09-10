@@ -46,7 +46,7 @@ test('MCP validates booleans, string maps, transport fields and URLs', () => {
 test('local import uses directory identifier and rejects traversal, links and missing/unavailable hubs', async (t) => {
   const old = process.env.LOCAL_SKILLHUB_PATH
   t.after(() => { if (old === undefined) delete process.env.LOCAL_SKILLHUB_PATH; else process.env.LOCAL_SKILLHUB_PATH = old })
-  const parent = join(tmpdir(), 'cumora-work', 'impl')
+  const parent = await mkdtemp(join(tmpdir(), 't5-resource-security-'))
   await mkdir(parent, { recursive: true })
   const root = await mkdtemp(join(parent, 't5-local-'))
   process.env.LOCAL_SKILLHUB_PATH = root
@@ -54,7 +54,12 @@ test('local import uses directory identifier and rejects traversal, links and mi
   await writeFile(join(root, 'directory-label', 'SKILL.md'), body)
   let writes = 0
   t.mock.method(pool, 'query', async (sql: string, params: unknown[] = []) => {
-    if (sql.startsWith('SELECT')) return { rows: [] }
+    if (sql.startsWith('SELECT')) {
+      // A fresh snapshot must win over whatever revision an earlier test (or a
+      // real DB refresh) installed — installSnapshot rejects lower revisions.
+      if (sql.includes('server_settings')) return { rows: [{ key: '__settings_revision', value: String(Date.now()) }] }
+      return { rows: [] }
+    }
     assert.ok(sql.includes('INSERT INTO skills'))
     writes++
     return { rows: [{ id: params[0], company_id: params[1], name: params[2], description: params[3],
