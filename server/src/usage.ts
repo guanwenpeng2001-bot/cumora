@@ -389,6 +389,16 @@ export async function usageByProvider(tenant: string, range: UsageRange): Promis
   return [...acc.values()].sort((a, b) => b.costUsd - a.costUsd)
 }
 
+// Expose only known failure categories; upstream messages may contain credentials or endpoints.
+function usageLogFailureReason(status: string, reason: string | null, httpStatus: string | null): string | null {
+  if (status === 'ok') return null
+  if (reason && /^(?:cancelled|non-fallbackable-error|upstream-http-[45]\d{2}|transport:(?:APIConnectionError|APIConnectionTimeoutError|TimeoutError|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|EPIPE|UND_ERR_CONNECT_TIMEOUT|UND_ERR_HEADERS_TIMEOUT|UND_ERR_BODY_TIMEOUT|UND_ERR_SOCKET))$/.test(reason)) return reason
+  if (httpStatus && /^[45]\d{2}$/.test(httpStatus)) return 'upstream-http-' + httpStatus
+  if (status === 'rate_limited') return 'rate_limited'
+  if (status === 'timeout') return 'timeout'
+  return 'failed'
+}
+
 export interface UsageLogRow {
   id: string
   createdAt: string
@@ -408,6 +418,13 @@ export interface UsageLogRow {
   unpriced?: boolean
   route?: string | null
   platform?: string | null
+  requestedModel?: string
+  actualModel?: string
+  failureReason?: string | null
+  failureStage?: string | null
+  httpStatus?: number | null
+  callId?: string | null
+  attempt?: number | null
 }
 
 export interface UsageLogPage {
@@ -434,13 +451,22 @@ export async function usageLogs(
     input_tokens: number | null; output_tokens: number | null; cost_usd: string | null
     latency_ms: number | null; status: string
     measured: boolean; cost_estimated: boolean; unpriced: boolean; route: string | null; platform: string | null
+    requested_model: string | null; actual_model: string | null
+    failure_reason: string | null; failure_stage: string | null; http_status: string | null
+    call_id: string | null; attempt: string | null
   }>(
     `SELECT l.id, l.created_at, l.agent_id, p.name AS agent_name,
             l.model, l.purpose, l.source,
             l.input_tokens + COALESCE(l.cached_input_tokens, 0) AS input_tokens,
             l.output_tokens, l.cost_usd::text, l.latency_ms, l.status, l.measured, l.cost_estimated,
             (COALESCE(l.extras->>'unpriced', '') NOT IN ('', 'false')) AS unpriced,
-            l.extras->>'route' AS route, l.extras->>'platform' AS platform
+            l.extras->>'route' AS route, l.extras->>'platform' AS platform,
+            COALESCE(NULLIF(l.extras->>'requestedModel', ''), l.model) AS requested_model,
+            COALESCE(NULLIF(l.extras->>'actualModel', ''), NULLIF(l.extras->>'requestedModel', ''), l.model) AS actual_model,
+            l.extras->>'failureReason' AS failure_reason, l.extras->>'failureStage' AS failure_stage,
+            l.extras->>'httpStatus' AS http_status,
+            COALESCE(NULLIF(l.extras->>'logicalCallId', ''), NULLIF(l.extras->>'callId', '')) AS call_id,
+            l.extras->>'attempt' AS attempt
        FROM llm_calls l
        LEFT JOIN participants p ON p.id = l.agent_id
       WHERE ${where}
@@ -464,6 +490,13 @@ export async function usageLogs(
       latencyMs: r.latency_ms,
       status: r.status, measured: r.measured, costEstimated: r.cost_estimated,
       unpriced: r.unpriced, route: r.route, platform: r.platform,
+      requestedModel: r.requested_model || r.model,
+      actualModel: r.actual_model || r.requested_model || r.model,
+      failureReason: usageLogFailureReason(r.status, r.failure_reason, r.http_status),
+      failureStage: r.status !== 'ok' && ['generation', 'poll', 'download', 'storage'].includes(r.failure_stage ?? '') ? r.failure_stage : null,
+      httpStatus: r.http_status && /^[1-5]\d{2}$/.test(r.http_status) ? Number(r.http_status) : null,
+      callId: r.call_id || null,
+      attempt: r.attempt && /^[1-9]\d*$/.test(r.attempt) && Number.isSafeInteger(Number(r.attempt)) ? Number(r.attempt) : null,
     })),
     total: Number(countRows[0]?.total ?? 0),
     page,

@@ -274,11 +274,17 @@ export interface ApiBindingWriteResult {
   sync?: ApiSyncStatus
 }
 
-export interface ApiUsageRollupStatus {
-  enabled?: boolean
-  paused?: boolean
-  healthy?: boolean
-  processedThrough?: string | null
+export interface ApiUsageMetadata {
+  timezone: 'UTC'
+  aggregatedAt: string | null
+  completedThrough: string | null
+  aggregationStatus: 'pending' | 'ready' | 'failed' | 'paused' | 'stale'
+  rawRetentionFrom: string | null
+  earliestRawAt: string | null
+  logsComplete: boolean
+  boundaryComplete: boolean
+  aggregationVersion: 2
+  legacyBefore: string | null
 }
 
 /** Usage dashboard rows (GET /api/usage/*). */
@@ -293,7 +299,11 @@ export interface ApiUsageSummary {
   costEstimated: boolean
   cacheHitRate: number
   successRate: number
-  rollup?: ApiUsageRollupStatus
+  unknownRequests?: number
+  unpricedRequests?: number
+  qualityUnknownRequests?: number
+  sources?: string[]
+  metadata?: ApiUsageMetadata
 }
 export interface ApiUsageTrendPoint {
   bucket: string
@@ -307,6 +317,7 @@ export interface ApiUsageAgentRow {
   name: string
   avatarUrl: string | null
   source: 'managed' | 'byoa'
+  actualSource?: string
   requests: number
   inputTokens: number
   outputTokens: number
@@ -321,6 +332,12 @@ export interface ApiUsageModelRow {
   outputTokens: number
   costUsd: number
   costEstimated: boolean
+  route?: string | null
+  platform?: string | null
+  source?: string
+  unknownRequests?: number
+  unpricedRequests?: number
+  qualityUnknownRequests?: number
 }
 export interface ApiUsageProviderRow {
   provider: string
@@ -345,28 +362,23 @@ export interface ApiUsageLogRow {
   status: string
   measured?: boolean
   costEstimated?: boolean
-  measurementQuality?: string
-  errorCode?: string | null
+  unpriced?: boolean
+  route?: string | null
+  platform?: string | null
+  requestedModel?: string
+  actualModel?: string
+  failureReason?: string | null
   failureStage?: string | null
-  runId?: string | null
-  executionId?: string | null
-  attemptId?: string | null
-  attemptIndex?: number
-  actualModel?: string | null
-  role?: ApiModelRole
-  routeId?: string | null
-  routeSource?: 'sub2api' | 'env'
-  platform?: ApiModelPlatform
-  cacheReadTokens?: number
-  cacheWriteTokens?: number
-  reasoningTokens?: number
+  httpStatus?: number | null
+  callId?: string | null
+  attempt?: number | null
 }
 export interface ApiUsageLogPage {
   items: ApiUsageLogRow[]
   total: number
   page: number
   pageSize: number
-  rollup?: ApiUsageRollupStatus
+  metadata?: ApiUsageMetadata
 }
 
 /** Company skill library row. */
@@ -1549,13 +1561,13 @@ export const api = {
   getUsageSummary: (from: string, to: string, source?: string, signal?: AbortSignal) =>
     http<ApiUsageSummary>(`/usage/summary?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}${source ? `&source=${encodeURIComponent(source)}` : ''}`, { signal }),
   getUsageTrend: (from: string, to: string, granularity: 'hour' | 'day', signal?: AbortSignal) =>
-    http<{ granularity: string; points: ApiUsageTrendPoint[] }>(`/usage/trend?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&granularity=${granularity}`, { signal }),
+    http<{ granularity: 'hour' | 'day'; points: ApiUsageTrendPoint[]; metadata?: ApiUsageMetadata }>(`/usage/trend?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&granularity=${granularity}`, { signal }),
   getUsageByAgent: (from: string, to: string, signal?: AbortSignal) =>
-    http<{ items: ApiUsageAgentRow[] }>(`/usage/by-agent?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`, { signal }),
+    http<{ items: ApiUsageAgentRow[]; metadata?: ApiUsageMetadata }>(`/usage/by-agent?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`, { signal }),
   getUsageByModel: (from: string, to: string, signal?: AbortSignal) =>
-    http<{ items: ApiUsageModelRow[] }>(`/usage/by-model?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`, { signal }),
+    http<{ items: ApiUsageModelRow[]; metadata?: ApiUsageMetadata }>(`/usage/by-model?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`, { signal }),
   getUsageByProvider: (from: string, to: string, signal?: AbortSignal) =>
-    http<{ items: ApiUsageProviderRow[] }>(`/usage/by-provider?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`, { signal }),
+    http<{ items: ApiUsageProviderRow[]; metadata?: ApiUsageMetadata }>(`/usage/by-provider?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`, { signal }),
   /** Skills library + per-agent enablement. */
   getSkills: (signal?: AbortSignal) =>
     http<{ items: ApiSkill[]; hubConfigured: boolean; localHubPath: string | null }>('/skills', { signal }),
