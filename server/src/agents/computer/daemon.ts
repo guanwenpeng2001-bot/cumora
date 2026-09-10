@@ -50,7 +50,7 @@ import { SKYPE_EMOTICONS_GUIDE } from '../skype-emoticons.js'
 import { finalizeTriage, isRateLimited, parseTriage, triageDisposition, deferTriage, type InboxTriageVerdict } from '../triage-core.js'
 import { BYOA_SYNC_INTERVALS, ByoaPolicyController } from './runtime-policy.js'
 import { type ActionSurface, actionSurfaceFor, actionSurfaceText, calendarExampleText, postingMechanicsText } from './prompt-surface.js'
-import { buildEngineCodexMcpInjection, allowUnsandboxedByoa, detectEnginesWithStatus, ENGINE_IDS, type DetectedEngineSnapshot, type EngineHopReport, type EngineId, type EngineRunResult, type EngineSession, type EngineUsage, enrichDetectedEngines, evaluateRunnableEngines, getAdapter, runEngineDoctor, type RunnableEngineEvaluation, snapshotDetectedEngines } from './engine.js'
+import { buildEngineCodexMcpInjection, runnableEngineIds, allowUnsandboxedByoa, detectEnginesWithStatus, ENGINE_IDS, type DetectedEngineSnapshot, type EngineHopReport, type EngineId, type EngineRunResult, type EngineSession, type EngineUsage, enrichDetectedEngines, evaluateRunnableEngines, getAdapter, runEngineDoctor, type RunnableEngineEvaluation, snapshotDetectedEngines } from './engine.js'
 
 export { conversationHeader }
 
@@ -798,7 +798,8 @@ function missingEngineMessage(): string {
     '  - Claude Code: install the `claude` CLI, then run `claude` once to sign in',
     '  - Codex: install the `codex` CLI, then run `codex` once to sign in',
     '',
-    'Unsandboxed compatibility engines (explicit opt-in required):',
+    'Unsandboxed compatibility engines (CUMORA_BYOA_ALLOW_UNSANDBOXED=1 required):',
+    '  - Kimi Code: install the `kimi` CLI, then run `kimi login` once',
     '  - Grok Build: install the `grok` CLI, then run `grok login` once',
     '  - Cursor Agent: install Cursor (the `cursor-agent` CLI ships with it), then run `cursor-agent login`',
     '  - OpenCode: install the `opencode` CLI, then run `opencode providers login` once',
@@ -819,7 +820,7 @@ function sandboxedEngineMessage(installed: readonly EngineId[]): string {
     process.platform === 'win32'
       ? 'Use Codex on native Windows, or run Claude Code inside WSL2.'
       : 'Install and sign in to Claude Code or Codex.',
-    'Grok, Cursor, OpenCode, pi, Gemini, Qwen, Antigravity, and native-Windows Claude currently lack',
+    'Kimi, Grok, Cursor, OpenCode, pi, Gemini, Qwen, Antigravity, and native-Windows Claude currently lack',
     'a Cumora-verified fail-closed host boundary.',
     '',
     'Compatibility only (grants the model your host files, environment, and network):',
@@ -843,7 +844,7 @@ function helpText(): string {
     'cumora agent computer — run your Cumora agents on THIS machine (BYOA)',
     '',
     'The daemon talks to a Cumora server over HTTP and drives a local agent',
-    'engine. Claude Code and Codex are sandboxed by default. Grok Build, Cursor',
+    'engine. Claude Code and Codex are sandboxed by default. Kimi Code, Grok Build, Cursor',
     'Agent, OpenCode, pi, Gemini, Qwen, Antigravity, and native-Windows Claude require the explicit',
     'high-risk CUMORA_BYOA_ALLOW_UNSANDBOXED=1 compatibility switch.',
     'Pair once, then the daemon runs in the background.',
@@ -917,7 +918,7 @@ export function resolveAvailableEngine(
   requested: EngineId | null | undefined,
   available: readonly EngineId[],
 ): EngineId | null {
-  return requested && available.includes(requested) ? requested : (available[0] ?? null)
+  return requested ? (available.includes(requested) ? requested : null) : (available[0] ?? null)
 }
 
 export interface EngineInventory {
@@ -1424,7 +1425,7 @@ async function doPair(code: string, serverUrl: string, preferredEngine?: string)
       throw new Error(`--engine must be one of: ${ENGINE_IDS.join(', ')} (got "${preferredEngine}")`)
     }
     if (!detected.includes(preferredEngine as EngineId)) {
-      throw new Error(`--engine ${preferredEngine} chosen, but ${preferredEngine} is not installed on this machine. Installed: ${detected.join(', ') || 'none'}.`)
+      throw new Error(`--engine ${preferredEngine} chosen, but ${preferredEngine} is not runnable on this machine. Runnable: ${detected.join(', ') || 'none'}. ${evaluated.blocked.find(({ id }) => id === preferredEngine)?.reason ?? 'Install/sign in to the CLI; Kimi and other unsandboxed engines require CUMORA_BYOA_ALLOW_UNSANDBOXED=1 (PowerShell: $env:CUMORA_BYOA_ALLOW_UNSANDBOXED = 1).'}`)
     }
     engines = [preferredEngine as EngineId, ...detected.filter((e) => e !== preferredEngine)]
   }
@@ -1900,7 +1901,10 @@ class AgentRunner {
     if (this.busy) return
     this.busy = true
     try { await this.applyPendingResources() }
-    finally { this.busy = false }
+    finally {
+      this.busy = false
+      if (this.pendingRerun && !this.stopped) this.kickTurn('resources-applied')
+    }
   }
 
   private resourceResult(agent: AgentInfo): ResourceApplicationResult {
@@ -2165,6 +2169,12 @@ class AgentRunner {
       return deferTriage('fail-closed', 'triage snapshot no longer covers the unread boundary', 'invalid-result')
     }
     if (payload.verdict) return triageDisposition(payload.verdict)
+    // Cooling down only suppresses the local classifier. Fetching the payload
+    // still admits deterministic human/calendar verdicts without a model call.
+    if (Date.now() < this.triageBackoffUntil) {
+      return { ...deferTriage('rate-limited', 'local triage cooling down', 'rate-limited'),
+        retryAt: this.triageBackoffUntil }
+    }
     if (typeof payload.instructions !== 'string' || !payload.instructions || typeof payload.input !== 'string' || !payload.input) {
       return deferTriage('fail-closed', 'invalid triage payload', 'invalid-result')
     }
@@ -2758,16 +2768,6 @@ class AgentRunner {
       do {
         this.pendingRerun = false
         if (!await this.applyPendingResources()) break
-        // Triage-trouble backoff: while triage is cooling down (after a rate-limit
-        // or a fail-open), skip the WHOLE turn — no triage call, no engine spawn —
-        // so we neither hammer a broken/throttled triage nor burn the big brain.
-        // The poll just no-ops until the window passes; unread messages are
-        // untouched and get triaged then.
-        if (!this.pendingBackgroundBrief && Date.now() < this.triageBackoffUntil) {
-          const leftS = Math.round((this.triageBackoffUntil - Date.now()) / 1000)
-          console.log(`[computer] ${this.agent.id} skip (${reason}): triage backoff, ${leftS}s left`)
-          break
-        }
         // Big-brain rate-limit cooldown: the last attempt got throttled by the
         // provider. Skip this turn cleanly (no triage call either — even small
         // brain is wasted if we can't follow up with the big one). Unread is
@@ -2828,6 +2828,8 @@ class AgentRunner {
           deferTriage('fail-closed', err instanceof Error ? err.message : String(err), 'payload-unavailable')))
         const triageMs = Date.now() - turnStart // ensureToken + snapshot + triage
         if (triage?.outcome === 'defer') {
+          // A probe of an existing cooldown must not extend it indefinitely.
+          if (Date.now() < this.triageBackoffUntil) break
           this.triageTroubleStreak += 1
           const backoff = Math.min(runtimePolicy.values.triageBackoffMaxMs, runtimePolicy.values.triageBackoffBaseMs * 2 ** Math.min(31, this.triageTroubleStreak - 1))
           this.triageBackoffUntil = Math.max(Date.now() + backoff, triage.retryAt ?? 0)
@@ -3265,8 +3267,11 @@ async function doRun(serverOverride?: string): Promise<void> {
   }
   if (serverOverride) cfg.serverUrl = serverOverride
   let initialEngines: EngineId[]
+  let blockedEngines: RunnableEngineEvaluation['blocked'] = []
   try {
-    initialEngines = (await requireLocalEngine()).runnable
+    const evaluated = await requireLocalEngine()
+    initialEngines = evaluated.runnable
+    blockedEngines = evaluated.blocked
   } catch (err) {
     console.error(`[computer] ${err instanceof Error ? err.message : String(err)}`)
     process.exitCode = 70
@@ -3302,12 +3307,13 @@ async function doRun(serverOverride?: string): Promise<void> {
     for (const agent of agents) {
       const engine = resolveAvailableEngine(agent.engine, available)
       if (!engine) {
-        // A successful rescan may legitimately find that the last installed CLI
-        // was removed. Stop an existing runner instead of leaving it alive on an
-        // engine this machine no longer has.
+        const reason = blockedEngines.find(({ id }) => id === agent.engine)?.reason
+          ?? (agent.engine && runnableEngineIds([agent.engine]).length === 0
+            ? 'disabled by the secure BYOA default: this engine requires CUMORA_BYOA_ALLOW_UNSANDBOXED=1'
+            : 'no runnable CLI found in the latest PATH inventory; install the CLI and refresh engine detection')
+        console.warn(`[computer] ${agent.name} (${agent.id}): requested engine ${agent.engine ?? '(default)'} is unavailable: ${reason}. Runner stopped. Install/sign in to that CLI and resolve its sandbox requirements; for Kimi or other unsandboxed compatibility engines, set CUMORA_BYOA_ALLOW_UNSANDBOXED=1 and rerun --install-service (PowerShell: $env:CUMORA_BYOA_ALLOW_UNSANDBOXED = '1').`)
         const existing = runners.get(agent.id)
         if (existing) {
-          console.log(`[computer] no installed engine remains for ${agent.name} (${agent.id}) → stopping runner`)
           runners.delete(agent.id)
           await existing.stop({ forceEngine: true })
         }
@@ -3367,6 +3373,7 @@ async function doRun(serverOverride?: string): Promise<void> {
       if (!detected.reliable) return  // broken `which` / `where` — keep the last good list
       const evaluated = await evaluateRunnableEngines(detected.engines)
       const next = evaluated.runnable
+      blockedEngines = evaluated.blocked
       const capabilityWarning = evaluated.blocked.map(({ id, reason }) => `${id} (${reason})`).join('; ')
       if (capabilityWarning !== lastCapabilityWarning) {
         lastCapabilityWarning = capabilityWarning
@@ -3587,7 +3594,7 @@ function escapeXml(value: string): string {
   return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&apos;')
 }
 
-export function renderLaunchAgent(serverUrl: string, logPath: string, path: string): string {
+export function renderLaunchAgent(serverUrl: string, logPath: string, path: string, unsandboxed = allowUnsandboxedByoa()): string {
   const args = ['/usr/bin/env', 'cumora', 'agent', 'computer', '--server', serverUrl]
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -3600,7 +3607,7 @@ export function renderLaunchAgent(serverUrl: string, logPath: string, path: stri
   <key>StandardErrorPath</key><string>${escapeXml(logPath)}</string>
   <key>EnvironmentVariables</key><dict>
     <key>PATH</key><string>${escapeXml(path)}</string>
-    <key>CUMORA_SUPERVISED</key><string>1</string>
+    <key>CUMORA_SUPERVISED</key><string>1</string>${unsandboxed ? '\n    <key>CUMORA_BYOA_ALLOW_UNSANDBOXED</key><string>1</string>' : ''}
   </dict>
 </dict></plist>
 `
@@ -3610,7 +3617,7 @@ function quoteSystemd(value: string): string {
   return JSON.stringify(value).replaceAll('%', '%%')
 }
 
-export function renderSystemdUnit(serverUrl: string, path: string): string {
+export function renderSystemdUnit(serverUrl: string, path: string, unsandboxed = allowUnsandboxedByoa()): string {
   return `[Unit]
 Description=Cumora BYOA daemon
 After=network-online.target
@@ -3620,7 +3627,7 @@ ExecStart=/usr/bin/env cumora agent computer --server ${quoteSystemd(serverUrl).
 Restart=always
 RestartSec=5
 Environment=${quoteSystemd(`PATH=${path}`)}
-Environment=CUMORA_SUPERVISED=1
+Environment=CUMORA_SUPERVISED=1${unsandboxed ? '\nEnvironment=CUMORA_BYOA_ALLOW_UNSANDBOXED=1' : ''}
 
 [Install]
 WantedBy=default.target
@@ -3654,10 +3661,12 @@ export function renderWindowsSupervisor(
   logPath: string,
   disabledPath = windowsSupervisorDisabledPath(),
   path = process.env.PATH ?? '',
+  unsandboxed = allowUnsandboxedByoa(),
 ): string {
   return [
     "$ErrorActionPreference = 'Continue'",
     "$env:CUMORA_SUPERVISED = '1'",
+    ...(unsandboxed ? ["$env:CUMORA_BYOA_ALLOW_UNSANDBOXED = '1'"] : []),
     `$env:PATH = ${quotePowerShell(path)}`,
     '$utf8 = New-Object System.Text.UTF8Encoding($false)',
     `while (-not (Test-Path -LiteralPath ${quotePowerShell(disabledPath)})) {`,

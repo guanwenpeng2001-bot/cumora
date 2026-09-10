@@ -289,3 +289,41 @@ test('actual group steer respects the policy toggle and throttle while direct hu
   assert.equal(notices.length, 2)
   assert.match(notices[1], /bodies withheld/)
 })
+
+for (const fail of [false, true]) test(`resource materialization drains coalesced wakes after ${fail ? 'failure' : 'success'}`, async () => {
+  const source = read('../agents/computer/daemon.ts')
+  const ast = ts.createSourceFile('daemon.ts', source, ts.ScriptTarget.Latest, true)
+  const cls = ast.statements.find(n => ts.isClassDeclaration(n) && n.name?.text === 'AgentRunner') as ts.ClassDeclaration
+  const method = cls.members.find(n => n.name?.getText(ast) === 'queueResources')!.getText(ast)
+  const { Runner } = compile(`export class Runner { ${method} }`, { structuredClone })
+  const runner = new Runner()
+  let release!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  const kicks: string[] = []
+  Object.assign(runner, {
+    busy: false, stopped: false, pendingRerun: false,
+    applyPendingResources: async () => { await gate; if (fail) throw new Error('materialization failed') },
+    kickTurn: (reason: string) => {
+      assert.equal(runner.busy, false)
+      runner.pendingRerun = false
+      kicks.push(reason)
+    },
+  })
+  const applying = runner.queueResources({ id: 'a' })
+  assert.equal(runner.busy, true)
+  assert.deepEqual(kicks, [])
+  runner.pendingRerun = true
+  await runner.queueResources({ id: 'a', resourceVersion: '2' })
+  release()
+  if (fail) await assert.rejects(applying, /materialization failed/)
+  else await applying
+  assert.deepEqual(kicks, ['resources-applied'])
+  assert.equal(runner.busy, false)
+  runner.applyPendingResources = async () => {}
+  await runner.queueResources({ id: 'a' })
+  assert.equal(kicks.length, 1, 'no wake means no extra turn')
+  runner.stopped = true
+  runner.pendingRerun = true
+  await runner.queueResources({ id: 'a' })
+  assert.equal(kicks.length, 1, 'a stopped runner must not be revived')
+})

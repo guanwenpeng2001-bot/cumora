@@ -4,6 +4,7 @@ import { AppearancePicker, ChatLayoutPicker } from '@/components/AppearancePicke
 import { Avatar } from '@/components/Avatar'
 import { Checkbox } from '@/components/Checkbox'
 import { LanguagePicker } from '@/components/LanguagePicker'
+import { isWindows } from '@/lib/runtime'
 import { AGENT_CLI_RELEASE_TAG, agentCliCommand } from '@/lib/agentCliRelease'
 import { ENGINE_BIN, ENGINE_LABEL, engineLabel, RUNNABLE_ENGINE_IDS, RUNNABLE_ENGINES, type RunnableEngineId } from '@/lib/engines'
 import { type MessageKey, translate, useLocale, useT } from '@/lib/i18n'
@@ -892,8 +893,12 @@ function ComputersTab() {
 
   const origin = getPairingServerOrigin()
   const serverFlag = origin ? ` --server ${origin}` : ''
+  // Keep aligned with the daemon's SANDBOXED_ENGINE_IDS.
+  const SANDBOXED_ENGINE_IDS: readonly string[] = ['claude', 'codex']
+  const optIn = SANDBOXED_ENGINE_IDS.includes(engine) ? ''
+    : isWindows ? "$env:CUMORA_BYOA_ALLOW_UNSANDBOXED = '1'\n" : 'export CUMORA_BYOA_ALLOW_UNSANDBOXED=1\n'
   const engineFlag = engine === 'claude' ? '' : ` --engine ${engine}`
-  const pairCommand = code ? agentCliCommand(` --pair ${code}${serverFlag}${engineFlag}${asService ? ' --install-service' : ''}`) : ''
+  const pairCommand = code ? optIn + agentCliCommand(` --pair ${code}${serverFlag}${engineFlag}${asService ? ' --install-service' : ''}`) : ''
   const list = Object.values(byId).sort((a, b) =>
     (a.kind === 'cloud' ? 0 : 1) - (b.kind === 'cloud' ? 0 : 1) || a.name.localeCompare(b.name))
 

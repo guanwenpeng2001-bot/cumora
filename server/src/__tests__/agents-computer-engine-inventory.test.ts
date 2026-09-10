@@ -1,3 +1,7 @@
+import { readFileSync } from 'node:fs'
+import ts from 'typescript'
+import { SANDBOXED_ENGINE_IDS, ENGINE_IDS } from '../agents/computer/engine.js'
+import { agentCliCommand } from '../../../src/lib/agentCliRelease.js'
 /**
  * Runtime engine selection must use the daemon's current PATH inventory, not
  * the snapshot captured when the process started.
@@ -73,4 +77,38 @@ test('failed updates and forced reports retain the last successfully reported sn
   await assert.rejects(report('catalog-b', true, fail), /network unavailable/)
   await report('catalog-b', false, unexpected)
   await report('catalog-b', true, () => accept('catalog-b'))
+})
+
+test('an unavailable explicit engine never falls back to another installed engine', () => {
+  assert.equal(resolveAvailableEngine('kimi', ['claude', 'codex']), null)
+  assert.equal(resolveAvailableEngine('kimi', ['kimi', 'codex']), 'kimi')
+  assert.equal(resolveAvailableEngine(null, ['codex']), 'codex')
+  assert.equal(resolveAvailableEngine(undefined, []), null)
+})
+
+test('both pairing UIs opt in every unsandboxed engine on POSIX and PowerShell', () => {
+  for (const [file, output] of [['Onboarding', 'cmd'], ['MeView', 'pairCommand']]) {
+    const source = readFileSync(new URL(`../../../src/desktop/${file}.tsx`, import.meta.url), 'utf8')
+    const ast = ts.createSourceFile('ui.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
+    const names = new Set(['SANDBOXED_ENGINE_IDS', 'optIn', 'engineFlag', output])
+    const statements: string[] = []
+    const visit = (node: ts.Node) => {
+      if (ts.isVariableStatement(node) && node.declarationList.declarations.some(d => names.has(d.name.getText(ast)))) statements.push(node.getText(ast))
+      ts.forEachChild(node, visit)
+    }
+    visit(ast)
+    const code = ts.transpile(statements.join(';') + `;return { command: ${output}, sandboxed: SANDBOXED_ENGINE_IDS }`, { target: ts.ScriptTarget.ES2022 })
+    const generate = new Function('engine', 'isWindows', 'code', 'origin', 'serverFlag', 'serviceFlag', 'asService', 'agentCliCommand', code)
+    for (const engine of ENGINE_IDS) for (const windows of [false, true]) {
+      const result = generate(engine, windows, 'pair-token', '', '', ' --install-service', true, agentCliCommand)
+      assert.deepEqual(result.sandboxed, SANDBOXED_ENGINE_IDS)
+      assert.match(result.command, /--pair pair-token/)
+      assert.match(result.command, /--install-service/)
+      if (SANDBOXED_ENGINE_IDS.includes(engine)) assert.doesNotMatch(result.command, /CUMORA_BYOA_ALLOW_UNSANDBOXED/)
+      else {
+        assert.ok(result.command.startsWith(windows ? "$env:CUMORA_BYOA_ALLOW_UNSANDBOXED = '1'" : 'export CUMORA_BYOA_ALLOW_UNSANDBOXED=1'))
+        assert.ok(result.command.includes(`--engine ${engine}`))
+      }
+    }
+  }
 })

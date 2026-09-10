@@ -152,3 +152,29 @@ test('Release builds skip the official update request entirely', async (t) => {
   await checkForUpdate(true)
   assert.equal(fetchMock.mock.callCount(), 0)
 })
+
+test('all supervisor templates persist only an exact installation-time unsandboxed opt-in', () => {
+  const previous = process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED
+  try {
+    for (const value of [undefined, '', '0', 'true', '1']) {
+      if (value === undefined) delete process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED
+      else process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED = value
+      const templates = [
+        renderLaunchAgent('https://example.test', '/tmp/log', '/bin'),
+        renderSystemdUnit('https://example.test', '/bin'),
+        renderWindowsSupervisor('https://example.test', 'C:/log', 'C:/disabled', 'C:/bin'),
+      ]
+      for (const template of templates) {
+        assert.equal(template.includes('CUMORA_BYOA_ALLOW_UNSANDBOXED'), value === '1')
+      }
+      if (value === '1') {
+        assert.match(templates[0], /<key>CUMORA_BYOA_ALLOW_UNSANDBOXED<\/key><string>1<\/string>/)
+        assert.match(templates[1], /Environment=CUMORA_BYOA_ALLOW_UNSANDBOXED=1/)
+        assert.match(templates[2], /\$env:CUMORA_BYOA_ALLOW_UNSANDBOXED = '1'/)
+      }
+    }
+  } finally {
+    if (previous === undefined) delete process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED
+    else process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED = previous
+  }
+})

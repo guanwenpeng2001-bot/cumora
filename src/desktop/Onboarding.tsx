@@ -1,3 +1,4 @@
+import { isWindows } from '@/lib/runtime'
 import { agentCliCommand } from '@/lib/agentCliRelease'
 import { useEffect, useState } from 'react'
 import { api, getPairingServerOrigin } from '@/api/client'
@@ -40,9 +41,13 @@ export function Onboarding() {
   // Every non-default engine, not just Codex: without the flag the daemon
   // auto-detects and the server takes engines[0] as this computer's DEFAULT, so
   // picking Grok on a machine that also has Claude silently paired it to Claude.
+  // Keep aligned with the daemon's SANDBOXED_ENGINE_IDS.
+  const SANDBOXED_ENGINE_IDS: readonly string[] = ['claude', 'codex']
+  const optIn = SANDBOXED_ENGINE_IDS.includes(engine) ? ''
+    : isWindows ? "$env:CUMORA_BYOA_ALLOW_UNSANDBOXED = '1'\n" : 'export CUMORA_BYOA_ALLOW_UNSANDBOXED=1\n'
   const engineFlag = engine === 'claude' ? '' : ` --engine ${engine}`
   const serviceFlag = asService ? ' --install-service' : ''
-  const cmd = code ? agentCliCommand(` --pair ${code}${origin ? ` --server ${origin}` : ''}${engineFlag}${serviceFlag}`) : ''
+  const cmd = code ? optIn + agentCliCommand(` --pair ${code}${origin ? ` --server ${origin}` : ''}${engineFlag}${serviceFlag}`) : ''
 
   async function getCode() {
     setErr(null); setBusy(true)

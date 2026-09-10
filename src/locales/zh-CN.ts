@@ -1439,7 +1439,7 @@ export const zhCN: Partial<Record<keyof typeof en, string>> = {
   'me.copy': '复制',
   'me.copiedShort': '✓ 已复制',
   'me.runOnHost': '在托管智能体的机器上先运行第一行安装固定版本 fork CLI，安装成功后再运行第二行：',
-  'me.engineRequired': '需要装好 <span class="font-mono not-italic">claude</span>、<span class="font-mono not-italic">codex</span>、<span class="font-mono not-italic">grok</span>、<span class="font-mono not-italic">cursor-agent</span> 或 <span class="font-mono not-italic">opencode</span>。计算机会以那台机器命名，配对后出现在这里。这个令牌长期有效。',
+  'me.engineRequired': 'Kimi Code（<span class="font-mono not-italic">kimi</span>）和其他非沙箱引擎需要显式设置 <span class="font-mono not-italic">CUMORA_BYOA_ALLOW_UNSANDBOXED=1</span>，允许访问宿主机文件、环境变量和网络。选择这类引擎时，配对命令会自动包含此设置。也可装好 <span class="font-mono not-italic">claude</span>、<span class="font-mono not-italic">codex</span>、<span class="font-mono not-italic">grok</span>、<span class="font-mono not-italic">cursor-agent</span> 或 <span class="font-mono not-italic">opencode</span>。计算机会以那台机器命名，配对后出现在这里。这个令牌长期有效。',
   'me.keepInBackground': '让它在后台保持运行',
   'me.keepInBackgroundDetail': '登录自启、崩溃自恢复。fork CLI 更新需安装固定 Release。否则需要保持终端开启。',
   'me.done': '完成',
