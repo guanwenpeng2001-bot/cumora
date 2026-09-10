@@ -147,6 +147,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs: [changes, typecheck, quality]
+    # Forks lack the GCP WIF secrets; upstream sets CUMORA_DEPLOY_GCP=true.
+    if: vars.CUMORA_DEPLOY_GCP == 'true'
     outputs:
       digest: ${{ steps.push.outputs.digest }}
       tag: ${{ steps.meta.outputs.tag }}
@@ -207,7 +209,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs: [changes, typecheck, quality]
-    if: needs.changes.outputs.agent == 'true'
+    if: needs.changes.outputs.agent == 'true' && vars.CUMORA_DEPLOY_GCP == 'true'
     outputs:
       digest: ${{ steps.push.outputs.digest }}
       tag: ${{ steps.meta.outputs.tag }}
