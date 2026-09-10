@@ -14,7 +14,7 @@ services:
   sub2api:
     # Pin the locally built image name to the audited fork revision; never
     # resolve or pull a floating `latest` tag.
-    image: cumora-sub2api:fork-6c62581d2
+    image: cumora-sub2api:fork-3c8ea9d05
     build:
       # Local checkout of the fork (github.com/guanwenpeng2001-bot/sub2api) —
       # much faster than re-cloning the git URL on every build. Push to the
