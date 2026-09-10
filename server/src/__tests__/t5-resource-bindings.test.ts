@@ -9,7 +9,10 @@ import { setAgentConnectors, agentConnectorsFor, enabledConnectorsForAgent, list
 const connectionString = process.env.INTEGRATION_DATABASE_URL
 test('T5 isolated PostgreSQL: tenant binding, rollback, delivery and summaries', { skip: !connectionString }, async (t) => {
   const url = new URL(connectionString!)
-  assert.ok(['localhost', '127.0.0.1'].includes(url.hostname) && url.port === '15432', 'only designated isolated PostgreSQL allowed')
+  // CI provides a fresh postgres service (isolated by definition); locally only
+  // the coordinator-designated throwaway instance on port 15432 is allowed.
+  const isCiService = process.env.CI === 'true' && url.hostname === 'localhost' && url.pathname.endsWith('_test')
+  assert.ok(isCiService || (['localhost', '127.0.0.1'].includes(url.hostname) && url.port === '15432'), 'only designated isolated PostgreSQL allowed')
   const db = new Client({ connectionString })
   await db.connect()
   t.after(async () => { await db.end() })
