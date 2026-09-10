@@ -147,6 +147,7 @@ export const SETTING_DEFS: readonly SettingDef[] = [
   { key: 'chrome_pvc_size', type: 'string', defaultValue: '500Mi', scope: 'server', readOnly: true, envOnly: true, effect: 'restart-next-create', description: 'Deployment env; restart before next Pod/PVC creation. Existing storage requires a separate migration, not a hot settings update.', envKeys: ['CUMORA_CHROME_PVC_SIZE'], envValue: () => process.env.CUMORA_CHROME_PVC_SIZE ?? '500Mi' },
   { key: 'chrome_pvc_storage_class', type: 'string', defaultValue: '', scope: 'server', readOnly: true, envOnly: true, effect: 'restart-next-create', description: 'Deployment env; restart before next Pod/PVC creation. Existing storage requires a separate migration, not a hot settings update.', envKeys: ['CUMORA_CHROME_PVC_STORAGECLASS'], envValue: () => process.env.CUMORA_CHROME_PVC_STORAGECLASS ?? '' },
   // Not a model — the skills tab's local hub directory.
+  { key: 'mcp_allow_private_hosts', type: 'boolean', scope: 'server', defaultValue: 'false', envValue: () => 'false', description: 'Allow private MCP HTTP hosts for trusted self-hosted connectors.' },
   { key: 'local_skillhub_path', type: 'string', envKeys: ['LOCAL_SKILLHUB_PATH'], envValue: () => process.env.LOCAL_SKILLHUB_PATH ?? '' },
 ]
 

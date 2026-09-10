@@ -310,3 +310,11 @@ test('stdio env permits only explicitly supplied connector credentials', () => {
     assert.deepEqual(stdioEnvironment({ PATH: 'explicit' }, { Path: 'inherited' }), { PATH: 'explicit' })
   }
 })
+
+test('HTTP transport rejects redirects on every JSON-RPC request', async (t) => {
+  t.mock.method(globalThis, 'fetch', async (_url: unknown, init?: RequestInit) => {
+    assert.equal(init?.redirect, 'error')
+    throw new TypeError('redirect rejected')
+  })
+  await assert.rejects(connectMcpConnector({ name: 'redirect', type: 'http', url: 'https://mcp.example.com' }, { cwd: '.' }), /redirect rejected/)
+})

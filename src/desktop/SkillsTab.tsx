@@ -50,6 +50,7 @@ export function SkillsTab() {
     if (current()) setErrors((prev) => ({ ...prev, [source]: e instanceof Error ? e.message : String(e) }))
   }
   const loadLocal = useCallback(async () => {
+    if (!isSiteAdmin) return
     const sequence = ++localSequence.current
     setLocalLoading(true)
     setErrors((prev) => ({ ...prev, local: null }))
@@ -60,7 +61,7 @@ export function SkillsTab() {
       setLocalPath(r.path)
     } catch (e) { if (sequence === localSequence.current) fail('local', e) }
     finally { if (current() && sequence === localSequence.current) setLocalLoading(false) }
-  }, [epoch])
+  }, [epoch, isSiteAdmin])
   const load = useCallback(async () => {
     const sequence = ++librarySequence.current
     setErrors((prev) => ({ ...prev, library: null }))
@@ -69,13 +70,13 @@ export function SkillsTab() {
       if (useAuth.getState().contextEpoch !== epoch || sequence !== librarySequence.current) return
       setSkills(r.items)
       setHubConfigured(r.hubConfigured)
-      setLocalPath(r.localHubPath)
     } catch (e) { if (sequence === librarySequence.current) fail('library', e) }
   }, [epoch])
 
   useEffect(() => {
     setSkills(null)
     setLocalHub([])
+    setLocalPath(null)
     setHubHits(null)
     setPasteOpen(false)
     setPasteBody('')
@@ -89,7 +90,7 @@ export function SkillsTab() {
     setBusy(new Set())
     active.current.clear()
     void load()
-    if (canWrite) void loadLocal()
+    if (isSiteAdmin) void loadLocal()
     if (isSiteAdmin) void api.getModelSettings().then((r) => {
       if (current()) setLocalPathDraft(r.settings.local_skillhub_path ?? '')
     }).catch((e) => fail('path', e))
@@ -219,7 +220,7 @@ export function SkillsTab() {
         </div>
 
         {/* local hub */}
-        {(localPath || errors.local || localLoading) && (
+        {isSiteAdmin && (localPath || errors.local || localLoading) && (
           <div className="space-y-2 border-t border-ink-100 pt-3">
             <div className="text-[11.5px] font-semibold text-ink-500">
               {t('me.skills.localHub')} <span className="font-mono font-normal text-ink-400">{localPath}</span>

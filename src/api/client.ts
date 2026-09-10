@@ -1626,7 +1626,7 @@ export const api = {
     http<{ items: ApiUsageProviderRow[]; metadata?: ApiUsageMetadata }>(`/usage/by-provider?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`, { signal }),
   /** Skills library + per-agent enablement. */
   getSkills: (signal?: AbortSignal) =>
-    http<{ items: ApiSkill[]; hubConfigured: boolean; localHubPath: string | null }>('/skills', { signal }),
+    http<{ items: ApiSkill[]; hubConfigured: boolean; localHubConfigured: boolean }>('/skills', { signal }),
   createSkillFromPaste: (skillMd: string, signal?: AbortSignal) =>
     http<ApiSkill>('/skills/paste', { signal, method: 'POST', body: JSON.stringify({ skillMd }) }),
   installSkillFromHub: (hubId: string, signal?: AbortSignal) =>

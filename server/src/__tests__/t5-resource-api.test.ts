@@ -14,6 +14,7 @@ test('skills/MCP endpoint contracts: role redaction, errors and strict ID arrays
   const handlers = new Map<string, Handler>()
   const api = Object.fromEntries(['get', 'post', 'put', 'delete'].map((method) => [method, (path: string, handler: Handler) => handlers.set(method + ' ' + path, handler)]))
   let role = 'member'
+  let siteAdmin = false
   let writes = 0
   const connector = { id: 'm1', company_id: 'c1', name: 'one', type: 'stdio', command: 'command-secret',
     args: ['arg-secret'], env: { TOKEN: 'env-secret' }, url: 'https://url-secret',
@@ -34,6 +35,10 @@ test('skills/MCP endpoint contracts: role redaction, errors and strict ID arrays
   const block = source.slice(source.indexOf('function resourceSafe('), source.indexOf("api.put('/usage/pricing'"))
   runInNewContext(ts.transpileModule(block, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText, {
     ...skills, ...mcp, api, pool, HttpError, PRIVILEGED_ROLES: new Set(['owner', 'admin']),
+    listSkills: async () => [],
+    listLocalHub: async () => [],
+    localSkillHubPath: () => 'C:/private/hub',
+    requireSiteAdmin: async () => { if (!siteAdmin) throw new HttpError(403, 'admin only'); return 'u1' },
     requireCompany: async () => ({ userId: 'u1', companyId: 'c1' }),
     requireCompanyRole: async () => {
       if (!['owner', 'admin'].includes(role)) throw new HttpError(403, 'forbidden')
@@ -54,6 +59,18 @@ test('skills/MCP endpoint contracts: role redaction, errors and strict ID arrays
     return { status, json: JSON.stringify(result) }
   }
 
+  for (const memberRole of ['member', 'admin', 'owner']) {
+    role = memberRole
+    const response = await call('get /skills')
+    assert.equal(response.status, 200)
+    assert.equal(JSON.parse(response.json).localHubConfigured, true)
+    assert.ok(!response.json.includes('C:/private/hub'))
+    assert.equal((await call('get /skills/hub/local')).status, 403)
+  }
+  siteAdmin = true
+  assert.ok((await call('get /skills/hub/local')).json.includes('C:/private/hub'))
+  siteAdmin = false
+  role = 'member'
   for (const route of ['get /mcp-connectors', 'get /agents/:id/mcp-connectors']) {
     const member = await call(route)
     assert.equal(member.status, 200)

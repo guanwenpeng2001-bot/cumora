@@ -847,7 +847,7 @@ api.get('/skills', resourceSafe(async (req, res) => {
   res.json({
     items: await listSkills(companyId),
     hubConfigured: Boolean(skillHubUrl()),
-    localHubPath: localSkillHubPath() || null,
+    localHubConfigured: Boolean(localSkillHubPath()),
   })
 }))
 
@@ -867,6 +867,7 @@ api.post('/skills/install', resourceSafe(async (req, res) => {
 
 /** Local hub: list (flagged by imported) + import one. */
 api.get('/skills/hub/local', resourceSafe(async (req, res) => {
+  await requireSiteAdmin(req)
   const { companyId } = await requireCompany(req)
   res.json({ items: await listLocalHub(companyId), path: localSkillHubPath() || null })
 }))

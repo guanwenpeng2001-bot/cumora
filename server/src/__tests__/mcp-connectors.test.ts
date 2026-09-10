@@ -7,6 +7,7 @@ import { test } from 'node:test'
 import { readFileSync } from 'node:fs'
 import ts from 'typescript'
 import { buildEngineCodexMcpInjection } from '../agents/computer/engine.js'
+import { refreshServerSettings, validateServerSettings } from '../settings.js'
 import { pool } from '../db/pool.js'
 import { setAgentConnectors, upsertConnector } from '../mcp-connectors.js'
 import assert from 'node:assert/strict'
@@ -142,4 +143,30 @@ test('Codex binding and bound connector updates reject conflicts before mutation
   await assert.rejects(setAgentConnectors('c1', 'a', ['0']), { status: 409 })
   await assert.rejects(upsertConnector('c1', { id: 'm', name: 'a_b', type: 'stdio', command: 'node' }), { status: 409 })
   assert.equal(sqls.filter(sql => /^\s*(INSERT|UPDATE|DELETE)/.test(sql)).length, 0)
+})
+
+test('private HTTP hosts require explicit site opt-in', async (t) => {
+  const urls = ['http://127.1', 'http://2130706433', 'http://169.254.1.1', 'http://10.1.2.3',
+    'http://172.16.0.1', 'http://172.31.255.255', 'http://192.168.0.1', 'http://localhost.',
+    'http://x.internal.', 'http://metadata.google.internal', 'http://instance-data.ec2.internal',
+    'http://sub2api:8080', 'http://[::1]', 'http://[::ffff:127.0.0.1]', 'http://[fe80::1]', 'http://[fd00::1]']
+  const check = (url: string) => validateConnector({ name: 'private', type: 'http', url })
+  let settingRows: { key: string; value: string }[] = []
+  const origQuery = pool.query
+  // t.mock.method does not reliably replace the pg Pool's prototype query here;
+  // assign directly and restore in finally.
+  ;(pool as unknown as { query: unknown }).query = async () => ({ rows: [...settingRows, { key: '__settings_revision', value: String(Date.now()) }] })
+  try {
+    await refreshServerSettings(true)
+    for (const url of urls) assert.match(check(url) ?? '', /mcp_allow_private_hosts/, url)
+    for (const url of ['http://172.15.0.1', 'https://172.32.0.1', 'https://mcp.example.com']) assert.equal(check(url), null)
+    validateServerSettings({ mcp_allow_private_hosts: 'true' })
+    assert.throws(() => validateServerSettings({ mcp_allow_private_hosts: 'yes' }))
+    settingRows = [{ key: 'mcp_allow_private_hosts', value: 'true' }, { key: '__settings_revision', value: String(Date.now()) }]
+    await refreshServerSettings(true)
+    for (const url of urls) assert.equal(check(url), null, url)
+  } finally {
+    ;(pool as unknown as { query: unknown }).query = origQuery
+    await refreshServerSettings(true)
+  }
 })

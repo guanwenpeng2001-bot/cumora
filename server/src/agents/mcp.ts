@@ -306,6 +306,7 @@ async function httpSend(
     method: 'POST',
     headers,
     body: payload,
+    redirect: 'error',
     signal,
   })
   if (!res.ok) {

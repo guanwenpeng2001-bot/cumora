@@ -16,6 +16,7 @@
  *   - other engines: skipped with a daemon log note
  */
 import { randomUUID } from 'node:crypto'
+import { getServerSetting } from './settings.js'
 import { pool } from './db/pool.js'
 import { ResourceError, requireResourceAgent } from './skill-library.js'
 
@@ -58,6 +59,27 @@ function toRow(r: DbRow, redactSecrets = false): McpConnectorRow {
   }
 }
 
+/** URL normalizes alternate IPv4 spellings and compressed IPv6 before this check.
+ * This is a hostname guard, not DNS pinning or an egress policy. */
+function privateConnectorHost(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/\.$/, '').replace(/^\[|\]$/g, '')
+  if (host.includes(':')) {
+    const mapped = /^::ffff:([0-9a-f]+):([0-9a-f]+)$/.exec(host)
+    if (mapped) {
+      const high = parseInt(mapped[1], 16), low = parseInt(mapped[2], 16)
+      return privateConnectorHost([high >> 8, high & 255, low >> 8, low & 255].join('.'))
+    }
+    return host === '::' || host === '::1' || /^(?:f[cd][0-9a-f]{2}|fe[89ab][0-9a-f]):/.test(host)
+  }
+  if (!host.includes('.') || /(?:^|\.)(?:localhost|internal)$/.test(host)
+      || /(?:^|\.)(?:metadata|instance-data)(?:\.|$)/.test(host)) return true
+  const parts = host.split('.').map(Number)
+  if (parts.length !== 4 || parts.some(n => !Number.isInteger(n) || n < 0 || n > 255)) return false
+  const [a, b] = parts
+  return a === 0 || a === 127 || a === 10 || (a === 169 && b === 254)
+    || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168)
+}
+
 /** Validate an upsert payload. Returns a human error string or null. */
 export function validateConnector(input: {
   name?: unknown; type?: unknown; command?: unknown; args?: unknown
@@ -79,6 +101,9 @@ export function validateConnector(input: {
     try {
       const url = new URL(input.url.trim())
       if (!url.hostname || !['http:', 'https:'].includes(url.protocol)) return 'invalid http url'
+      if (getServerSetting('mcp_allow_private_hosts') !== 'true' && privateConnectorHost(url.hostname)) {
+        return 'private http hosts require the site setting mcp_allow_private_hosts'
+      }
     } catch { return 'invalid http url' }
   }
   for (const m of [input.env, input.headers]) {

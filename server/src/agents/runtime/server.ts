@@ -573,7 +573,7 @@ async function recordRuntimeLlmCalls(c: AuthorizedAgentRuntimeClaims, req: Reque
     res.status(400).json({ error: 'invalid LLM batch payload' }); return
   }
   const source = normalizeByoaSource(body?.source)
-  const daemonVersion = typeof body?.daemonVersion === 'string' && body.daemonVersion.trim() ? body.daemonVersion.trim().slice(0, 32) : null
+  const daemonVersion = typeof body?.daemonVersion === 'string' && body.daemonVersion.trim() ? body.daemonVersion.trim().slice(0, 128) : null
   const hops = Array.isArray(body?.hops) ? body!.hops : []
   if (hops.length === 0) { res.json({ ok: true, inserted: 0 }); return }
   if (hops.length > MAX_LLM_HOPS_PER_BATCH) {

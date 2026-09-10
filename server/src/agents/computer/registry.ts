@@ -311,31 +311,37 @@ function versionGt(a: string, b: string): boolean {
 // GitHub on every call. Refreshes hourly; fail-safe (keeps the last good value,
 // or null when never fetched — and null means we never flag anyone outdated).
 let latestCache: { version: string | null; downloadUrl: string | null; at: number } = { version: null, downloadUrl: null, at: 0 }
+let latestRefresh: Promise<void> | null = null
 const LATEST_TTL_MS = 60 * 60 * 1000
 async function getLatestDaemonRelease(): Promise<{ version: string; downloadUrl: string } | null> {
   const now = Date.now()
-  if (latestCache.version && now - latestCache.at < LATEST_TTL_MS) {
-    return { version: latestCache.version, downloadUrl: latestCache.downloadUrl! }
-  }
-  try {
-    const res = await fetch('https://api.github.com/repos/guanwenpeng2001-bot/cumora/releases?per_page=30', {
-      headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'cumora-server' },
+  if (!latestRefresh && (latestCache.at === 0 || now - latestCache.at >= LATEST_TTL_MS)) {
+    latestRefresh = (async () => {
+      try {
+        const res = await fetch('https://api.github.com/repos/guanwenpeng2001-bot/cumora/releases?per_page=30', {
+          headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'cumora-server' },
+          signal: AbortSignal.timeout(5000),
+        })
+        if (res.ok) {
+          const releases = await res.json() as Array<{ tag_name?: string; published_at?: string; assets?: Array<{ name: string; browser_download_url: string }> }>
+          const cli = releases
+            .filter((r) => r.tag_name?.startsWith('agent-cli-v'))
+            .sort((a, b) => {
+              const va = a.tag_name!.replace('agent-cli-v', '')
+              const vb = b.tag_name!.replace('agent-cli-v', '')
+              return versionGt(vb, va) ? 1 : versionGt(va, vb) ? -1 : 0
+            })[0]
+          const asset = cli?.assets?.find((a) => a.name.endsWith('.tgz'))
+          if (cli?.tag_name && asset) {
+            latestCache = { version: cli.tag_name.replace('agent-cli-v', ''), downloadUrl: asset.browser_download_url, at: now }
+          }
+        }
+      } catch { /* offline — keep the last good value */ }
+    })().finally(() => {
+      latestCache.at = Date.now()
+      latestRefresh = null
     })
-    if (res.ok) {
-      const releases = await res.json() as Array<{ tag_name?: string; published_at?: string; assets?: Array<{ name: string; browser_download_url: string }> }>
-      const cli = releases
-        .filter((r) => r.tag_name?.startsWith('agent-cli-v'))
-        .sort((a, b) => {
-          const va = a.tag_name!.replace('agent-cli-v', '')
-          const vb = b.tag_name!.replace('agent-cli-v', '')
-          return versionGt(vb, va) ? 1 : versionGt(va, vb) ? -1 : 0
-        })[0]
-      const asset = cli?.assets?.find((a) => a.name.endsWith('.tgz'))
-      if (cli?.tag_name && asset) {
-        latestCache = { version: cli.tag_name.replace('agent-cli-v', ''), downloadUrl: asset.browser_download_url, at: now }
-      }
-    }
-  } catch { /* offline — keep the last good value */ }
+  }
   return latestCache.version ? { version: latestCache.version, downloadUrl: latestCache.downloadUrl! } : null
 }
 
@@ -444,7 +450,7 @@ export async function pairComputer(args: {
   const blocked = args.blocked ?? []
   const detected = sanitizeDetectedEngines(args.detected, engines, blocked)
   const detectedJson = JSON.stringify(detected)
-  const version = typeof args.version === 'string' && args.version ? args.version.slice(0, 32) : null
+  const version = typeof args.version === 'string' && args.version ? args.version.slice(0, 128) : null
   const supervised = typeof args.supervised === 'boolean' ? args.supervised : null
   const deviceToken = randomBytes(32).toString('base64url')
   const reportedName = (args.hostName ?? '').slice(0, 80)
@@ -531,7 +537,7 @@ export async function heartbeatComputer(
   supervised?: boolean,
   detectedEngines?: string[],
 ): Promise<boolean> {
-  const v = typeof version === 'string' && version ? version.slice(0, 32) : null
+  const v = typeof version === 'string' && version ? version.slice(0, 128) : null
   const sup = typeof supervised === 'boolean' ? supervised : null
   // Liveness is the primary heartbeat contract. Refreshing the optional PATH
   // inventory must not run first: one transient read failure used to reject the
