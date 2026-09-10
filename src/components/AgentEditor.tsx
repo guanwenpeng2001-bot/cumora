@@ -15,7 +15,7 @@ import { TextArea } from '@/components/TextArea'
 import { Select } from '@/components/Select'
 import { Combobox, type ComboboxOption } from '@/components/Combobox'
 import type { Participant, EngineId } from '@/types'
-import { useT, useLocaleStore } from '@/lib/i18n'
+import { translate, useT, useLocaleStore } from '@/lib/i18n'
 import { AgentEditorSave, bindingReplacement, type BindingStatus, type SaveStage, type StageStatus } from './agentEditorSave'
 import { engineLabel } from '@/lib/engines'
 
@@ -61,24 +61,26 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
   const [savedAgentId, setSavedAgentId] = useState<string | null>(null)
   const [resourceRefresh, setResourceRefresh] = useState(0)
   const locale = useLocaleStore((s) => s.locale)
-  const copy = locale === 'zh-CN' ? {
-    loading: '正在加载绑定…', loadError: '读取失败；保存档案不会替换此区绑定。',
-    retryLoad: '重新读取', empty: '暂无可用资源', dirty: '有未保存的绑定修改',
-    unchanged: '绑定未修改', retry: '重试未完成阶段',
-    frozen: '本次保存内容已锁定；重试会继续保存相同内容。已完成的阶段不会重复提交。',
-    contextChanged: '公司或登录身份已变化，此编辑器已失效。请关闭后重新打开。',
-    profile: '档案', host: '主机', skills: '技能', mcp: 'MCP',
-    pending: '待保存', saving: '保存中', saved: '已保存', skipped: '无需写入', error: '失败，待重试',
-    savedId: '已创建 Agent ID',
-  } : {
-    loading: 'Loading bindings…', loadError: 'Loading failed; saving the profile will preserve these bindings.',
-    retryLoad: 'Reload', empty: 'No resources available', dirty: 'Unsaved binding changes',
-    unchanged: 'Bindings unchanged', retry: 'Retry unfinished stages',
-    frozen: 'This save is locked to its original content. Retry continues that content and skips completed stages.',
-    contextChanged: 'The company or sign-in context changed. Close and reopen this editor.',
-    profile: 'Profile', host: 'Host', skills: 'Skills', mcp: 'MCP',
-    pending: 'Pending', saving: 'Saving', saved: 'Saved', skipped: 'No write needed', error: 'Failed; retry needed',
-    savedId: 'Created Agent ID',
+  const copy = {
+    loading: translate(locale, 'settings.loadingBindings'),
+    loadError: translate(locale, 'settings.loadingFailedSavingTheProfileWillPreserveTheseBindings'),
+    retryLoad: translate(locale, 'settings.reload'),
+    empty: translate(locale, 'settings.noResourcesAvailable'),
+    dirty: translate(locale, 'settings.unsavedBindingChanges'),
+    unchanged: translate(locale, 'settings.bindingsUnchanged'),
+    retry: translate(locale, 'settings.retryUnfinishedStages'),
+    frozen: translate(locale, 'settings.thisSaveIsLockedToItsOriginalContentRetry'),
+    contextChanged: translate(locale, 'settings.theCompanyOrSignInContextChangedCloseAnd'),
+    profile: translate(locale, 'settings.profile'),
+    host: translate(locale, 'settings.host'),
+    skills: translate(locale, 'me.tab.skills'),
+    mcp: 'MCP',
+    pending: translate(locale, 'settings.pending2'),
+    saving: translate(locale, 'settings.saving'),
+    saved: translate(locale, 'settings.saved'),
+    skipped: translate(locale, 'settings.noWriteNeeded'),
+    error: translate(locale, 'settings.failedRetryNeeded'),
+    savedId: translate(locale, 'settings.createdAgentId'),
   }
   const context = useRef(useAuth.getState())
   const epoch = useAuth((s) => s.contextEpoch)
@@ -576,7 +578,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
                         style={{ border: '1px solid var(--ink-100)' }}
                       >
                         <option value="">{t('agent.mcFollowGlobal')}</option>
-                        {mcEffort && !effortOptions.includes(mcEffort) && <option value={mcEffort} disabled>{mcEffort} — {locale === 'zh-CN' ? '不支持，请重新选择' : 'Unsupported; choose another value'}</option>}
+                        {mcEffort && !effortOptions.includes(mcEffort) && <option value={mcEffort} disabled>{mcEffort} — {translate(locale, 'settings.unsupportedChooseAnotherValue')}</option>}
                         {effortOptions.map((o) => <option key={o} value={o}>{o}</option>)}
                       </select>
                       <label className="text-[11.5px] font-semibold text-ink-500">{t('agent.mcContextWindow')}</label>
@@ -602,8 +604,8 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
                         onChange={(e) => setMcThinking(e.target.value === '' ? undefined : e.target.value === 'true')}
                         className="h-8 px-2 rounded-[8px] text-[12.5px] bg-paper">
                         <option value="">{t('agent.mcFollowGlobal')}</option>
-                        <option value="true">{locale === 'zh-CN' ? '启用（仍受模型配置约束）' : 'Enabled (subject to model configuration)'}</option>
-                        <option value="false">{locale === 'zh-CN' ? '关闭' : 'Disabled'}</option>
+                        <option value="true">{translate(locale, 'settings.enabledSubjectToModelConfiguration')}</option>
+                        <option value="false">{translate(locale, 'settings.disabled')}</option>
                       </select>
                     </div>
                     <div>
@@ -663,7 +665,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
               {connectorStatus === 'error' && <button type="button" className="ml-2 underline" onClick={() => setConnectorReload((n) => n + 1)}>{copy.retryLoad}</button>}
             </div>
             <div className="text-[10.5px] text-ink-400 italic mb-1.5">
-              {locale === 'zh-CN' ? '勾选以绑定；取消勾选并保存会从此 Agent 解绑。全局启用/禁用请前往连接器设置。' : 'Check to bind; uncheck and save to unbind from this agent. Enable or disable globally in connector settings.'}
+              {translate(locale, 'settings.checkToBindUncheckAndSaveToUnbindFrom')}
             </div>
             <div className="space-y-1">
               {connectorStatus === 'ready' && connectorChoices.map((c) => (
@@ -681,7 +683,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
                     })
                   }}
                   label={c.name}
-                  description={c.type + (c.globallyEnabled ? '' : (locale === 'zh-CN' ? ' · 已全局禁用；绑定仍保留' : ' · Globally disabled; binding retained'))}
+                  description={c.type + (c.globallyEnabled ? '' : (translate(locale, 'settings.globallyDisabledBindingRetained')))}
                 />
               ))}
             </div>
@@ -904,12 +906,12 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
         </fieldset>
 
         {!contextChanged && <ResourceApplication agentId={savedAgentId ?? save.current?.agentId ?? agent?.id ?? null} refresh={resourceRefresh} saving={busy} />}
-        {!canWrite && <div role="status" className="px-6 py-2 text-[12px]">{locale === 'zh-CN' ? '只读；修改 Agent 和绑定需要公司 owner/admin 权限。' : 'Read only. Editing agents and bindings requires company owner/admin permission.'}</div>}
+        {!canWrite && <div role="status" className="px-6 py-2 text-[12px]">{translate(locale, 'settings.readOnlyEditingAgentsAndBindingsRequiresCompanyOwner')}</div>}
         {(progress || err || contextChanged) && (
           <div className="px-6 py-3 text-[12px] border-t border-ink-100" aria-live="polite">
             {contextChanged ? <div role="alert">{copy.contextChanged}</div> : <>
               {progress && <>
-                <div>{savedAgentId ? (locale === 'zh-CN' ? '已保存；运行应用状态见上方。' : 'Saved. See runtime application status above.') : copy.frozen}</div>
+                <div>{savedAgentId ? (translate(locale, 'settings.savedSeeRuntimeApplicationStatusAbove')) : copy.frozen}</div>
                 {save.current?.agentId && !editing && <div>{copy.savedId}: {save.current.agentId}</div>}
                 <ul>{(['profile', 'host', 'skills', 'mcp'] as const).map((stage) => (
                   <li key={stage}>{copy[stage]}: {copy[progress[stage]]}</li>
@@ -1009,7 +1011,7 @@ function ResourceApplication({ agentId, refresh, saving }: { agentId: string | n
         const r = await http<ResourceApplicationState>(`/agents/${encodeURIComponent(agentId)}/resources/status`, { signal: controller.signal })
         if (controller.signal.aborted || useAuth.getState().contextEpoch !== epoch) return
         if (r.saved !== true || typeof r.version !== 'string' || !['pending', 'applied', 'failed'].includes(r.status)
-            || (r.status === 'applied' && r.appliedVersion !== r.version)) throw new Error(zh ? '资源状态响应无效' : 'Invalid resource status response')
+            || (r.status === 'applied' && r.appliedVersion !== r.version)) throw new Error(translate(zh ? 'zh-CN' : 'en', 'settings.invalidResourceStatusResponse'))
         setState(r)
         setError(null)
       } catch (e) {
@@ -1023,20 +1025,20 @@ function ResourceApplication({ agentId, refresh, saving }: { agentId: string | n
     return () => { controller.abort(); clearTimeout(timer) }
   }, [agentId, refresh, saving, reload, epoch, zh])
   if (!agentId) return null
-  const label = state?.status === 'applied' ? (zh ? '已应用' : 'Applied')
-    : state?.status === 'failed' ? (zh ? '应用失败' : 'Application failed') : (zh ? '待应用' : 'Pending application')
+  const label = state?.status === 'applied' ? (translate(zh ? 'zh-CN' : 'en', 'settings.applied'))
+    : state?.status === 'failed' ? (translate(zh ? 'zh-CN' : 'en', 'settings.applicationFailed')) : (translate(zh ? 'zh-CN' : 'en', 'settings.pendingApplication'))
   return <div className="px-6 py-3 border-t border-ink-100 text-[12px]" aria-live="polite">
-    <div className="font-semibold">{zh ? '技能 / MCP 资源应用状态' : 'Skills / MCP resource application'}</div>
-    {saving ? <div>{zh ? '正在保存，应用状态将在保存后重新读取。' : 'Saving; application status will refresh after saving.'}</div>
-      : error ? <div role="alert" className="text-coral-deep">{zh ? '无法读取应用状态：' : 'Application status unavailable: '}{error}</div>
+    <div className="font-semibold">{translate(zh ? 'zh-CN' : 'en', 'settings.skillsMcpResourceApplication')}</div>
+    {saving ? <div>{translate(zh ? 'zh-CN' : 'en', 'settings.savingApplicationStatusWillRefreshAfterSaving')}</div>
+      : error ? <div role="alert" className="text-coral-deep">{translate(zh ? 'zh-CN' : 'en', 'settings.applicationStatusUnavailable')}{error}</div>
       : state ? <>
-        <div>{zh ? '已保存' : 'Saved'} · {label}</div>
-        <div className="break-all text-[10.5px] text-ink-400">{zh ? '目标版本：' : 'Desired version: '}{state.version}</div>
-        {state.appliedVersion && <div className="break-all text-[10.5px] text-ink-400">{zh ? '已应用版本：' : 'Applied version: '}{state.appliedVersion}</div>}
-        {state.status === 'failed' && <div role="alert" className="text-coral-deep">{state.error ?? (zh ? '运行端未能应用资源' : 'The runtime could not apply resources')}</div>}
-      </> : <div>{zh ? '正在读取应用状态…' : 'Loading application status…'}</div>}
-    <div className="text-ink-500">{zh ? '保存后在下一安全 turn 边界应用，不中断在途任务。BYOA 通常约 60 秒发现资源变更；旧运行端未确认时保持待应用。' : 'Saved changes apply at the next safe turn boundary without interrupting active work. BYOA usually discovers changes in about 60 seconds; unacknowledged changes remain pending on older runtimes.'}</div>
-    <button type="button" disabled={saving} className="underline mt-1" onClick={() => setReload((n) => n + 1)}>{zh ? '刷新应用状态' : 'Refresh application status'}</button>
+        <div>{translate(zh ? 'zh-CN' : 'en', 'settings.saved')} · {label}</div>
+        <div className="break-all text-[10.5px] text-ink-400">{translate(zh ? 'zh-CN' : 'en', 'settings.desiredVersion')}{state.version}</div>
+        {state.appliedVersion && <div className="break-all text-[10.5px] text-ink-400">{translate(zh ? 'zh-CN' : 'en', 'settings.appliedVersion')}{state.appliedVersion}</div>}
+        {state.status === 'failed' && <div role="alert" className="text-coral-deep">{state.error ?? (translate(zh ? 'zh-CN' : 'en', 'settings.theRuntimeCouldNotApplyResources'))}</div>}
+      </> : <div>{translate(zh ? 'zh-CN' : 'en', 'settings.loadingApplicationStatus')}</div>}
+    <div className="text-ink-500">{translate(zh ? 'zh-CN' : 'en', 'settings.savedChangesApplyAtTheNextSafeTurnBoundary')}</div>
+    <button type="button" disabled={saving} className="underline mt-1" onClick={() => setReload((n) => n + 1)}>{translate(zh ? 'zh-CN' : 'en', 'settings.refreshApplicationStatus')}</button>
   </div>
 }
 

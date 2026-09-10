@@ -2,7 +2,7 @@ import { useLayoutEffect, useRef, useState } from 'react'
 import { api } from '@/api/client'
 import { useAuth } from '@/stores/auth'
 import { isApiAbortError } from './apiErrors'
-import { useLocale, useT } from './i18n'
+import { translate, useLocale, useT } from './i18n'
 
 export type VoiceState = 'idle' | 'requesting' | 'recording' | 'stopping' | 'transcribing' | 'error'
 
@@ -120,16 +120,16 @@ export function useVoiceInput(scopeKey: string | null, onText: (text: string) =>
     const name = error instanceof Error ? error.name : ''
     const zh = locale === 'zh-CN'
     const messages: Record<string, string> = {
-      NotAllowedError: zh ? '麦克风权限被拒绝，请允许访问后重试。' : 'Microphone access denied. Allow access and try again.',
-      NotFoundError: zh ? '未找到麦克风，请连接设备后重试。' : 'No microphone found. Connect one and try again.',
-      NotReadableError: zh ? '麦克风被占用或无法读取，请检查设备后重试。' : 'Microphone is busy or unreadable. Check the device and try again.',
-      TimeoutError: zh ? '语音操作超时，请重试。' : 'Voice input timed out. Please try again.',
+      NotAllowedError: translate(zh ? 'zh-CN' : 'en', 'settings.microphoneAccessDeniedAllowAccessAndTryAgain'),
+      NotFoundError: translate(zh ? 'zh-CN' : 'en', 'settings.noMicrophoneFoundConnectOneAndTryAgain'),
+      NotReadableError: translate(zh ? 'zh-CN' : 'en', 'settings.microphoneIsBusyOrUnreadableCheckTheDeviceAnd'),
+      TimeoutError: translate(zh ? 'zh-CN' : 'en', 'settings.voiceInputTimedOutPleaseTryAgain'),
       NotSupportedError: t('chat.voiceNoSupport'),
     }
     const status = typeof error === 'object' && error !== null && 'status' in error ? error.status : null
     setVoiceState('error')
     showError(status === 413
-      ? (zh ? '录音过大，请缩短录音后重试。' : 'Recording is too large. Record a shorter clip and try again.')
+      ? (translate(zh ? 'zh-CN' : 'en', 'settings.recordingIsTooLargeRecordAShorterClipAnd'))
       : messages[name] ?? t('chat.voiceFailed'))
   }
 
@@ -230,7 +230,7 @@ export function useVoiceInput(scopeKey: string | null, onText: (text: string) =>
   }
 
   const voiceActionLabel = voiceState === 'requesting' || voiceState === 'transcribing'
-    ? (locale === 'zh-CN' ? '取消语音输入' : 'Cancel voice input')
+    ? (translate(locale, 'settings.cancelVoiceInput'))
     : voiceState === 'recording' || voiceState === 'stopping' ? t('chat.voiceStop') : t('chat.voiceInput')
 
   return { voiceState, voiceSeconds, voiceError, voiceActionLabel, onVoiceClick, start, stop, cancel }

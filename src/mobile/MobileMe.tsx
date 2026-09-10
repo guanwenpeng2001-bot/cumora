@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Avatar } from '@/components/Avatar'
+import { MeView } from '@/desktop/MeView'
 import { cn } from '@/lib/utils'
 import { useApp } from '@/stores/app'
 import { useAuth, useMe } from '@/stores/auth'
@@ -29,6 +30,7 @@ const TOGGLE_PREFS: ToggleablePref[] = [
 
 export function MobileMe() {
   const t = useT()
+  const [showSettings, setShowSettings] = useState(false)
   const authUser = useAuth((s) => s.user)
   const meId = useMe()
   const companies = useAuth((s) => s.companies)
@@ -79,6 +81,17 @@ export function MobileMe() {
     return tr('mobileMe.steward', { parts: parts.join(' · ') })
   }, [agents.length, convoList.length, whisperList.length, locale])
 
+  if (showSettings) return (
+    <section className="flex flex-col h-full min-w-0 overflow-hidden bg-paper pb-20">
+      <button type="button" autoFocus onClick={() => setShowSettings(false)}
+        className="shrink-0 p-4 text-left text-[13px] font-semibold text-skype-deep focus-visible:ring-2 focus-visible:ring-skype"
+        style={{ paddingTop: 'max(env(safe-area-inset-top), 16px)' }}>
+        ← {t('mobileMe.backToMe')}
+      </button>
+      <MeView initialTab="models" />
+    </section>
+  )
+
   return (
     <section className="flex flex-col h-full overflow-hidden bg-paper">
       <div
@@ -111,6 +124,13 @@ export function MobileMe() {
       </div>
 
       <div className="flex-1 overflow-y-auto pb-20">
+        <Section title={t('mobileMe.settings')}>
+          <button type="button" onClick={() => setShowSettings(true)}
+            className="w-full rounded-[12px] border border-ink-100 bg-cloud p-3.5 text-left text-[13px] font-semibold text-skype-deep focus-visible:ring-2 focus-visible:ring-skype">
+            {t('mobileMe.settings')}
+            <span className="block mt-1 text-[11px] font-normal text-ink-500">{t('mobileMe.settingsSub')}</span>
+          </button>
+        </Section>
         {companies.length > 1 && (
           <Section title={t('mobileMe.workspace')}>
             <div className="bg-cloud rounded-[12px] p-2" style={{ border: '1px solid var(--ink-100)' }}>

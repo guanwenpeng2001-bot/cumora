@@ -6,7 +6,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, type ApiMcpConnector } from '@/api/client'
 import { useAuth } from '@/stores/auth'
-import { useT, useLocaleStore } from '@/lib/i18n'
+import { translate, useT, useLocaleStore } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
 
 interface FormState {
@@ -96,7 +96,7 @@ export function ConnectorsTab() {
     try {
       await action()
       if (!current()) return
-      setNotice(zh ? '已保存；绑定此连接器的 Agent 将在下一安全 turn 边界应用。请在 Agent 编辑器查看应用状态。' : 'Saved. Bound agents apply changes at the next safe turn boundary. Check application status in the agent editor.')
+      setNotice(translate(zh ? 'zh-CN' : 'en', 'settings.savedBoundAgentsApplyChangesAtTheNextSafe'))
       await load()
     } catch (e) { if (current()) setError(e instanceof Error ? e.message : String(e)) }
     finally {
@@ -134,13 +134,13 @@ export function ConnectorsTab() {
 
   return (
     <div className="space-y-6">
-      <div className="text-[11.5px] text-ink-500 italic max-w-2xl">{zh ? '公司 MCP 连接器。全局禁用影响所有绑定的 Agent；从某个 Agent 解绑请使用 Agent 编辑器。' : 'Company MCP connectors. Disabling globally affects all bound agents; use the agent editor to unbind from one agent.'}</div>
-      {!canWrite && <div className="text-[11.5px] text-ink-500">{zh ? '只读摘要；修改需要公司 owner/admin 权限。' : 'Read-only summary. Changes require company owner/admin permission.'}</div>}
+      <div className="text-[11.5px] text-ink-500 italic max-w-2xl">{translate(zh ? 'zh-CN' : 'en', 'settings.companyMcpConnectorsDisablingGloballyAffectsAllBoundAgents')}</div>
+      {!canWrite && <div className="text-[11.5px] text-ink-500">{translate(zh ? 'zh-CN' : 'en', 'settings.readOnlySummaryChangesRequireCompanyOwnerAdminPermission')}</div>}
       {notice && <div role="status" className="text-[11.5px] text-skype-deep">{notice}</div>}
       {error && <div className="text-[11.5px] text-coral-deep">{error}</div>}
 
       <div className="bg-cloud rounded-[14px] divide-y divide-ink-100" style={{ border: '1px solid var(--ink-100)' }}>
-        {loadError && <div role="alert" className="p-4 text-[12px] text-coral-deep">{loadError} <button type="button" className="underline" onClick={() => void load()}>{zh ? '重试' : 'Retry'}</button></div>}
+        {loadError && <div role="alert" className="p-4 text-[12px] text-coral-deep">{loadError} <button type="button" className="underline" onClick={() => void load()}>{translate(zh ? 'zh-CN' : 'en', 'ship.retry')}</button></div>}
         {!loadError && items === null && <div className="p-4 text-[12px] text-ink-400 italic">{t('common.loading')}</div>}
         {!loadError && items?.length === 0 && <div className="p-4 text-[12px] text-ink-400 italic">{t('me.mcp.empty')}</div>}
         {items?.map((c) => (
@@ -154,12 +154,12 @@ export function ConnectorsTab() {
                 {c.type === 'stdio' ? [c.command, ...c.args].join(' ') : c.url}
               </div>
             </div>
-            <span className="text-[11px] text-ink-500">{c.enabled ? (zh ? '全局启用' : 'Globally enabled') : (zh ? '全局禁用' : 'Globally disabled')}</span>
+            <span className="text-[11px] text-ink-500">{c.enabled ? (translate(zh ? 'zh-CN' : 'en', 'settings.globallyEnabled')) : (translate(zh ? 'zh-CN' : 'en', 'settings.globallyDisabled'))}</span>
             {canWrite && <><button type="button" disabled={busy.has(c.id) || form?.id === c.id} aria-busy={busy.has(c.id)}
-              aria-label={c.enabled ? (zh ? '全局禁用' : 'Disable globally') : (zh ? '全局启用' : 'Enable globally')}
+              aria-label={c.enabled ? (translate(zh ? 'zh-CN' : 'en', 'settings.disableGlobally')) : (translate(zh ? 'zh-CN' : 'en', 'settings.enableGlobally'))}
               onClick={() => void run(c.id, () => api.updateMcpConnector(c.id, { ...c, enabled: !c.enabled }))}
               className={cn('w-9 h-5 rounded-full relative shrink-0 transition-colors', c.enabled ? 'bg-skype' : 'bg-ink-200')}
-              title={c.enabled ? (zh ? '全局禁用' : 'Disable globally') : (zh ? '全局启用' : 'Enable globally')}>
+              title={c.enabled ? (translate(zh ? 'zh-CN' : 'en', 'settings.disableGlobally')) : (translate(zh ? 'zh-CN' : 'en', 'settings.enableGlobally'))}>
               <span className={cn('absolute w-4 h-4 bg-white rounded-full top-0.5 transition-all', c.enabled ? 'left-[18px]' : 'left-0.5')}
                 style={{ boxShadow: '0 1px 3px rgba(0,0,0,0.2)' }} />
             </button>
@@ -223,10 +223,10 @@ export function ConnectorsTab() {
             )}
           </div>
           {kv.errors.map((e) => <div key={e.line} role="alert" className="text-[11px] text-coral-deep">
-            {form.type === 'stdio' ? 'env' : 'header'} {zh ? '第' : 'line '}{e.line}{zh ? '行：' : ': '}
-            {({ format: zh ? '请使用 KEY=VALUE 格式' : 'Use KEY=VALUE', key: zh ? '名称非法' : 'Invalid key', duplicate: zh ? '名称重复' : 'Duplicate key', value: zh ? '值包含非法控制字符' : 'Invalid control character in value' })[e.reason]}
+            {form.type === 'stdio' ? 'env' : 'header'} {translate(zh ? 'zh-CN' : 'en', 'settings.line')}{e.line}{translate(zh ? 'zh-CN' : 'en', 'settings.label')}
+            {({ format: translate(zh ? 'zh-CN' : 'en', 'settings.useKeyValue'), key: translate(zh ? 'zh-CN' : 'en', 'settings.invalidKey'), duplicate: translate(zh ? 'zh-CN' : 'en', 'settings.duplicateKey'), value: translate(zh ? 'zh-CN' : 'en', 'settings.invalidControlCharacterInValue') })[e.reason]}
           </div>)}
-          {!validConnectorForm(form) && <div role="alert" className="text-[11px] text-coral-deep">{zh ? '名称须为 1–64 个小写字母、数字、_ 或 -，以字母或数字开头且不含 __；stdio 需有效命令，HTTP 需有效 http(s) URL。' : 'Name: 1–64 lowercase letters, digits, _ or -, starting with a letter or digit, without __. stdio needs a valid command; HTTP needs a valid http(s) URL.'}</div>}
+          {!validConnectorForm(form) && <div role="alert" className="text-[11px] text-coral-deep">{translate(zh ? 'zh-CN' : 'en', 'settings.name164LowercaseLettersDigitsOrStartingWith')}</div>}
           <div className="flex items-center gap-2.5 pt-1">
             <button type="button" onClick={save} disabled={formBusy || !valid}
               className="h-8 px-4 rounded-full text-[12.5px] font-semibold text-white disabled:cursor-not-allowed"

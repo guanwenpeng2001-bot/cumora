@@ -9,7 +9,7 @@ import {
   api, ApiError, resolveAssetUrl,
   type ApiUsageTrendPoint, type ApiUsageMetadata,
 } from '@/api/client'
-import { useLocale, useT } from '@/lib/i18n'
+import { translate, useLocale, useT } from '@/lib/i18n'
 import { useAuth } from '@/stores/auth'
 
 type T = ReturnType<typeof useT>
@@ -114,22 +114,21 @@ function TrendChart({ points, granularity, t }: {
 
 function UsageMetadata({ metadata }: { metadata?: ApiUsageMetadata }) {
   const locale = useLocale()
-  const text = (zh: string, en: string) => locale === 'zh-CN' ? zh : en
-  const unknown = text('未知', 'Unknown')
+  const unknown = translate(locale, 'push.permUnknown')
   const date = (value: string | null | undefined) => value ? new Date(value).toLocaleString() : unknown
   const states = {
-    pending: text('待聚合', 'Pending'), ready: text('就绪', 'Ready'),
-    failed: text('聚合失败', 'Failed'), paused: text('聚合暂停', 'Paused'), stale: text('聚合滞后', 'Stale'),
+    pending: translate(locale, 'settings.pending'), ready: translate(locale, 'ship.statusReady'),
+    failed: translate(locale, 'settings.failed'), paused: translate(locale, 'settings.paused'), stale: translate(locale, 'settings.stale'),
   }
   return <div role="status" className="text-[11px] text-ink-500 space-y-1 my-2 break-words">
-    <div>{text('聚合状态', 'Rollup status')}: {metadata ? states[metadata.aggregationStatus] ?? unknown : unknown}
-      {' · '}{text('水位', 'Completed through')}: {date(metadata?.completedThrough)}
-      {' · '}{text('聚合时间', 'Aggregated at')}: {date(metadata?.aggregatedAt)}</div>
+    <div>{translate(locale, 'settings.rollupStatus')}: {metadata ? states[metadata.aggregationStatus] ?? unknown : unknown}
+      {' · '}{translate(locale, 'settings.completedThrough')}: {date(metadata?.completedThrough)}
+      {' · '}{translate(locale, 'settings.aggregatedAt')}: {date(metadata?.aggregatedAt)}</div>
     {metadata && <>
-      <div>{text('原始日志保留起点', 'Raw retention starts')}: {date(metadata.rawRetentionFrom)}
-        {' · '}{text('时区', 'Timezone')}: {metadata.timezone}</div>
+      <div>{translate(locale, 'settings.rawRetentionStarts')}: {date(metadata.rawRetentionFrom)}
+        {' · '}{translate(locale, 'settings.timezone')}: {metadata.timezone}</div>
       {(!metadata.logsComplete || !metadata.boundaryComplete) && <div className="text-coral-deep">
-        {text('窗口数据不完整：保留期外日志或边界数据不可用，不能据此断言零用量。', 'Window incomplete: retained logs or boundary data are unavailable; missing usage is not zero.')}
+        {translate(locale, 'settings.windowIncompleteRetainedLogsOrBoundaryDataAreUnavailable')}
       </div>}
     </>}
   </div>
@@ -196,16 +195,15 @@ function UsageDashboardContent() {
   const token = useAuth((s) => s.token)
   const companyId = useAuth((s) => s.activeCompanyId)
   const locale = useLocale()
-  const text = (zh: string, en: string) => locale === 'zh-CN' ? zh : en
   const [refresh, setRefresh] = useState(0)
   const range = useMemo(() => {
     try { return rangeOf(preset, customFrom, customTo) } catch { return null }
   }, [preset, customFrom, customTo, refresh])
   const invalidRange = !range || Date.parse(range.from) >= Date.parse(range.to)
-  const blocked = !ready ? text('公司上下文加载中…', 'Loading company context…')
-    : !token ? text('请登录后查看用量。', 'Sign in to view usage.')
-    : !companyId ? text('请先选择公司。', 'Select a company to view usage.')
-    : invalidRange ? text('开始时间必须早于结束时间。', 'Start time must be before end time.') : null
+  const blocked = !ready ? translate(locale, 'settings.loadingCompanyContext')
+    : !token ? translate(locale, 'settings.signInToViewUsage')
+    : !companyId ? translate(locale, 'settings.selectACompanyToViewUsage')
+    : invalidRange ? translate(locale, 'settings.startTimeMustBeBeforeEndTime') : null
   const enabled = blocked === null
   const from = range?.from ?? ''
   const to = range?.to ?? ''
@@ -221,7 +219,7 @@ function UsageDashboardContent() {
   const byModel = modelQuery.data?.items ?? []
   const byProvider = providerQuery.data?.items ?? []
   const logs = logsQuery.data
-  const unknown = text('未知', 'Unknown')
+  const unknown = translate(locale, 'push.permUnknown')
   const partial = !summary || summary.unknownRequests == null || summary.unpricedRequests == null || summary.qualityUnknownRequests == null
     || summary.unknownRequests > 0 || summary.unpricedRequests > 0 || summary.qualityUnknownRequests > 0
     || summary.metadata?.boundaryComplete !== true
@@ -236,15 +234,15 @@ function UsageDashboardContent() {
 
   const status = (query: QueryState<unknown>, empty: boolean) => {
     let message = blocked
-    if (!message && query.loading) message = text('加载中…', 'Loading…')
+    if (!message && query.loading) message = translate(locale, 'common.loading')
     if (!message && query.error) {
       const code = query.error instanceof ApiError ? query.error.status : null
-      message = code === 401 ? text('登录已失效，请重新登录。', 'Session expired. Sign in again.')
-        : code === 403 ? text('无权查看此用量区块。', 'You do not have permission to view this usage section.')
-        : code === 404 ? text('当前服务器未提供此用量接口。', 'This usage endpoint is unavailable on the current server.')
-        : text('加载失败，请点击刷新重试。', 'Loading failed. Click Refresh to retry.')
+      message = code === 401 ? translate(locale, 'settings.sessionExpiredSignInAgain')
+        : code === 403 ? translate(locale, 'settings.youDoNotHavePermissionToViewThisUsage')
+        : code === 404 ? translate(locale, 'settings.thisUsageEndpointIsUnavailableOnTheCurrentServer')
+        : translate(locale, 'settings.loadingFailedClickRefreshToRetry')
     }
-    if (!message && empty) message = text('所选时间范围内无数据。', 'No data in the selected time range.')
+    if (!message && empty) message = translate(locale, 'settings.noDataInTheSelectedTimeRange')
     return message ? <div role={query.error || invalidRange ? 'alert' : 'status'} className={cn('text-[11.5px] py-2', query.error || invalidRange ? 'text-coral-deep' : 'text-ink-500')}>{message}</div> : null
   }
 
@@ -287,22 +285,22 @@ function UsageDashboardContent() {
       {summary && <>
         <UsageMetadata metadata={summary.metadata} />
         <div className="text-[11.5px] text-ink-500 break-words">
-          {text('未计量请求', 'Unmeasured requests')}: {summary.unknownRequests ?? unknown}
-          {' · '}{text('未计价请求', 'Unpriced requests')}: {summary.unpricedRequests ?? unknown}
-          {' · '}{text('质量未知请求', 'Requests with unknown quality')}: {summary.qualityUnknownRequests ?? unknown}
-          {' · source: '}{summary.sources?.join(', ') || unknown}
-          <div>{text('金额为 Cumora 已知参考成本；不等于 sub2api 实际扣费。未知或未计价的 0 不表示免费。', 'Amounts are known Cumora reference costs, separate from sub2api charges. Unknown or unpriced zero does not mean free.')}</div>
-          {partial && <div className="text-coral-deep">{text('以下统计仅含已知部分，不能作为完整用量或总成本。', 'The statistics below include known portions only, not complete usage or total cost.')}</div>}
+          {translate(locale, 'settings.unmeasuredRequests')}: {summary.unknownRequests ?? unknown}
+          {' · '}{translate(locale, 'settings.unpricedRequests')}: {summary.unpricedRequests ?? unknown}
+          {' · '}{translate(locale, 'settings.requestsWithUnknownQuality')}: {summary.qualityUnknownRequests ?? unknown}
+          {' · '}{t('adminobs.colSource')}: {summary.sources?.join(', ') || unknown}
+          <div>{translate(locale, 'settings.amountsAreKnownCumoraReferenceCostsSeparateFromSub2api')}</div>
+          {partial && <div className="text-coral-deep">{translate(locale, 'settings.theStatisticsBelowIncludeKnownPortionsOnlyNotComplete')}</div>}
         </div>
       </>}
 
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
         <Card label={t('me.usage.totalTokens')} value={summary ? tokensUnknown ? unknown : `${fmtTokens(summary.inputTokens + summary.cacheReadTokens + summary.cacheWriteTokens + summary.outputTokens)}${partial ? ' *' : ''}` : '—'}
-          sub={tokensUnknown ? text('未取得完整计量', 'Complete measurement unavailable') : summary ? `${t('me.usage.inShort')} ${fmtTokens(summary.inputTokens + summary.cacheReadTokens)} · ${t('me.usage.outShort')} ${fmtTokens(summary.outputTokens)}` : undefined} />
+          sub={tokensUnknown ? translate(locale, 'settings.completeMeasurementUnavailable') : summary ? `${t('me.usage.inShort')} ${fmtTokens(summary.inputTokens + summary.cacheReadTokens)} · ${t('me.usage.outShort')} ${fmtTokens(summary.outputTokens)}` : undefined} />
         <Card label={t('me.usage.requests')} value={summary ? String(summary.requests) : '—'}
           sub={summary ? `${t('me.usage.successRate')} ${fmtPct(summary.successRate)}` : undefined} />
-        <Card label={text('Cumora 参考成本', 'Cumora reference cost')} value={summary ? partial && summary.costUsd === 0 ? unknown : `${fmtUsd(summary.costUsd)}${partial ? ' *' : ''}` : '—'}
-          sub={partial ? text('仅已知部分；未知不计为零', 'Known portion only; unknown is not zero') : summary?.costEstimated ? t('me.usage.costEstimated') : undefined} />
+        <Card label={translate(locale, 'settings.cumoraReferenceCost')} value={summary ? partial && summary.costUsd === 0 ? unknown : `${fmtUsd(summary.costUsd)}${partial ? ' *' : ''}` : '—'}
+          sub={partial ? translate(locale, 'settings.knownPortionOnlyUnknownIsNotZero') : summary?.costEstimated ? t('me.usage.costEstimated') : undefined} />
         <Card label={t('me.usage.cacheHit')} value={summary ? tokensUnknown ? unknown : fmtPct(summary.cacheHitRate) : '—'}
           sub={summary ? `${t('me.usage.chartCacheRead')} ${fmtTokens(summary.cacheReadTokens)} · ${t('me.usage.chartCacheWrite')} ${fmtTokens(summary.cacheWriteTokens)}` : undefined} />
       </div>
@@ -322,7 +320,7 @@ function UsageDashboardContent() {
         </div>
         {status(trendQuery, trend.length === 0)}
         {trendQuery.data && <UsageMetadata metadata={trendQuery.data.metadata} />}
-        <div className="text-[11px] text-ink-500">{text('趋势与分组金额仅为已知参考成本；缺失计量不代表零用量。', 'Trend and group amounts show known reference costs; missing measurement does not mean zero usage.')}</div>
+        <div className="text-[11px] text-ink-500">{translate(locale, 'settings.trendAndGroupAmountsShowKnownReferenceCostsMissing')}</div>
         <TrendChart points={trend} granularity={granularity} t={t} />
       </div>
 
@@ -347,7 +345,7 @@ function UsageDashboardContent() {
             <table className="w-full border-collapse">
               <thead><tr>
                 <th className={th}>{t('me.usage.colAgent')}</th><th className={th}>{t('me.usage.colTokens')}</th>
-                <th className={th}>{text('参考成本（已知）', 'Reference cost (known)')}</th><th className={th}>{t('me.usage.colRequests')}</th>
+                <th className={th}>{translate(locale, 'settings.referenceCostKnown')}</th><th className={th}>{t('me.usage.colRequests')}</th>
                 <th className={th}>{t('me.usage.colSuccess')}</th>
               </tr></thead>
               <tbody>
@@ -375,7 +373,7 @@ function UsageDashboardContent() {
             <table className="w-full border-collapse">
               <thead><tr>
                 <th className={th}>{t('me.usage.colModel')}</th><th className={th}>{t('me.usage.colProvider')}</th>
-                <th className={th}>{t('me.usage.colTokens')}</th><th className={th}>{text('参考成本（已知）', 'Reference cost (known)')}</th>
+                <th className={th}>{t('me.usage.colTokens')}</th><th className={th}>{translate(locale, 'settings.referenceCostKnown')}</th>
                 <th className={th}>{t('me.usage.colRequests')}</th>
               </tr></thead>
               <tbody>
@@ -383,8 +381,8 @@ function UsageDashboardContent() {
                   <tr key={JSON.stringify([r.model, r.route, r.platform, r.source])} className="border-t border-ink-100">
                     <td className={cn(td, 'font-mono')}>
                       {r.model}
-                      <div className="text-[10px] whitespace-normal">route: {r.route ?? unknown} · platform: {r.platform ?? unknown} · source: {r.source ?? unknown}</div>
-                      <div className="text-[10px] whitespace-normal">{text('未计量 / 未计价 / 质量未知', 'Unmeasured / unpriced / unknown quality')}: {r.unknownRequests ?? unknown} / {r.unpricedRequests ?? unknown} / {r.qualityUnknownRequests ?? unknown}</div>
+                      <div className="text-[10px] whitespace-normal">{t('settings.route')}: {r.route ?? unknown} · {t('settings.platform')}: {r.platform ?? unknown} · {t('adminobs.colSource')}: {r.source ?? unknown}</div>
+                      <div className="text-[10px] whitespace-normal">{translate(locale, 'settings.unmeasuredUnpricedUnknownQuality')}: {r.unknownRequests ?? unknown} / {r.unpricedRequests ?? unknown} / {r.qualityUnknownRequests ?? unknown}</div>
                     </td>
                     <td className={td}>{r.provider}</td>
                     <td className={td}>{fmtTokens(r.inputTokens + r.outputTokens)}</td>
@@ -399,7 +397,7 @@ function UsageDashboardContent() {
             <table className="w-full border-collapse">
               <thead><tr>
                 <th className={th}>{t('me.usage.colProvider')}</th><th className={th}>{t('me.usage.colTokens')}</th>
-                <th className={th}>{text('参考成本（已知）', 'Reference cost (known)')}</th><th className={th}>{t('me.usage.colRequests')}</th>
+                <th className={th}>{translate(locale, 'settings.referenceCostKnown')}</th><th className={th}>{t('me.usage.colRequests')}</th>
               </tr></thead>
               <tbody>
                 {byProvider.map((r) => (
@@ -420,13 +418,13 @@ function UsageDashboardContent() {
         <div className="text-[12px] font-semibold text-ink-700 mb-2">{t('me.usage.logs')}</div>
         {status(logsQuery, logs?.items.length === 0)}
         {logs && <UsageMetadata metadata={logs.metadata} />}
-        <div className="text-[11px] text-ink-500">{text('每行是一条应用层尝试；用 callId 关联失败与后续成功。', 'Each row is an application attempt; use callId to correlate failures and later success.')}</div>
+        <div className="text-[11px] text-ink-500">{translate(locale, 'settings.eachRowIsAnApplicationAttemptUseCallidTo')}</div>
         <div className="overflow-x-auto">
           <table className="w-full border-collapse">
             <thead><tr>
               <th className={th}>{t('me.usage.colTime')}</th><th className={th}>{t('me.usage.colAgent')}</th>
               <th className={th}>{t('me.usage.colModel')}</th><th className={th}>{t('me.usage.colIn')}</th>
-              <th className={th}>{t('me.usage.colOut')}</th><th className={th}>{text('参考成本（已知）', 'Reference cost (known)')}</th>
+              <th className={th}>{t('me.usage.colOut')}</th><th className={th}>{translate(locale, 'settings.referenceCostKnown')}</th>
               <th className={th}>{t('me.usage.colStatus')}</th>
             </tr></thead>
             <tbody>
@@ -437,31 +435,31 @@ function UsageDashboardContent() {
                   <td className={cn(td, 'font-mono')}>
                     {r.actualModel || unknown}
                     <details className="text-[11px] whitespace-normal min-w-[220px] max-w-[360px] break-words">
-                      <summary className="cursor-pointer">{text('尝试详情', 'Attempt details')} · #{r.attempt ?? unknown}</summary>
-                      <div>{text('请求模型', 'Requested model')}: {r.requestedModel || r.model || unknown}</div>
-                      <div>{text('实际模型', 'Actual model')}: {r.actualModel || unknown}</div>
-                      <div>route: {r.route ?? unknown} · platform: {r.platform ?? unknown}</div>
-                      <div>source: {r.source || unknown} · provider: {r.provider || unknown}</div>
-                      <div>purpose: {r.purpose || unknown}</div>
-                      <div>callId: {r.callId ?? unknown} · attempt: {r.attempt ?? unknown}</div>
-                      <div>{text('台账 ID', 'Ledger ID')}: {r.id}</div>
-                      <div>{text('Agent ID', 'Agent ID')}: {r.agentId ?? unknown}</div>
-                      <div>{text('脱敏原因', 'Sanitized reason')}: {r.failureReason ?? unknown}</div>
-                      <div>{text('失败阶段', 'Failure stage')}: {r.failureStage ?? unknown} · HTTP: {r.httpStatus ?? unknown}</div>
-                      <div>{text('延迟', 'Latency')}: {r.latencyMs == null ? unknown : `${r.latencyMs} ms`}</div>
+                      <summary className="cursor-pointer">{translate(locale, 'settings.attemptDetails')} · #{r.attempt ?? unknown}</summary>
+                      <div>{translate(locale, 'settings.requestedModel')}: {r.requestedModel || r.model || unknown}</div>
+                      <div>{translate(locale, 'settings.actualModel')}: {r.actualModel || unknown}</div>
+                      <div>{t('settings.route')}: {r.route ?? unknown} · {t('settings.platform')}: {r.platform ?? unknown}</div>
+                      <div>{t('adminobs.colSource')}: {r.source || unknown} · {t('settings.provider')}: {r.provider || unknown}</div>
+                      <div>{t('settings.purpose')}: {r.purpose || unknown}</div>
+                      <div>{t('settings.callId')}: {r.callId ?? unknown} · {t('settings.attempt')}: {r.attempt ?? unknown}</div>
+                      <div>{translate(locale, 'settings.ledgerId')}: {r.id}</div>
+                      <div>{t('settings.agentId')}: {r.agentId ?? unknown}</div>
+                      <div>{translate(locale, 'settings.sanitizedReason')}: {r.failureReason ?? unknown}</div>
+                      <div>{translate(locale, 'settings.failureStage')}: {r.failureStage ?? unknown} · HTTP: {r.httpStatus ?? unknown}</div>
+                      <div>{translate(locale, 'settings.latency')}: {r.latencyMs == null ? unknown : `${r.latencyMs} ms`}</div>
                     </details>
                   </td>
                   <td className={td}>{r.measured === true ? fmtTokens(r.inputTokens) : unknown}</td>
                   <td className={td}>{r.measured === true ? fmtTokens(r.outputTokens) : unknown}</td>
-                  <td className={td}>{r.unpriced === true ? text('未计价', 'Unpriced') : r.measured !== true || r.unpriced !== false ? unknown : fmtUsd(r.costUsd)}
+                  <td className={td}>{r.unpriced === true ? translate(locale, 'settings.unpriced') : r.measured !== true || r.unpriced !== false ? unknown : fmtUsd(r.costUsd)}
                     {r.costEstimated && <div>{t('me.usage.estimated')}</div>}
                   </td>
                   <td className={td}>
                     <span className={cn('text-[10.5px] font-semibold px-1.5 py-0.5 rounded', r.status === 'ok' ? 'text-skype-deep bg-sky2-50' : 'text-coral-deep bg-coral-soft')}>
                       {r.status}
                     </span>
-                    <div className="text-[10px] whitespace-normal">measured: {r.measured === true ? text('已计量', 'Measured') : r.measured === false ? text('未计量', 'Unmeasured') : unknown}</div>
-                    <div className="text-[10px] whitespace-normal">unpriced: {r.unpriced === true ? text('未计价', 'Unpriced') : r.unpriced === false ? text('已计价', 'Priced') : unknown}</div>
+                    <div className="text-[10px] whitespace-normal">{t('settings.measuredLabel')}: {r.measured === true ? translate(locale, 'settings.measured') : r.measured === false ? translate(locale, 'settings.unmeasured') : unknown}</div>
+                    <div className="text-[10px] whitespace-normal">{t('settings.unpricedLabel')}: {r.unpriced === true ? translate(locale, 'settings.unpriced') : r.unpriced === false ? translate(locale, 'settings.priced') : unknown}</div>
                   </td>
                 </tr>
               ))}

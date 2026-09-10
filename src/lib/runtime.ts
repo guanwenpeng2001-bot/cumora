@@ -149,17 +149,16 @@ declare global {
 
 export const isElectron: boolean = typeof window !== 'undefined' && window.cumora?.isElectron === true
 
-/** True when this renderer is the public web client (e.g. app.cumora.ai).
- *  Cumora is a desktop-only product on the web side — when this is true
- *  we skip the full chat shell and only surface sign-in, waitlist, and a
- *  desktop hand-off. The `?webonly=1` escape exists so localhost dev can
- *  preview the trimmed shell without /etc/hosts trickery. */
+/** The desktop hand-off shell is opt-in; deployed web clients keep chat
+ *  and settings regardless of hostname. VITE_WEB_SHELL=true selects the
+ *  hand-off build; ?webonly=1/0 overrides it for a single page load. */
 export const isWebAppHost: boolean = (() => {
   if (typeof window === 'undefined') return false
   if (isElectron) return false
-  if (/^app\./i.test(window.location.hostname)) return true
-  if (window.location.search.includes('webonly=1')) return true
-  return false
+  const mode = new URLSearchParams(window.location.search).get('webonly')
+  if (mode === '1') return true
+  if (mode === '0') return false
+  return import.meta.env.VITE_WEB_SHELL === 'true'
 })()
 
 export const platform: string = (typeof window !== 'undefined' && window.cumora?.platform) || (typeof navigator !== 'undefined' ? navigator.platform.toLowerCase() : 'web')

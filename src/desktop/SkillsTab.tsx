@@ -6,7 +6,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, type ApiSkill, type ApiLocalHubEntry } from '@/api/client'
 import { useAuth } from '@/stores/auth'
-import { useT, useLocaleStore } from '@/lib/i18n'
+import { translate, useT, useLocaleStore } from '@/lib/i18n'
 
 type T = ReturnType<typeof useT>
 type LocalHubEntry = ApiLocalHubEntry & { directory?: string; skillName?: string }
@@ -104,7 +104,7 @@ export function SkillsTab() {
       await fn()
       if (!current()) return
       if (key !== 'hub-search') {
-        setNotice(zh ? '技能库已更新；请在 Agent 编辑器中管理绑定，并查看资源应用状态。' : 'Library updated. Manage bindings and check resource application status in the agent editor.')
+        setNotice(translate(zh ? 'zh-CN' : 'en', 'settings.libraryUpdatedManageBindingsAndCheckResourceApplicationStatus'))
         await load()
         void loadLocal()
       }
@@ -149,7 +149,7 @@ export function SkillsTab() {
   return (
     <div className="space-y-6">
       {notice && <div role="status" className="text-[11.5px] text-skype-deep">{notice}</div>}
-      {!canWrite && <div className="text-[11.5px] text-ink-500">{zh ? '技能库只读；安装和删除需要公司 owner/admin 权限。' : 'Read-only library. Installing and deleting require company owner/admin permission.'}</div>}
+      {!canWrite && <div className="text-[11.5px] text-ink-500">{translate(zh ? 'zh-CN' : 'en', 'settings.readOnlyLibraryInstallingAndDeletingRequireCompanyOwner')}</div>}
 
       {/* install paths */}
       {(canWrite || isSiteAdmin) && <div className="bg-cloud rounded-[14px] p-4 space-y-3" style={{ border: '1px solid var(--ink-100)' }}>
@@ -173,7 +173,7 @@ export function SkillsTab() {
               {localPathSaving ? t('me.skills.localPathSaving') : t('me.skills.localPathSave')}
             </button>
           </div>
-          <div className="text-[11px] text-ink-400 italic">{zh ? '服务端可读路径：由服务端读取的技能根目录；仅站点管理员可修改，影响所有公司。' : 'Server-readable path: the skill root read by the server. Only site administrators can change it; it affects all companies.'}</div>
+          <div className="text-[11px] text-ink-400 italic">{translate(zh ? 'zh-CN' : 'en', 'settings.serverReadablePathTheSkillRootReadByThe')}</div>
           {localPathSaved && <div className="text-[11px] text-skype-deep">{t('me.skills.localPathSaved')}</div>}
           {errors.path && <div role="alert" className="text-[11px] text-coral-deep">{errors.path}</div>}
         </div>}
@@ -277,7 +277,7 @@ export function SkillsTab() {
 
       {/* library list */}
       <div className="bg-cloud rounded-[14px] divide-y divide-ink-100" style={{ border: '1px solid var(--ink-100)' }}>
-        {errors.library && <div role="alert" className="p-4 text-[12px] text-coral-deep">{zh ? '技能库' : 'Library'}: {errors.library} <button type="button" className="underline" onClick={() => void load()}>{zh ? '重试' : 'Retry'}</button></div>}
+        {errors.library && <div role="alert" className="p-4 text-[12px] text-coral-deep">{translate(zh ? 'zh-CN' : 'en', 'settings.library')}: {errors.library} <button type="button" className="underline" onClick={() => void load()}>{translate(zh ? 'zh-CN' : 'en', 'ship.retry')}</button></div>}
         {skills === null && !errors.library && <div className="p-4 text-[12px] text-ink-400 italic">{t('common.loading')}</div>}
         {!errors.library && skills?.length === 0 && (
           <div className="p-4 text-[12px] text-ink-400 italic">{t('me.skills.empty')}</div>

@@ -15,6 +15,8 @@
   <true/>
   <key>com.apple.security.cs.allow-dyld-environment-variables</key>
   <true/>
+  <key>com.apple.security.device.audio-input</key>
+  <true/>
   <!-- Network access (for talking to api.cumora.ai etc.) -->
   <key>com.apple.security.network.client</key>
   <true/>

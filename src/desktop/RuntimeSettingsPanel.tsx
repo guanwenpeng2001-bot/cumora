@@ -1,34 +1,34 @@
 import { useEffect, useRef, useState } from 'react'
 import { api, type ApiComputer, type ApiModelGroup, type ApiModelRole, type ApiModelRoutePreview, type ApiModelSettings, type ApiSettingDefinition } from '@/api/client'
 import { useAuth } from '@/stores/auth'
-import { useLocaleStore } from '@/lib/i18n'
+import { translate, useLocaleStore } from '@/lib/i18n'
 
 const controlClass = 'w-full rounded-lg border border-ink-100 bg-paper px-3 py-2 text-[12px] text-ink-900'
 const buttonClass = 'rounded-lg border border-ink-100 px-3 py-1.5 text-[12px] disabled:opacity-40'
 const roles: ApiModelRole[] = ['brain', 'support', 'compaction', 'image', 'audio', 'embed']
 
 export function settingEffect(def: ApiSettingDefinition | undefined, zh: boolean): string {
-  const labels: Record<string, [string, string]> = {
-    immediate: ['立即更新快照', 'Immediate snapshot'], 'next-turn': ['下一 turn', 'Next turn'],
-    'next-gate': ['下一次 gate；BYOA 等待在途 spawn 完成', 'Next gate; BYOA waits for active spawns'],
-    'next-tick': ['下一次调度 tick；不重入在途任务', 'Next scheduler tick; no in-flight re-entry'],
-    'next-admission': ['下一次准入；不取消现有 Pod', 'Next admission; existing Pods continue'],
-    'next-create': ['下次创建', 'Next creation'], restart: ['待重启', 'Restart required'],
-    'restart-next-create': ['待重启后下次创建', 'Next creation after restart'], fixed: ['固定底线', 'Fixed safety floor'],
-    'pending-T41': ['服务端尚未支持应用', 'Application not supported by this server'],
+  const labels: Record<string, string> = {
+    immediate: translate(zh ? 'zh-CN' : 'en', 'settings.immediateSnapshot'), 'next-turn': translate(zh ? 'zh-CN' : 'en', 'settings.nextTurn'),
+    'next-gate': translate(zh ? 'zh-CN' : 'en', 'settings.nextGateByoaWaitsForActiveSpawns'),
+    'next-tick': translate(zh ? 'zh-CN' : 'en', 'settings.nextSchedulerTickNoInFlightReEntry'),
+    'next-admission': translate(zh ? 'zh-CN' : 'en', 'settings.nextAdmissionExistingPodsContinue'),
+    'next-create': translate(zh ? 'zh-CN' : 'en', 'settings.nextCreation'), restart: translate(zh ? 'zh-CN' : 'en', 'settings.restartRequired'),
+    'restart-next-create': translate(zh ? 'zh-CN' : 'en', 'settings.nextCreationAfterRestart'), fixed: translate(zh ? 'zh-CN' : 'en', 'settings.fixedSafetyFloor'),
+    'pending-T41': translate(zh ? 'zh-CN' : 'en', 'settings.applicationNotSupportedByThisServer'),
   }
-  return labels[def?.effect ?? '']?.[zh ? 0 : 1] ?? (zh ? '下一次调用读取快照；不改变在途调用' : 'Snapshot read on next call; in-flight calls unchanged')
+  return labels[def?.effect ?? ''] ?? (translate(zh ? 'zh-CN' : 'en', 'settings.snapshotReadOnNextCallInFlightCallsUnchanged'))
 }
 
 export function SettingInfo({ snapshot, settingKey, zh }: { snapshot: ApiModelSettings; settingKey: string; zh: boolean }) {
   const def = snapshot.definitions?.find(d => d.key === settingKey)
   const source = snapshot.sources?.[settingKey] ?? snapshot.metadata?.[settingKey]?.source
-  const label = source === 'db' ? 'DB' : source === 'env' ? 'ENV' : source === 'default' ? (zh ? '默认' : 'Default') : (zh ? '未知（旧服务端）' : 'Unknown (older server)')
+  const label = source === 'db' ? 'DB' : source === 'env' ? 'ENV' : source === 'default' ? (translate(zh ? 'zh-CN' : 'en', 'me.agentsIsDefault')) : (translate(zh ? 'zh-CN' : 'en', 'settings.unknownOlderServer'))
   return <div className="text-[11px] text-ink-500 break-words">
-    {zh ? '来源' : 'Source'}: {label} · {zh ? '范围' : 'Scope'}: {def?.scope ?? 'managed / server'} · {settingEffect(def, zh)}
+    {translate(zh ? 'zh-CN' : 'en', 'adminobs.sourceAria')}: {label} · {translate(zh ? 'zh-CN' : 'en', 'settings.scope')}: {def?.scope ?? 'managed / server'} · {settingEffect(def, zh)}
     {def?.unit && <> · {def.unit}</>}
-    {def?.readOnly && <> · {zh ? '只读' : 'Read only'}</>}
-    {def?.sensitive && <> · {zh ? '敏感值已隐藏' : 'Sensitive value hidden'}</>}
+    {def?.readOnly && <> · {translate(zh ? 'zh-CN' : 'en', 'settings.readOnly')}</>}
+    {def?.sensitive && <> · {translate(zh ? 'zh-CN' : 'en', 'settings.sensitiveValueHidden')}</>}
   </div>
 }
 
@@ -76,7 +76,7 @@ function SettingFields({ snapshot, definitions, onSaved }: { snapshot: ApiModelS
       if (!current()) return
       onSaved(next)
       setDraft({})
-      setMessage(zh ? '已保存快照；实际应用遵循各项生效边界。' : 'Snapshot saved; runtime application follows each setting’s boundary.')
+      setMessage(translate(zh ? 'zh-CN' : 'en', 'settings.snapshotSavedRuntimeApplicationFollowsEachSettingSBoundary'))
     } catch (e) { if (current()) setMessage(e instanceof Error ? e.message : String(e)) }
     finally { submitting.current = false; if (current()) setBusy(false) }
   }
@@ -90,26 +90,26 @@ function SettingFields({ snapshot, definitions, onSaved }: { snapshot: ApiModelS
         const change = (value: string) => { setDraft(old => ({ ...old, [def.key]: value })); setMessage('') }
         return <div key={def.key} className="rounded-xl border border-ink-100 bg-cloud p-4 space-y-2">
           <label htmlFor={`setting-${def.key}`} className="block text-[12px] font-semibold break-all">{def.key}</label>
-          {highRisk && <div className="text-[11px] font-semibold text-coral-deep">{zh ? '高风险：影响执行、资源、费用或数据保留' : 'High risk: affects execution, resources, costs or retention'}</div>}
+          {highRisk && <div className="text-[11px] font-semibold text-coral-deep">{translate(zh ? 'zh-CN' : 'en', 'settings.highRiskAffectsExecutionResourcesCostsOrRetention')}</div>}
           <SettingInfo snapshot={snapshot} settingKey={def.key} zh={zh} />
-          <div className="text-[11px] text-ink-500 break-words">{zh ? '当前值' : 'Current'}: {def.sensitive ? '••••' : snapshot.settings[def.key] || '∅'}</div>
+          <div className="text-[11px] text-ink-500 break-words">{translate(zh ? 'zh-CN' : 'en', 'settings.current')}: {def.sensitive ? '••••' : snapshot.settings[def.key] || '∅'}</div>
           {def.description && <p className="text-[11px] text-ink-500">{def.description}</p>}
-          {(def.min !== undefined || def.max !== undefined) && <div className="text-[11px] text-ink-500">{zh ? '允许范围' : 'Allowed range'}: {def.min ?? '—'} … {def.max ?? '—'}</div>}
+          {(def.min !== undefined || def.max !== undefined) && <div className="text-[11px] text-ink-500">{translate(zh ? 'zh-CN' : 'en', 'settings.allowedRange')}: {def.min ?? '—'} … {def.max ?? '—'}</div>}
           {writable && <>
             {options ? <select id={`setting-${def.key}`} className={controlClass} value={value} onChange={e => change(e.target.value)}>
-              {!options.includes(value) && <option value={value} disabled>{value} — {zh ? '不支持' : 'Unsupported'}</option>}
+              {!options.includes(value) && <option value={value} disabled>{value} — {translate(zh ? 'zh-CN' : 'en', 'settings.unsupported')}</option>}
               {options.map(option => <option key={option} value={option}>{option}</option>)}
             </select> : def.type === 'json' ? <textarea id={`setting-${def.key}`} className={`${controlClass} font-mono`} rows={7} value={value} onChange={e => change(e.target.value)} />
               : <input id={`setting-${def.key}`} className={controlClass} type={['integer', 'number'].includes(def.type) ? 'number' : 'text'} min={def.min} max={def.max} step={def.type === 'number' ? 'any' : 1} value={value} onChange={e => change(e.target.value)} />}
-            <button type="button" className={buttonClass} onClick={() => { setDraft(old => ({ ...old, [def.key]: null })); setMessage('') }}>{zh ? '恢复继承' : 'Restore inheritance'}</button>
-            {draft[def.key] === null && <span className="ml-2 text-[11px] text-gold-deep">{zh ? '待保存：移除 DB 覆盖，重新解析 ENV／默认' : 'Pending save: remove DB override and resolve ENV/default'}</span>}
+            <button type="button" className={buttonClass} onClick={() => { setDraft(old => ({ ...old, [def.key]: null })); setMessage('') }}>{translate(zh ? 'zh-CN' : 'en', 'settings.restoreInheritance')}</button>
+            {draft[def.key] === null && <span className="ml-2 text-[11px] text-gold-deep">{translate(zh ? 'zh-CN' : 'en', 'settings.pendingSaveRemoveDbOverrideAndResolveEnvDefault')}</span>}
           </>}
         </div>
       })}
     </fieldset>
     {isAdmin && definitions.some(d => !d.readOnly && !d.envOnly && !d.sensitive) && <div className="flex gap-2">
-      <button type="button" className={`${buttonClass} bg-skype text-white`} disabled={busy || !Object.keys(patch).length} onClick={() => void save()}>{zh ? '保存此配置域' : 'Save this domain'}</button>
-      <button type="button" className={buttonClass} disabled={busy || !Object.keys(draft).length} onClick={() => { setDraft({}); setMessage('') }}>{zh ? '放弃修改' : 'Discard changes'}</button>
+      <button type="button" className={`${buttonClass} bg-skype text-white`} disabled={busy || !Object.keys(patch).length} onClick={() => void save()}>{translate(zh ? 'zh-CN' : 'en', 'settings.saveThisDomain')}</button>
+      <button type="button" className={buttonClass} disabled={busy || !Object.keys(draft).length} onClick={() => { setDraft({}); setMessage('') }}>{translate(zh ? 'zh-CN' : 'en', 'settings.discardChanges')}</button>
     </div>}
     {message && <p role="status" className="text-[12px] break-words">{message}</p>}
   </div>
@@ -138,21 +138,21 @@ export function ByoaPolicyStatus() {
     const timer = setInterval(() => void load(), 30_000)
     return () => { controller.abort(); clearInterval(timer) }
   }, [refresh])
-  const labels = { unknown: ['未知／未上报', 'Unknown / not reported'], unsupported: ['旧 daemon 不支持', 'Unsupported by older daemon'], pending: ['待接收', 'Pending receipt'], received: ['已接收，等待安全应用边界', 'Received; awaiting safe boundary'], applied: ['已应用', 'Applied'] }
+  const labels = { unknown: translate(zh ? 'zh-CN' : 'en', 'settings.unknownNotReported'), unsupported: translate(zh ? 'zh-CN' : 'en', 'settings.unsupportedByOlderDaemon'), pending: translate(zh ? 'zh-CN' : 'en', 'settings.pendingReceipt'), received: translate(zh ? 'zh-CN' : 'en', 'settings.receivedAwaitingSafeBoundary'), applied: translate(zh ? 'zh-CN' : 'en', 'settings.applied') }
   return <section className="space-y-3">
-    <h3 className="font-semibold">{zh ? 'BYOA 策略与 daemon 应用版本' : 'BYOA policy and daemon application versions'}</h3>
-    <p className="text-[12px] text-ink-500">{zh ? '策略约 30 秒心跳发现，资源约 60 秒同步；实际应用等待安全边界。本机模型、凭据和 endpoint 保持自治。' : 'Policy discovery uses ~30s heartbeats; resources sync ~60s. Application waits for a safe boundary. Local models, credentials and endpoints remain autonomous.'}</p>
-    <button type="button" className={buttonClass} onClick={() => setRefresh(x => x + 1)}>{zh ? '刷新应用状态' : 'Refresh application status'}</button>
-    {error && <p role="alert" className="text-coral-deep text-[12px]">{zh ? '刷新失败；以下可能是旧状态：' : 'Refresh failed; displayed state may be stale: '}{error}</p>}
-    {loading && <p>{zh ? '正在加载…' : 'Loading…'}</p>}
-    {!loading && !computers.length && !error && <p className="text-[12px]">{zh ? '当前公司没有 BYOA 电脑' : 'No BYOA computers in this company'}</p>}
+    <h3 className="font-semibold">{translate(zh ? 'zh-CN' : 'en', 'settings.byoaPolicyAndDaemonApplicationVersions')}</h3>
+    <p className="text-[12px] text-ink-500">{translate(zh ? 'zh-CN' : 'en', 'settings.policyDiscoveryUses30sHeartbeatsResourcesSync60sApplication')}</p>
+    <button type="button" className={buttonClass} onClick={() => setRefresh(x => x + 1)}>{translate(zh ? 'zh-CN' : 'en', 'settings.refreshApplicationStatus')}</button>
+    {error && <p role="alert" className="text-coral-deep text-[12px]">{translate(zh ? 'zh-CN' : 'en', 'settings.refreshFailedDisplayedStateMayBeStale')}{error}</p>}
+    {loading && <p>{translate(zh ? 'zh-CN' : 'en', 'settings.loading')}</p>}
+    {!loading && !computers.length && !error && <p className="text-[12px]">{translate(zh ? 'zh-CN' : 'en', 'settings.noByoaComputersInThisCompany')}</p>}
     {computers.map(c => <div key={c.id} className="rounded-xl bg-cloud border border-ink-100 p-4 text-[12px] space-y-1 break-all">
-      <div className="font-semibold">{c.name} · daemon {c.daemon_version ?? (zh ? '版本未知' : 'version unknown')} · {c.status}</div>
-      <div>{labels[c.runtimePolicy?.status ?? 'unknown']?.[zh ? 0 : 1] ?? (zh ? '未知状态' : 'Unknown state')}</div>
-      <div>{zh ? '目标版本' : 'Desired'}: {c.runtimePolicy?.desired ?? '—'}</div>
-      <div>{zh ? '已接收版本' : 'Received'}: {c.runtimePolicy?.received ?? '—'}</div>
-      <div>{zh ? '已应用版本' : 'Applied'}: {c.runtimePolicy?.applied ?? '—'}</div>
-      <div>{zh ? '最近上报' : 'Last report'}: {c.runtimePolicy?.reportedAt ?? '—'}</div>
+      <div className="font-semibold">{c.name} · daemon {c.daemon_version ?? (translate(zh ? 'zh-CN' : 'en', 'me.agentsCliUnknown'))} · {c.status}</div>
+      <div>{labels[c.runtimePolicy?.status ?? 'unknown'] ?? (translate(zh ? 'zh-CN' : 'en', 'settings.unknownState'))}</div>
+      <div>{translate(zh ? 'zh-CN' : 'en', 'settings.desired')}: {c.runtimePolicy?.desired ?? '—'}</div>
+      <div>{translate(zh ? 'zh-CN' : 'en', 'settings.received')}: {c.runtimePolicy?.received ?? '—'}</div>
+      <div>{translate(zh ? 'zh-CN' : 'en', 'settings.applied2')}: {c.runtimePolicy?.applied ?? '—'}</div>
+      <div>{translate(zh ? 'zh-CN' : 'en', 'settings.lastReport')}: {c.runtimePolicy?.reportedAt ?? '—'}</div>
     </div>)}
   </section>
 }
@@ -175,18 +175,18 @@ function RuntimeSettingsContent() {
       .catch(e => { if (!controller.signal.aborted) setError(e instanceof Error ? e.message : String(e)) })
     return () => controller.abort()
   }, [isAdmin])
-  const domains = [ ['automation', '自动化／唤醒', 'Automation / wake'], ['triage', '小脑／分流', 'Cerebellum / triage'], ['pod', 'Pod／安全', 'Pod / safety'], ['turn', '压缩／turn', 'Compaction / turn'], ['operations', '运维／保留期', 'Operations / retention'], ['byoa', 'BYOA 运行策略', 'BYOA runtime policy'] ]
+  const domains = [ ['automation', 'settings.automationWake'], ['triage', 'settings.cerebellumTriage'], ['pod', 'settings.podSafety'], ['turn', 'settings.compactionTurn'], ['operations', 'settings.operationsRetention'], ['byoa', 'settings.byoaRuntimePolicy'] ] as const
   return <div className="space-y-6">
-    <p className="text-[12px] text-ink-500">{zh ? '全局配置仅站点管理员可写。保存后立即安装服务端快照，健康进程约 30 秒刷新；每项配置按标注边界应用，不中断在途工作。' : 'Only site admins can write global settings. Saving installs the server snapshot; healthy processes refresh in ~30s. Each setting applies at its stated boundary without interrupting in-flight work.'}</p>
-    {!isAdmin && <p>{zh ? '全局配置需要站点管理员权限。' : 'Global settings require site admin access.'}</p>}
+    <p className="text-[12px] text-ink-500">{translate(zh ? 'zh-CN' : 'en', 'settings.onlySiteAdminsCanWriteGlobalSettingsSavingInstalls')}</p>
+    {!isAdmin && <p>{translate(zh ? 'zh-CN' : 'en', 'settings.globalSettingsRequireSiteAdminAccess')}</p>}
     {error && <p role="alert" className="text-coral-deep">{error}</p>}
-    {isAdmin && !snapshot && !error && <p>{zh ? '正在加载…' : 'Loading…'}</p>}
+    {isAdmin && !snapshot && !error && <p>{translate(zh ? 'zh-CN' : 'en', 'settings.loading')}</p>}
     {snapshot && <>
-      <p className="text-[12px]">{zh ? '已保存快照版本' : 'Saved snapshot revision'}: {snapshot.revision ?? '—'}</p>
-      {!snapshot.definitions && <p>{zh ? '旧服务端缺少配置定义，无法安全编辑。' : 'Older server lacks setting definitions; editing is unavailable.'}</p>}
+      <p className="text-[12px]">{translate(zh ? 'zh-CN' : 'en', 'settings.savedSnapshotRevision')}: {snapshot.revision ?? '—'}</p>
+      {!snapshot.definitions && <p>{translate(zh ? 'zh-CN' : 'en', 'settings.olderServerLacksSettingDefinitionsEditingIsUnavailable')}</p>}
       {snapshot.diagnostics?.map(d => <p key={d} role="alert" className="text-[12px] text-coral-deep">{d}</p>)}
-      {domains.map(([domain, cn, en]) => <details key={domain} open className="space-y-3">
-        <summary className="font-semibold cursor-pointer">{zh ? cn : en}</summary>
+      {domains.map(([domain, label]) => <details key={domain} open className="space-y-3">
+        <summary className="font-semibold cursor-pointer">{translate(zh ? 'zh-CN' : 'en', label)}</summary>
         <SettingFields snapshot={snapshot} definitions={snapshot.definitions?.filter(d => d.scope && runtimeDomain(d) === domain) ?? []} onSaved={next => setSnapshot(current => newerSettings(current, next))} />
       </details>)}
     </>}
@@ -227,33 +227,33 @@ export function ModelRoutingPanel({ snapshot, onSaved }: { snapshot: ApiModelSet
   } catch { invalidGroups = true }
   const backups = preview?.candidates.filter(c => c.source === 'llm_config:env_after_chain') ?? []
   return <section className="space-y-3">
-    <h3 className="font-semibold">{zh ? 'Managed 路由预览／ENV 后备' : 'Managed route preview / ENV backup'}</h3>
-    <p className="text-[12px] text-ink-500">{zh ? '预览仅解析已保存配置，不发起模型调用；可用表示凭据与协议已配置，不代表上游实测成功。BYOA 使用本机引擎配置。' : 'Preview resolves saved settings without calling a model. Available means credentials and protocol are configured, not that an upstream call succeeded. BYOA uses local engine settings.'}</p>
+    <h3 className="font-semibold">{translate(zh ? 'zh-CN' : 'en', 'settings.managedRoutePreviewEnvBackup')}</h3>
+    <p className="text-[12px] text-ink-500">{translate(zh ? 'zh-CN' : 'en', 'settings.previewResolvesSavedSettingsWithoutCallingAModelAvailable')}</p>
     <div className="flex flex-wrap gap-2">
-      <select aria-label={zh ? '角色' : 'Role'} className={buttonClass} value={role} onChange={e => setRole(e.target.value as ApiModelRole)}>{roles.map(r => <option key={r}>{r}</option>)}</select>
-      <input aria-label={zh ? '用途' : 'Purpose'} className={buttonClass} value={purpose} onChange={e => setPurpose(e.target.value)} />
-      <button type="button" className={buttonClass} onClick={() => setRefresh(x => x + 1)}>{zh ? '刷新预览与组校验' : 'Refresh preview and group validation'}</button>
+      <select aria-label={translate(zh ? 'zh-CN' : 'en', 'agent.roleLabel')} className={buttonClass} value={role} onChange={e => setRole(e.target.value as ApiModelRole)}>{roles.map(r => <option key={r}>{r}</option>)}</select>
+      <input aria-label={translate(zh ? 'zh-CN' : 'en', 'adminobs.colPurpose')} className={buttonClass} value={purpose} onChange={e => setPurpose(e.target.value)} />
+      <button type="button" className={buttonClass} onClick={() => setRefresh(x => x + 1)}>{translate(zh ? 'zh-CN' : 'en', 'settings.refreshPreviewAndGroupValidation')}</button>
     </div>
     {error && <p role="alert" className="text-coral-deep text-[12px]">{error}</p>}
     {preview && <div className="space-y-2 text-[12px]">
-      <p>{preview.domain} · revision {preview.revision} · {zh ? '网关路由配置' : 'Gateway routing'}: {String(preview.routable)} · {zh ? '开通配置' : 'Provisioning configured'}: {String(preview.provisionable)}</p>
-      <p>{role === 'embed' ? (zh ? 'Embedding 不使用后备链' : 'Embedding has no fallback chain') : backups.length ? (zh ? `显式 ENV 后备：${backups.length} 个候选；已配置可用 ${backups.filter(c => c.available).length} 个` : `Explicit ENV backup: ${backups.length} candidates; ${backups.filter(c => c.available).length} configured`) : (zh ? '本角色／用途未追加显式 ENV 后备；主路由仍可能是纯 ENV 直连' : 'No explicit ENV backup appended for this role/purpose; the primary may still use direct ENV routing')}</p>
+      <p>{preview.domain} · {translate(zh ? 'zh-CN' : 'en', 'settings.revision')} {preview.revision} · {translate(zh ? 'zh-CN' : 'en', 'settings.gatewayRouting')}: {String(preview.routable)} · {translate(zh ? 'zh-CN' : 'en', 'settings.provisioningConfigured')}: {String(preview.provisionable)}</p>
+      <p>{role === 'embed' ? (translate(zh ? 'zh-CN' : 'en', 'settings.embeddingHasNoFallbackChain')) : backups.length ? (translate(zh ? 'zh-CN' : 'en', 'settings.explicitEnvBackupValue1CandidatesValue2Configured', { value1: backups.length, value2: backups.filter(c => c.available).length })) : (translate(zh ? 'zh-CN' : 'en', 'settings.noExplicitEnvBackupAppendedForThisRolePurpose'))}</p>
       <ol className="list-decimal pl-5 space-y-2">{preview.candidates.map((c, i) => <li key={i} className="rounded-lg bg-cloud p-3 break-words">
         <div className="font-semibold">{c.model} → {c.requestModel}</div>
-        <div>{c.route.kind} / {c.route.id} / {c.protocol} · {c.available ? (zh ? '已配置' : 'Configured') : (zh ? '不可用' : 'Unavailable')}</div>
-        <div>{zh ? '来源' : 'Source'}: {c.source} · endpoint: {c.route.endpointSource} · {zh ? '凭据来源' : 'Credential source'}: {c.route.credentialSource}</div>
+        <div>{c.route.kind} / {c.route.id} / {c.protocol} · {c.available ? (translate(zh ? 'zh-CN' : 'en', 'settings.configured')) : (translate(zh ? 'zh-CN' : 'en', 'settings.unavailable'))}</div>
+        <div>{translate(zh ? 'zh-CN' : 'en', 'adminobs.sourceAria')}: {c.source} · {translate(zh ? 'zh-CN' : 'en', 'settings.endpoint')}: {c.route.endpointSource} · {translate(zh ? 'zh-CN' : 'en', 'settings.credentialSource')}: {c.route.credentialSource}</div>
         {c.diagnostic && <div className="text-coral-deep">{c.diagnostic}</div>}
       </li>)}</ol>
       {preview.diagnostics.map(d => <p key={d} className="text-coral-deep">{d}</p>)}
     </div>}
-    <h3 className="font-semibold">{zh ? '平台组校验（已保存配置）' : 'Platform group validation (saved settings)'}</h3>
-    {groupError && <p role="alert" className="text-coral-deep text-[12px]">{zh ? '无法校验：' : 'Unable to validate: '}{groupError}</p>}
-    {invalidGroups && <p role="alert">{zh ? '组配置格式无效' : 'Invalid group configuration'}</p>}
-    {!invalidGroups && !selection.length && <p className="text-[12px]">{zh ? '无显式组覆盖；继承部署组配置，不能据此确认组有效。' : 'No explicit group overrides; deployment group settings are inherited and not validated here.'}</p>}
-    {selection.map(g => <p key={`${g.tier}:${g.platform}`} className="text-[12px]">{g.tier} / {g.platform} / {g.id}: {groups === null ? (zh ? '尚未验证' : 'Not verified') : groups.some(c => c.id === g.id && c.platform === g.platform) ? (zh ? '有效' : 'Valid') : (zh ? '不可用或平台不匹配' : 'Unavailable or platform mismatch')}</p>)}
-    {groups && <details><summary className="text-[12px] cursor-pointer">{zh ? '可选组' : 'Available groups'} ({groups.length})</summary>{groups.map(g => <p key={`${g.platform}:${g.id}`} className="text-[12px]">{g.platform} / {g.id} / {g.name}</p>)}</details>}
-    <details className="space-y-3"><summary className="font-semibold cursor-pointer">{zh ? '高级路由／平台组配置' : 'Advanced route / platform group settings'}</summary>
-      <p className="text-[12px] text-ink-500">{zh ? '显式 llm_config 角色配置优先于上方模型字段，请以预览为准。JSON 仅接受路由与模型元信息，不包含密钥或地址。保存时服务端校验 schema、组归属和向量空间。' : 'Explicit llm_config roles override the model fields above; check the preview. JSON accepts route/model metadata without keys or addresses. The server validates schema, group ownership and embedding space on save.'}</p>
+    <h3 className="font-semibold">{translate(zh ? 'zh-CN' : 'en', 'settings.platformGroupValidationSavedSettings')}</h3>
+    {groupError && <p role="alert" className="text-coral-deep text-[12px]">{translate(zh ? 'zh-CN' : 'en', 'settings.unableToValidate')}{groupError}</p>}
+    {invalidGroups && <p role="alert">{translate(zh ? 'zh-CN' : 'en', 'settings.invalidGroupConfiguration')}</p>}
+    {!invalidGroups && !selection.length && <p className="text-[12px]">{translate(zh ? 'zh-CN' : 'en', 'settings.noExplicitGroupOverridesDeploymentGroupSettingsAreInherited')}</p>}
+    {selection.map(g => <p key={`${g.tier}:${g.platform}`} className="text-[12px]">{g.tier} / {g.platform} / {g.id}: {groups === null ? (translate(zh ? 'zh-CN' : 'en', 'settings.notVerified')) : groups.some(c => c.id === g.id && c.platform === g.platform) ? (translate(zh ? 'zh-CN' : 'en', 'settings.valid')) : (translate(zh ? 'zh-CN' : 'en', 'settings.unavailableOrPlatformMismatch'))}</p>)}
+    {groups && <details><summary className="text-[12px] cursor-pointer">{translate(zh ? 'zh-CN' : 'en', 'settings.availableGroups')} ({groups.length})</summary>{groups.map(g => <p key={`${g.platform}:${g.id}`} className="text-[12px]">{g.platform} / {g.id} / {g.name}</p>)}</details>}
+    <details className="space-y-3"><summary className="font-semibold cursor-pointer">{translate(zh ? 'zh-CN' : 'en', 'settings.advancedRoutePlatformGroupSettings')}</summary>
+      <p className="text-[12px] text-ink-500">{translate(zh ? 'zh-CN' : 'en', 'settings.explicitLlmConfigRolesOverrideTheModelFieldsAbove')}</p>
       <SettingFields snapshot={snapshot} definitions={snapshot.definitions?.filter(d => ['llm_config', 'sub2api_group_config'].includes(d.key)) ?? []} onSaved={onSaved} />
     </details>
   </section>

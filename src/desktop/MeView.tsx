@@ -9,7 +9,7 @@ import { Avatar } from '@/components/Avatar'
 import { Checkbox } from '@/components/Checkbox'
 import { AppearancePicker, ChatLayoutPicker } from '@/components/AppearancePicker'
 import { LanguagePicker } from '@/components/LanguagePicker'
-import { useT, useLocale, type MessageKey } from '@/lib/i18n'
+import { translate, useT, useLocale, type MessageKey } from '@/lib/i18n'
 import { ModelsTab } from './ModelsTab'
 import { RuntimeSettingsPanel } from './RuntimeSettingsPanel'
 import { cn } from '@/lib/utils'
@@ -265,8 +265,7 @@ function QuotaCard({ period, label, sub, window }: {
 }) {
   const t = useT()
   const locale = useLocale()
-  const text = (zh: string, en: string) => locale === 'zh-CN' ? zh : en
-  const unknown = text('未知', 'Unknown')
+  const unknown = translate(locale, 'push.permUnknown')
   const used = window?.usedUsd
   const limit = window?.limitUsd
   const knownUsed = typeof used === 'number' && Number.isFinite(used) && used >= 0
@@ -308,8 +307,8 @@ function QuotaCard({ period, label, sub, window }: {
           }}
         />
       </div>
-      <div className="text-[11px] text-ink-500">{text('sub2api 实际扣费', 'sub2api actual charges')}: {knownUsed ? fmtUsd(used) : unknown}
-        {' · '}{text('剩余额度', 'Remaining quota')}: {knownUsed && knownLimit ? fmtUsd(Math.max(0, limit - used)) : unlimited && knownUsed ? t('me.unlimited') : unknown}</div>
+      <div className="text-[11px] text-ink-500">{translate(locale, 'settings.sub2apiActualCharges')}: {knownUsed ? fmtUsd(used) : unknown}
+        {' · '}{translate(locale, 'settings.remainingQuota')}: {knownUsed && knownLimit ? fmtUsd(Math.max(0, limit - used)) : unlimited && knownUsed ? t('me.unlimited') : unknown}</div>
       <div className="flex items-center justify-between text-[11px]">
         <span className="font-display italic text-ink-400">{t(sub)}</span>
         {resets && <span className="font-mono text-ink-500">{resets}</span>}
@@ -326,7 +325,6 @@ function UsageTab() {
 function UsageTabContent() {
   const t = useT()
   const locale = useLocale()
-  const text = (zh: string, en: string) => locale === 'zh-CN' ? zh : en
   const epoch = useAuth((s) => s.contextEpoch)
   const [refresh, setRefresh] = useState(0)
   const [state, setState] = useState<
@@ -342,7 +340,7 @@ function UsageTabContent() {
     setState({ kind: 'loading' })
     api.getQuota(controller.signal)
       .then((r) => { if (current()) setState({ kind: 'ready', configured: r.configured, snapshot: r.error ? null : r.snapshot, error: r.error }) })
-      .catch(() => { if (current()) setState({ kind: 'error', message: text('额度未知；无法读取网关，请重试。', 'Quota unknown; unable to read the gateway. Please retry.') }) })
+      .catch(() => { if (current()) setState({ kind: 'error', message: translate(locale, 'settings.quotaUnknownUnableToReadTheGatewayPleaseRetry') }) })
     return () => controller.abort()
   }, [refresh, epoch])
 
@@ -386,7 +384,7 @@ function UsageTabContent() {
       <div className="bg-cloud rounded-[14px] p-6"
         style={{ border: '1px dashed var(--ink-100)' }}>
         <div className="font-display text-[14px] text-ink-700">
-          {state.error ? text('网关不可达，额度未知', 'Gateway unreachable; quota unknown') : text('无可用订阅快照，额度未知', 'No subscription snapshot; quota unknown')}
+          {state.error ? translate(locale, 'settings.gatewayUnreachableQuotaUnknown') : translate(locale, 'settings.noSubscriptionSnapshotQuotaUnknown')}
         </div>
         <div className="font-display italic text-[12px] text-ink-500 mt-1 max-w-xl">
           {state.error ? t('me.quotaGatewayUnreachHint') : t('me.subNotProvisioned')}
@@ -401,9 +399,9 @@ function UsageTabContent() {
   ) : (
     <Section title={t('me.sectionQuota')}>
       <div className="text-[13px] text-ink-500 leading-[1.55] mb-4 max-w-2xl font-display italic">
-        {text('当前登录用户的 sub2api 订阅组', 'sub2api subscription group for the signed-in user')}: {state.snapshot.groupName || text('未命名组', 'Unnamed group')} (ID: {state.snapshot.groupId})
-        <div>{text('仅限该订阅组；primary 订阅不代表四平台共享余额。其他组、钱包及 key 余额：未知（接口未提供）。', 'This subscription group only; a primary subscription is not a shared balance across four platforms. Other groups, wallets and key balances: unknown (not provided).')}</div>
-        <div>{text('订阅状态', 'Subscription status')}: {state.snapshot.status} · {text('到期时间', 'Expires at')}: {state.snapshot.expiresAt ? new Date(state.snapshot.expiresAt).toLocaleString() : text('未知', 'Unknown')}</div>
+        {translate(locale, 'settings.sub2apiSubscriptionGroupForTheSignedInUser')}: {state.snapshot.groupName || translate(locale, 'settings.unnamedGroup')} (ID: {state.snapshot.groupId})
+        <div>{translate(locale, 'settings.thisSubscriptionGroupOnlyAPrimarySubscriptionIsNot')}</div>
+        <div>{translate(locale, 'settings.subscriptionStatus')}: {state.snapshot.status} · {translate(locale, 'settings.expiresAt')}: {state.snapshot.expiresAt ? new Date(state.snapshot.expiresAt).toLocaleString() : translate(locale, 'push.permUnknown')}</div>
       </div>
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
         {PERIOD_META.map((p) => (
@@ -1343,19 +1341,19 @@ function DaemonUpgradeBanner({ onJump }: { onJump: () => void }) {
   )
 }
 
-export function MeView() {
+export function MeView({ initialTab = 'profile' }: { initialTab?: Tab } = {}) {
   const t = useT()
   const zh = useLocale() === 'zh-CN'
-  const [tab, setTab] = useState<Tab>('profile')
+  const [tab, setTab] = useState<Tab>(initialTab)
   const hasOutdated = useComputers((s) => Object.values(s.byId).some((c) => c.daemonOutdated))
   useEffect(() => { void useComputers.getState().refresh() }, [])
 
   return (
-    <main className="overflow-y-auto p-8 pt-6"
+    <main className="min-w-0 w-full flex-1 overflow-y-auto p-4 sm:p-8 sm:pt-6 [overflow-wrap:anywhere] [&_input]:min-w-0 [&_input]:max-w-full [&_select]:min-w-0 [&_select]:max-w-full [&_.grid]:min-w-0 [&_.grid>*]:min-w-0 max-sm:[&_.grid]:grid-cols-[minmax(0,1fr)]"
       style={{ background: 'linear-gradient(180deg, transparent, var(--paper))' }}>
-      <div className="max-w-[1100px] mx-auto">
+      <div className="min-w-0 max-w-[1100px] mx-auto">
         <div className="mb-6">
-          <h1 className="font-display font-medium text-[36px] tracking-tight text-ink-900 mb-1" style={{ letterSpacing: '-0.025em' }}>
+          <h1 className="font-display font-medium text-[28px] sm:text-[36px] tracking-tight text-ink-900 mb-1" style={{ letterSpacing: '-0.025em' }}>
             {t('me.headline')} {t('me.headlineEm')}
           </h1>
           <div className="font-display italic font-normal text-[15px] text-ink-500">
@@ -1371,12 +1369,13 @@ export function MeView() {
               type="button"
               key={tabDef.key}
               onClick={() => setTab(tabDef.key)}
+              aria-pressed={tab === tabDef.key}
               className={cn(
                 'py-2.5 text-[13px] font-semibold border-b-2 transition -mb-px inline-flex items-center gap-1.5',
-                i === 0 ? 'pl-0 pr-5' : 'px-5',
+                i === 0 ? 'pl-0 pr-3 sm:pr-5' : 'px-3 sm:px-5',
                 tab === tabDef.key ? 'border-skype text-skype-deep' : 'border-transparent text-ink-500 hover:text-ink-700',
               )}>
-              {tabDef.key === 'runtime' ? (zh ? '运行／自动化' : 'Runtime / automation') : t(tabDef.label)}
+              {tabDef.key === 'runtime' ? (translate(zh ? 'zh-CN' : 'en', 'settings.runtimeAutomation')) : t(tabDef.label)}
               {tabDef.key === 'computers' && hasOutdated && (
                 <span className="w-1.5 h-1.5 rounded-full" style={{ background: 'var(--gold-deep)' }} title={t('me.daemonNeedsUpdate')} />
               )}

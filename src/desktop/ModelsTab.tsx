@@ -6,7 +6,7 @@
  */
 import { useEffect, useRef, useState } from 'react'
 import { api, type ApiModelCatalog, type ApiModelSettings } from '@/api/client'
-import { useT, useLocaleStore, type MessageKey } from '@/lib/i18n'
+import { translate, useT, useLocaleStore, type MessageKey } from '@/lib/i18n'
 import { ModelInput, FallbackChainEditor, CatalogStatus, EFFORT_OPTIONS, modelInteger } from '@/components/ModelFields'
 import { ModelRoutingPanel, SettingInfo, newerSettings } from './RuntimeSettingsPanel'
 import { cn } from '@/lib/utils'
@@ -119,11 +119,11 @@ function ModelsTabContent() {
       const patch = dirtyModelSettings(draft, initial, inherited)
       for (const role of ROLES) {
         for (const [key, min] of [[role.tokensKey, 1], [role.headroomKey, 0]] as const) {
-          if (key && typeof patch[key] === 'string' && modelInteger(patch[key], key, min) === undefined) throw new Error(`${key}: ${zh ? '请输入整数或恢复继承' : 'Enter an integer or restore inheritance'}`)
+          if (key && typeof patch[key] === 'string' && modelInteger(patch[key], key, min) === undefined) throw new Error(`${key}: ${translate(zh ? 'zh-CN' : 'en', 'settings.enterAnIntegerOrRestoreInheritance')}`)
         }
         const effort = role.effortKey ? patch[role.effortKey] : undefined
         if (typeof effort === 'string' && !EFFORT_OPTIONS.includes(effort)) throw new Error('effort: ' + EFFORT_OPTIONS.join('/'))
-        if (typeof patch[role.modelKey] === 'string' && !patch[role.modelKey]?.trim()) throw new Error(`${role.modelKey}: ${zh ? '主模型不能为空；可恢复继承' : 'Primary required; use restore inheritance'}`)
+        if (typeof patch[role.modelKey] === 'string' && !patch[role.modelKey]?.trim()) throw new Error(`${role.modelKey}: ${translate(zh ? 'zh-CN' : 'en', 'settings.primaryRequiredUseRestoreInheritance')}`)
       }
       const result = await api.putModelSettings(patch, requests.current?.signal)
       if (!current()) return
@@ -150,8 +150,8 @@ function ModelsTabContent() {
   return (
     <div className="space-y-6">
       <CatalogStatus {...catalogState} />
-      <p className="text-[12px] text-ink-500">{zh ? 'Managed 全局模型；保存后安装快照，下一次调用使用。在途 turn 不切换；BYOA 模型和凭据由本机管理。' : 'Managed global models. Saving installs a snapshot for subsequent calls; in-flight turns continue. BYOA models and credentials are managed locally.'}</p>
-      <p className="text-[12px]">{zh ? '快照版本' : 'Snapshot revision'}: {snapshot?.revision ?? '—'}</p>
+      <p className="text-[12px] text-ink-500">{translate(zh ? 'zh-CN' : 'en', 'settings.managedGlobalModelsSavingInstallsASnapshotForSubsequent')}</p>
+      <p className="text-[12px]">{translate(zh ? 'zh-CN' : 'en', 'settings.snapshotRevision')}: {snapshot?.revision ?? '—'}</p>
       {saveError && <div role="alert" className="text-[12px] text-coral-deep">{saveError}</div>}
       <fieldset disabled={saving} className="space-y-6">
       {ROLES.map((role) => {
@@ -181,8 +181,8 @@ function ModelsTabContent() {
                     onChange={(e) => e.target.value ? set(role.effortKey!, e.target.value) : setInherited((old) => new Set([...old, role.effortKey!]))}
                     className="h-8 px-2 rounded-[8px] text-[12.5px] text-ink-900 bg-paper outline-none focus:ring-2 focus:ring-skype/30"
                     style={{ border: '1px solid var(--ink-100)' }}>
-                    <option value="">{zh ? '继承' : 'Inherit'}</option>
-                    {draft[role.effortKey] && !efforts.includes(draft[role.effortKey]) && <option value={draft[role.effortKey]} disabled>{draft[role.effortKey]} — {zh ? '不支持' : 'Unsupported'}</option>}
+                    <option value="">{translate(zh ? 'zh-CN' : 'en', 'settings.inherit')}</option>
+                    {draft[role.effortKey] && !efforts.includes(draft[role.effortKey]) && <option value={draft[role.effortKey]} disabled>{draft[role.effortKey]} — {translate(zh ? 'zh-CN' : 'en', 'settings.unsupported')}</option>}
                     {efforts.map((o) => <option key={o} value={o}>{o}</option>)}
                   </select>
                 </>
@@ -235,7 +235,7 @@ function ModelsTabContent() {
               <SettingInfo snapshot={snapshot} settingKey={key} zh={zh} />
             </div>)}</div>}
             <details className="text-[11px] text-ink-500">
-              <summary className="cursor-pointer">{zh ? '恢复继承（保存后按调用边界应用）' : 'Restore inheritance (applies at call boundary after save)'}</summary>
+              <summary className="cursor-pointer">{translate(zh ? 'zh-CN' : 'en', 'settings.restoreInheritanceAppliesAtCallBoundaryAfterSave')}</summary>
               <div className="flex flex-wrap gap-3 mt-2">
               {[role.modelKey, role.fallbackKey, role.effortKey, role.tokensKey, role.headroomKey].filter((k): k is string => !!k).map((key) => <label key={key} className="flex items-center gap-1">
                 <input type="checkbox" checked={inherited.has(key)} onChange={(e) => setInherited((old) => {
@@ -258,7 +258,7 @@ function ModelsTabContent() {
           style={{ background: saving ? 'var(--ink-200)' : 'var(--skype)', boxShadow: '0 4px 12px -3px rgba(0, 168, 240, 0.5)' }}>
           {saving ? t('me.models.saving') : t('me.models.save')}
         </button>
-        {savedTick && <span className="text-[12px] text-skype-deep font-medium">{zh ? '快照已保存，实际调用按生效边界应用' : 'Snapshot saved; calls apply it at their boundary'}</span>}
+        {savedTick && <span className="text-[12px] text-skype-deep font-medium">{translate(zh ? 'zh-CN' : 'en', 'settings.snapshotSavedCallsApplyItAtTheirBoundary')}</span>}
 
       </div>
       {snapshot && <ModelRoutingPanel snapshot={snapshot} onSaved={result => {
