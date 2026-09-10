@@ -1277,7 +1277,11 @@ function DaemonUpgradeBanner({ onJump }: { onJump: () => void }) {
   const outdated = Object.values(byId).filter((c) => c.daemonOutdated)
   if (outdated.length === 0) return null
 
-  const latest = AGENT_CLI_RELEASE_TAG.replace('agent-cli-v', '')
+  // The server reports the newest fork release (version + download URL) on
+  // every computer row; fall back to the tag this build shipped with.
+  const serverLatest = outdated.map((c) => c.latestDaemonVersion).find(Boolean) ?? null
+  const serverUrl = outdated.map((c) => c.latestDaemonDownloadUrl).find(Boolean) ?? null
+  const latest = serverLatest ?? AGENT_CLI_RELEASE_TAG.replace('agent-cli-v', '')
   const one = outdated.length === 1 ? outdated[0] : null
   // Run-mode-aware instructions. A supervised daemon (--install-service) is
   // restarted through its launchd/systemd wrapper; a manually-run foreground
@@ -1286,7 +1290,7 @@ function DaemonUpgradeBanner({ onJump }: { onJump: () => void }) {
   // which itself prints install-service guidance when no service exists.
   const manual = outdated.filter((c) => c.daemonSupervised === false)
   const allManual = manual.length === outdated.length
-  const cmd = agentCliCommand(allManual ? '' : ' --restart')
+  const cmd = agentCliCommand(allManual ? '' : ' --restart', serverUrl)
   const copy = () => { void navigator.clipboard?.writeText(cmd); setCopied(true); window.setTimeout(() => setCopied(false), 1600) }
 
   return (

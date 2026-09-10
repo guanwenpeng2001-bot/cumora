@@ -549,6 +549,8 @@ export interface ApiComputer {
   daemon_supervised?: boolean | null
   /** Newest published cumora daemon version, for the upgrade banner. */
   latest_daemon_version?: string | null
+  /** Direct tgz download URL of the newest fork agent-cli release. */
+  latest_daemon_download_url?: string | null
   /** True when this BYOA daemon is behind the latest version → show upgrade banner. */
   daemon_outdated?: boolean
   runtimePolicy?: ApiByoaPolicyState

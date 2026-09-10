@@ -64,6 +64,8 @@ export interface Computer {
   daemonSupervised?: boolean | null
   /** Newest published daemon version (for the upgrade banner). */
   latestDaemonVersion?: string | null
+  /** Direct tgz download URL of the newest fork agent-cli release. */
+  latestDaemonDownloadUrl?: string | null
   /** True when the daemon is behind the latest version → show the upgrade banner. */
   daemonOutdated?: boolean
 }

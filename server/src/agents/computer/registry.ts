@@ -284,42 +284,55 @@ export interface ComputerRow {
 
 /** A computer plus the computed upgrade signal the app uses to show the banner. */
 export interface ComputerWithUpgrade extends ComputerRow {
-  /** The newest published cumora version (npm 'latest'), or null if unknown. */
+  /** The newest published fork agent-cli release, or null if unknown. */
   latest_daemon_version: string | null
+  /** Direct tgz download URL of that release (for the banner command). */
+  latest_daemon_download_url: string | null
   /** True iff this is a BYOA daemon running behind the latest version (or one so
    *  old it never reported a version). Cloud computers are never outdated. */
   daemon_outdated: boolean
   runtimePolicy?: ByoaPolicyState
 }
 
-/** semver-ish "a > b" over dotted numbers. Pre-release/build tags are ignored
- *  (we only ship plain x.y.z), so a bare numeric compare is enough. */
+/** semver-ish "a > b": numeric x.y.z first, then the fork prerelease counter
+ *  (0.16.2-fork.2 > 0.16.2-fork.1). Build metadata (+sha) ignored. */
 function versionGt(a: string, b: string): boolean {
-  const pa = a.split('.').map((n) => parseInt(n, 10) || 0)
-  const pb = b.split('.').map((n) => parseInt(n, 10) || 0)
+  const core = (v: string) => v.split('+')[0].split('-')[0].split('.').map((n) => parseInt(n, 10) || 0)
+  const pa = core(a), pb = core(b)
   for (let i = 0; i < 3; i++) {
     if ((pa[i] ?? 0) > (pb[i] ?? 0)) return true
     if ((pa[i] ?? 0) < (pb[i] ?? 0)) return false
   }
-  return false
+  const forkN = (v: string) => Number(/-fork\.(\d+)/.exec(v)?.[1] ?? 0)
+  return forkN(a) > forkN(b)
 }
 
-// Newest published cumora version, cached so listComputers doesn't hit npm on
-// every call. Refreshes hourly; fail-safe (keeps the last good value, or null
-// when never fetched — and null means we never flag anyone outdated).
-let latestCache: { version: string | null; at: number } = { version: null, at: 0 }
+// Newest published fork agent-cli release, cached so listComputers doesn't hit
+// GitHub on every call. Refreshes hourly; fail-safe (keeps the last good value,
+// or null when never fetched — and null means we never flag anyone outdated).
+let latestCache: { version: string | null; downloadUrl: string | null; at: number } = { version: null, downloadUrl: null, at: 0 }
 const LATEST_TTL_MS = 60 * 60 * 1000
-async function getLatestDaemonVersion(): Promise<string | null> {
+async function getLatestDaemonRelease(): Promise<{ version: string; downloadUrl: string } | null> {
   const now = Date.now()
-  if (latestCache.version && now - latestCache.at < LATEST_TTL_MS) return latestCache.version
+  if (latestCache.version && now - latestCache.at < LATEST_TTL_MS) {
+    return { version: latestCache.version, downloadUrl: latestCache.downloadUrl! }
+  }
   try {
-    const res = await fetch('https://registry.npmjs.org/cumora/latest', { headers: { Accept: 'application/json' } })
+    const res = await fetch('https://api.github.com/repos/guanwenpeng2001-bot/cumora/releases?per_page=30', {
+      headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'cumora-server' },
+    })
     if (res.ok) {
-      const v = (await res.json() as { version?: string })?.version
-      if (typeof v === 'string' && v) latestCache = { version: v, at: now }
+      const releases = await res.json() as Array<{ tag_name?: string; published_at?: string; assets?: Array<{ name: string; browser_download_url: string }> }>
+      const cli = releases
+        .filter((r) => r.tag_name?.startsWith('agent-cli-v'))
+        .sort((a, b) => (b.published_at ?? '').localeCompare(a.published_at ?? ''))[0]
+      const asset = cli?.assets?.find((a) => a.name.endsWith('.tgz'))
+      if (cli?.tag_name && asset) {
+        latestCache = { version: cli.tag_name.replace('agent-cli-v', ''), downloadUrl: asset.browser_download_url, at: now }
+      }
     }
   } catch { /* offline — keep the last good value */ }
-  return latestCache.version
+  return latestCache.version ? { version: latestCache.version, downloadUrl: latestCache.downloadUrl! } : null
 }
 
 const AGENT_TOKEN_TTL_SECONDS = 2 * 60 * 60 // 2h; daemon refreshes before expiry
@@ -756,17 +769,18 @@ export async function listComputers(companyId: string): Promise<ComputerWithUpgr
       ORDER BY (kind = 'cloud') DESC, created_at ASC`,
     [companyId],
   )
-  const latest = await getLatestDaemonVersion()
+  const latest = await getLatestDaemonRelease()
   return Promise.all(rows.map(async (r) => ({
     ...r,
     ...(r.kind !== 'cloud' ? { runtimePolicy: await getComputerPolicyState(r.company_id, r.id) } : {}),
-    latest_daemon_version: latest,
+    latest_daemon_version: latest?.version ?? null,
+    latest_daemon_download_url: latest?.downloadUrl ?? null,
     // Only BYOA daemons can be outdated, and only when we actually know the
     // latest. A daemon that never reported a version (NULL) is pre-feature →
     // definitionally old → outdated.
     daemon_outdated:
       r.kind !== 'cloud' && latest != null &&
-      (r.daemon_version == null || versionGt(latest, r.daemon_version)),
+      (r.daemon_version == null || versionGt(latest.version, r.daemon_version)),
   })))
 }
 
