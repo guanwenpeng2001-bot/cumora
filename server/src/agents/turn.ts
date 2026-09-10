@@ -21,7 +21,7 @@ import type { ResponseInputItem, ResponseStreamEvent } from 'openai/resources/re
 import { env } from '../env.js'
 import { supportReasoningOptions, supportReasoningHeadroom, reasoningOptions } from './reasoning.js'
 import { type AgentModelConfig } from './model-config.js'
-import { getBrainModel, getCompactionModel } from '../settings.js'
+import { getBrainModel, getCompactionModel, getTurnBudgetPolicy, type TurnBudgetPolicy } from '../settings.js'
 import { redis } from '../redis.js'
 import { readLocalMessageAttachment } from '../local-attachment-files.js'
 import { messageAttachmentStorageKey } from '../storage-keys.js'
@@ -54,7 +54,7 @@ import {
   newResponseStreamState,
   type ResponseStreamState,
 } from './turn-stream.js'
-import { compactHistoryWithSummary, estimateHistoryTokens, estimateTokens } from './turn-compaction.js'
+import { compactHistoryWithSummary, DEFAULT_COMPACTION_POLICY, type CompactionPolicy, estimateHistoryTokens, estimateTokens, truncateChars, truncateUtf8 } from './turn-compaction.js'
 import { addUsage, EMPTY_USAGE, type TokenUsage } from './cost.js'
 import { recordLlmCall, readStreamUsage, readStreamReasoningTokens } from './llm-ledger.js'
 import { resolveDeclaredAutoRelayTarget } from './auto-relay.js'
@@ -844,15 +844,6 @@ async function loadFaces(companyId: string, participantIds: string[]): Promise<A
  */
 const lastCompletedInbox = new Map<string, string>()
 
-/** Maximum LLM hops per turn. Raised 4 → 8 → 100 → 200 as we kept
- *  hitting real production cases where models needed long tool chains
- *  (Iris's video-download incident at 4-hop; multi-step research tasks
- *  past 100-hop). 200 is essentially "no cap" for any realistic task;
- *  the LLM-summarized auto-compaction path below handles cost /
- *  context-window pressure by ACTUALLY SUMMARIZING earlier work, not
- *  truncating it. */
-const MAX_HOPS = 200
-
 const MCP_CONNECT_FAILURE_CACHE_MS = 30_000
 const mcpConnectorFailureCache = new Map<string, number>()
 
@@ -864,15 +855,7 @@ const MODEL_TOOL_OUTPUT_BYTES = 8_000
 const MCP_TOOL_SCHEMA_MAX_BYTES = 8_000
 
 function utf8Head(value: string, maxBytes: number): string {
-  if (Buffer.byteLength(value, 'utf8') <= maxBytes) return value
-  let lo = 0
-  let hi = value.length
-  while (lo < hi) {
-    const mid = Math.ceil((lo + hi) / 2)
-    if (Buffer.byteLength(value.slice(0, mid), 'utf8') <= maxBytes) lo = mid
-    else hi = mid - 1
-  }
-  return value.slice(0, lo)
+  return truncateUtf8(value, maxBytes)
 }
 
 function modelToolOutputPayload(value: unknown): string {
@@ -933,22 +916,22 @@ function contextWindowFor(model: string | null): number {
   return 200_000
 }
 
-/** Soft compaction threshold: 75% of the model's context window. Past
+/** Soft compaction threshold: defaults to 75% of the model's context window. Past
  *  this point we trigger an LLM-summarized compaction pass — earlier
  *  tool-call pairs are SUMMARIZED into a concise paragraph, NOT just
  *  dropped, so the agent retains semantic continuity across very long
  *  turns. */
-function compactThresholdFor(model: string | null, windowOverride?: number): number {
-  return Math.floor((windowOverride ?? contextWindowFor(model)) * 0.75)
+function compactThresholdFor(model: string | null, windowOverride?: number, policy: CompactionPolicy = DEFAULT_COMPACTION_POLICY): number {
+  return Math.floor((windowOverride ?? contextWindowFor(model)) * policy.softRatio)
 }
 
-/** Absolute ceiling: 95% of the model's context window. Even after
+/** Absolute ceiling: defaults to 95% of the model's context window. Even after
  *  compaction, if the projected input STILL exceeds this — typically
  *  only when the original user input itself is huge (a giant
  *  attachment dump) — we break the loop and let the next wake start
  *  fresh. Should be ultra-rare in practice. */
-function hardLimitFor(model: string | null, windowOverride?: number): number {
-  return Math.floor((windowOverride ?? contextWindowFor(model)) * 0.95)
+function hardLimitFor(model: string | null, windowOverride?: number, policy: CompactionPolicy = DEFAULT_COMPACTION_POLICY): number {
+  return Math.floor((windowOverride ?? contextWindowFor(model)) * policy.hardRatio)
 }
 // `COMPACTED_OUTPUT_BYTES` + `KEEP_RECENT_PAIRS` live in turn-compaction.ts
 // — turn.ts only needs the token budgets above.
@@ -1335,7 +1318,7 @@ Reply ONLY as JSON: {"complete":boolean,"reason":"short factual reason","next_st
  *  summarization call cost bounded; older items past the cap get
  *  elided with a count line. */
 function formatItemsForSummary(items: ResponseInputItem[]): string {
-  const MAX_BYTES = 32_000
+  const MAX_CHARS = 32_000
   const lines: string[] = []
   let elided = 0
   for (const item of items) {
@@ -1346,11 +1329,11 @@ function formatItemsForSummary(items: ResponseInputItem[]): string {
       const name = String(r.name ?? '?')
       const callId = String(r.call_id ?? '?')
       const args = String(r.arguments ?? '')
-      line = `function_call ${name} (call_id=${callId})\n  args: ${args.slice(0, 600)}`
+      line = `function_call ${name} (call_id=${callId})\n  args: ${truncateChars(args, 600)}`
     } else if (type === 'function_call_output') {
       const callId = String(r.call_id ?? '?')
       const out = String(r.output ?? '')
-      line = `function_call_output (call_id=${callId})\n  output: ${out.slice(0, 1200)}`
+      line = `function_call_output (call_id=${callId})\n  output: ${truncateChars(out, 1200)}`
     } else if (type === 'item_reference') {
       // These are bookkeeping only — they don't carry user-visible
       // content. Skip them in the summary input so we don't waste
@@ -1358,9 +1341,9 @@ function formatItemsForSummary(items: ResponseInputItem[]): string {
       continue
     } else {
       // message items inserted by previous compaction passes, etc.
-      line = `${type}: ${JSON.stringify(r).slice(0, 600)}`
+      line = `${type}: ${truncateChars(JSON.stringify(r), 600)}`
     }
-    if (lines.join('\n\n').length + line.length > MAX_BYTES) {
+    if (lines.join('\n\n').length + line.length > MAX_CHARS) {
       elided += 1
       continue
     }
@@ -1382,6 +1365,7 @@ async function summarizeHistoryItems(
   persona: { name: string; model: string | null },
   tenant: string | null,
   agentId: string,
+  signal?: AbortSignal,
 ): Promise<string> {
   const flattened = formatItemsForSummary(itemsToDrop)
   if (flattened.length === 0) return '(no earlier work to summarize)'
@@ -1394,8 +1378,8 @@ async function summarizeHistoryItems(
 Skip narrative framing. No headings, no bullet symbols unless they aid clarity. Plain paragraphs. Treat the output as a private memo to your future self.`
   try {
     const result = await executeAuxiliaryStream({
-      purpose: 'compaction', companyId: tenant, agentId, extras: { itemsDropped: itemsToDrop.length, inputCharsBefore: flattened.length, inputTokensBefore: estimateTokens(flattened) },
-      instructions, outputTokens: 1500,
+      purpose: 'compaction', companyId: tenant, agentId, extras: { itemsDropped: itemsToDrop.length, inputCharsBefore: Array.from(flattened).length, inputTokensBefore: estimateTokens(flattened) },
+      instructions, outputTokens: 1500, signal,
       input: [
         {
           role: 'user',
@@ -1560,6 +1544,7 @@ export async function executeAgentTurnHop(args: {
   tools: unknown[]
   signal?: AbortSignal
   wallTimeoutMs?: number
+  compactionPolicy?: CompactionPolicy
   idleTimeoutMs?: number
   retryEvent?: (kind: string, data: Record<string, unknown>) => Promise<void>
   requestEvent?: (data: Record<string, unknown>) => Promise<void>
@@ -1567,7 +1552,8 @@ export async function executeAgentTurnHop(args: {
 }): Promise<{ state: ResponseStreamState; input: ResponseInputItem[] }> {
   const { executeLlmPlan, responsesToChat } = await import('../llm-execution.js')
   const { getLlmCandidateClient } = await import('../llm.js')
-  const { compactHistory } = await import('./turn-compaction.js')
+  const { compactHistory, DEFAULT_COMPACTION_POLICY } = await import('./turn-compaction.js')
+  const compactionPolicy = args.compactionPolicy ?? DEFAULT_COMPACTION_POLICY
   const { measuredUsage } = await import('./cost.js')
   const { chatResponseStream } = await import('../novita.js')
   const { fallbackReason } = await import('./fallback.js')
@@ -1601,9 +1587,9 @@ export async function executeAgentTurnHop(args: {
         const overhead = estimateTokens(args.instructions) + estimateTokens(JSON.stringify(args.tools))
         const window = candidate.parameters.contextWindow ?? contextWindowFor(candidate.model)
         const output = Math.min(candidate.parameters.maxOutputTokens ?? 4000, window - overhead - 1)
-        const inputBudget = Math.min(hardLimitFor(candidate.model, window), window - overhead - output)
+        const inputBudget = Math.min(hardLimitFor(candidate.model, window, compactionPolicy), window - overhead - output)
         if (output < 1 || inputBudget < 1) throw new Error('Turn candidate context budget exhausted')
-        if (estimateHistoryTokens(input) > inputBudget) input = compactHistory(input, n => n > inputBudget).newHistory
+        if (estimateHistoryTokens(input) > inputBudget) input = compactHistory(input, n => n > inputBudget, compactionPolicy).newHistory
         if (estimateHistoryTokens(input) > inputBudget) throw new Error('Turn candidate input exceeds context budget')
         const shim = candidate.route.kind === 'direct' && ['novita', 'orcarouter'].includes(candidate.route.env ?? '')
         const useChat = candidate.protocol === 'chat' && !shim
@@ -1656,6 +1642,21 @@ export async function executeAgentTurnHop(args: {
 }
 
 export async function runAgentTurn(agentId: string, options: AgentTurnOptions = {}): Promise<void> {
+  const policy = getTurnBudgetPolicy()
+  const controller = new AbortController()
+  const signal = options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal
+  const timer = policy.timeoutMs > 0
+    ? setTimeout(() => controller.abort(new DOMException('Managed turn deadline exceeded', 'TimeoutError')), policy.timeoutMs)
+    : undefined
+  timer?.unref()
+  try {
+    await runAgentTurnWithBudget(agentId, { ...options, signal }, policy)
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+async function runAgentTurnWithBudget(agentId: string, options: AgentTurnOptions, turnPolicy: TurnBudgetPolicy): Promise<void> {
   const resources = await runtime.applyPendingResources(agentId)
   if (resources.status !== 'applied') throw new Error('Pending resources failed to apply')
   const persona = await runtime.loadPersona(agentId)
@@ -1761,7 +1762,7 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
   // Main-model turn-status protocol. The runtime records the latest
   // declaration and never infers semantic completion from silence.
   let declaredTurnStatus: TurnStatusOutput | null = null
-  // Why the hop loop exited. 'max_hops' = we hit MAX_HOPS while the model was
+  // Why the hop loop exited. 'max_hops' = we hit turnPolicy.maxHops while the model was
   // still mid-task — the failure mode where an agent says "I'll do X"
   // and then goes silent because the loop ran out of headroom. 'budget'
   // = the 75%-budget guard fired. Used to emit `turn.cap_reached` for
@@ -2584,7 +2585,7 @@ Mechanics:
     }).catch(() => { /* observability best-effort */ })
   }
 
-  for (let hop = 0; hop < MAX_HOPS; hop++) {
+  for (let hop = 0; hop < turnPolicy.maxHops; hop++) {
     options.signal?.throwIfAborted()
     // Auto-compaction: when the previous hop's reported usage crosses the
     // soft threshold, reshape `history` BEFORE sending it. compactHistory()
@@ -2600,9 +2601,10 @@ Mechanics:
     // dump). In that case the next wake will start fresh, which IS the
     // ultimate compaction.
     const modelInUse = persona.model ?? getBrainModel()
-    const compactThreshold = compactThresholdFor(modelInUse, turnContextWindow)
-    const hardLimit = hardLimitFor(modelInUse, turnContextWindow)
-    if (totalTokensThisTurn > compactThreshold) {
+    const compactThreshold = compactThresholdFor(modelInUse, turnContextWindow, turnPolicy)
+    const hardLimit = hardLimitFor(modelInUse, turnContextWindow, turnPolicy)
+    if ((turnPolicy.autoEnabled && Math.max(totalTokensThisTurn, estimateHistoryTokens(history)) > compactThreshold)
+      || estimateHistoryTokens(history) > hardLimit) {
       // The compaction predicate runs against a CJK-aware token
       // estimate (estimateTokens), so Chinese/Japanese turns trigger
       // compaction at the right point — the old byte-count heuristic
@@ -2620,7 +2622,8 @@ Mechanics:
       const compaction = await compactHistoryWithSummary(
         history,
         (estimateTokensCount) => estimateTokensCount > budgetTokens,
-        async (itemsToDrop) => summarizeHistoryItems(itemsToDrop, persona, runCompanyId, agentId),
+        async (itemsToDrop) => summarizeHistoryItems(itemsToDrop, persona, runCompanyId, agentId, options.signal),
+        turnPolicy,
       )
       const didAnything = compaction.truncatedOutputCount > 0 || compaction.droppedPairCount > 0
       if (didAnything) {
@@ -2642,6 +2645,7 @@ Mechanics:
             droppedItemBytes: compaction.droppedItemBytes,
             historyItemsAfter: history.length,
             usedLlmSummary: compaction.usedLlmSummary,
+            settingsRevision: turnPolicy.revision,
           },
           stage: 'compacted',
         }).catch(() => { /* observability best-effort */ })
@@ -2700,7 +2704,7 @@ Mechanics:
           extras: { hop: hop + 1 } },
         input: nextInput, instructions,
         tools: mcpToolDefs.length > 0 ? [...TOOL_DEFS_RESPONSES, ...mcpToolDefs] : TOOL_DEFS_RESPONSES,
-        signal: options.signal,
+        signal: options.signal, compactionPolicy: turnPolicy,
         retryEvent: async (kind, data) => { await runtime.recordEvent({
           runId, agentId, companyId: runCompanyId, kind, level: 'warn',
           title: kind === 'model.retry_no_images' ? 'Retrying model without images' : 'Retrying model provider connection',
@@ -2901,7 +2905,7 @@ Mechanics:
     // Cap-out capture: if this is the LAST allowed hop, snapshot any text the
     // model emitted (rare, since this hop also returned tool calls). It remains
     // a draft unless the model declared a relay target.
-    if (hop === MAX_HOPS - 1) {
+    if (hop === turnPolicy.maxHops - 1) {
       pendingAssistantText = Array.from(streamState.responseTextByPart.values()).join('\n').trim()
     }
 
@@ -3212,7 +3216,7 @@ Mechanics:
   // event so future "why did the agent stop?" investigations don't have to
   // count tool.started rows to spot it.
   if (loopExitReason === 'max_hops') {
-    finalSummary ||= `Stopped at MAX_HOPS=${MAX_HOPS} — model was still requesting tools`
+    finalSummary ||= `Stopped at max hops=${turnPolicy.maxHops} — model was still requesting tools`
     finalStatus = 'failed'
     finalError = finalSummary
     await runtime.recordEvent({
@@ -3221,7 +3225,7 @@ Mechanics:
       level: 'warn',
       title: finalSummary,
       data: {
-        maxHops: MAX_HOPS,
+        maxHops: turnPolicy.maxHops,
         toolCallCount,
         postedReplyViaTool,
         hadDraftText: pendingAssistantText.length > 0,

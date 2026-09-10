@@ -98,6 +98,40 @@ export const COMPACTED_OUTPUT_BYTES = 600
  *  exchange that the model needs to reason about its next move. */
 export const KEEP_RECENT_PAIRS = 2
 
+export interface CompactionPolicy {
+  readonly autoEnabled: boolean
+  readonly softRatio: number
+  readonly hardRatio: number
+  readonly outputBytes: number
+  readonly keepRecentPairs: number
+  readonly strategy: 'summary' | 'drop-and-marker'
+  readonly summaryMaxChars: number
+}
+
+export const DEFAULT_COMPACTION_POLICY: Readonly<CompactionPolicy> = Object.freeze({
+  autoEnabled: true, softRatio: 0.75, hardRatio: 0.95,
+  outputBytes: COMPACTED_OUTPUT_BYTES, keepRecentPairs: KEEP_RECENT_PAIRS,
+  strategy: 'summary', summaryMaxChars: 4000,
+})
+
+/** Unicode code points, not UTF-16 code units. */
+export function truncateChars(text: string, maxChars: number): string {
+  return Array.from(text).slice(0, maxChars).join('')
+}
+
+/** Keep only complete code points within a UTF-8 byte budget. */
+export function truncateUtf8(text: string, maxBytes: number): string {
+  let bytes = 0
+  let end = 0
+  for (const char of text) {
+    const size = Buffer.byteLength(char, 'utf8')
+    if (bytes + size > maxBytes) break
+    bytes += size
+    end += char.length
+  }
+  return text.slice(0, end)
+}
+
 /** Result of one compaction pass over `history`. The caller emits a
  *  single `turn.compacted` observability event populated with these
  *  numbers so post-hoc investigations can see exactly when (and how
@@ -107,8 +141,8 @@ export interface CompactionResult {
   truncatedOutputBytes: number
   truncatedOutputCount: number
   droppedPairCount: number
-  /** Total chars of dropped items (function_call args + function_call_output
-   *  content + item_reference shells), measured BEFORE any truncation —
+  /** Total UTF-8 bytes of dropped items (function_call args + function_call_output
+   *  content + item_reference shells), measured AFTER output truncation —
    *  useful for spotting whether the truncate stage alone would have
    *  been enough. */
   droppedItemBytes: number
@@ -128,8 +162,9 @@ export interface CompactionResult {
 export function compactHistory(
   history: ResponseInputItem[],
   stillOverThreshold: (estimateTokens: number) => boolean,
+  policy: CompactionPolicy = DEFAULT_COMPACTION_POLICY,
 ): CompactionResult {
-  return compactHistoryInternal(history, stillOverThreshold, null)
+  return compactHistoryInternal(history, stillOverThreshold, policy)
 }
 
 /** Compact `history` with REAL LLM-summarized dropped content. The
@@ -145,7 +180,9 @@ export async function compactHistoryWithSummary(
   history: ResponseInputItem[],
   stillOverThreshold: (estimateTokens: number) => boolean,
   summarize: (itemsToDrop: ResponseInputItem[]) => Promise<string>,
+  policy: CompactionPolicy = DEFAULT_COMPACTION_POLICY,
 ): Promise<CompactionResult> {
+  if (!policy.autoEnabled || policy.strategy === 'drop-and-marker') return compactHistory(history, stillOverThreshold, policy)
   // Stage 1 runs synchronously — truncating oversized outputs is free +
   // idempotent + saves tokens BEFORE we feed the dropped portion to the
   // summarizer LLM. CRITICALLY: we do NOT run the stage-2 fallback drop
@@ -153,7 +190,7 @@ export async function compactHistoryWithSummary(
   // summarize. compactHistoryInternal's contract is "stage 1 + stage 2
   // drop fallback", so we go through truncateOversizedOutputs directly
   // and decide between summarize / drop ourselves.
-  const stage1 = truncateOversizedOutputs(deepishCopy(history))
+  const stage1 = truncateOversizedOutputs(deepishCopy(history), policy)
   const working = stage1.newHistory
   const stage1Out = {
     truncatedOutputBytes: stage1.truncatedOutputBytes,
@@ -176,8 +213,11 @@ export async function compactHistoryWithSummary(
   // on the ORIGINAL caller-supplied history (so we don't re-truncate
   // outputs twice; compactHistoryInternal redoes stage 1 anyway).
   try {
-    const result = await summarizeAndSplice(working, stage1Out, summarize)
-    if (result !== null) return result
+    const result = await summarizeAndSplice(working, stage1Out, summarize, policy)
+    if (result !== null) {
+      if (!stillOverThreshold(estimateHistoryTokens(result.newHistory))) return result
+      return compactHistoryInternal(history, stillOverThreshold, policy)
+    }
     // No pairs to drop after all — fall through.
     return {
       newHistory: working,
@@ -188,7 +228,7 @@ export async function compactHistoryWithSummary(
   } catch (err) {
     console.warn('[compaction] summarize failed, falling back to drop-and-marker:',
       err instanceof Error ? err.message : err)
-    return compactHistoryInternal(history, stillOverThreshold, null)
+    return compactHistoryInternal(history, stillOverThreshold, policy)
   }
 }
 
@@ -257,7 +297,7 @@ function deepishCopy(history: ResponseInputItem[]): ResponseInputItem[] {
 /** Stage 1: truncate oversized function_call_output payloads in place.
  *  Returns mutation counters so the caller can roll them into the
  *  observability event. */
-function truncateOversizedOutputs(history: ResponseInputItem[]): {
+function truncateOversizedOutputs(history: ResponseInputItem[], policy: CompactionPolicy): {
   newHistory: ResponseInputItem[]
   truncatedOutputBytes: number
   truncatedOutputCount: number
@@ -268,11 +308,12 @@ function truncateOversizedOutputs(history: ResponseInputItem[]): {
     const raw = item as unknown as Record<string, unknown>
     if (raw && raw.type === 'function_call_output' && typeof raw.output === 'string') {
       const out = raw.output as string
-      if (out.length > COMPACTED_OUTPUT_BYTES) {
-        const head = out.slice(0, COMPACTED_OUTPUT_BYTES)
-        truncatedOutputBytes += out.length - head.length
+      const originalBytes = Buffer.byteLength(out, 'utf8')
+      if (originalBytes > policy.outputBytes) {
+        const head = truncateUtf8(out, policy.outputBytes)
+        truncatedOutputBytes += originalBytes - Buffer.byteLength(head, 'utf8')
         truncatedOutputCount += 1
-        return { ...raw, output: `${head}… [truncated by auto-compaction: original ${out.length} bytes]` } as unknown as ResponseInputItem
+        return { ...raw, output: `${head}… [truncated by auto-compaction: original ${originalBytes} bytes]` } as unknown as ResponseInputItem
       }
     }
     return item
@@ -284,9 +325,9 @@ function truncateOversizedOutputs(history: ResponseInputItem[]): {
 function compactHistoryInternal(
   history: ResponseInputItem[],
   stillOverThreshold: (estimateTokens: number) => boolean,
-  _placeholder: null,
+  policy: CompactionPolicy,
 ): CompactionResult {
-  const stage1 = truncateOversizedOutputs(deepishCopy(history))
+  const stage1 = truncateOversizedOutputs(deepishCopy(history), policy)
   let newHistory = stage1.newHistory
   const truncatedOutputBytes = stage1.truncatedOutputBytes
   const truncatedOutputCount = stage1.truncatedOutputCount
@@ -297,13 +338,13 @@ function compactHistoryInternal(
   }
 
   const { leadingNonToolEnd, callIdsInOrder, pairItems, tailNonTool } = partitionHistory(newHistory)
-  const dropEligible = callIdsInOrder.slice(0, Math.max(0, callIdsInOrder.length - KEEP_RECENT_PAIRS))
+  const dropEligible = callIdsInOrder.slice(0, Math.max(0, callIdsInOrder.length - policy.keepRecentPairs))
   let droppedPairCount = 0
   let droppedItemBytes = 0
   for (let idx = 0; idx < dropEligible.length; idx++) {
     const cid = dropEligible[idx]
     const items = pairItems.get(cid) ?? []
-    for (const it of items) droppedItemBytes += JSON.stringify(it).length
+    for (const it of items) droppedItemBytes += Buffer.byteLength(JSON.stringify(it), 'utf8')
     pairItems.delete(cid)
     droppedPairCount += 1
     const surviving: ResponseInputItem[] = []
@@ -334,20 +375,21 @@ async function summarizeAndSplice(
   stage1History: ResponseInputItem[],
   stage1Counters: { truncatedOutputBytes: number; truncatedOutputCount: number },
   summarize: (itemsToDrop: ResponseInputItem[]) => Promise<string>,
+  policy: CompactionPolicy,
 ): Promise<CompactionResult | null> {
   const { leadingNonToolEnd, callIdsInOrder, pairItems, tailNonTool } = partitionHistory(stage1History)
-  const dropEligible = callIdsInOrder.slice(0, Math.max(0, callIdsInOrder.length - KEEP_RECENT_PAIRS))
+  const dropEligible = callIdsInOrder.slice(0, Math.max(0, callIdsInOrder.length - policy.keepRecentPairs))
   if (dropEligible.length === 0) return null
 
   const itemsToDrop: ResponseInputItem[] = []
   let droppedItemBytes = 0
   for (const cid of dropEligible) {
     const items = pairItems.get(cid) ?? []
-    for (const it of items) droppedItemBytes += JSON.stringify(it).length
+    for (const it of items) droppedItemBytes += Buffer.byteLength(JSON.stringify(it), 'utf8')
     itemsToDrop.push(...items)
   }
   const summaryText = await summarize(itemsToDrop)
-  const cleaned = summaryText.trim().slice(0, 4000) || '(no summary returned)'
+  const cleaned = truncateChars(summaryText.trim() || '(no summary returned)', policy.summaryMaxChars)
   const summaryMarker: ResponseInputItem = {
     type: 'message',
     role: 'user',

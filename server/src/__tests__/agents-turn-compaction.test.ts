@@ -19,6 +19,9 @@ import assert from 'node:assert/strict'
 import type { ResponseInputItem } from 'openai/resources/responses/responses'
 import {
   COMPACTED_OUTPUT_BYTES,
+  DEFAULT_COMPACTION_POLICY,
+  truncateUtf8,
+  truncateChars,
   KEEP_RECENT_PAIRS,
   compactHistory,
   compactHistoryWithSummary,
@@ -380,7 +383,7 @@ test('summary: stage 1 alone suffices → summarizer is NEVER invoked', async ()
 test('summary: stage 1 not enough → summarize() invoked with the items to be dropped', async () => {
   const history: ResponseInputItem[] = [
     userMsg('original question'),
-    fnCall('call_1', 'bash', '{"command":"step-1"}'), fnOutput('call_1', 'result-1'),
+    fnCall('call_1', 'bash', JSON.stringify({ command: 'x'.repeat(10_000) })), fnOutput('call_1', 'result-1'),
     fnCall('call_2', 'bash', '{"command":"step-2"}'), fnOutput('call_2', 'result-2'),
     fnCall('call_3', 'bash', '{"command":"step-3"}'), fnOutput('call_3', 'result-3'),
     fnCall('call_4', 'bash', '{"command":"step-4"}'), fnOutput('call_4', 'result-4'),
@@ -388,7 +391,7 @@ test('summary: stage 1 not enough → summarize() invoked with the items to be d
   let receivedItems: ResponseInputItem[] = []
   const result = await compactHistoryWithSummary(
     history,
-    () => true,    // force stage 2
+    (tokens) => tokens > 2000,    // older arguments exceed the finite budget
     async (items) => {
       receivedItems = items
       return 'AGENT_SUMMARY: ran 2 bash commands; key outputs were result-1 and result-2.'
@@ -412,13 +415,13 @@ test('summary: stage 1 not enough → summarize() invoked with the items to be d
 test('summary: most-recent KEEP_RECENT_PAIRS pairs survive intact alongside the summary', async () => {
   const history: ResponseInputItem[] = [
     userMsg('q'),
-    fnCall('call_old1'), fnOutput('call_old1', 'old-1'),
+    fnCall('call_old1', 'bash', JSON.stringify({ command: 'x'.repeat(10_000) })), fnOutput('call_old1', 'old-1'),
     fnCall('call_old2'), fnOutput('call_old2', 'old-2'),
     fnCall('call_recent_a'), fnOutput('call_recent_a', 'recent-a'),
     fnCall('call_recent_b'), fnOutput('call_recent_b', 'recent-b'),
   ]
   const result = await compactHistoryWithSummary(
-    history, () => true,
+    history, (tokens) => tokens > 2000,
     async () => '[summarized two old pairs]',
   )
   // recent_a and recent_b survive in their original form.
@@ -469,13 +472,13 @@ test('summary: leading non-tool items are preserved through the summarized path'
   const history: ResponseInputItem[] = [
     userMsg('What is the kanban board id?'),
     userMsg('please be quick'),
-    fnCall('call_1'), fnOutput('call_1', 'a'),
+    fnCall('call_1', 'bash', JSON.stringify({ command: 'x'.repeat(10_000) })), fnOutput('call_1', 'a'),
     fnCall('call_2'), fnOutput('call_2', 'b'),
     fnCall('call_3'), fnOutput('call_3', 'c'),
     fnCall('call_4'), fnOutput('call_4', 'd'),
   ]
   const result = await compactHistoryWithSummary(
-    history, () => true,
+    history, (tokens) => tokens > 2000,
     async () => 'summary text',
   )
   const first = result.newHistory[0] as unknown as { type: string; content: string }
@@ -489,13 +492,13 @@ test('summary: leading non-tool items are preserved through the summarized path'
 test('summary: empty summary text from LLM is gracefully replaced with a placeholder', async () => {
   const history: ResponseInputItem[] = [
     userMsg('q'),
-    fnCall('call_1'), fnOutput('call_1', 'a'),
+    fnCall('call_1', 'bash', JSON.stringify({ command: 'x'.repeat(10_000) })), fnOutput('call_1', 'a'),
     fnCall('call_2'), fnOutput('call_2', 'b'),
     fnCall('call_3'), fnOutput('call_3', 'c'),
     fnCall('call_4'), fnOutput('call_4', 'd'),
   ]
   const result = await compactHistoryWithSummary(
-    history, () => true,
+    history, (tokens) => tokens > 2000,
     async () => '   ',     // whitespace-only — useless
   )
   assert.equal(result.usedLlmSummary, true)
@@ -521,13 +524,13 @@ test('summary: when there are fewer than KEEP_RECENT_PAIRS pairs total, summariz
 test('summary: input mutation safety — caller history not modified', async () => {
   const original: ResponseInputItem[] = [
     userMsg('q'),
-    fnCall('call_1'), fnOutput('call_1', 'X'.repeat(COMPACTED_OUTPUT_BYTES * 3)),
+    fnCall('call_1', 'bash', JSON.stringify({ command: 'x'.repeat(10_000) })), fnOutput('call_1', 'X'.repeat(COMPACTED_OUTPUT_BYTES * 3)),
     fnCall('call_2'), fnOutput('call_2', 'b'),
     fnCall('call_3'), fnOutput('call_3', 'c'),
     fnCall('call_4'), fnOutput('call_4', 'd'),
   ]
   const originalOutput = (original[2] as unknown as { output: string }).output
-  await compactHistoryWithSummary(original, () => true, async () => 'summary')
+  await compactHistoryWithSummary(original, (tokens) => tokens > 2000, async () => 'summary')
   // Caller-supplied items still intact.
   assert.equal((original[2] as unknown as { output: string }).output, originalOutput)
 })
@@ -535,14 +538,14 @@ test('summary: input mutation safety — caller history not modified', async () 
 test('summary: every dropped pair appears in summarize() input — caller can verify nothing was silently skipped', async () => {
   const history: ResponseInputItem[] = [
     userMsg('q'),
-    fnCall('call_aa', 'bash', '{"command":"step-aa"}'), fnOutput('call_aa', 'out-aa'),
+    fnCall('call_aa', 'bash', JSON.stringify({ command: 'x'.repeat(10_000) })), fnOutput('call_aa', 'out-aa'),
     fnCall('call_bb', 'web_search', '{"query":"q-bb"}'), fnOutput('call_bb', 'out-bb'),
     fnCall('call_cc', 'bash', '{"command":"step-cc"}'), fnOutput('call_cc', 'out-cc'),
     fnCall('call_recent_1'), fnOutput('call_recent_1', 'recent-1'),
     fnCall('call_recent_2'), fnOutput('call_recent_2', 'recent-2'),
   ]
   let received: ResponseInputItem[] = []
-  await compactHistoryWithSummary(history, () => true, async (items) => {
+  await compactHistoryWithSummary(history, (tokens) => tokens > 2000, async (items) => {
     received = items
     return 'sum'
   })
@@ -562,14 +565,14 @@ test('summary: pairs are dropped in OLDEST-FIRST order — newest pairs always s
   // order) and the newest TWO survive in the output history.
   const history: ResponseInputItem[] = [
     userMsg('q'),
-    fnCall('call_old1'), fnOutput('call_old1', 'a'),
+    fnCall('call_old1', 'bash', JSON.stringify({ command: 'x'.repeat(10_000) })), fnOutput('call_old1', 'a'),
     fnCall('call_old2'), fnOutput('call_old2', 'b'),
     fnCall('call_old3'), fnOutput('call_old3', 'c'),
     fnCall('call_new4'), fnOutput('call_new4', 'd'),
     fnCall('call_new5'), fnOutput('call_new5', 'e'),
   ]
   let dropped: string[] = []
-  const result = await compactHistoryWithSummary(history, () => true, async (items) => {
+  const result = await compactHistoryWithSummary(history, (tokens) => tokens > 2000, async (items) => {
     dropped = items
       .map((it) => (it as unknown as { call_id: string }).call_id)
       .filter((c, i, arr) => arr.indexOf(c) === i)    // unique
@@ -591,14 +594,14 @@ test('summary: pairs are dropped in OLDEST-FIRST order — newest pairs always s
 test('summary: history length AFTER compaction is shorter than before (sanity check on actual shrink)', async () => {
   const history: ResponseInputItem[] = [
     userMsg('q'),
-    fnCall('call_1'), fnOutput('call_1', 'aaaaaaaaaaaaaaaaaaaaaaaaa'),
+    fnCall('call_1', 'bash', JSON.stringify({ command: 'x'.repeat(10_000) })), fnOutput('call_1', 'aaaaaaaaaaaaaaaaaaaaaaaaa'),
     fnCall('call_2'), fnOutput('call_2', 'bbbbbbbbbbbbbbbbbbbbbbbbb'),
     fnCall('call_3'), fnOutput('call_3', 'ccccccccccccccccccccccccc'),
     fnCall('call_4'), fnOutput('call_4', 'ddddddddddddddddddddddddd'),
     fnCall('call_5'), fnOutput('call_5', 'eeeeeeeeeeeeeeeeeeeeeeeeee'),
   ]
   const before = history.length
-  const result = await compactHistoryWithSummary(history, () => true, async () => 'short summary')
+  const result = await compactHistoryWithSummary(history, (tokens) => tokens > 2000, async () => 'short summary')
   // 5 pairs × 2 items + 1 user msg = 11 before.
   // 1 user msg + 1 summary + 2 surviving pairs × 2 items = 6 after.
   assert.equal(before, 11)
@@ -612,14 +615,14 @@ test('summary: summarize() called EXACTLY once per compaction pass (no accidenta
   // are summarized.
   const history: ResponseInputItem[] = [
     userMsg('q'),
-    fnCall('call_1'), fnOutput('call_1', 'a'),
+    fnCall('call_1', 'bash', JSON.stringify({ command: 'x'.repeat(10_000) })), fnOutput('call_1', 'a'),
     fnCall('call_2'), fnOutput('call_2', 'b'),
     fnCall('call_3'), fnOutput('call_3', 'c'),
     fnCall('call_4'), fnOutput('call_4', 'd'),
     fnCall('call_5'), fnOutput('call_5', 'e'),
   ]
   let calls = 0
-  await compactHistoryWithSummary(history, () => true, async () => {
+  await compactHistoryWithSummary(history, (tokens) => tokens > 2000, async () => {
     calls += 1
     return 'sum'
   })
@@ -634,12 +637,12 @@ test('summary: marker text is hidden inside a message item — model sees the su
   // wake prompt feeds inbox items into the model.
   const history: ResponseInputItem[] = [
     userMsg('q'),
-    fnCall('call_1'), fnOutput('call_1', 'a'),
+    fnCall('call_1', 'bash', JSON.stringify({ command: 'x'.repeat(10_000) })), fnOutput('call_1', 'a'),
     fnCall('call_2'), fnOutput('call_2', 'b'),
     fnCall('call_3'), fnOutput('call_3', 'c'),
     fnCall('call_4'), fnOutput('call_4', 'd'),
   ]
-  const result = await compactHistoryWithSummary(history, () => true, async () => 'CUSTOM_SUMMARY_TEXT')
+  const result = await compactHistoryWithSummary(history, (tokens) => tokens > 2000, async () => 'CUSTOM_SUMMARY_TEXT')
   const summary = result.newHistory[1] as unknown as { type: string; role: string; content: string }
   assert.equal(summary.type, 'message')
   assert.equal(summary.role, 'user')
@@ -652,13 +655,13 @@ test('summary: oversize summary text is hard-capped at 4000 chars in the spliced
   // the budget we just spent compacting under.
   const history: ResponseInputItem[] = [
     userMsg('q'),
-    fnCall('call_1'), fnOutput('call_1', 'a'),
+    fnCall('call_1', 'bash', JSON.stringify({ command: 'x'.repeat(10_000) })), fnOutput('call_1', 'a'),
     fnCall('call_2'), fnOutput('call_2', 'b'),
     fnCall('call_3'), fnOutput('call_3', 'c'),
     fnCall('call_4'), fnOutput('call_4', 'd'),
   ]
   const huge = 'Z'.repeat(20_000)
-  const result = await compactHistoryWithSummary(history, () => true, async () => huge)
+  const result = await compactHistoryWithSummary(history, (tokens) => tokens > 2000, async () => huge)
   const marker = result.newHistory[1] as unknown as { content: string }
   // marker content = header (~120 chars) + body (≤ 4000 chars)
   assert.ok(marker.content.length < 5000, `marker should be capped; got ${marker.content.length} chars`)
@@ -775,4 +778,60 @@ test('summary: items with no call_id (legacy / bare function_call) do NOT confus
   const last = result.newHistory[result.newHistory.length - 1] as unknown as { type: string; name?: string }
   assert.equal(last.type, 'function_call')
   assert.equal(last.name, 'orphan')
+})
+
+
+test('policy: UTF-8 byte truncation and Unicode character caps never split Chinese or emoji', () => {
+  assert.equal(truncateUtf8('中😀文', 6), '中')
+  assert.equal(truncateUtf8('中😀文', 7), '中😀')
+  assert.equal(truncateChars('中😀文', 2), '中😀')
+  const original = '中😀文'.repeat(100)
+  const result = compactHistory([fnCall('c'), fnOutput('c', original)], NEVER_OVER,
+    { ...DEFAULT_COMPACTION_POLICY, outputBytes: 7 })
+  const output = (result.newHistory[1] as { output: string }).output
+  assert.ok(output.startsWith('中😀…'))
+  assert.match(output, /original 1000 bytes/)
+  assert.equal(result.truncatedOutputBytes, 993)
+  assert.equal(Buffer.from(output).toString('utf8'), output)
+})
+
+test('policy: custom recent groups and summary character limit preserve whole code points', async () => {
+  const history = [userMsg('继续任务')]
+  for (let i = 0; i < 8; i++) history.push(fnCall(String(i), 'bash', '中'.repeat(1000)), fnOutput(String(i), '结果'))
+  const result = await compactHistoryWithSummary(history, n => n > 4000, async () => '中😀文😀尾',
+    { ...DEFAULT_COMPACTION_POLICY, keepRecentPairs: 3, summaryMaxChars: 4 })
+  assert.equal(result.usedLlmSummary, true)
+  assert.equal(result.droppedPairCount, 5)
+  assert.ok((result.newHistory[1] as { content: string }).content.endsWith('中😀文😀'))
+  assert.ok(estimateHistoryTokens(result.newHistory) <= 4000)
+  assert.deepEqual(result.newHistory.filter((x: any) => x.type === 'function_call').map((x: any) => x.call_id), ['5', '6', '7'])
+})
+
+test('policy: oversized successful summary is rejected in favor of a budget-checked paired fallback', async () => {
+  const history = [userMsg('继续任务')]
+  for (let i = 0; i < 10; i++) history.push(fnCall(String(i)), itemRef(String(i)), fnOutput(String(i), '结果'.repeat(100)))
+  const result = await compactHistoryWithSummary(history, n => n > 700, async () => '中文'.repeat(2000))
+  assert.equal(result.usedLlmSummary, false)
+  assert.ok(estimateHistoryTokens(result.newHistory) <= 700)
+  const calls = new Set(result.newHistory.filter((x: any) => x.type === 'function_call').map((x: any) => x.call_id))
+  for (const item of result.newHistory as any[]) {
+    if (item.type === 'function_call_output') assert.ok(calls.has(item.call_id))
+    if (item.type === 'item_reference') assert.ok(calls.has(item.id))
+  }
+  assert.ok(calls.has('8') && calls.has('9'))
+})
+
+for (const policy of [
+  { ...DEFAULT_COMPACTION_POLICY, autoEnabled: false },
+  { ...DEFAULT_COMPACTION_POLICY, strategy: 'drop-and-marker' as const },
+]) test(`policy: hard protection remains without summary (${policy.autoEnabled}/${policy.strategy})`, async () => {
+  const history = [userMsg('继续任务')]
+  for (let i = 0; i < 60; i++) history.push(fnCall(String(i)), fnOutput(String(i), '中文😀'.repeat(1000)))
+  let calls = 0
+  const result = await compactHistoryWithSummary(history, n => n > 1000, async () => { calls++; return 'unused' }, policy)
+  assert.equal(calls, 0)
+  assert.ok(result.droppedPairCount > 0)
+  assert.ok(estimateHistoryTokens(result.newHistory) <= 1000)
+  assert.deepEqual(result.newHistory[0], history[0])
+  assert.equal(Buffer.from(JSON.stringify(result.newHistory)).toString('utf8'), JSON.stringify(result.newHistory))
 })
