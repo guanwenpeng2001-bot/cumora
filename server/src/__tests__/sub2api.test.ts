@@ -4,7 +4,7 @@ import assert from 'node:assert/strict'
 import { env } from '../env.js'
 import {
   getUserQuota, sub2apiOpenAIBaseURL, tierGroups, parseApiKeyMap, serializeApiKeyMap,
-  pickPlatformForModel, listKeyModelsWithStatus,
+  pickPlatformForModel, listKeyModelsWithStatus, gatewayCatalogHasImages,
 } from '../sub2api.js'
 import { parseGroupConfig, parseLlmConfig } from '../settings.js'
 
@@ -259,6 +259,13 @@ test('parseGroupConfig and llm_config accept discovered platform ids', () => {
     models: [], roles: [],
   }), true)
   assert.equal(config.routes[0].platform, 'zhipu')
+})
+
+test('gateway image catalog precheck only admits Images-capable models', () => {
+  assert.equal(gatewayCatalogHasImages(['gpt-4.1', 'kimi-k2']), false)
+  assert.equal(gatewayCatalogHasImages(['gpt-4.1', 'gpt-image-2']), true)
+  assert.equal(gatewayCatalogHasImages(['grok-imagine-image']), true)
+  assert.equal(gatewayCatalogHasImages(undefined), false)
 })
 
 test('empty model catalogs are not treated as success', async () => {

@@ -408,6 +408,22 @@ export async function applyPendingAgentResources(agentId: string, version?: stri
   const client = await pool.connect()
   let snapshot: Awaited<ReturnType<typeof loadAgentResources>> = null
   try {
+    snapshot = await loadAgentResources(agentId, undefined, client, true)
+    if (snapshot) {
+      if (version && version !== snapshot.resourceVersion) throw new ResourceError(409, 'resource version changed')
+      if (snapshot.computerKind && snapshot.computerKind !== 'cloud') throw new ResourceError(409, 'resources are applied by the computer')
+      const { rows: unlockedRows } = await client.query<{ path: string; digest: string; managed: boolean }>(
+        `SELECT path, md5(body) AS digest, (meta->>'cumoraLibrarySkill' = 'true') AS managed FROM agent_workspace
+          WHERE agent_id = $1 AND company_id = $2 AND path LIKE 'skills/%' ORDER BY path`, [agentId, snapshot.companyId],
+      )
+      unlockedRows.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0)
+      const unlockedWorkspace = JSON.stringify(unlockedRows)
+      const cacheKey = JSON.stringify([snapshot.companyId, agentId, snapshot.assignmentId])
+      const applied = appliedResourceSnapshots.get(cacheKey)
+      if (applied?.version === snapshot.resourceVersion && applied.workspace === unlockedWorkspace) {
+        return { version: snapshot.resourceVersion, status: 'applied' }
+      }
+    }
     await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ')
     // Shared across replicas, and uses the same agent row lock as binding writes.
     await client.query(`SELECT id FROM participants WHERE id = $1 AND kind = 'agent' AND departed_at IS NULL FOR UPDATE`, [agentId])

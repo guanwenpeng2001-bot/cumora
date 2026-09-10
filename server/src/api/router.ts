@@ -17,7 +17,7 @@ import { parseAgentModelConfig, validateAgentModelConfig, InvalidAgentModelConfi
 import { publicBodyParserError } from '../body-parser-errors.js'
 import { startConvene } from '../agents/convene.js'
 import { ensureDirectConversation } from '../agents/private_chat.js'
-import { transcribeAudio, AudioInputError } from '../llm.js'
+import { transcribeAudio, AudioInputError, ImageGenerationError } from '../llm.js'
 import { LLM_ROLES, type LlmRole, getServerSettingsSnapshot, writeServerSettings, validateServerSettings, InvalidServerSettingError } from '../settings.js'
 import { availableModels, invalidateModelCatalog } from '../models-catalog.js'
 import { TenantLlmAccessError, resolveTenantLlmContext } from '../tenant-llm-context.js'
@@ -3466,7 +3466,8 @@ api.delete('/agents/:id', async (req, res) => {
 
 /**
  * Generate an AI portrait for an agent and save it as their avatar.
- * Uses the configured OPENAI_IMAGE_MODEL (default: gpt-image-2). The prompt
+ * Uses the configured OPENAI_IMAGE_MODEL (qwen-image-max when DashScope is
+ * configured, otherwise gpt-image-2). The prompt
  * combines the agent's name + role + style with a deterministic visual
  * signature derived from their id, so every agent gets a *distinct* look
  * (different age, skin tone, hair, wardrobe, etc.) but the same person
@@ -3590,6 +3591,7 @@ api.post('/agents/:id/avatar/generate', async (req, res) => {
   } catch (e) {
     if (controller.signal.aborted) return
     if (e instanceof HttpError) { res.status(e.status).json({ error: e.message }); return }
+    if (e instanceof ImageGenerationError) { res.status(e.status).json({ error: e.message }); return }
     const msg = e instanceof Error ? e.message : String(e)
     res.status(502).json({ error: `image generation failed: ${msg}` })
   } finally {

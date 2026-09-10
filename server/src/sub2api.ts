@@ -515,6 +515,13 @@ export function supportsGatewayImages(model: string): boolean {
   return id.startsWith('gpt-image-') || id === 'grok-imagine' || id === 'grok-imagine-edit' || id.startsWith('grok-imagine-image')
 }
 
+/** True when a live group catalog lists at least one Images-admissible model. */
+export function gatewayCatalogHasImages(models: Iterable<string> | undefined): boolean {
+  if (!models) return false
+  for (const model of models) if (supportsGatewayImages(model)) return true
+  return false
+}
+
 /** Provider ownership is distinct from sub2api's four provisioned platform pools.
  * DashScope currently shares the OpenAI pool; media needs its own direct adapter. */
 export function dashscopeMediaRole(model: string): 'audio' | 'image' | null {
