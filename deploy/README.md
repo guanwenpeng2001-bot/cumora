@@ -67,9 +67,13 @@ docker compose -f docker-compose.yml -f docker-compose.gateway.yml -f docker-com
 
 使用与纯网关相同的两个 Compose 文件、网关身份和服务拓扑,再为允许后备的角色配置独立 direct key、endpoint、模型和协议。凭据填写本身不会开启后备。
 
-完整策略依赖 T52 的 `env_after_chain` 落地:在该策略提供的设置入口显式启用后,只有网关候选耗尽且符合降级分类时才走 direct;关闭策略或缺少有效 direct 凭据时应明确失败。Cumora 自身认证/授权失败不能触发外呼,embedding 不使用自动模型或出口降级。direct 请求应记录在 Cumora 用量台账,不计入 sub2api 扣费。
+`env_after_chain` 已落地:后备不是独立 env 开关,而是在 `CUMORA_LLM_CONFIG`(JSON,与站点设置 `llm_config` 同源)中给角色设置 `fallbackPolicy: "env_after_chain"` 并提供 `directTargets`。最小样例:
 
-当前 T46 只交付部署组合与凭据准备说明;当前源码尚未提供 `env_after_chain`,没有可在本文件中承诺有效的同名环境变量。T52 完成后再按其设置契约启用,并在隔离环境验证网关不可达、后备成功、关闭后备、缺凭据和错误归因,才能将混合形态的自动后备标为可用。
+```json
+{"roles":[{"role":"brain","fallbackPolicy":"env_after_chain","directTargets":[{"platform":"dashscope","model":"qwen3-max"}]}]}
+```
+
+启用后,只有网关候选耗尽且符合降级分类时才走 direct;关闭策略或缺少有效 direct 凭据时应明确失败。Cumora 自身认证/授权失败不能触发外呼,embedding 不使用自动模型或出口降级。direct 请求应记录在 Cumora 用量台账,不计入 sub2api 扣费。
 
 ## 图片主控与目录调度注入
 

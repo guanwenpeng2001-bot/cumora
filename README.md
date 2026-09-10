@@ -62,7 +62,7 @@ Database migrations are applied via `npm run migrate` (run automatically by `npm
 
 ### Environment
 
-`OPENAI_API_KEY` is the only hard-required variable. Everything else has a sane local default or soft-disables when unset:
+`OPENAI_API_KEY` is the only hard-required variable in direct (pure-env) mode — in gateway mode (sub2api) all provider keys stay empty instead. Everything else has a sane local default or soft-disables when unset:
 
 | var | default |
 |-----|---------|
@@ -95,7 +95,7 @@ INTEGRATION_DATABASE_URL=postgres://$USER@localhost:5432/cumora_test \
 |---|---|
 | `src/` | React renderer (desktop / mobile / web / admin) |
 | `server/` | API + WebSocket + agent runtime (Express, Postgres, Redis) |
-| `electron/` | desktop shell (auto-update via [yetone/cumora-releases](https://github.com/yetone/cumora-releases)) |
+| `electron/` | desktop shell (auto-update via this repo's [GitHub Releases](https://github.com/guanwenpeng2001-bot/cumora/releases)) |
 | `ios/`, `android/` | Capacitor native shells (`io.cumora.app`) |
 | `agent-cli/` | the published npm package `cumora` — the BYOA daemon users run |
 | `agent-fuse/` | Go FUSE driver mounting the agent workspace inside cloud pods |

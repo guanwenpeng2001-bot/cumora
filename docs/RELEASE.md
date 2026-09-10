@@ -1,8 +1,17 @@
-# Release Manual
+# Release Manual (fork)
 
 How to cut a new desktop release of Cumora.
 
-## TL;DR
+> **Fork note (guanwenpeng2001-bot/cumora):** this fork does not use
+> `yetone/cumora-releases` or `updates.cumora.ai`. Desktop auto-update reads
+> **this repository's GitHub Releases** (`package.json` → `build.publish`).
+> The agent CLI ships as `agent-cli-v*` tags on this repo's Releases
+> (`.github/workflows/agent-cli-release.yml`). The upstream dispatch workflow
+> described below remains for reference but requires upstream-only secrets and
+> will fail on the fork — build desktop packages locally with
+> `electron-builder --publish` targeting this repo instead.
+
+## TL;DR (upstream reference)
 
 ```bash
 # 1. Bump the version in package.json
