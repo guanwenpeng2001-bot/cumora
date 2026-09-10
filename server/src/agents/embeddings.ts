@@ -14,7 +14,7 @@
  * break the entire wake cycle.
  */
 import OpenAI from 'openai'
-import { env } from '../env.js'
+import { resolveDirectLlmEnv } from '../env.js'
 import { pool } from '../db/pool.js'
 
 import { getEmbedModel } from '../settings.js'
@@ -24,16 +24,14 @@ const EMBED_DIM = 1536
  *  recent inbox messages. */
 const MAX_INPUT_CHARS = 8000
 
-const client = new OpenAI({
-  apiKey: process.env.OPENAI_EMBED_API_KEY ?? env.OPENAI_API_KEY,
-  baseURL: process.env.OPENAI_EMBED_BASE_URL || undefined,
-  // Best-effort auxiliary call: an unreachable/slow embedding endpoint
-  // must degrade memory to recency-only, not hang the wake (the SDK
-  // default is a 10-minute timeout with 2 retries — longer than the
-  // pod-side runtime read budget, which kills the whole turn).
-  timeout: 10_000,
-  maxRetries: 1,
-})
+let client: OpenAI | null = null
+function embeddingClient(): OpenAI {
+  if (client) return client
+  const direct = resolveDirectLlmEnv('embed')
+  if (!direct.configured) throw new Error('Direct embedding LLM is not configured')
+  client = new OpenAI({ apiKey: direct.apiKey, baseURL: direct.baseURL, timeout: 10_000, maxRetries: 1 })
+  return client
+}
 
 /** Test-only override. When set, every {@link embedText} call returns
  *  whatever this function produces — bypassing the real OpenAI
@@ -53,7 +51,7 @@ export async function embedText(text: string): Promise<string | null> {
   if (!trimmed) return null
   if (testEmbedOverride) return testEmbedOverride(trimmed)
   try {
-    const resp = await client.embeddings.create({
+    const resp = await embeddingClient().embeddings.create({
       model: getEmbedModel() || 'text-embedding-3-small',
       dimensions: EMBED_DIM,
       input: trimmed.length > MAX_INPUT_CHARS ? trimmed.slice(0, MAX_INPUT_CHARS) : trimmed,

@@ -40,7 +40,8 @@
  */
 import { resolveTenantLlmContext, tenantModelSnapshot, invalidateTenantModelSnapshot, onTenantLlmInvalidated } from './tenant-llm-context.js'
 import OpenAI from 'openai'
-import { env } from './env.js'
+import { env, resolveDirectLlmEnv } from './env.js'
+export { resolveRoleCall } from './llm-resolver.js'
 import { isNovitaModel, novitaResponsesShim } from './novita.js'
 import { resolvedChain, runWithFallback, isFallbackableError } from './agents/fallback.js'
 import { isOrcaRouterModel, orcarouterResponsesCreate } from './orcarouter.js'
@@ -306,13 +307,38 @@ export function invalidateModelRouteCache(tenant: string): void {
 onTenantLlmInvalidated(invalidateLlmClient)
 
 let _legacy: OpenAI | null = null
-function legacyClient(): OpenAI {
+function directTextClient(): OpenAI {
+  const direct = resolveDirectLlmEnv('text')
+  if (!direct.configured) throw new Error('Direct text LLM is not configured')
   if (!_legacy) _legacy = new OpenAI({
-    apiKey: env.OPENAI_API_KEY,
+    apiKey: direct.apiKey,
+    baseURL: direct.baseURL,
     maxRetries: SDK_MAX_RETRIES,
     timeout: SDK_TIMEOUT_MS,
   })
   return _legacy
+}
+
+function legacyClient(): OpenAI {
+  const resource = (path: string[]): object => new Proxy({}, {
+    get(_target, prop): unknown {
+      if (prop === 'then') return undefined
+      if (['responses', 'chat', 'completions', 'images', 'embeddings'].includes(String(prop))) return resource([...path, String(prop)])
+      const resolve = () => {
+        let target: unknown = directTextClient()
+        for (const key of path) target = (target as Record<string, unknown>)[key]
+        return target as Record<PropertyKey, unknown>
+      }
+      if (prop === 'create') return (...args: unknown[]) => {
+        const target = resolve()
+        return (target[prop] as (...args: unknown[]) => unknown).apply(target, args)
+      }
+      const target = resolve()
+      const value = target[prop]
+      return typeof value === 'function' ? value.bind(target) : value
+    },
+  })
+  return resource([]) as OpenAI
 }
 
 /** Dedicated client for image generation (avatars, agent `cumora image`).
@@ -333,8 +359,7 @@ interface DashscopeTaskResponse {
   }
 }
 
-function dashscopeImageClient(apiKey: string): OpenAI {
-  const base = 'https://dashscope.aliyuncs.com/api/v1'
+function dashscopeImageClient(apiKey: string, base: string): OpenAI {
 
   function dashscopeHttpError(message: string, status: number): Error & { status: number } {
     return Object.assign(new Error(message), { status })
@@ -444,11 +469,10 @@ function dashscopeImageClient(apiKey: string): OpenAI {
 let _imageClient: OpenAI | null = null
 export function getImageClient(): OpenAI {
   if (_imageClient) return _imageClient
-  const apiKey = process.env.OPENAI_IMAGE_API_KEY ?? ''
-  const provider = (process.env.OPENAI_IMAGE_PROVIDER ?? '').toLowerCase()
-  const baseURL = (process.env.OPENAI_IMAGE_BASE_URL ?? '').replace(/\/+$/, '')
-  if (provider === 'dashscope' && apiKey) {
-    _imageClient = dashscopeImageClient(apiKey)
+  const { apiKey, baseURL, protocol, configured } = resolveDirectLlmEnv('image')
+  if (!configured) throw new Error('Direct image LLM is not configured')
+  if (protocol === 'dashscope-image' && apiKey) {
+    _imageClient = dashscopeImageClient(apiKey, baseURL)
   } else if (baseURL && apiKey) {
     _imageClient = new OpenAI({ apiKey, baseURL, maxRetries: SDK_MAX_RETRIES, timeout: SDK_TIMEOUT_MS })
   } else {
@@ -467,11 +491,10 @@ export function getImageClient(): OpenAI {
  *  Key comes from OPENAI_AUDIO_API_KEY, falling back to
  *  OPENAI_IMAGE_API_KEY (same Bailian key on this deployment). */
 export async function transcribeAudio(audioBase64: string, format: string): Promise<string> {
-  const apiKey = (process.env.OPENAI_AUDIO_API_KEY ?? '').trim() || (process.env.OPENAI_IMAGE_API_KEY ?? '').trim()
-  if (!apiKey) throw new Error('OPENAI_AUDIO_API_KEY is not set (and no OPENAI_IMAGE_API_KEY fallback)')
+  const { apiKey, baseURL: base, configured } = resolveDirectLlmEnv('audio')
+  if (!configured) throw new Error('Direct audio LLM is not configured')
   const chain = resolvedChain('audio')
   if (chain.length === 0) throw new Error('audio_model is not set (OPENAI_AUDIO_MODEL)')
-  const base = (process.env.OPENAI_AUDIO_BASE_URL || 'https://dashscope.aliyuncs.com/compatible-mode/v1').replace(/\/+$/, '')
   let lastErr: unknown = null
   for (const model of chain) {
     try {

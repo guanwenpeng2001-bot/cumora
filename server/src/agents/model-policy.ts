@@ -10,7 +10,7 @@
  * caught immediately ("及时发现") and contained rather than silently burning
  * brain-model tokens.
  */
-import { getBrainModel, getSupportModel } from '../settings.js'
+import { getBrainModel, getSupportModel, getCompactionModel } from '../settings.js'
 import { notifyAlert } from '../alerting.js'
 
 export type ModelPurpose =
@@ -40,7 +40,7 @@ export function supportModel(): string {
 
 /** The big/brain model for a real task (a per-agent override wins). */
 export function realTaskModel(personaModel?: string | null): string {
-  return personaModel ?? getBrainModel()
+  return personaModel?.trim() || getBrainModel()
 }
 
 /**
@@ -48,21 +48,28 @@ export function realTaskModel(personaModel?: string | null): string {
  * If a non-real-task purpose is about to spend the big model, log an error and
  * fall back to the support model so the misuse is both surfaced and contained.
  */
+export function roleForPurpose(purpose: ModelPurpose): 'brain' | 'support' | 'compaction' {
+  if (REAL_TASK_PURPOSES.has(purpose)) return 'brain'
+  return ['compaction', 'completion-verify', 'steer-summary'].includes(purpose) ? 'compaction' : 'support'
+}
+
 export function enforceModelPolicy(model: string, purpose: ModelPurpose): string {
-  if (!REAL_TASK_PURPOSES.has(purpose) && model === getBrainModel()) {
+  const role = roleForPurpose(purpose)
+  const auxiliary = role === 'compaction' ? getCompactionModel() : getSupportModel()
+  if (role !== 'brain' && model === getBrainModel() && model !== auxiliary) {
     const msg =
       `[model-policy] VIOLATION: purpose "${purpose}" attempted the BIG model "${model}". ` +
       `Only real tasks (${[...REAL_TASK_PURPOSES].join(', ')}) may use the big model; ` +
-      `forcing the support model "${getSupportModel()}".`
+      `forcing the ${role} model "${auxiliary}".`
     console.error(msg)
     // P0: an unnecessary big-brain selection reached runtime — page immediately.
     // notifyAlert never throws/blocks; fire-and-forget so the policy stays sync.
     void notifyAlert({
       label: 'model-policy.violation',
       error: new Error(`big model used for non-real-task purpose "${purpose}"`),
-      extras: { purpose, attemptedModel: model, forcedModel: getSupportModel() },
+      extras: { purpose, attemptedModel: model, forcedModel: auxiliary },
     })
-    return getSupportModel()
+    return auxiliary
   }
   return model
 }

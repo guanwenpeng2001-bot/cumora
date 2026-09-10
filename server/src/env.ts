@@ -34,7 +34,7 @@ export const env = {
   NODE_ENV: process.env.NODE_ENV ?? 'development',
   DATABASE_URL: required('DATABASE_URL', `postgres://${process.env.USER ?? 'postgres'}@localhost:5432/cumora`),
   REDIS_URL: required('REDIS_URL', 'redis://localhost:6379'),
-  OPENAI_API_KEY: required('OPENAI_API_KEY'),
+  OPENAI_API_KEY: process.env.OPENAI_API_KEY ?? '',
   /**
    * "Brain" model — the agent's main reasoning loop and convene speech.
    * Default model used when an agent's `participants.model` is NULL.
@@ -506,4 +506,38 @@ if (env.NODE_ENV === 'production') {
     )
     process.exit(1)
   }
+}
+
+export type DirectLlmSlot = 'text' | 'image' | 'audio' | 'embed' | 'novita' | 'orcarouter'
+
+export function normalizeLlmEndpoint(value: string): string {
+  if (!value.trim()) return ''
+  try {
+    const url = new URL(value.trim())
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) return ''
+    return url.toString().replace(/\/+$/, '')
+  } catch { return '' }
+}
+
+/** Protected env is read only here; public plans carry source names, never keys. */
+export function resolveDirectLlmEnv(slot: DirectLlmSlot) {
+  const prefix = slot === 'text' ? 'OPENAI' : slot === 'novita' || slot === 'orcarouter' ? slot.toUpperCase() : `OPENAI_${slot.toUpperCase()}`
+  const ownKey = (process.env[`${prefix}_API_KEY`] ?? '').trim()
+  const imageKey = (process.env.OPENAI_IMAGE_API_KEY ?? '').trim()
+  const keySource = ownKey ? `${prefix}_API_KEY` : slot === 'audio' ? (imageKey ? 'OPENAI_IMAGE_API_KEY' : 'OPENAI_AUDIO_API_KEY') : slot === 'novita' || slot === 'orcarouter' ? `${prefix}_API_KEY` : 'OPENAI_API_KEY'
+  const apiKey = ownKey || (slot === 'audio' ? imageKey : '') || (['audio', 'novita', 'orcarouter'].includes(slot) ? '' : env.OPENAI_API_KEY.trim())
+  const dashscopeImage = slot === 'image' && (process.env.OPENAI_IMAGE_PROVIDER ?? '').toLowerCase() === 'dashscope'
+  const defaults: Record<DirectLlmSlot, string> = {
+    text: 'https://api.openai.com/v1', image: dashscopeImage ? 'https://dashscope.aliyuncs.com/api/v1' : 'https://api.openai.com/v1',
+    audio: 'https://dashscope.aliyuncs.com/compatible-mode/v1', embed: 'https://api.openai.com/v1',
+    novita: env.NOVITA_BASE_URL, orcarouter: env.ORCAROUTER_BASE_URL,
+  }
+  const baseKey = dashscopeImage ? 'OPENAI_IMAGE_NATIVE_BASE_URL' : `${prefix}_BASE_URL`
+  const ownBase = process.env[baseKey]?.trim()
+  const sharedBase = !dashscopeImage && ['image', 'embed'].includes(slot) ? process.env.OPENAI_BASE_URL?.trim() : undefined
+  const endpointSource = ownBase ? baseKey : sharedBase ? 'OPENAI_BASE_URL' : 'default'
+  const baseURL = normalizeLlmEndpoint(ownBase || sharedBase || defaults[slot])
+  return { apiKey, baseURL, keySource, endpointSource, configured: Boolean(apiKey && baseURL),
+    protocol: slot === 'image' ? (dashscopeImage ? 'dashscope-image' : 'images')
+      : slot === 'audio' || slot === 'novita' ? 'chat' : slot === 'embed' ? 'embeddings' : 'responses' }
 }

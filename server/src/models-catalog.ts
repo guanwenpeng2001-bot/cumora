@@ -1,5 +1,5 @@
 import { pool } from './db/pool.js'
-import { SETTING_DEFS, getServerSetting, getServerSettingList } from './settings.js'
+import { SETTING_DEFS, getServerSetting, getServerSettingList, getServerSettingsSnapshot, parseLlmConfig } from './settings.js'
 import { SUB2API_PLATFORMS, type Platform, type KeyModelsResult } from './sub2api.js'
 import { TenantLlmAccessError, resolveTenantLlmContext, tenantModelSnapshot, invalidateTenantModelSnapshot } from './tenant-llm-context.js'
 
@@ -50,7 +50,8 @@ async function byoaModels(companyId: string, computerId?: string, engine?: strin
 /** Configured models from settings (primaries + chains), so hand-written
  *  config stays selectable even when no live source lists it. */
 function configuredModels(): Set<string> {
-  const out = new Set<string>()
+  const config = parseLlmConfig(getServerSettingsSnapshot().settings.llm_config ?? '')
+  const out = new Set<string>([...config.models.map(m => m.model), ...config.roles.flatMap(r => r.models)])
   for (const def of SETTING_DEFS) {
     // `*_model` primaries only — `*_fallback_models` keys don't match this
     // suffix and are collected below.
@@ -81,15 +82,21 @@ export async function availableModels(userId: string, refresh: boolean, companyI
   const current = await resolveTenantLlmContext(companyId, userId)
   if (current.authorizationVersion !== snapshot.authorizationVersion) return availableModels(userId, refresh, companyId, computerId, engine)
   const catalog: ModelCatalog = { text: [], image: [], audio: [], embedding: [], gateway: false, platforms: {}, byoa }
+  const config = parseLlmConfig(getServerSettingsSnapshot().settings.llm_config ?? '')
+  const addModel = (model: string) => {
+    const roles = config.models.find(m => m.model === model)?.roles ?? config.roles.filter(r => r.models.includes(model)).map(r => r.role)
+    const targets: Bucket[] = roles.length ? roles.map(r => r === 'embed' ? 'embedding' : r === 'image' || r === 'audio' ? r : 'text') : [bucketOf(model)]
+    for (const target of targets) buckets[target].add(model)
+  }
   const buckets: Record<Bucket, Set<string>> = { text: new Set(), image: new Set(), audio: new Set(), embedding: new Set() }
   for (const platform of SUB2API_PLATFORMS) {
     const result = snapshot.platforms[platform]
     catalog.platforms![platform] = { status: result.status, stale: result.stale, models: [...result.models].sort(), diagnostic: result.diagnostic }
     if (result.ok || result.stale) catalog.gateway = true
-    for (const model of result.models) buckets[bucketOf(model)].add(model)
+    for (const model of result.models) addModel(model)
   }
-  for (const model of configuredModels()) buckets[bucketOf(model)].add(model)
-  for (const entry of byoa) for (const model of entry.models) buckets[bucketOf(model)].add(model)
+  for (const model of configuredModels()) addModel(model)
+  for (const entry of byoa) for (const model of entry.models) addModel(model)
   for (const b of ['text', 'image', 'audio', 'embedding'] as const) catalog[b] = [...buckets[b]].sort()
   return catalog
 }

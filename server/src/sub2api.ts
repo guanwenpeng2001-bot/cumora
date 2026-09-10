@@ -36,7 +36,8 @@
  * and the LLM client falls back to the legacy global key.
  */
 import { randomBytes } from 'node:crypto'
-import { env } from './env.js'
+import { env, normalizeLlmEndpoint } from './env.js'
+import { getServerSetting, parseGroupConfig, InvalidServerSettingError, type Sub2apiGroupConfig } from './settings.js'
 
 export type Tier = 'free' | 'pro' | 'max'
 
@@ -98,12 +99,18 @@ function envTierPlatformGroup(tier: Tier, platform: Platform): number {
  *  zero when nothing is configured (provision without group access —
  *  the staged-rollout posture). */
 export function tierGroups(tier: Tier): Record<Platform, number> {
-  const openai = envTierPlatformGroup(tier, 'openai') || legacyTierGroupId(tier)
+  const configured = parseGroupConfig(getServerSetting('sub2api_group_config'))[tier]
+  const valid = (id: number) => {
+    if (Number.isSafeInteger(id) && id >= 0) return id
+    console.warn('[sub2api] invalid env group reference', tier)
+    return 0
+  }
+  const openai = configured?.openai ?? (valid(envTierPlatformGroup(tier, 'openai')) || valid(legacyTierGroupId(tier)))
   return {
     openai,
-    kimi:     envTierPlatformGroup(tier, 'kimi')     || openai,
-    deepseek: envTierPlatformGroup(tier, 'deepseek') || openai,
-    grok:     envTierPlatformGroup(tier, 'grok')     || openai,
+    kimi: configured?.kimi ?? (valid(envTierPlatformGroup(tier, 'kimi')) || openai),
+    deepseek: configured?.deepseek ?? (valid(envTierPlatformGroup(tier, 'deepseek')) || openai),
+    grok: configured?.grok ?? (valid(envTierPlatformGroup(tier, 'grok')) || openai),
   }
 }
 
@@ -155,7 +162,7 @@ export function serializeApiKeyMap(keys: ApiKeyMap): string {
  *  to sub2api. When false, callers should silently fall back to the
  *  legacy global OPENAI_API_KEY path. */
 export function sub2apiConfigured(): boolean {
-  return Boolean(env.SUB2API_INTERNAL_URL && env.SUB2API_ADMIN_KEY)
+  return Boolean(normalizeLlmEndpoint(env.SUB2API_INTERNAL_URL) && env.SUB2API_ADMIN_KEY)
 }
 
 /** Read-side gate for LLM routing (getLlmClient). Only needs a gateway
@@ -164,7 +171,7 @@ export function sub2apiConfigured(): boolean {
  *  route per-platform when this is set (they have DATABASE_URL and read
  *  the owner's key map themselves). */
 export function sub2apiRoutingConfigured(): boolean {
-  return Boolean(env.SUB2API_INTERNAL_URL || env.SUB2API_PUBLIC_URL)
+  return Boolean(sub2apiOpenAIBaseURL())
 }
 
 /** OpenAI-compatible base URL for backend agent/model traffic.
@@ -178,10 +185,10 @@ export function sub2apiOpenAIBaseURL(args?: {
   internalUrl?: string
   publicUrl?: string
 }): string {
-  const internalUrl = (args?.internalUrl ?? env.SUB2API_INTERNAL_URL).replace(/\/+$/, '')
-  const publicUrl = (args?.publicUrl ?? env.SUB2API_PUBLIC_URL).replace(/\/+$/, '')
+  const internalUrl = normalizeLlmEndpoint(args?.internalUrl ?? env.SUB2API_INTERNAL_URL)
+  const publicUrl = normalizeLlmEndpoint(args?.publicUrl ?? env.SUB2API_PUBLIC_URL)
   const base = internalUrl || publicUrl
-  return base ? `${base}/v1` : ''
+  return base ? base.endsWith('/v1') ? base : `${base}/v1` : ''
 }
 
 /** sub2api wraps every response in {code, message, data}. `code: 0`
@@ -625,5 +632,36 @@ export async function setUserTier(sub2apiUserId: number, tier: Tier, ownerId?: s
     const { invalidateOwnerLlmCaches } = await import('./tenant-llm-context.js')
     for (const { id } of rows) await invalidateOwnerLlmCaches(id)
     if (ownerId && !rows.some((row) => row.id === ownerId)) await invalidateOwnerLlmCaches(ownerId)
+  }
+}
+
+export interface Sub2apiGroupChoice { id: number; name: string; platform: Platform }
+
+/** Read-only discovery projects a small DTO, excluding upstream account details. */
+export async function discoverSub2apiGroups(): Promise<Sub2apiGroupChoice[]> {
+  if (!sub2apiConfigured()) throw new InvalidServerSettingError('sub2api provisioning is not configured')
+  const rows = await adminFetch<unknown>('/api/v1/admin/groups/all', { signal: AbortSignal.timeout(10_000) })
+  if (!Array.isArray(rows)) throw new Error('invalid sub2api group discovery response')
+  const out: Sub2apiGroupChoice[] = []
+  for (const row of rows) {
+    if (!row || !Number.isSafeInteger(row.id) || row.id <= 0 || typeof row.name !== 'string') throw new Error('invalid sub2api group discovery row')
+    if (!SUB2API_PLATFORMS.includes(row.platform)) {
+      console.warn('[sub2api] unsupported group platform')
+      continue
+    }
+    if (row.status !== undefined && row.status !== 'active') continue
+    out.push({ id: row.id, name: row.name, platform: row.platform })
+  }
+  return out
+}
+
+export async function validateSub2apiGroupSelection(config: Sub2apiGroupConfig): Promise<void> {
+  const choices = await discoverSub2apiGroups()
+  for (const groups of Object.values(config)) {
+    for (const [platform, id] of Object.entries(groups)) {
+      if (!choices.some(g => g.id === id && g.platform === platform)) {
+        throw new InvalidServerSettingError('selected group is unavailable or belongs to a different platform')
+      }
+    }
   }
 }

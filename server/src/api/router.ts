@@ -1,3 +1,4 @@
+import { resolveRoleCall } from '../llm-resolver.js'
 import { Router, json, type Request, type Response, type NextFunction } from 'express'
 import type { PoolClient } from 'pg'
 import {
@@ -18,9 +19,9 @@ import { startConvene } from '../agents/convene.js'
 import { ensureDirectConversation } from '../agents/private_chat.js'
 import { fetchImageBytes } from '../agents/image-fetcher.js'
 import { transcribeAudio } from '../llm.js'
-import { getServerSettingsSnapshot, writeServerSettings, validateServerSettings, InvalidServerSettingError } from '../settings.js'
+import { LLM_ROLES, type LlmRole, getServerSettingsSnapshot, writeServerSettings, validateServerSettings, InvalidServerSettingError } from '../settings.js'
 import { availableModels, invalidateModelCatalog } from '../models-catalog.js'
-import { TenantLlmAccessError } from '../tenant-llm-context.js'
+import { TenantLlmAccessError, resolveTenantLlmContext } from '../tenant-llm-context.js'
 import { parseUsageRange, usageSummary, usageTrend, usageByAgent, usageByModel, usageByProvider, usageLogs } from '../usage.js'
 import { modelPricingTable, upsertModelPricing } from '../model-pricing.js'
 import {
@@ -51,7 +52,7 @@ import { adminRouter } from './admin-router.js'
 import { isWaitlistEnabled } from '../admin.js'
 import { ogPreview, OgError } from '../og.js'
 import { sendInvitationEmail, type InvitationEmailDelivery } from '../invitation-email.js'
-import { getUserQuota, sub2apiConfigured } from '../sub2api.js'
+import { discoverSub2apiGroups, getUserQuota, sub2apiConfigured } from '../sub2api.js'
 import {
   ensureCloudComputer, issuePairingCode, pairComputer, announceComputerOnline,
   resolveDevice, mintAgentRuntimeToken, listAgentsForComputer,
@@ -707,6 +708,31 @@ async function requireSiteAdmin(req: Request & AuthedRequest): Promise<string> {
 api.get('/settings/models', safe(async (req, res) => {
   await requireSiteAdmin(req)
   res.json(getServerSettingsSnapshot())
+}))
+
+api.get('/settings/models/groups', safe(async (req, res) => {
+  await requireSiteAdmin(req)
+  try { res.json({ groups: await discoverSub2apiGroups() }) } catch (e) {
+    if (e instanceof InvalidServerSettingError) throw new HttpError(400, e.message)
+    throw e
+  }
+}))
+
+api.get('/settings/models/preview', safe(async (req, res) => {
+  await requireSiteAdmin(req)
+  const { userId, companyId } = await requireCompany(req)
+  try {
+    await resolveTenantLlmContext(companyId, userId)
+    const role = typeof req.query.role === 'string' ? req.query.role as LlmRole : 'brain'
+    if (!LLM_ROLES.includes(role)) throw new HttpError(400, 'invalid role')
+    const purpose = typeof req.query.purpose === 'string' ? req.query.purpose : 'preview'
+    const plan = await resolveRoleCall(companyId, 'managed', role, purpose)
+    await resolveTenantLlmContext(companyId, userId)
+    res.json(plan)
+  } catch (e) {
+    if (e instanceof TenantLlmAccessError) throw new HttpError(e.status, e.message)
+    throw e
+  }
 }))
 
 api.put('/settings/models', safe(async (req, res) => {
