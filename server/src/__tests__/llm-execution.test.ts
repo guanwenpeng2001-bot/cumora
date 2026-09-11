@@ -493,6 +493,9 @@ test('F04/F10: explicit DashScope direct route stays direct with gateway keys an
   gatewayFixture(['qwen-image-plus', 'wanx-v1'])
   const calls: { url: string; body: any }[] = []
   globalThis.fetch = async (url, options) => {
+    // The DashScope client now pre-downloads result images itself; that fetch
+    // must see real bytes, and it is not a JSON API call in `calls`.
+    if (String(url).includes('image.invalid/generated.png')) return new Response('image-bytes')
     calls.push({ url: String(url), body: JSON.parse(String(options?.body ?? '{}')) })
     const output = String(url).includes('/tasks/') ? { task_status: 'SUCCEEDED', results: [{ url: 'https://image.invalid/generated.png' }] }
       : String(url).includes('image-synthesis') ? { task_id: 'isolated-task' }
@@ -586,6 +589,7 @@ test('executeImage hops past a catalog-blocked gateway image hop onto DashScope'
   setSdkClientFactory(options => ({ apiKey: options.apiKey, baseURL: options.baseURL }))
   const urls: string[] = []
   globalThis.fetch = async (url) => {
+    if (String(url).includes('image.invalid/generated.png')) return new Response('image-bytes')
     urls.push(String(url))
     assert.match(String(url), /dashscope\.invalid/)
     return new Response(JSON.stringify({ output: { choices: [{ message: { content: [{ image: 'https://image.invalid/generated.png' }] } }] }, usage: { input_tokens: 1, output_tokens: 1 } }))
