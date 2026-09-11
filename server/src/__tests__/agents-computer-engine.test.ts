@@ -572,6 +572,8 @@ test('unsandboxed Codex forwards IPC to the engine, tool environment and MCP bri
         && arg.includes(`CUMORA_AGENT_IPC_DIR=${JSON.stringify(ipc)}`)))
       assert.equal(capture.argv.includes('--strict-config'), false)
       assert.equal(capture.argv.includes('default_permissions="cumora"'), false)
+      assert.equal(capture.argv.includes('--json'), customArgs === undefined,
+        'known-good exec passes --json; an opaque CUMORA_CODEX_ARGS override does not')
     }
   } finally {
     if (previousArgs === undefined) delete process.env.CUMORA_CODEX_ARGS
@@ -658,6 +660,7 @@ test('Codex one-shot paths send prompts through stdin', async () => {
       && arg.includes('required=true'),
   ))
   assert.ok(runCapture.argv?.includes('exec'))
+  assert.ok(runCapture.argv?.includes('--json'), 'exec must emit JSONL so usage can be parsed without reading ~/.codex')
   assert.ok(runCapture.argv?.includes('--ignore-user-config'))
   assert.ok(runCapture.argv?.includes('--ignore-rules'))
   assert.ok(runCapture.argv?.includes('--model'))
@@ -681,6 +684,7 @@ test('Codex one-shot paths send prompts through stdin', async () => {
   assert.equal(triageCapture.argv?.some((arg) => arg.startsWith('mcp_servers.cumora=')), false)
   assert.ok(triageCapture.argv?.includes('--ignore-user-config'))
   assert.ok(triageCapture.argv?.includes('triage-model'))
+  assert.equal(triageCapture.argv?.includes('--json'), false, 'triage stays text-mode so parseTriage reads the model reply')
   assert.equal(triageCapture.argv?.at(-1), '-')
   assert.equal(triageCapture.stdin, triagePrompt)
 

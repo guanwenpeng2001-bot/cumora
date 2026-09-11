@@ -593,10 +593,10 @@ export interface EngineRunArgs {
   onLog: (line: string) => void
   /** Optional per-hop trajectory hook — same shape as EngineSessionArgs.onHopUsage.
    *  When the one-shot path runs the engine via a stream parser (Claude
-   *  stream-json), each assistant message fires this; for engines that don't
-   *  emit per-hop usage (Codex `exec`), the callback fires once at the
-   *  terminating `result` event with the run's full usage. Daemon wires this
-   *  into the same buffered ledger as the persistent-session path. */
+   *  stream-json), each assistant message fires this; for engines that only
+   *  publish turn totals (Codex `exec --json` `turn.completed`, Gemini
+   *  `result`), the callback fires once with that turn's full usage. Daemon
+   *  wires this into the same buffered ledger as the persistent-session path. */
   onHopUsage?: (report: EngineHopReport) => void
   /** Aborts the run (daemon shutdown / future mid-run steering). */
   signal: AbortSignal
@@ -2051,6 +2051,181 @@ function codexSecureExecArgs(args: { home: string; env: NodeJS.ProcessEnv }, rea
   return [...secureArgs, '-a', 'never', 'exec', '--ignore-user-config', '--ignore-rules']
 }
 
+/** Codex native usage (exec JSONL snake_case and app-server camelCase).
+ *  `input_tokens` is the TOTAL prompt INCLUDING cache reads (OpenAI-shaped), so
+ *  the common EngineUsage record subtracts the cached portion the way
+ *  usageFromOpenAI does. Never invented from ~/.codex sqlite — callers feed
+ *  CLI stdout / JSON-RPC only. */
+function readCodexNativeTotals(raw: unknown): { input: number; cached: number; cacheWrite: number; output: number } | null {
+  if (!raw || typeof raw !== 'object') return null
+  const t = raw as Record<string, unknown>
+  const num = (value: unknown): number => (typeof value === 'number' && Number.isFinite(value) ? Math.max(0, value) : 0)
+  return {
+    input: num(t.input_tokens ?? t.inputTokens),
+    cached: num(t.cached_input_tokens ?? t.cachedInputTokens),
+    cacheWrite: num(t.cache_write_input_tokens ?? t.cacheWriteInputTokens),
+    output: num(t.output_tokens ?? t.outputTokens) + num(t.reasoning_output_tokens ?? t.reasoningOutputTokens),
+  }
+}
+
+function codexTotalsToEngineUsage(totals: { input: number; cached: number; cacheWrite: number; output: number }): EngineUsage | undefined {
+  if (!totals.input && !totals.cached && !totals.cacheWrite && !totals.output) return undefined
+  const usage: EngineUsage = {
+    input_tokens: Math.max(0, totals.input - totals.cached),
+    output_tokens: totals.output,
+    cache_read_input_tokens: totals.cached,
+  }
+  if (totals.cacheWrite) usage.cache_creation_input_tokens = totals.cacheWrite
+  return usage
+}
+
+function codexNativeUsage(raw: unknown): EngineUsage | undefined {
+  const totals = readCodexNativeTotals(raw)
+  return totals ? codexTotalsToEngineUsage(totals) : undefined
+}
+
+function sniffCodexModel(value: unknown): string | null {
+  if (typeof value === 'string' && value.trim()) return value.trim()
+  if (!value || typeof value !== 'object') return null
+  const record = value as Record<string, unknown>
+  for (const key of ['model', 'modelSlug', 'currentModel', 'currentModelId']) {
+    const named = record[key]
+    if (typeof named === 'string' && named.trim()) return named.trim()
+  }
+  return null
+}
+
+interface CodexExecEvent {
+  type?: string
+  thread_id?: string
+  model?: string
+  usage?: unknown
+  message?: string
+  error?: { message?: unknown } | string
+  item?: { type?: unknown; text?: unknown; model?: unknown }
+}
+
+function parseCodexExecLine(line: string): CodexExecEvent | null {
+  if (!line.startsWith('{')) return null
+  try { return JSON.parse(line) as CodexExecEvent } catch { return null }
+}
+
+function codexExecErrorMessage(event: CodexExecEvent): string | null {
+  if (typeof event.error === 'string' && event.error.trim()) return event.error.trim()
+  if (event.error && typeof event.error === 'object' && typeof event.error.message === 'string' && event.error.message.trim()) {
+    return event.error.message.trim()
+  }
+  if (typeof event.message === 'string' && event.message.trim()) return event.message.trim()
+  return null
+}
+
+/** Fold `codex exec --json` JSONL into the common turn/result shape.
+ *
+ *  Codex does not emit Claude's `{type:'result', usage}` envelope, so the
+ *  shared spawnEngine sniffer never sees a hop. The documented events are
+ *  `thread.started`, `turn.started`, item lifecycle, and a terminal
+ *  `turn.completed` carrying OpenAI-shaped usage. One hop per turn — same
+ *  granularity as Gemini / the app-server path. */
+class CodexExecTurnTracker {
+  sessionId: string | null = null
+  model: string | null = null
+  usage: EngineUsage | undefined
+  error: string | null = null
+  private startedAt: number | null = null
+  private toolUses = 0
+  private textChars = 0
+  private hopEmitted = false
+
+  constructor(private readonly onHopUsage?: (report: EngineHopReport) => void) {}
+
+  observe(event: CodexExecEvent): void {
+    if (typeof event.thread_id === 'string' && event.thread_id) this.sessionId = event.thread_id
+    const named = sniffCodexModel(event) ?? sniffCodexModel(event.item)
+    if (named) this.model = named
+
+    if (event.type === 'turn.started') {
+      this.startedAt = Date.now()
+      return
+    }
+    if (event.type === 'item.started' || event.type === 'item.updated' || event.type === 'item.completed') {
+      const itemType = typeof event.item?.type === 'string' ? event.item.type : ''
+      if (event.type === 'item.completed' && (itemType === 'command_execution' || itemType === 'commandExecution')) {
+        this.toolUses += 1
+      }
+      if (typeof event.item?.text === 'string') this.textChars += event.item.text.length
+      return
+    }
+    if (event.type === 'turn.failed') {
+      this.error = codexExecErrorMessage(event) ?? 'codex turn failed'
+      this.finish(codexNativeUsage(event.usage))
+      return
+    }
+    if (event.type !== 'turn.completed') return
+    this.finish(codexNativeUsage(event.usage))
+  }
+
+  private finish(usage: EngineUsage | undefined): void {
+    if (usage) this.usage = usage
+    if (this.hopEmitted || !usage || !this.onHopUsage) return
+    this.hopEmitted = true
+    try {
+      this.onHopUsage({
+        model: this.model ?? 'codex',
+        usage,
+        latencyMs: this.startedAt == null ? undefined : Date.now() - this.startedAt,
+        hopIndex: 1,
+        toolUses: this.toolUses,
+        textChars: this.textChars,
+      })
+    } catch { /* ledger reporting is best-effort */ }
+  }
+}
+
+async function spawnCodexExec(
+  command: string,
+  argv: string[],
+  args: EngineRunArgs,
+  spawnOpts: { shell?: boolean },
+): Promise<EngineRunResult> {
+  const tracker = new CodexExecTurnTracker(args.onHopUsage)
+  let processResult: EngineRunResult
+  try {
+    processResult = await spawnEngine(
+      command,
+      argv,
+      {
+        ...args,
+        onLog: (line) => {
+          const event = parseCodexExecLine(line)
+          if (event) tracker.observe(event)
+          args.onLog(line)
+        },
+      },
+      { shell: spawnOpts.shell, stdinText: args.prompt },
+    )
+  } catch (err) {
+    return {
+      exitCode: 1,
+      error: err instanceof Error ? err.message : String(err),
+      sessionId: tracker.sessionId,
+      usage: tracker.usage,
+      model: tracker.model,
+    }
+  }
+  const eventError = tracker.error
+    ? `engine turn error: ${tracker.error.slice(0, MAX_FAILURE_CHARS)}`
+    : null
+  return {
+    exitCode: processResult.exitCode !== 0 ? processResult.exitCode : (eventError ? 1 : 0),
+    error: processResult.exitCode !== 0
+      ? [processResult.error, eventError].filter(Boolean).join('\n')
+      : (eventError ?? undefined),
+    sessionId: tracker.sessionId ?? processResult.sessionId,
+    usage: tracker.usage ?? processResult.usage,
+    model: tracker.model,
+  }
+}
+
 /** A persistent Codex session over the app-server JSON-RPC protocol
  *  (`codex app-server --listen stdio://`) — the transport with Codex's NATIVE
  *  context management + auto-compaction (unlike one-shot
@@ -2086,9 +2261,13 @@ class CodexSession implements EngineSession {
   private steerGate = false
   private readonly model: string | null
   readonly carriesStandingPrompt: boolean
+  /** Model id the CLI actually named (never the Cumora pin). Null until an
+   *  event carries one — hops then use the last-resort engine id, and
+   *  EngineRunResult.model stays null rather than inventing a slug. */
+  private actualModel: string | null = null
   // Codex reports a RUNNING thread token total; per-turn usage is the delta.
-  private cum = { input: 0, cached: 0, output: 0 }
-  private turnStart = { input: 0, cached: 0, output: 0 }
+  private cum = { input: 0, cached: 0, cacheWrite: 0, output: 0 }
+  private turnStart = { input: 0, cached: 0, cacheWrite: 0, output: 0 }
 
   constructor(bin: string, spawnArgs: string[], home: string, env: NodeJS.ProcessEnv, opts: EngineSessionArgs) {
     this.onLog = opts.onLog
@@ -2208,10 +2387,14 @@ class CodexSession implements EngineSession {
     }
     // thread ready: response to thread/start|resume, OR a thread/started notification.
     const threadId = msg.result?.thread?.id ?? (msg.method === 'thread/started' ? (msg.params?.thread as { id?: unknown } | undefined)?.id : undefined)
-    if (typeof threadId === 'string') { this.onThreadReady(threadId); return }
+    if (typeof threadId === 'string') {
+      this.noteActualModel(msg.result?.thread, msg.params?.thread)
+      this.onThreadReady(threadId); return
+    }
     // turn id (for steering) — from the turn/start response or turn/started notif.
     const turnId = msg.result?.turn?.id ?? msg.result?.turnId ?? (msg.method === 'turn/started' ? (msg.params?.turn as { id?: unknown } | undefined)?.id : undefined)
     if (typeof turnId === 'string') { this.activeTurnId = turnId; this.steerGate = false }
+    this.noteActualModel(msg.result?.turn, msg.result, msg.params?.turn, msg.params?.item, msg.params?.tokenUsage)
     // running thread token total.
     if (msg.method === 'thread/tokenUsage/updated') { this.updateUsage((msg.params?.tokenUsage as { total?: unknown } | undefined)?.total); return }
     // surface the account rate limit ONLY when it's getting tight (would have flagged
@@ -2237,24 +2420,24 @@ class CodexSession implements EngineSession {
     if (msg.error && msg.id !== undefined) { this.failPending(String(msg.error.message || 'codex app-server request failed')); return }
     // turn finished → resolve the pending send.
     if (msg.method === 'turn/completed') {
-      const turn = msg.params?.turn as { status?: unknown; error?: { message?: unknown } } | undefined
+      const turn = msg.params?.turn as { status?: unknown; error?: { message?: unknown }; model?: unknown } | undefined
+      this.noteActualModel(turn)
       const failed = turn?.status === 'failed' ? String(turn?.error?.message || 'codex turn failed') : undefined
       // Per-hop trajectory for Codex: app-server doesn't expose per-message
       // usage (only running thread totals via thread/tokenUsage/updated), so
       // the finest granularity we can honestly report is ONE row per turn
-      // with that turn's delta — same shape as turnUsage(). When future
-      // app-server versions expose per-item usage we can split this further;
-      // the ledger schema doesn't change. We deliberately emit BEFORE settle()
-      // so the daemon's flush window includes this hop's row reliably.
-      if (!failed && this.onHopUsage && this.model) {
+      // with that turn's delta — same shape as turnUsage(). Emit even when
+      // the operator left the model unpinned (the default): requiring a pin
+      // dropped every hop on the BYOA path. actualModel is CLI-reported or
+      // null; the hop's model string falls back to the engine id so the
+      // ledger row still lands.
+      const usage = this.turnUsage()
+      if (this.onHopUsage && usage) {
         try {
           this.onHopUsage({
-            model: this.model,
-            usage: this.turnUsage(),
+            model: this.actualModel || 'codex',
+            usage,
             latencyMs: this.turnStartedAt != null ? Date.now() - this.turnStartedAt : undefined,
-            // Codex only reports turn-level totals today, so every emission is
-            // the 1st (and only) hop for that turn. When app-server starts
-            // exposing per-item usage, this becomes a real running counter.
             hopIndex: 1,
           })
         } catch { /* never break the stream */ }
@@ -2276,30 +2459,39 @@ class CodexSession implements EngineSession {
     if (this.queuedPrompt && this.pending) { const p = this.queuedPrompt; this.queuedPrompt = null; this.startTurn(p) }
   }
 
-  private updateUsage(total: unknown): void {
-    if (!total || typeof total !== 'object') return
-    const t = total as Record<string, unknown>
-    const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0)
-    const input = num(t.inputTokens), cached = num(t.cachedInputTokens)
-    const output = num(t.outputTokens) + num(t.reasoningOutputTokens)
-    // Keep the max so a late/partial update can't regress the running total.
-    this.cum = { input: Math.max(this.cum.input, input), cached: Math.max(this.cum.cached, cached), output: Math.max(this.cum.output, output) }
+  private noteActualModel(...candidates: unknown[]): void {
+    if (this.actualModel) return
+    for (const candidate of candidates) {
+      const named = sniffCodexModel(candidate)
+      if (named) { this.actualModel = named; return }
+    }
   }
 
-  private turnUsage(): EngineUsage {
-    const inputTotal = Math.max(0, this.cum.input - this.turnStart.input)
-    const cached = Math.max(0, this.cum.cached - this.turnStart.cached)
-    return {
-      input_tokens: Math.max(0, inputTotal - cached), // non-cached portion (Claude-style fields)
-      cache_read_input_tokens: cached,
-      output_tokens: Math.max(0, this.cum.output - this.turnStart.output),
+  private updateUsage(total: unknown): void {
+    const totals = readCodexNativeTotals(total)
+    if (!totals) return
+    // Keep the max so a late/partial update can't regress the running total.
+    this.cum = {
+      input: Math.max(this.cum.input, totals.input),
+      cached: Math.max(this.cum.cached, totals.cached),
+      cacheWrite: Math.max(this.cum.cacheWrite, totals.cacheWrite),
+      output: Math.max(this.cum.output, totals.output),
     }
+  }
+
+  private turnUsage(): EngineUsage | undefined {
+    return codexTotalsToEngineUsage({
+      input: Math.max(0, this.cum.input - this.turnStart.input),
+      cached: Math.max(0, this.cum.cached - this.turnStart.cached),
+      cacheWrite: Math.max(0, this.cum.cacheWrite - this.turnStart.cacheWrite),
+      output: Math.max(0, this.cum.output - this.turnStart.output),
+    })
   }
 
   private settle(error?: string): void {
     const p = this.pending
     this.pending = null
-    if (p) p.resolve({ exitCode: error ? 1 : 0, error, sessionId: this.threadId, usage: this.turnUsage(), model: this.model })
+    if (p) p.resolve({ exitCode: error ? 1 : 0, error, sessionId: this.threadId, usage: this.turnUsage(), model: this.actualModel })
   }
   private failPending(error: string): void {
     if (this.pending) this.settle(error)
@@ -2328,7 +2520,7 @@ class CodexSession implements EngineSession {
     }
     const p = this.pending
     this.pending = null
-    if (p) p.resolve({ exitCode: code, error: why, sessionId: this.threadId })
+    if (p) p.resolve({ exitCode: code, error: why, sessionId: this.threadId, usage: this.turnUsage(), model: this.actualModel })
   }
 }
 
@@ -2485,18 +2677,23 @@ class CodexAdapter implements EngineAdapter {
     const base = flags.length
       ? ['exec', ...flags]
       : allowUnsandboxedByoa()
-        ? ['exec', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check']
-        : [...codexSecureExecArgs(args), '--skip-git-repo-check']
+        ? ['exec', '--json', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check']
+        : [...codexSecureExecArgs(args), '--json', '--skip-git-repo-check']
     const model = args.model ? ['--model', args.model] : []
     const { command, shell, argsPrefix } = resolveCodexSpawn()
     const compatibility = allowUnsandboxedByoa() ? codexCompatibilityConfigOverrides(args) : []
-    return spawnEngine(command, [...argsPrefix, ...base, ...model, ...compatibility, '-'], args, { shell, stdinText: args.prompt })
-      .then((res) => {
-        // A rejected -c override aborts codex before it reads the prompt, so the
-        // turn fails with a config error that never mentions Cumora. Say it once.
-        noteCodexConfigRejection(res.error, args.onLog)
-        return res
-      })
+    const argv = [...argsPrefix, ...base, ...model, ...compatibility, '-']
+    // Opaque CUMORA_CODEX_ARGS cannot be assumed to be JSONL; the known-good
+    // paths pass --json and parse turn.completed usage from stdout.
+    const run = flags.length
+      ? spawnEngine(command, argv, args, { shell, stdinText: args.prompt })
+      : spawnCodexExec(command, argv, args, { shell })
+    return run.then((res) => {
+      // A rejected -c override aborts codex before it reads the prompt, so the
+      // turn fails with a config error that never mentions Cumora. Say it once.
+      noteCodexConfigRejection(res.error, args.onLog)
+      return res
+    })
   }
 
   startSession(args: EngineSessionArgs): EngineSession | null {
