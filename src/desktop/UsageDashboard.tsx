@@ -1,3 +1,4 @@
+import type { UsageFilter } from '../../shared/llm-usage-contract'
 /**
  * Usage dashboard (settings → usage tab, below the quota cards).
  * cc-switch-style: totals cards, a self-drawn SVG multi-line trend,
@@ -108,9 +109,10 @@ function TrendChart({ points, granularity, t }: {
   const timeSpan = Math.max(1, Date.parse(sampled[n - 1]!.bucket) - firstTime)
   const x = (i: number) => PAD.l + ((Date.parse(sampled[i]!.bucket) - firstTime) / timeSpan) * (W - PAD.l - PAD.r)
   const lines = series.map((s) => {
-    const max = Math.max(...sampled.map((p) => p[s.key]), 1e-9)
-    const y = (v: number) => PAD.t + (1 - v / max) * (H - PAD.t - PAD.b)
-    return { ...s, max, d: sampled.map((p, i) => `${i === 0 ? 'M' : 'L'}${x(i).toFixed(1)},${y(p[s.key]).toFixed(1)}`).join(' ') }
+    const values=sampled.flatMap((p) => p[s.key] == null ? [] : [p[s.key]!])
+    const max = Math.max(0,...values)
+    const y = (v: number) => PAD.t + (1 - v / Math.max(max,1e-9)) * (H - PAD.t - PAD.b)
+    return { ...s, max, available:values.length>0, d: sampled.map((p, i) => p[s.key] == null ? '' : `${i === 0 || sampled[i-1][s.key] == null ? 'M' : 'L'}${x(i).toFixed(1)},${y(p[s.key]!).toFixed(1)}`).join(' ') }
   })
   const labelEvery = Math.max(1, Math.ceil(n / 8))
   return (
@@ -129,7 +131,7 @@ function TrendChart({ points, granularity, t }: {
         {lines.map((l) => (
           <span key={l.key} className="inline-flex items-center gap-1.5 text-[10.5px] text-ink-500">
             <span className="w-2.5 h-[2px] rounded" style={{ background: l.color }} />
-            {l.label} · 0–{l.max}
+            {l.label} · {l.available ? `0–${l.max}` : t('push.permUnknown')}
           </span>
         ))}
       </div>
@@ -184,14 +186,20 @@ function LogAttemptDetails({ r, locale, t, unknown }: {
   unknown: string
 }) {
   const [open, setOpen] = useState(false)
+  if (r.attempts) return <details className="text-xs leading-relaxed whitespace-normal"><summary className="cursor-pointer">{r.callId ?? r.id} · {r.attempts.length} {locale==='zh-CN' ? '次尝试' : 'attempts'}</summary>
+    {r.attempts.map(attempt => <LogAttemptDetails key={attempt.id} r={attempt} locale={locale} t={t} unknown={unknown} />)}</details>
   return (
-    <details className="text-[11px] whitespace-normal min-w-[220px] max-w-[360px] break-words" onToggle={(e) => {
+    <details className="text-[11px] leading-relaxed whitespace-normal min-w-[220px] max-w-[360px] break-words" onToggle={(e) => {
       setOpen((e.currentTarget as HTMLDetailsElement).open)
     }}>
       <summary className="cursor-pointer">{translate(locale, 'settings.attemptDetails')} · #{r.attempt ?? unknown}</summary>
       {open && <>
         <div>{translate(locale, 'settings.requestedModel')}: {r.requestedModel || r.model || unknown}</div>
         <div>{translate(locale, 'settings.actualModel')}: {r.actualModel || unknown}</div>
+        <div>Request: {r.requestModel ?? r.requestedModel} · {r.sourceKind ?? r.source} · {r.pricingState} · {r.unpricedReason} · {r.settlementState}</div>
+        <div>参考成本 {money(r.referenceCostUsd)} · 上游确认 {money(r.upstreamCostUsd)} · 套餐扣额 {money(r.quotaDebit)}</div>
+        <div>{locale==='zh-CN' ? '计量粒度 / 证据' : 'Granularity / evidence'}: {r.observationGranularity ?? unknown} · {r.usageProvenance ?? unknown}</div>
+        <div>{locale==='zh-CN' ? '价格版本' : 'Price version'}: {r.priceVersionId ?? unknown} · Trace: {r.traceId ?? unknown}</div>
         <div>{t('settings.route')}: {r.route ?? unknown} · {t('settings.platform')}: {r.platform ? modelPlatformLabel(r.platform) : unknown}</div>
         <div>{t('adminobs.colSource')}: {r.source || unknown} · {t('settings.provider')}: {r.provider || unknown}</div>
         <div>{t('settings.purpose')}: {r.purpose || unknown}</div>
@@ -216,7 +224,7 @@ function Card({ label, value, sub }: { label: string; value: string; sub?: strin
   )
 }
 
-type Dim = 'agent' | 'model' | 'provider'
+type Dim = 'agent' | 'model' | 'provider' | 'source'
 
 type QueryState<D> = { loading: boolean; error: unknown; data: D | null }
 
@@ -267,6 +275,7 @@ function UsageDashboardContent() {
   const [granularity, setGranularity] = useState<'hour' | 'day'>('hour')
   const [autoRefresh, setAutoRefresh] = useState(false)
   const [dim, setDim] = useState<Dim>('agent')
+  const [filters,setFilters] = useState<UsageFilter>({})
   const [page, setPage] = useState(1)
   const epoch = useAuth((s) => s.contextEpoch)
   const ready = useAuth((s) => s.ready)
@@ -285,18 +294,27 @@ function UsageDashboardContent() {
   const enabled = blocked === null
   const from = range?.from ?? ''
   const to = range?.to ?? ''
-  const summaryQuery = useUsageQuery(useCallback((signal: AbortSignal) => api.getUsageSummary(from, to, undefined, signal), [range, refresh]), enabled, epoch)
-  const trendQuery = useUsageQuery(useCallback((signal: AbortSignal) => api.getUsageTrend(from, to, granularity, signal), [range, refresh, granularity]), enabled, epoch)
-  const agentQuery = useUsageQuery(useCallback((signal: AbortSignal) => api.getUsageByAgent(from, to, signal), [range, refresh]), enabled && dim === 'agent', epoch)
-  const modelQuery = useUsageQuery(useCallback((signal: AbortSignal) => api.getUsageByModel(from, to, signal), [range, refresh]), enabled && dim === 'model', epoch)
-  const providerQuery = useUsageQuery(useCallback((signal: AbortSignal) => api.getUsageByProvider(from, to, signal), [range, refresh]), enabled && dim === 'provider', epoch)
-  const logsQuery = useUsageQuery(useCallback((signal: AbortSignal) => api.getUsageLogs(from, to, page, 50, undefined, signal), [range, refresh, page]), enabled, epoch)
+  const summaryQuery = useUsageQuery(useCallback((signal: AbortSignal) => api.getUsageSummary(from, to, undefined, signal, filters), [filters, range, refresh]), enabled, epoch)
+  const trendQuery = useUsageQuery(useCallback((signal: AbortSignal) => api.getUsageTrend(from, to, granularity, signal, filters), [filters, range, refresh, granularity]), enabled, epoch)
+  const agentQuery = useUsageQuery(useCallback((signal: AbortSignal) => api.getUsageByAgent(from, to, signal, filters), [filters, range, refresh]), enabled && dim === 'agent', epoch)
+  const modelQuery = useUsageQuery(useCallback((signal: AbortSignal) => api.getUsageByModel(from, to, signal, filters), [filters, range, refresh]), enabled && dim === 'model', epoch)
+  const providerQuery = useUsageQuery(useCallback((signal: AbortSignal) => api.getUsageByProvider(from, to, signal, filters), [filters, range, refresh]), enabled && dim === 'provider', epoch)
+  const logsQuery = useUsageQuery(useCallback((signal: AbortSignal) => api.getUsageLogs(from, to, page, 50, undefined, signal, filters), [filters, range, refresh, page]), enabled, epoch)
+  const sourceQuery = useUsageQuery(useCallback((signal: AbortSignal) => api.getUsageBySource(from,to,signal,filters),[range,refresh,filters]),enabled && dim === 'source',epoch)
   const summary = summaryQuery.data
   const trend = trendQuery.data?.points ?? []
   const byAgent = agentQuery.data?.items ?? []
   const byModel = modelQuery.data?.items ?? []
   const byProvider = providerQuery.data?.items ?? []
-  const logs = logsQuery.data
+  const logs = useMemo(() => {
+    if (!logsQuery.data) return null
+    const groups = new Map<string,ApiUsageLogRow[]>()
+    for (const row of logsQuery.data.items) { const key = row.callId ?? row.id; groups.set(key,[...(groups.get(key) ?? []),row]) }
+    return { ...logsQuery.data, items: [...groups.values()].map(attempts => {
+      const sorted=attempts.sort((a,b) => (a.attempt ?? 0)-(b.attempt ?? 0))
+      return {...sorted[sorted.length-1],attempts:sorted}
+    }) }
+  },[logsQuery.data])
   const unknown = translate(locale, 'push.permUnknown')
   const partial = !summary || summary.unknownRequests == null || summary.unpricedRequests == null || summary.qualityUnknownRequests == null
     || summary.unknownRequests > 0 || summary.unpricedRequests > 0 || summary.qualityUnknownRequests > 0
@@ -329,6 +347,14 @@ function UsageDashboardContent() {
 
   return (
     <div className="space-y-6">
+      <div className="flex flex-wrap gap-2" role="group" aria-label="Usage filters">
+        <label>{locale === 'zh-CN' ? '来源' : 'Source'} <select aria-label="Source" value={filters.source ?? ''} onChange={e => { setFilters(f => ({...f,source:e.target.value as UsageFilter['source'] || undefined}));setPage(1) }}>
+          <option value="">{locale === 'zh-CN' ? '全部来源' : 'All sources'}</option>
+          {['sub2api','env','byoa'].map(source => <option key={source}>{source}</option>)}
+        </select></label>
+        {(['platform','provider','capability','role','purpose','agentId','runId'] as const).map(key => <input key={key} aria-label={key} placeholder={key} value={filters[key] ?? ''}
+          className="w-28 rounded border border-ink-100 px-2 text-xs" onChange={e => {setFilters(f => ({...f,[key]:e.target.value || undefined}));setPage(1)}} />)}
+      </div>
       <div className="flex flex-wrap items-center gap-2">
         {(['today', 'week', 'custom'] as const).map((p) => (
           <button key={p} type="button" onClick={() => { setPreset(p); setPage(1) }}
@@ -377,7 +403,9 @@ function UsageDashboardContent() {
           sub={tokensUnknown ? translate(locale, 'settings.completeMeasurementUnavailable') : summary ? `${t('me.usage.inShort')} ${fmtTokens(summary.inputTokens + summary.cacheReadTokens)} · ${t('me.usage.outShort')} ${fmtTokens(summary.outputTokens)}` : undefined} />
         <Card label={t('me.usage.requests')} value={summary ? String(summary.requests) : '—'}
           sub={summary ? `${t('me.usage.successRate')} ${fmtPct(summary.successRate)}` : undefined} />
-        <Card label={translate(locale, 'settings.cumoraReferenceCost')} value={summary ? partial && summary.costUsd === 0 ? unknown : `${fmtUsd(summary.costUsd)}${partial ? ' *' : ''}` : '—'}
+        <Card label={locale === 'zh-CN' ? '上游确认成本' : 'Upstream confirmed cost'} value={money(summary?.upstreamCostUsd)} />
+        <Card label={locale === 'zh-CN' ? '套餐扣额' : 'Quota debit'} value={money(summary?.quotaDebit)} sub={`${locale==='zh-CN' ? '待结算' : 'Pending settlement'}: ${summary?.pendingSettlement ?? '—'}`} />
+        <Card label={translate(locale, 'settings.cumoraReferenceCost')} value={summary ? `${money(summary.referenceCostUsd)}${partial ? ' *' : ''}` : '—'}
           sub={partial ? translate(locale, 'settings.knownPortionOnlyUnknownIsNotZero') : summary?.costEstimated ? t('me.usage.costEstimated') : undefined} />
         <Card label={t('me.usage.cacheHit')} value={summary ? tokensUnknown ? unknown : fmtPct(summary.cacheHitRate) : '—'}
           sub={summary ? `${t('me.usage.chartCacheRead')} ${fmtTokens(summary.cacheReadTokens)} · ${t('me.usage.chartCacheWrite')} ${fmtTokens(summary.cacheWriteTokens)}` : undefined} />
@@ -407,14 +435,20 @@ function UsageDashboardContent() {
 
       <div className="bg-cloud rounded-[14px] p-4" style={{ border: '1px solid var(--ink-100)' }}>
         <div className="flex gap-1 mb-3 border-b border-ink-100">
-          {(['agent', 'model', 'provider'] as const).map((d) => (
+          {(['agent', 'model', 'provider', 'source'] as const).map((d) => (
             <button key={d} type="button" onClick={() => setDim(d)}
               className={cn('py-2 px-4 text-[12px] font-semibold border-b-2 transition -mb-px',
                 dim === d ? 'border-skype text-skype-deep' : 'border-transparent text-ink-500 hover:text-ink-700')}>
-              {t(`me.usage.dim.${d}`)}
+              {d === 'source' ? locale === 'zh-CN' ? '来源' : 'Source' : t(`me.usage.dim.${d}`)}
             </button>
           ))}
         </div>
+        {dim === 'source' && <>
+          {status(sourceQuery,sourceQuery.data?.items.length === 0)}
+          <div className="overflow-x-auto"><table className="w-full min-w-[560px]"><thead><tr>{['来源 / Source','Attempts','参考成本 / Reference','上游确认 / Upstream','套餐扣额 / Quota'].map(label => <th key={label} className={th}>{label}</th>)}</tr></thead>
+            <tbody>{sourceQuery.data?.items.map(row => <tr key={row.source ?? 'legacy'}><td className={td}>{row.source ?? '历史来源未标注'}</td><td className={td}>{row.requests}</td>
+              <td className={td}>{money(row.referenceCostUsd)}{row.unpricedRequests > 0 ? ' · 部分未计价' : ''}</td><td className={td}>{money(row.upstreamCostUsd)}</td><td className={td}>{money(row.quotaDebit)}</td></tr>)}</tbody></table></div>
+        </>}
         {dim === 'agent' && status(agentQuery, byAgent.length === 0)}
         {dim === 'model' && status(modelQuery, byModel.length === 0)}
         {dim === 'provider' && status(providerQuery, byProvider.length === 0)}
@@ -442,7 +476,7 @@ function UsageDashboardContent() {
                       </span>
                     </td>
                     <td className={td}>{fmtTokens(r.inputTokens + r.outputTokens)}</td>
-                    <td className={td}>{fmtUsd(r.costUsd)}</td>
+                    <td className={td}>{money(r.referenceCostUsd)}</td>
                     <td className={td}>{r.requests}</td>
                     <td className={td}>{fmtPct(r.successRate)}</td>
                   </tr>
@@ -459,15 +493,15 @@ function UsageDashboardContent() {
               </tr></thead>
               <tbody>
                 {byModel.map((r) => (
-                  <tr key={JSON.stringify([r.model, r.route, r.platform, r.source])} className="border-t border-ink-100">
+                  <tr key={JSON.stringify([r.offeringId,r.sourceId,r.model,r.requestModel,r.actualModelState, r.route, r.platform, r.sourceKind,r.source])} className="border-t border-ink-100">
                     <td className={cn(td, 'font-mono')}>
-                      {r.model}
-                      <div className="text-[10px] whitespace-normal">{t('settings.route')}: {r.route ?? unknown} · {t('settings.platform')}: {r.platform ? modelPlatformLabel(r.platform) : unknown} · {t('adminobs.colSource')}: {r.source ?? unknown}</div>
+                      {r.actualModel ?? <>{translate(locale,'settings.requestedModelFallback')}: {r.requestModel ?? r.model}<div className="text-[10px] whitespace-normal">{translate(locale,'settings.actualModelMissing')}</div></>}
+                      <div className="text-[10px] whitespace-normal">{t('settings.route')}: {r.route ?? unknown} · {t('settings.platform')}: {r.platform ? modelPlatformLabel(r.platform) : unknown} · {t('adminobs.colSource')}: {r.sourceKind ?? r.source ?? unknown}</div>
                       <div className="text-[10px] whitespace-normal">{translate(locale, 'settings.unmeasuredUnpricedUnknownQuality')}: {r.unknownRequests ?? unknown} / {r.unpricedRequests ?? unknown} / {r.qualityUnknownRequests ?? unknown}</div>
                     </td>
                     <td className={td}>{r.provider}</td>
                     <td className={td}>{fmtTokens(r.inputTokens + r.outputTokens)}</td>
-                    <td className={td}>{fmtUsd(r.costUsd)}{r.costEstimated && <span className="text-ink-300 text-[10px]"> {t('me.usage.estimated')}</span>}</td>
+                    <td className={td}>{money(r.referenceCostUsd)}{r.costEstimated && <span className="text-ink-300 text-[10px]"> {t('me.usage.estimated')}</span>}</td>
                     <td className={td}>{r.requests}</td>
                   </tr>
                 ))}
@@ -485,7 +519,7 @@ function UsageDashboardContent() {
                   <tr key={r.provider} className="border-t border-ink-100">
                     <td className={cn(td, 'font-semibold text-ink-900')}>{r.provider}</td>
                     <td className={td}>{fmtTokens(r.inputTokens + r.outputTokens)}</td>
-                    <td className={td}>{fmtUsd(r.costUsd)}</td>
+                    <td className={td}>{money(r.referenceCostUsd)}</td>
                     <td className={td}>{r.requests}</td>
                   </tr>
                 ))}
@@ -502,7 +536,7 @@ function UsageDashboardContent() {
         <div className="text-[11px] text-ink-500">{translate(locale, 'settings.eachRowIsAnApplicationAttemptUseCallidTo')}</div>
         <div className="overflow-x-auto">
           <TableVirtuoso
-            style={{ height: Math.min(420, Math.max(160, (logs?.items.length ?? 0) * 72)) }}
+            style={{ height: Math.min(560, Math.max(320, (logs?.items.length ?? 0) * 96)) }}
             data={logs?.items ?? []}
             increaseViewportBy={160}
             defaultItemHeight={72}
@@ -530,12 +564,12 @@ function UsageDashboardContent() {
                 </td>
                 <td className={td}>{tokensMeasured(r) ? fmtTokens(r.inputTokens) : unknown}</td>
                 <td className={td}>{tokensMeasured(r) ? fmtTokens(r.outputTokens) : unknown}</td>
-                <td className={td}>{r.unpriced === true ? translate(locale, 'settings.unpriced') : r.measured !== true || r.unpriced !== false ? unknown : fmtUsd(r.costUsd)}
+                <td className={td}>{r.unpriced === true ? translate(locale, 'settings.unpriced') : r.measured !== true || r.unpriced !== false ? unknown : money(r.referenceCostUsd)}
                   {r.costEstimated && <div>{t('me.usage.estimated')}</div>}
                   <UnitCostDetails row={r} />
                 </td>
                 <td className={td}>
-                  <span className={cn('text-[10.5px] font-semibold px-1.5 py-0.5 rounded', r.status === 'ok' ? 'text-skype-deep bg-sky2-50' : 'text-coral-deep bg-coral-soft')}>
+                  <span className={cn('text-[10.5px] font-semibold px-1.5 py-0.5 rounded', ['ok','succeeded'].includes(r.status) ? 'text-skype-deep bg-sky2-50' : 'text-coral-deep bg-coral-soft')}>
                     {r.status}
                   </span>
                   <div className="text-[10px] whitespace-normal">{t('settings.measuredLabel')}: {r.measured === true ? translate(locale, 'settings.measured') : r.measured === false ? translate(locale, 'settings.unmeasured') : unknown}</div>
@@ -559,3 +593,5 @@ function UsageDashboardContent() {
     </div>
   )
 }
+
+function money(value: string | null | undefined): string { return value == null ? '—' : fmtUsd(Number(value)) }

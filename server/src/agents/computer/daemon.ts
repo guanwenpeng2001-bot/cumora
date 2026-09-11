@@ -53,6 +53,8 @@ import { finalizeTriage, isRateLimited, parseTriage, triageDisposition, deferTri
 import { BYOA_SYNC_INTERVALS, ByoaPolicyController } from './runtime-policy.js'
 import { type ActionSurface, actionSurfaceFor, actionSurfaceText, calendarExampleText, postingMechanicsText } from './prompt-surface.js'
 import { buildEngineCodexMcpInjection, runnableEngineIds, allowUnsandboxedByoa, detectEnginesWithStatus, ENGINE_IDS, engineFailureOf, type DetectedEngineSnapshot, type EngineHopReport, type EngineId, type EngineRunResult, type EngineSession, type EngineUsage, enrichDetectedEngines, evaluateRunnableEngines, getAdapter, runEngineDoctor, type RunnableEngineEvaluation, snapshotDetectedEngines } from './engine.js'
+import { DurableOutbox } from '../../models/durable-outbox.js'
+import type { RuntimeUsageEvent } from '../runtime/llm-events.js'
 import { EngineSessionStore, sessionIdPreview } from './session-store.js'
 import { runWithSessionRecovery } from './session-recovery.js'
 import { acquireDaemonLock, DAEMON_ALREADY_RUNNING_EXIT_CODE } from './daemon-lock.js'
@@ -1558,20 +1560,9 @@ async function doPair(code: string, serverUrl: string, preferredEngine?: string)
 
 // ─── per-agent runner ───────────────────────────────────────────────────
 
-/** Buffered per-hop trajectory reporter. The engine sessions (ClaudeSession /
- *  CodexSession) fire `onHopUsage` for every assistant message / turn-completed
- *  event; this collects them and POSTs in batches so the universal llm_calls
- *  ledger sees BYOA trajectory at the same granularity it sees cloud, without
- *  paying a round-trip per hop.
- *
- *  Discipline:
- *    - Fire-and-forget. A network blip on the report MUST NEVER affect the
- *      engine turn that produced it.
- *    - Bounded queue (MAX_BUFFER) so a hard server outage can't blow memory on
- *      a long-running daemon — old hops are dropped first with a warn log.
- *    - Auto-flush on every WINDOW_MS tick AND when buffer hits FLUSH_AT.
- *    - flush() can be awaited at "natural pauses" (turn end) to push the tail
- *      promptly without waiting for the timer. */
+/** Per-observation durable telemetry. Provider hops and engine-turn totals never add together.
+ * Each event is fsynced locally, replayed across restarts, and removed only after an explicit ACK.
+ * Transport failure preserves the queue; disk exhaustion reports incomplete telemetry. */
 type ByoaSource = `byoa-${EngineId}`
 
 function byoaSourceOf(id: EngineId): ByoaSource {
@@ -1592,67 +1583,41 @@ interface PendingHop {
 }
 
 class HopReporter {
-  private buf: PendingHop[] = []
-  private timer: ReturnType<typeof setTimeout> | null = null
-  private stopped = false
-  private readonly WINDOW_MS = 250
-  private readonly FLUSH_AT = 10
-  private readonly MAX_BUFFER = 500
-  constructor(
-    private readonly serverUrl: string,
-    private readonly getToken: () => Promise<string>,
-  ) {}
-
-  push(hop: PendingHop): void {
-    if (this.stopped) return
-    if (this.buf.length >= this.MAX_BUFFER) {
-      // Drop the OLDEST entry — newer hops are more interesting + the bound
-      // protects the process from a hung server. We log once per overflow
-      // window so the log isn't a flood.
-      const dropped = this.buf.shift()
-      if (dropped) console.warn(`[hop-reporter] buffer overflow — dropped oldest hop (${dropped.purpose}, ${dropped.model})`)
-    }
-    this.buf.push(hop)
-    if (this.buf.length >= this.FLUSH_AT) { void this.flush(); return }
-    if (!this.timer) this.timer = setTimeout(() => { this.timer = null; void this.flush() }, this.WINDOW_MS)
-  }
-
-  /** Send everything queued right now. Idempotent + reentrant-safe — drains
-   *  the snapshot, leaves new pushes for the next flush. Resolves after the
-   *  HTTP attempt (or instantly if nothing to send). */
-  async flush(): Promise<void> {
-    if (this.timer) { clearTimeout(this.timer); this.timer = null }
-    if (this.buf.length === 0) return
-    // Snapshot + clear; new pushes during the await go to a fresh buffer.
-    const batch = this.buf
-    this.buf = []
-    // Codex + Claude batches might intermix (the same reporter is used across
-    // session lifetimes), so split by source — the server endpoint takes one
-    // source per call (the row's `source` column is set from it).
-    const byHourceSource = new Map<ByoaSource, PendingHop[]>()
-    for (const h of batch) {
-      const arr = byHourceSource.get(h.source) ?? []
-      arr.push(h); byHourceSource.set(h.source, arr)
-    }
-    let token: string
-    try { token = await this.getToken() } catch { /* token unavailable — drop, daemon recovers */ return }
-    await Promise.all([...byHourceSource.entries()].map(([source, hops]) =>
-      // daemonVersion lets the operator correlate spend / cache patterns with
-      // an agent-cli release in the Observability dashboard. One version per
-      // batch — daemons never upgrade mid-batch, so every hop in this group
-      // shares it on the server side.
-      runtimeBest(this.serverUrl, '/llm-calls', token, { source, hops, daemonVersion: CURRENT_VERSION }),
-    ))
-  }
-
-  stop(): void {
-    this.stopped = true
-    if (this.timer) { clearTimeout(this.timer); this.timer = null }
-    // Final flush — best-effort, fire-and-forget.
+  private readonly outbox: DurableOutbox<RuntimeUsageEvent>
+  private flushing = false
+  private readonly timer: ReturnType<typeof setInterval>
+  constructor(private readonly serverUrl: string, private readonly getToken: () => Promise<string>, directory: string) {
+    this.outbox = new DurableOutbox(directory)
+    this.timer = setInterval(() => { void this.flush() }, 2000)
+    this.timer.unref()
     void this.flush()
   }
+  push(hop: PendingHop): void {
+    const eventId = randomUUID()
+    // Persist before any HTTP; restart replays the same ID until its explicit ACK.
+    // Engine-turn totals and provider-hop totals are mutually exclusive observations.
+    this.outbox.put({ schemaVersion: 2, producerEventId: eventId,
+      engine:hop.source.slice(5),profileRef:typeof hop.extras?.profileRef==='string' ? hop.extras.profileRef : null,
+      engineSessionId: String(hop.extras?.engineSessionId ?? hop.runId ?? eventId),
+      occurredAt: new Date().toISOString(), daemonVersion: CURRENT_VERSION,
+      attempts: [{ ...hop }] }, eventId)
+    void this.flush()
+  }
+  async flush(): Promise<void> {
+    if (this.flushing) return
+    this.flushing = true
+    try {
+      const token = await this.getToken()
+      for (const event of this.outbox.entries().slice(0,100)) {
+        const response = await runtimeBest(this.serverUrl, '/llm-calls', token, event.payload) as { acknowledgedEventIds?: string[] } | null
+        if (!response?.acknowledgedEventIds?.includes(event.payload.producerEventId)) return
+        this.outbox.ack(event.id)
+      }
+    } catch (error) { console.warn('[hop-reporter] telemetry incomplete; durable events retained', error instanceof Error ? error.message : String(error)) }
+    finally { this.flushing = false }
+  }
+  stop(): void { clearInterval(this.timer); void this.flush() }
 }
-
 /** CUMORA_ENGINE_MODEL value meaning "impose no model at all — use whatever
  *  the local CLI is already configured for". */
 const ENGINE_MODEL_LOCAL = 'local'
@@ -1860,7 +1825,7 @@ export class AgentRunner {
 
   private get reporter(): HopReporter {
     if (!this.hopReporter) {
-      this.hopReporter = new HopReporter(this.cfg.serverUrl, async () => this.ensureToken())
+      this.hopReporter = new HopReporter(this.cfg.serverUrl, async () => this.ensureToken(), join(CONFIG_DIR, '.usage-outbox', createHash('sha256').update(this.cfg.serverUrl).digest('hex').slice(0,16), this.agent.id))
     }
     return this.hopReporter
   }
@@ -1880,7 +1845,7 @@ export class AgentRunner {
    *  without having to pull the prompt body back. */
   private onEngineHop(report: EngineHopReport, purpose: PendingHop['purpose']): void {
     try {
-      const extras: Record<string, unknown> = { route: `byoa:${this.adapter.id}` }
+      const extras: Record<string, unknown> = { route: `byoa:${this.adapter.id}`, profileRef:this.provider?.id ?? null, engineSessionId: this.sessionId, requestedModel: this.engineModel(), actualModel: report.actualModelState === 'reported' ? report.model : null, observationGranularity: this.adapter.id === 'claude' ? 'provider_request' : 'engine_turn' }
       if (typeof report.hopIndex === 'number') extras.hopIndex = report.hopIndex
       if (typeof report.toolUses === 'number') extras.toolUses = report.toolUses
       if (typeof report.textChars === 'number') extras.textChars = report.textChars
@@ -1889,10 +1854,10 @@ export class AgentRunner {
         purpose,
         runId: this.currentRunId,
         conversationId: this.lastWakeConvo,
-        model: report.model || this.engineModel() || this.adapter.id,
+        model: this.engineModel() || report.model || this.adapter.id,
         usage: this.hopUsageOf(report.usage),
         latencyMs: report.latencyMs ?? 0,
-        status: 'ok',
+        status: report.status ?? 'ok',
         extras: Object.keys(extras).length ? extras : undefined,
       })
     } catch (err) {

@@ -30,7 +30,8 @@ import { resolveDirectLlmEnv } from './env.js'
 export { resolveRoleCall } from './llm-resolver.js'
 import { resolveRoleCall, type RoleCallPlan, type RoleCallCandidate } from './llm-resolver.js'
 import { executeLlmPlan } from './llm-execution.js'
-import { recordLlmCall, type LlmCallContext } from './agents/llm-ledger.js'
+import { tracedFetch } from './models/trace.js'
+import type { LlmCallContext } from './agents/llm-ledger.js'
 import { fetchImageBytes } from './agents/image-fetcher.js'
 import { measuredUsage } from './agents/cost.js'
 import { createChatResponsesShim } from './novita.js'
@@ -73,7 +74,8 @@ function capTtlMap<K, V>(map: Map<K, V>, max: number, expired: (value: V) => boo
  *  Timeout is 5 min — model responses (especially with reasoning) can
  *  legitimately take a couple minutes; the SDK aborts and retries within
  *  this budget. */
-const SDK_MAX_RETRIES = 1
+// One HTTP send is one ledger attempt; application retries own their own IDs.
+const SDK_MAX_RETRIES = 0
 const SDK_TIMEOUT_MS = 5 * 60_000
 
 /** Test-only override. When set, every {@link getLlmClient} call returns
@@ -116,7 +118,7 @@ export async function getLlmCandidateClient(plan: RoleCallPlan, candidate: RoleC
     }
     let client = cached.clients.get(candidate.route.platform)
     if (!client) {
-      client = new OpenAI({ apiKey, baseURL: context.baseURL, maxRetries: SDK_MAX_RETRIES, timeout: SDK_TIMEOUT_MS })
+      client = new OpenAI({ fetch: tracedFetch, apiKey, baseURL: context.baseURL, maxRetries: SDK_MAX_RETRIES, timeout: SDK_TIMEOUT_MS })
       cached.clients.set(candidate.route.platform, client)
     }
     return client
@@ -128,7 +130,7 @@ export async function getLlmCandidateClient(plan: RoleCallPlan, candidate: RoleC
   const cached = directCandidateClients.get(cacheKey)
   if (cached?.apiKey === direct.apiKey && cached.baseURL === direct.baseURL
     && Date.now() - cached.mintedAt < CANDIDATE_CLIENT_TTL_MS) return cached.client
-  let client = new OpenAI({ apiKey: direct.apiKey, baseURL: direct.baseURL, maxRetries: SDK_MAX_RETRIES, timeout: SDK_TIMEOUT_MS })
+  let client = new OpenAI({ fetch: tracedFetch, apiKey: direct.apiKey, baseURL: direct.baseURL, maxRetries: SDK_MAX_RETRIES, timeout: SDK_TIMEOUT_MS })
   if (candidate.route.env === 'novita' || candidate.route.env === 'orcarouter') {
     const baseClient = client
     const responses = candidate.protocol === 'chat' ? createChatResponsesShim(baseClient, candidate.requestModel) : {
@@ -181,7 +183,7 @@ async function routePlatformForModel(
 function buildSub2apiClient(baseURL: string, keys: ApiKeyMap, tenant: string): OpenAI {
   const available = keyedPlatforms(keys)
   const fallback: Platform = available.includes('openai') ? 'openai' : available[0] ?? 'openai'
-  const mk = (p: Platform) => new OpenAI({
+  const mk = (p: Platform) => new OpenAI({ fetch: tracedFetch,
     apiKey: keys[p]!,
     baseURL,
     maxRetries: SDK_MAX_RETRIES,
@@ -268,7 +270,7 @@ let _legacy: OpenAI | null = null
 function directTextClient(): OpenAI {
   const direct = resolveDirectLlmEnv('text')
   if (!direct.configured) throw new Error('Direct text LLM is not configured')
-  if (!_legacy) _legacy = new OpenAI({
+  if (!_legacy) _legacy = new OpenAI({ fetch: tracedFetch,
     apiKey: direct.apiKey,
     baseURL: direct.baseURL,
     maxRetries: SDK_MAX_RETRIES,
@@ -453,7 +455,7 @@ export async function executeImage<T>(context: LlmCallContext,
   let generationCompleted = false
   try {
     return await executeLlmPlan({ plan, context: { ...context, role: 'image' }, signal, sdkMaxRetries: 0,
-    record: record => recordLlmCall({ ...record, extras: { ...record.extras,
+    decorateRecord: record => ({ ...record, extras: { ...record.extras,
       n: args.n ?? 1, size: args.size,
       imageStage: stage, failureStage: record.status === 'ok' ? null : stage,
       taskId: taskId ?? null, generationCompleted } }),

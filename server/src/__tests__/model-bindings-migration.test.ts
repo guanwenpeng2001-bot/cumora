@@ -8,7 +8,7 @@ import { buildModelImport, persistModelImport } from '../models/import.js'
 import { modelHubFixture } from './model-hub-fixture.js'
 
 test('migration 19 is append-only, registered and checksummed', () => {
-  assert.equal(MAX_SUPPORTED_SCHEMA_VERSION, 19)
+  assert.ok(MAX_SUPPORTED_SCHEMA_VERSION >= 19)
   assert.equal(SCHEMA_MIGRATIONS[18].checksum, modelHubChecksum())
   assert.equal(SCHEMA_MIGRATIONS[17].checksum, '37f7dc9cf2989d0b54218aa8ea6f30d5e47387a5e33ace1447c2ab3950c9bdb4')
   assert.doesNotMatch(MODEL_HUB_SQL, /ALTER TABLE|llm_calls|rollup|tier_policies|quota_windows/)

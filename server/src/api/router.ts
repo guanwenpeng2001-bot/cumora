@@ -27,7 +27,7 @@ import { transcribeAudio, AudioInputError, ImageGenerationError } from '../llm.j
 import { LLM_ROLES, type LlmRole, getServerSettingsSnapshot, writeServerSettings, validateServerSettings, InvalidServerSettingError } from '../settings.js'
 import { availableModels, invalidateModelCatalog } from '../models-catalog.js'
 import { TenantLlmAccessError, resolveTenantLlmContext } from '../tenant-llm-context.js'
-import { UsageInputError, parseUsagePagination, usageMetadata, parseUsageRange, usageSummary, usageTrend, usageByAgent, usageByModel, usageByProvider, usageLogs } from '../usage.js'
+import { UsageInputError, parseUsagePagination, usageMetadata, parseUsageRange, usageSummary, usageTrend, usageByAgent, usageByModel, usageByProvider, usageBySource, usageLogs } from '../usage.js'
 import { modelPricingTable, upsertModelPricing, validateModelPricing } from '../model-pricing.js'
 import {
   ResourceError, listSkills, createSkillFromPaste, deleteSkill, installFromHub, searchHub,
@@ -879,6 +879,12 @@ api.get('/usage/by-provider', safeUsage(async (req, res) => {
   res.json({ items: await usageByProvider(companyId, range), metadata: await usageMetadata(companyId, range) })
 }))
 
+api.get('/usage/by-source', safeUsage(async (req, res) => {
+  const { companyId } = await requireCompany(req)
+  const range = parseUsageRange(req.query)
+  res.json({ items: await usageBySource(companyId, range), metadata: await usageMetadata(companyId, range) })
+}))
+
 api.get('/usage/logs', safeUsage(async (req, res) => {
   const { companyId } = await requireCompany(req)
   const q = req.query ?? {}
@@ -1053,13 +1059,24 @@ api.put('/agents/:id/mcp-connectors', resourceSafe(async (req, res) => {
   res.json({ ok: true })
 }))
 
+api.put('/admin/models/:offeringId/prices', safe(async (req,res) => {
+  await requireSiteAdmin(req)
+  const {validatePricePublication,publishPriceVersion}=await import('../models/pricing.js')
+  let value
+  try { value=validatePricePublication(req.body) } catch(error) {throw new HttpError(400,error instanceof Error ? error.message : 'invalid price')}
+  try {res.json({priceVersionId:await publishPriceVersion(String(req.params.offeringId),value)})}
+  catch(error) {throw new HttpError(409,error instanceof Error && /overlapping|not found/.test(error.message) ? error.message : 'price publication conflict')}
+}))
+
 api.put('/usage/pricing', safe(async (req, res) => {
   await requireSiteAdmin(req)
   let row
   try { row = validateModelPricing(req.body ?? {}) }
   catch (error) { throw new HttpError(400, error instanceof Error ? error.message : 'invalid pricing') }
+  const offerings=await pool.query('SELECT id FROM model_offerings WHERE request_model=$1 LIMIT 2',[row.model])
+  if(offerings.rows.length>1) throw new HttpError(400,'Ambiguous model: publish a price version with an explicit offeringId at /admin/models/:offeringId/prices')
   await upsertModelPricing(row)
-  res.json({ ok: true })
+  res.json({ ok: true, scope:'legacy_compatibility', ...(offerings.rows[0] ? {offeringId:offerings.rows[0].id,versionedPrices:'/api/admin/models/:offeringId/prices'} : {}) })
 }))
 
 // Liveness: "is this process alive?" — MUST NOT touch the DB. A slow or

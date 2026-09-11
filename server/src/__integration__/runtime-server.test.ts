@@ -1248,6 +1248,7 @@ test('[integration] runtime: /llm-calls atomically records multiple caller-owned
     body: {
       source: 'byoa-codex',
       daemonVersion: '9.9.9-test',
+      schemaVersion: 1,
       hops: [
         {
           runId,
@@ -1324,4 +1325,29 @@ test('[integration] runtime: /llm-calls atomically records multiple caller-owned
       measured: true, latency_ms: 9, status: 'rate_limited', error: null, extras: { hop: 3 }, daemon_version: '9.9.9-test',
     },
   ])
+})
+
+test('[integration] runtime v2 ACK, replay deduplication and authenticated BYOA source', async () => {
+  const agent=await seedAgent(), assigned=await mintAssignedAgentRuntimeToken(agent)
+  const run=await call('/runtime/runs',{token:assigned.token,body:{trigger:{kind:'usage-v2'},inboxCount:0}})
+  assert.equal(run.status,200)
+  const body={schemaVersion:2,producerEventId:randomUUID(),engineSessionId:'session-v2',engine:'codex',profileRef:null,occurredAt:new Date().toISOString(),
+    source:'env',computerId:'forged',attempts:[{purpose:'agent-turn',runId:run.body.runId,model:'selected-model',status:'ok',latencyMs:1,
+      usage:{inputTokens:10,cachedInputTokens:0,cacheCreationTokens:0,outputTokens:2},
+      extras:{actualModel:'reported-model',observationGranularity:'engine_turn',upstreamCostUsd:'999',providerId:'forged'}}]}
+  const first=await call('/runtime/llm-calls',{token:assigned.token,body})
+  assert.equal(first.status,200);assert.deepEqual(first.body.acknowledgedEventIds,[body.producerEventId])
+  const replay=await call('/runtime/llm-calls',{token:assigned.token,body})
+  assert.equal(replay.status,200)
+  const rows=(await pool.query('SELECT * FROM llm_calls WHERE event_id=$1',[body.producerEventId])).rows
+  assert.equal(rows.length,1);assert.equal(rows[0].source_kind,'byoa');assert.equal(rows[0].computer_id,assigned.computerId)
+  assert.equal(rows[0].engine,'codex');assert.equal(rows[0].provider_id,null);assert.equal(rows[0].upstream_cost_usd,null)
+  assert.equal(rows[0].usage_provenance,'daemon_reported');assert.equal(rows[0].actual_model,'reported-model')
+  const mixed=await call('/runtime/llm-calls',{token:assigned.token,body:{...body,producerEventId:randomUUID(),attempts:[{...body.attempts[0],extras:{observationGranularity:'provider_request'}}]}})
+  assert.equal(mixed.status,409);assert.equal(mixed.body.rejected[0].reason,'mixed_granularity')
+  const rebound=await call('/runtime/llm-calls',{token:assigned.token,body:{...body,producerEventId:randomUUID(),engine:'claude'}})
+  assert.equal(rebound.status,409);assert.equal(rebound.body.rejected[0].reason,'producer_binding_changed')
+  const other=await seedAgent()
+  const rejected=await call('/runtime/llm-calls',{token:other.token,body})
+  assert.equal(rejected.status,404)
 })

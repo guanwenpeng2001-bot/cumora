@@ -34,6 +34,13 @@ const compiled = new Map<string, string>()
 let modules = new Map<string, any>()
 let imageDownloads: { url: string; options: ImageFetchOptions }[] = []
 function load(relative: string): any {
+  // Execution tests replace durable storage with the existing captured SQL recorder.
+  // The real start/final/replay transactions are exercised in ledger-v2 integration tests.
+  if (relative === 'models/ledger.ts') return { recordRejectedDecision: async () => {},
+    startAttempt: async (record: any) => ({ attempt_id: record.extras.attemptId }),
+    finishAttempt: async (_identity: any, record: any) => load('agents/llm-ledger.ts').recordLlmCall(record),
+  }
+  if (relative === 'models/trace.ts') return { withCallTrace: async (_trace: any, send: any) => send(), tracedFetch: undefined }
   if (relative === 'redis.ts') return { redis: {} }
   if (relative === 'agents/runtime/inproc-client.ts') return { inprocClient: { peekWorklog: async () => [], humanRecentlyActive: async () => false } }
   if (relative === 'agents/observability.ts') return { recordTriage: async () => {} }
@@ -160,7 +167,8 @@ test('prepare failures are recorded and advance without sending the failed candi
   }}), 'ok')
   assert.deepEqual(sent, ['c'])
   assert.equal(inserts.length, 3)
-  assert.deepEqual(inserts.map(row => extras(row).attempt), [1, 2, 3])
+  assert.deepEqual(inserts.map(row => extras(row).attempt), [0, 0, 3])
+  assert.equal(extras(inserts[0]).recordKind, 'decision')
   assert.equal(extras(inserts[0]).failureStage, 'prepare')
   assert.equal(extras(inserts[0]).failureReason, 'prepare-failed')
 })
@@ -867,13 +875,12 @@ for (const status of [500, 502, 503, 504, 599]) test('5xx is failed even with qu
   assert.equal(classify(Object.assign(new Error('rate limit quota overload timeout'), { status })), 'failed')
   assert.equal(classify(httpError(429)), 'rate_limited')
 })
-test('a pending recorder never delays success or fallback; rejection is handled', async () => {
+test('settlement is awaited before fallback and recorder errors cannot silently disappear', async () => {
   const records: any[] = []
-  const record = async (row: any) => { records.push(row); if (row.status === 'ok') throw new Error('recorder unavailable'); await new Promise(() => {}) }
-  assert.equal(await execute(c => { if (c.model === 'a') throw httpError(503); return 'ok' }, {record}), 'ok')
-  assert.deepEqual(sent, ['a', 'b'])
-  assert.equal(records.length, 2)
-  await new Promise(resolve => setImmediate(resolve))
+  const record = async (row: any) => { records.push(row); throw new Error('durable recorder unavailable') }
+  await assert.rejects(execute(c => { if (c.model === 'a') throw httpError(503); return 'ok' }, {record}), /durable recorder unavailable/)
+  assert.deepEqual(sent, ['a'])
+  assert.equal(records.length, 1)
 })
 test('pgvector transient failure retries and then caches the successful probe', async () => {
   let probes = 0

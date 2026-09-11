@@ -32,6 +32,7 @@ import { startDbGcWorker } from './db-gc.js'
 import { startCalendarScheduler } from './calendar.js'
 import { startPollExpirationSweeper } from './polls.js'
 import { startLlmRollupRefresher } from './agents/llm-rollup.js'
+import { startSettlementWorker } from './models/ledger.js'
 import { startTrialSweepWorker } from './trial-sweep.js'
 import { startSub2apiSyncWorker } from './sub2api-sync.js'
 import { seedAdmins } from './admin.js'
@@ -316,6 +317,7 @@ async function main() {
   // tick backfills; steady-state upserts the recent few hours. Advisory-locked
   // so one replica refreshes. LLM_ROLLUP_INTERVAL_MS=0 disables.
   startLlmRollupRefresher()
+  startSettlementWorker()
 
   // Product shipping loop maintenance — promotes missed production
   // readbacks to visible overdue friction and mines repeated agent completion

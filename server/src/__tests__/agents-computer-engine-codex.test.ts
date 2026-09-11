@@ -280,7 +280,8 @@ test('codex exec takes actualModel from CLI output when present', async () => {
 
   assert.equal(res.model, 'gpt-5.4', 'the pin is not actualModel')
   assert.equal(hops[0].model, 'gpt-5.4')
-  assert.equal(assembleHop(hops[0]).model, 'gpt-5.4')
+  assert.equal(assembleHop(hops[0]).model, 'gpt-5.5', 'request selection is retained independently')
+  assert.equal(assembleHop(hops[0]).extras?.actualModel, 'gpt-5.4')
 })
 
 test('a zero-usage Codex exec failure does not invent a hop', async () => {
@@ -377,5 +378,6 @@ test('a Codex app-server turn uses the CLI-reported model as actualModel', { ski
   assert.equal(result.exitCode, 0, result.error)
   assert.equal(result.model, 'gpt-5.4')
   assert.equal(hops[0].model, 'gpt-5.4')
-  assert.equal(assembleHop(hops[0]).model, 'gpt-5.4')
+  assert.equal(assembleHop(hops[0]).model, 'gpt-5.5', 'request selection is retained independently')
+  assert.equal(assembleHop(hops[0]).extras?.actualModel, 'gpt-5.4')
 })

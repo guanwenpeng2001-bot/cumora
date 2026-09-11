@@ -1,41 +1,7 @@
-/**
- * Universal sub2api / cloud-LLM call ledger.
- *
- * Why this exists:
- *   Before this module, only the main agent turn (`agent_runs`) and the inbox
- *   triage gate (`agent_triages`) were observable per-call. Every other sub2api
- *   spend — auto-compaction, completion-verify, steer-summary, convene
- *   speech/decision, palette, gender inference, avatar image-gen — was rolled
- *   into "part of the turn total" or wasn't recorded at all. That made it
- *   impossible to answer the question the operator actually needs:
- *
- *     "Which business purpose burned the most gpt-5.4-mini last month?"
- *
- * Design contract:
- *   1. One row in `llm_calls` per OUTBOUND model call. Every cloud LLM spend
- *      is attributable to a single `purpose` + tenant + agent + (optional) run.
- *   2. Recording is FIRE-AND-FORGET; a DB hiccup MUST NEVER fail the LLM call
- *      itself. Every error path here is caught and logged, never re-thrown.
- *   3. The PRIMARY entry point is `getTrackedLlmClient(ctx)` — it returns the
- *      same shape as `getLlmClient()` but auto-records every
- *      `responses.create`, `chat.completions.create`, and `images.generate`
- *      against the bound context. Forgetting it for a NEW callsite is caught
- *      at CI by `scripts/guard-llm-tracked.mjs`.
- *   4. Streaming calls (only the main agent turn today) can't surface final
- *      usage on the create() return — usage arrives on the stream as
- *      `response.completed.usage`. Those callsites stay on `getLlmClient()`
- *      directly AND manually call `recordLlmCall()` per hop from inside their
- *      stream consumer, where final usage is known. Same ledger row shape,
- *      different timing. The CI guard's allowlist documents these exceptions.
- *
- * What this is NOT for:
- *   - BYOA-local LLM calls (the operator's paired engine CLI). Those
- *     are billed against the operator's own subscription, not Cumora's sub2api,
- *     and are already accounted for in `agent_triages` (BYOA triage rows) +
- *     `agent_runs` (BYOA turn rows) with `source='byoa-*'`. Putting them into
- *     `llm_calls` would muddy the "sub2api spend" rollup that's the whole
- *     point. If we later want a unified ledger across cloud + BYOA, that's a
- *     separate, additive widening.
+/** Unified call ledger compatibility projection.
+ * New server attempts use models/ledger: started transaction → HTTP → durable final event.
+ * v1 BYOA reports remain accepted for one release, explicitly marked legacy_unknown.
+ * Gateway internal retries are child evidence, never additional consumption rows.
  */
 
 import { randomUUID } from 'node:crypto'
@@ -125,7 +91,7 @@ const LLM_CALL_COLUMNS = `
   input_tokens, cached_input_tokens, cache_creation_tokens,
   output_tokens, reasoning_tokens,
   cost_usd, cost_estimated, measured,
-  latency_ms, status, error, extras, daemon_version
+  latency_ms, status, error, extras, daemon_version, usage_provenance, usage_state, source_kind, requested_model, request_model, actual_model, actual_model_state
 `
 
 function llmCallValues(rec: LlmCallRecord): unknown[] {
@@ -160,13 +126,18 @@ function llmCallValues(rec: LlmCallRecord): unknown[] {
     rec.error ? rec.error.slice(0, 500) : null,
     JSON.stringify({ ...rec.extras, pricing: price, units: validUnits ? units : null, unpriced: reason || undefined, usage: validUsage ? rec.usage : null, measurement: measured ? 'measured' : 'unknown' }),
     rec.daemonVersion ?? null,
+    'legacy_unknown', validUsage ? 'reported' : 'unknown',
+    rec.source?.startsWith('byoa-') ? 'byoa' : rec.extras?.routeKind === 'gateway' ? 'sub2api' : rec.extras?.routeKind === 'direct' ? 'env' : null,
+    rec.extras?.requestedModel ?? rec.model, rec.extras?.requestModel ?? rec.model,
+    typeof rec.extras?.actualModel === 'string' ? rec.extras.actualModel : null,
+    typeof rec.extras?.actualModel === 'string' ? 'reported' : 'not_reported',
   ]
 }
 
 async function insertLlmCall(rec: LlmCallRecord): Promise<void> {
   await pool.query(
     `INSERT INTO llm_calls (${LLM_CALL_COLUMNS})
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20::jsonb,$21)`,
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20::jsonb,$21,$22,$23,$24,$25,$26,$27,$28)`,
     llmCallValues(rec),
   )
 }
@@ -199,8 +170,8 @@ export async function recordLlmCallsBatch(
   if (records.length === 0) return
   const values = records.flatMap(llmCallValues)
   const rows = records.map((_, rowIndex) => {
-    const offset = rowIndex * 21
-    return `(${Array.from({ length: 21 }, (_value, columnIndex) => {
+    const offset = rowIndex * 28
+    return `(${Array.from({ length: 28 }, (_value, columnIndex) => {
       const placeholder = `$${offset + columnIndex + 1}`
       return columnIndex === 19 ? `${placeholder}::jsonb` : placeholder
     }).join(',')})`

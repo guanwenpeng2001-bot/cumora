@@ -38,6 +38,7 @@ import {
   withRuntimeConversationAuthorization,
   withRuntimeMessageReadAuthorization,
 } from './authorization.js'
+import { validateUsageEvent, ingestUsageEvent, UsageEventRejection } from './llm-events.js'
 import { normalizeByoaSource } from './byoa-source.js'
 import { buildRuntimeArgv } from './cli-argv.js'
 import type { RuntimeTokenUsage, RuntimeTriageReport } from './client.js'
@@ -637,6 +638,20 @@ runtimeRouter.post('/triage', withAgent(async (c, req, res) => {
 // The server commits the bounded batch atomically; the daemon still treats an
 // HTTP/DB failure as best-effort so observability can never break the wake.
 async function recordRuntimeLlmCalls(c: AuthorizedAgentRuntimeClaims, req: Request, res: Response): Promise<void> {
+  if (req.body?.schemaVersion !== undefined && req.body.schemaVersion !== 1) {
+    if (!validateUsageEvent(req.body)) { res.status(400).json({ error: 'invalid v2 usage event' }); return }
+    const event = req.body
+    const gate = await withRuntimeAgentRunAuthorization({ agentId: c.sub, companyId: c.companyId,
+      runIds: event.attempts.flatMap(h => h.runId ? [h.runId] : []),
+      task: client => ingestUsageEvent(event, c, client) }).catch(error=>{
+        if(!(error instanceof UsageEventRejection)) throw error
+        res.status(409).json({schemaVersion:2,rejected:[{producerEventId:event.producerEventId,reason:error.reason}]})
+        return null
+      })
+    if(!gate) return
+    if (!gate.authorized) { res.status(404).json({ error: 'agent run not found' }); return }
+    res.json({ ok: true, schemaVersion: 2, acknowledgedEventIds: [event.producerEventId] }); return
+  }
   const body = req.body as {
     source?: string
     /** agent-cli (npm cumora) version of the daemon emitting this batch. One

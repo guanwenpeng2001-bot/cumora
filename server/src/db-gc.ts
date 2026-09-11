@@ -67,7 +67,8 @@ export function targets(): SweepTarget[] {
     { table: 'agent_log',    pkCol: 'id',         timeCol: 'created_at', days: automationNumber('db_gc_agent_log_days') },
     { table: 'agent_events', pkCol: 'id',         timeCol: 'created_at', days: automationNumber('db_gc_agent_events_days') },
     { table: 'agent_runs',   pkCol: 'id',         timeCol: 'started_at', days: automationNumber('db_gc_agent_runs_days') },
-    { table: 'llm_calls',    pkCol: 'id',         timeCol: 'created_at', days: automationNumber('db_gc_llm_calls_days') },
+    // Settlement facts are retained until an accounting retention policy is published (P3).
+    // The 90-day observability window must never delete pending or billable attempts.
   ]
 }
 

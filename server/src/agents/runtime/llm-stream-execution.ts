@@ -40,6 +40,7 @@ export async function executeRuntimeStream(body: RuntimeStreamRequest, context: 
       'contextWindow', 'contextWindowSource', 'status', 'failureStage', 'httpStatus', 'failureReason',
       'nextCandidate', 'nextCandidateReason', 'stopReason', 'usage', 'rawUsage', 'measurement',
       'sdkMaxRetries', 'sdkRetryPolicy', 'sdkRetriesIndividuallyObservable',
+      'pendingSettlement',
     ].filter(key => key in extras).map(key => [key, extras[key]]))
     await emit('attempt', { ...context, model: record.model, status: record.status, usage: record.usage,
       reasoningTokens: record.reasoningTokens, latencyMs: record.latencyMs, error: null,

@@ -106,6 +106,8 @@ function fixture(bootstrap?: Managed.ManagedPodSettings, extraEnv: Record<string
           return { ...next, source: 'db', policy: { ...next.policy, source: 'db' } }
         } }
 
+        if (dep.endsWith('/models/ledger.js')) return { recordRejectedDecision: async () => {}, startAttempt: async () => ({}), finishAttempt: async (_identity: unknown,rec: unknown) => ((dependencies['./agents/llm-ledger.js'] ?? load('agents/llm-ledger')) as any).recordLlmCall(rec) }
+        if (dep.endsWith('/models/trace.js')) return { withCallTrace: async (_trace: unknown,send: () => Promise<unknown>) => send(),tracedFetch: undefined }
         if (dep === 'dotenv/config') return {}
         if (dep === 'node:crypto') return { randomBytes, randomUUID }
         const target = posix.normalize(posix.join(posix.dirname(name), dep)).replace(/\.js$/, '')

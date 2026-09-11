@@ -20,8 +20,8 @@ async function summarySql() {
 
 test('usage raw ledger has independently pushable half-open time bounds', async () => {
   const sql = await summarySql()
-  assert.match(sql, /l\.created_at >= \$2::timestamptz AND l\.created_at < \$3::timestamptz/)
-  assert.match(sql, /l\.created_at >= o\.from_at AND l\.created_at < o\.to_at/)
+  assert.match(sql, /l\.occurred_at >= \$2::timestamptz AND l\.occurred_at < \$3::timestamptz/)
+  assert.match(sql, /l\.occurred_at >= o\.from_at AND l\.occurred_at < o\.to_at/)
   assert.doesNotMatch(sql, /enable_material/)
 })
 

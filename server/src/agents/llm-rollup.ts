@@ -26,6 +26,7 @@
 import { pool } from '../db/pool.js'
 import type { PoolClient } from 'pg'
 import { automationNumber, createOperationsWorker } from '../settings.js'
+import { refreshLlmRollupV3 } from '../models/rollup.js'
 
 // Distinct from migrate's SCHEMA_LOCK_KEY (7_643_178_926_104n).
 const ROLLUP_LOCK_KEY = 7_643_178_926_211n
@@ -64,9 +65,9 @@ export async function refreshLlmRollup(sinceHours: number, connection?: PoolClie
        cost_usd, cost_estimated)
      SELECT date_trunc('hour', created_at, 'UTC'), company_id, agent_id, purpose, model, source, daemon_version,
             COUNT(*),
-            COUNT(*) FILTER (WHERE status = 'ok'),
-            COUNT(*) FILTER (WHERE status != 'ok'),
-            COUNT(*) FILTER (WHERE status = 'rate_limited'),
+            COUNT(*) FILTER (WHERE status IN ('ok','succeeded')),
+            COUNT(*) FILTER (WHERE status NOT IN ('ok','succeeded')),
+            COUNT(*) FILTER (WHERE status = 'rate_limited' OR http_status = 429),
             COALESCE(SUM(input_tokens), 0),
             COALESCE(SUM(cached_input_tokens), 0),
             COALESCE(SUM(cache_creation_tokens), 0),
@@ -75,7 +76,7 @@ export async function refreshLlmRollup(sinceHours: number, connection?: PoolClie
             COALESCE(SUM(cost_usd), 0),
             BOOL_OR(cost_estimated)
        FROM llm_calls
-      WHERE created_at >= $1::timestamptz AND created_at < $2::timestamptz
+      WHERE created_at >= $1::timestamptz AND created_at < $2::timestamptz AND record_kind='attempt'
       GROUP BY 1, 2, 3, 4, 5, 6, 7
      ON CONFLICT (bucket_hour, company_id, agent_id, purpose, model, source, daemon_version)
      DO UPDATE SET
@@ -100,9 +101,9 @@ export async function refreshLlmRollup(sinceHours: number, connection?: PoolClie
             COUNT(*) FILTER (WHERE measured IS NOT TRUE),
             COUNT(*) FILTER (WHERE COALESCE(extras->>'unpriced', '') NOT IN ('', 'false')),
             COUNT(*),
-            COUNT(*) FILTER (WHERE status = 'ok'),
-            COUNT(*) FILTER (WHERE status != 'ok'),
-            COUNT(*) FILTER (WHERE status = 'rate_limited'),
+            COUNT(*) FILTER (WHERE status IN ('ok','succeeded')),
+            COUNT(*) FILTER (WHERE status NOT IN ('ok','succeeded')),
+            COUNT(*) FILTER (WHERE status = 'rate_limited' OR http_status = 429),
             COALESCE(SUM(input_tokens), 0),
             COALESCE(SUM(cached_input_tokens), 0),
             COALESCE(SUM(cache_creation_tokens), 0),
@@ -111,7 +112,7 @@ export async function refreshLlmRollup(sinceHours: number, connection?: PoolClie
             COALESCE(SUM(cost_usd), 0),
             BOOL_OR(cost_estimated)
        FROM llm_calls
-      WHERE created_at >= $1::timestamptz AND created_at < $2::timestamptz
+      WHERE created_at >= $1::timestamptz AND created_at < $2::timestamptz AND record_kind='attempt'
       GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9
      ON CONFLICT (bucket_hour, company_id, agent_id, purpose, model, source, daemon_version, route, platform)
      DO UPDATE SET
@@ -188,6 +189,7 @@ export async function runLlmRollupTick(): Promise<{ skipped?: boolean; buckets?:
         ? MAX_BACKFILL_HOURS
         : Math.min(MAX_BACKFILL_HOURS, Math.max(STEADY_WINDOW_HOURS, gap + 1))
       const buckets = await refreshLlmRollup(sinceHours, client)
+      await refreshLlmRollupV3(client)
       return { buckets, sinceHours }
     } catch (error) {
       await client.query("UPDATE llm_rollup_state SET status = 'failed', attempted_at = NOW() WHERE id").catch(() => {})

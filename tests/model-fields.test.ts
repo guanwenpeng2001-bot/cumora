@@ -408,17 +408,17 @@ test('usage requests summary, trend, logs and only the selected breakdown on ini
     ts.forEachChild(node, visit)
   }
   visit(ast)
-  assert.equal(queries.length, 6)
+  assert.equal(queries.length, 7)
   const js = ts.transpileModule(queries.join('\n'), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText
-  for (const dim of ['agent', 'model', 'provider', 'agent']) {
+  for (const dim of ['agent', 'model', 'provider', 'source', 'agent']) {
     for (const refresh of [0, 1]) {
       const calls: string[] = []
       const pending: Promise<unknown>[] = []
-      const api = Object.fromEntries(['Summary', 'Trend', 'Logs', 'ByAgent', 'ByModel', 'ByProvider'].map(name => [
+      const api = Object.fromEntries(['Summary', 'Trend', 'Logs', 'ByAgent', 'ByModel', 'ByProvider', 'BySource'].map(name => [
         `getUsage${name}`, async () => { calls.push(name) },
       ]))
       vm.runInNewContext(js, {
-        api, dim, refresh, from: 'from', to: 'to', granularity: 'hour', page: 1, range: {}, enabled: true, epoch: 1,
+        api, dim, refresh, filters: {}, from: 'from', to: 'to', granularity: 'hour', page: 1, range: {}, enabled: true, epoch: 1,
         useCallback: (callback: unknown) => callback,
         useUsageQuery: (request: (signal: AbortSignal) => Promise<unknown>, enabled: boolean) => {
           if (enabled) pending.push(request(new AbortController().signal))

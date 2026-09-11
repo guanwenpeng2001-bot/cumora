@@ -1682,7 +1682,7 @@ export async function executeAgentTurnHop(args: {
             }, { signal: requestSignal, idleTimeoutMs, wallTimeoutMs, abortRequest: reason => requestController.abort(reason) })
             signal.throwIfAborted()
             if (!state.completed) throw Object.assign(new Error('Response stream ended before completion'), { code: 'ECONNRESET' })
-            state.actualModel ??= candidate.model
+            // An absent provider model stays null; request identity is recorded separately.
             return { state, input }
           } finally {
             requestController.abort()

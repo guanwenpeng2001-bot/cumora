@@ -841,6 +841,8 @@ export interface EngineWakeProbeResult {
  *  `usage` is the engine's raw usage shape so this module stays standalone
  *  (no pricing import); the daemon maps it to the cost ledger. */
 export interface EngineHopReport {
+  status?: 'ok' | 'failed' | 'timeout' | 'rate_limited'
+  actualModelState?: 'reported' | 'inferred' | 'not_reported'
   /** Model id the engine just hit for this hop (e.g. claude-sonnet-4-6,
    *  gpt-5.5). The model on this hop's own message — NOT the session default,
    *  since native auto-compaction etc. can switch models mid-turn. Null when
@@ -1235,7 +1237,7 @@ function spawnEngine(
               hopStartedAt = null
               hopIndex += 1
               const { toolUses, textChars } = countAssistantContent(obj.message.content)
-              try { onHopUsage({ model: m, usage: obj.message.usage, latencyMs: startedAt != null ? Date.now() - startedAt : undefined, hopIndex, toolUses, textChars }) }
+              try { onHopUsage({ model: m, actualModelState: m ? 'reported' : 'not_reported', usage: obj.message.usage, latencyMs: startedAt != null ? Date.now() - startedAt : undefined, hopIndex, toolUses, textChars }) }
               catch { /* never break the run on a ledger error */ }
             } else if (hopStartedAt == null && (obj.type === 'assistant' || obj.type === 'user' || obj.type === 'system')) {
               hopStartedAt = Date.now()
@@ -1666,7 +1668,7 @@ class ClaudeSession implements EngineSession {
         const { toolUses, textChars } = countAssistantContent(ev.message.content)
         try {
           this.onHopUsage?.({
-            model: evModel,
+            model: evModel, actualModelState: ev.message?.model ? 'reported' : 'not_reported',
             usage: ev.message.usage,
             latencyMs: startedAt != null ? Date.now() - startedAt : undefined,
             hopIndex: this.hopIndex,
@@ -2373,7 +2375,7 @@ class CodexExecTurnTracker {
     this.hopEmitted = true
     try {
       this.onHopUsage({
-        model: this.model,
+        model: this.model, actualModelState: this.model ? 'reported' : 'not_reported', status:this.error ? 'failed' : 'ok',
         usage,
         latencyMs: this.startedAt == null ? undefined : Date.now() - this.startedAt,
         hopIndex: 1,
@@ -2644,7 +2646,7 @@ class CodexSession implements EngineSession {
       if (this.onHopUsage && usage) {
         try {
           this.onHopUsage({
-            model: this.actualModel,
+            model: this.actualModel, actualModelState: this.actualModel ? 'reported' : 'not_reported', status:failed ? 'failed' : 'ok',
             usage,
             latencyMs: this.turnStartedAt != null ? Date.now() - this.turnStartedAt : undefined,
             hopIndex: 1,

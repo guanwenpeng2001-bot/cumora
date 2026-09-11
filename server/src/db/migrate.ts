@@ -64,6 +64,9 @@ import { RUNTIME_CALL_ID_INDEX_SQL, runtimeCallIdIndexChecksum } from './migrati
 import { ENGINE_DEFAULTS_SQL, engineDefaultsChecksum } from './migrations/0015-engine-defaults.js'
 import { TURN_SAFETY_SQL, turnSafetyChecksum } from './migrations/0018-turn-safety.js'
 import { MODEL_HUB_SQL, modelHubChecksum } from './migrations/0019-model-hub.js'
+import { LLM_LEDGER_V2_SQL, LLM_LEDGER_V2_INDEXES, llmLedgerV2Checksum, llmLedgerV2IndexesChecksum } from './migrations/0020-llm-ledger-v2.js'
+import { LEDGER_RECONCILIATION_SQL, ledgerReconciliationChecksum } from './migrations/0022-ledger-reconciliation.js'
+import { ROLLUP_MODEL_EVIDENCE_SQL, rollupModelEvidenceChecksum } from './migrations/0023-rollup-model-evidence.js'
 import { AGENT_MESSAGE_CONSUMPTIONS_SQL, agentMessageConsumptionsChecksum } from './migrations/0017-agent-message-consumptions.js'
 import { AGENT_PROVIDER_PROFILE_SQL, agentProviderProfileChecksum } from './migrations/0016-agent-provider-profile.js'
 
@@ -2711,6 +2714,21 @@ const VERSIONED_MIGRATIONS: readonly VersionedMigration[] = [
     transactional: true,
     up: async (client) => { await client.query(MODEL_HUB_SQL) },
   },
+  { ...SCHEMA_MIGRATIONS[19], sourceChecksum: llmLedgerV2Checksum(), transactional: true,
+    up: async client => { await client.query(LLM_LEDGER_V2_SQL) } },
+  { ...SCHEMA_MIGRATIONS[20], sourceChecksum: llmLedgerV2IndexesChecksum(), transactional: false,
+    up: async client => {
+      for (const sql of LLM_LEDGER_V2_INDEXES) {
+        const name = sql.match(/EXISTS (\w+)/)![1]
+        const result = await client.query('SELECT indisvalid FROM pg_index WHERE indexrelid=to_regclass($1)', [name])
+        if (result.rows[0]?.indisvalid === false) await client.query(`DROP INDEX CONCURRENTLY ${name}`)
+        await client.query(sql)
+      }
+    } },
+  { ...SCHEMA_MIGRATIONS[21], sourceChecksum: ledgerReconciliationChecksum(), transactional: true,
+    up: async client => { await client.query(LEDGER_RECONCILIATION_SQL) } },
+  { ...SCHEMA_MIGRATIONS[22], sourceChecksum: rollupModelEvidenceChecksum(), transactional: true,
+    up: async client => { await client.query(ROLLUP_MODEL_EVIDENCE_SQL) } },
 ]
 
 export async function applyPendingMigration(
@@ -2978,6 +2996,9 @@ const BASELINE_REQUIRED_SCHEMA_INDEXES = [
 
 export const REQUIRED_SCHEMA_INDEXES = [
   ...BASELINE_REQUIRED_SCHEMA_INDEXES,
+  'llm_calls_attempt_v2',
+  'llm_calls_event_v2',
+  'llm_calls_occurred_v2',
   USAGE_LOGS_INDEX_NAME,
   'conversation_members_conversation_ordinal_key',
   'idx_conversation_members_participant',

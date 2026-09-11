@@ -9,6 +9,25 @@ import { readFile, writeFile, mkdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
+import ts from 'typescript'
+
+/** A historical fixture is an array prefix, not a regular-expression slice of
+ * nested function bodies. New migrations may contain their own blocks/arrays. */
+function retainArrayPrefix(source:string,name:string,count:number):string {
+  const file=ts.createSourceFile('fixture.ts',source,ts.ScriptTarget.Latest,true,ts.ScriptKind.TS)
+  let array:ts.ArrayLiteralExpression|undefined
+  const visit=(node:ts.Node) => {
+    if(ts.isVariableDeclaration(node) && node.name.getText(file)===name && node.initializer) {
+      let expression:ts.Expression=node.initializer
+      while(ts.isAsExpression(expression) || ts.isSatisfiesExpression(expression)) expression=expression.expression
+      if(ts.isArrayLiteralExpression(expression)) array=expression
+    }
+    ts.forEachChild(node,visit)
+  }
+  visit(file)
+  assert.ok(array,`missing ${name} fixture array`)
+  return source.slice(0,array.getStart(file))+`[\n${array.elements.slice(0,count).map(e=>e.getText(file)).join(',\n')}\n]`+source.slice(array.end)
+}
 
 const integrationUrl = process.env.INTEGRATION_DATABASE_URL
 test('T32 durable reconciliation and appended migration', { skip: !integrationUrl }, async t => {
@@ -151,21 +170,19 @@ test('T32 durable reconciliation and appended migration', { skip: !integrationUr
       await ensureSchema()
       await ensureSchema()
       // Execute a v11 source snapshot in a separate empty test database.
-      const dir = join(tmpdir(), 'cumora-work', 'impl', dbName)
+      const dir = join(tmpdir(), 'cumora-work', 'audit3', 'wave-b', 'migration-fixtures', dbName)
       await mkdir(dir, { recursive: true })
       const manifestURL = new URL('../db/migrations/manifest.ts', import.meta.url)
       let manifest = await readFile(manifestURL, 'utf8')
-      manifest = manifest.replace(/ {2}\{\s+version: (\d+),[\s\S]*? {2}\},/g,
-        (entry, version: string) => Number(version) > 11 ? '' : entry)
+      manifest = retainArrayPrefix(manifest,'SCHEMA_MIGRATIONS',11)
         .replace(/MIN_SUPPORTED_SCHEMA_VERSION = \d+/, 'MIN_SUPPORTED_SCHEMA_VERSION = 10')
         .replace(/MAX_SUPPORTED_SCHEMA_VERSION = \d+/, 'MAX_SUPPORTED_SCHEMA_VERSION = 11')
       const manifestPath = join(dir, 'manifest.mts')
       await writeFile(manifestPath, manifest)
       const migrateURL = new URL('../db/migrate.ts', import.meta.url)
       let source = await readFile(migrateURL, 'utf8')
-      source = source.replace(/^import \{ SUB2API_SYNC_SQL.*$/m, '')
-        .replace(/ {2}\{\s+\.\.\.SCHEMA_MIGRATIONS\[(\d+)\],[\s\S]*? {2}\},/g,
-          (entry, index: string) => Number(index) >= 11 ? '' : entry)
+      source = retainArrayPrefix(source,'VERSIONED_MIGRATIONS',11)
+        .replace(/^\s+'llm_calls_(?:attempt_v2|event_v2|occurred_v2)',\r?\n/gm,'')
         .replace(/from '([^']+)'/g, (all, spec: string) => {
           if (spec === './migrations/manifest.js') return `from '${pathToFileURL(manifestPath).href}'`
           return spec.startsWith('.') ? `from '${new URL(spec.replace(/\.js$/, '.ts'), migrateURL).href}'` : all

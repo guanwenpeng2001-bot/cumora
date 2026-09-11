@@ -1,3 +1,4 @@
+import type { UsageFilter, SettlementAmounts } from '../../shared/llm-usage-contract'
 import { getActiveCompanyId, getAuthToken, useAuth } from '@/stores/auth'
 import { isApiAbortError } from '@/lib/apiErrors'
 import type { AgentModelConfig } from '@/types'
@@ -354,12 +355,14 @@ export interface ApiUsageMetadata {
   earliestRawAt: string | null
   logsComplete: boolean
   boundaryComplete: boolean
-  aggregationVersion: 2
+  aggregationVersion: 2 | 3
   legacyBefore: string | null
 }
 
 /** Usage dashboard rows (GET /api/usage/*). */
-export interface ApiUsageSummary {
+export interface ApiUsageSummary extends Partial<SettlementAmounts> {
+  logicalCalls?: number
+  pendingSettlement?: number
   requests: number
   inputTokens: number
   outputTokens: number
@@ -378,12 +381,12 @@ export interface ApiUsageSummary {
 }
 export interface ApiUsageTrendPoint {
   bucket: string
-  costUsd: number
+  costUsd: number | null
   inputTokens: number
   outputTokens: number
   cacheReadTokens: number
 }
-export interface ApiUsageAgentRow {
+export interface ApiUsageAgentRow extends Partial<SettlementAmounts> {
   agentId: string
   name: string
   avatarUrl: string | null
@@ -395,7 +398,13 @@ export interface ApiUsageAgentRow {
   costUsd: number
   successRate: number
 }
-export interface ApiUsageModelRow {
+export interface ApiUsageModelRow extends Partial<SettlementAmounts> {
+  actualModel?: string | null
+  requestModel?: string | null
+  actualModelState?: string
+  sourceKind?: string | null
+  sourceId?: string | null
+  offeringId?: string | null
   model: string
   provider: string
   requests: number
@@ -410,14 +419,28 @@ export interface ApiUsageModelRow {
   unpricedRequests?: number
   qualityUnknownRequests?: number
 }
-export interface ApiUsageProviderRow {
+export interface ApiUsageProviderRow extends Partial<SettlementAmounts> {
   provider: string
   requests: number
   inputTokens: number
   outputTokens: number
   costUsd: number
 }
-export interface ApiUsageLogRow {
+export interface ApiUsageLogRow extends Partial<SettlementAmounts> {
+  traceId?: string | null
+  gatewayRequestId?: string | null
+  priceVersionId?: string | null
+  observationGranularity?: string
+  usageProvenance?: string | null
+  sourceKind?: string | null
+  sourceId?: string | null
+  offeringId?: string | null
+  requestModel?: string | null
+  pricingState?: string
+  unpricedReason?: string | null
+  settlementState?: string
+  attempts?: ApiUsageLogRow[]
+
   id: string
   createdAt: string
   agentId: string | null
@@ -1655,16 +1678,18 @@ export const api = {
   getAvailableModels: (refresh = false, signal?: AbortSignal) =>
     http<ApiModelCatalog>(`/models/available${refresh ? '?refresh=1' : ''}`, { signal }),
   /** Usage dashboard. `range` = ISO from/to; `source` filters ledger source. */
-  getUsageSummary: (from: string, to: string, source?: string, signal?: AbortSignal) =>
-    http<ApiUsageSummary>(`/usage/summary?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}${source ? `&source=${encodeURIComponent(source)}` : ''}`, { signal }),
-  getUsageTrend: (from: string, to: string, granularity: 'hour' | 'day', signal?: AbortSignal) =>
-    http<{ granularity: 'hour' | 'day'; points: ApiUsageTrendPoint[]; metadata?: ApiUsageMetadata }>(`/usage/trend?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&granularity=${granularity}`, { signal }),
-  getUsageByAgent: (from: string, to: string, signal?: AbortSignal) =>
-    http<{ items: ApiUsageAgentRow[]; metadata?: ApiUsageMetadata }>(`/usage/by-agent?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`, { signal }),
-  getUsageByModel: (from: string, to: string, signal?: AbortSignal) =>
-    http<{ items: ApiUsageModelRow[]; metadata?: ApiUsageMetadata }>(`/usage/by-model?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`, { signal }),
-  getUsageByProvider: (from: string, to: string, signal?: AbortSignal) =>
-    http<{ items: ApiUsageProviderRow[]; metadata?: ApiUsageMetadata }>(`/usage/by-provider?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`, { signal }),
+  getUsageSummary: (from: string, to: string, source?: string, signal?: AbortSignal, filters?: UsageFilter) =>
+    http<ApiUsageSummary>(`/usage/summary?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}${source ? `&source=${encodeURIComponent(source)}` : ''}${usageFilterQuery(filters)}`, { signal }),
+  getUsageTrend: (from: string, to: string, granularity: 'hour' | 'day', signal?: AbortSignal, filters?: UsageFilter) =>
+    http<{ granularity: 'hour' | 'day'; points: ApiUsageTrendPoint[]; metadata?: ApiUsageMetadata }>(`/usage/trend?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&granularity=${granularity}${usageFilterQuery(filters)}`, { signal }),
+  getUsageByAgent: (from: string, to: string, signal?: AbortSignal, filters?: UsageFilter) =>
+    http<{ items: ApiUsageAgentRow[]; metadata?: ApiUsageMetadata }>(`/usage/by-agent?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}${usageFilterQuery(filters)}`, { signal }),
+  getUsageByModel: (from: string, to: string, signal?: AbortSignal, filters?: UsageFilter) =>
+    http<{ items: ApiUsageModelRow[]; metadata?: ApiUsageMetadata }>(`/usage/by-model?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}${usageFilterQuery(filters)}`, { signal }),
+  getUsageByProvider: (from: string, to: string, signal?: AbortSignal, filters?: UsageFilter) =>
+    http<{ items: ApiUsageProviderRow[]; metadata?: ApiUsageMetadata }>(`/usage/by-provider?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}${usageFilterQuery(filters)}`, { signal }),
+  getUsageBySource: (from: string, to: string, signal?: AbortSignal, filters?: UsageFilter) =>
+    http<{ items: Array<SettlementAmounts & { source: string | null; requests: number; inputTokens: number; outputTokens: number; unpricedRequests: number }> }>(`/usage/by-source?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}${usageFilterQuery(filters)}`, { signal }),
   /** Skills library + per-agent enablement. */
   getSkills: (signal?: AbortSignal) =>
     http<{ items: ApiSkill[]; hubConfigured: boolean; localHubConfigured: boolean }>('/skills', { signal }),
@@ -1697,8 +1722,8 @@ export const api = {
     http<{ items: ApiAgentSkillState[]; sync?: ApiSyncStatus }>(`/agents/${encodeURIComponent(agentId)}/skills`, { signal }),
   setAgentSkills: (agentId: string, skillIds: string[], signal?: AbortSignal) =>
     http<ApiBindingWriteResult>(`/agents/${encodeURIComponent(agentId)}/skills`, { signal, method: 'PUT', body: JSON.stringify({ skillIds }) }),
-  getUsageLogs: (from: string, to: string, page: number, pageSize: number, source?: string, signal?: AbortSignal) =>
-    http<ApiUsageLogPage>(`/usage/logs?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&page=${page}&pageSize=${pageSize}${source ? `&source=${encodeURIComponent(source)}` : ''}`, { signal }),
+  getUsageLogs: (from: string, to: string, page: number, pageSize: number, source?: string, signal?: AbortSignal, filters?: UsageFilter) =>
+    http<ApiUsageLogPage>(`/usage/logs?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&page=${page}&pageSize=${pageSize}${source ? `&source=${encodeURIComponent(source)}` : ''}${usageFilterQuery(filters)}`, { signal }),
   markRead: (conversationId: string, boundary: { messageId: string; sequence: number }) =>
     http<{ ok: boolean }>(`/conversations/${encodeURIComponent(conversationId)}/read`, {
       method: 'POST',
@@ -2154,3 +2179,7 @@ export class WsClient {
 }
 
 export const ws = new WsClient()
+
+function usageFilterQuery(filters?: UsageFilter): string {
+  return Object.entries(filters ?? {}).filter(([,value]) => value).map(([key,value]) => `&${key}=${encodeURIComponent(value)}`).join('')
+}

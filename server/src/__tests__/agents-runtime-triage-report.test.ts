@@ -140,8 +140,8 @@ function serverFixture() {
         }
         assert.match(sql, /^INSERT INTO llm_calls/)
         if (failInsert) throw new Error('fake DB failure')
-        for (let i = 0; i < params.length; i += 21) {
-          const v = params.slice(i, i + 21)
+        for (let i = 0; i < params.length; i += 28) {
+          const v = params.slice(i, i + 28)
           staged.push({ companyId: v[1], agentId: v[2], purpose: v[5], source: v[6], model: v[7], measured: v[15],
             latencyMs: v[16], status: v[17], error: v[18], extras: JSON.parse(v[19]), daemonVersion: v[20] })
         }

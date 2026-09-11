@@ -22,6 +22,7 @@ function fixture(failV2 = false, locked = true, gap: number | null = null, setti
     { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText
   const exports: Record<string, any> = {}
   new Function('exports', 'require', output)(exports, (name: string) => {
+    if (name === '../models/rollup.js') return { refreshLlmRollupV3: async () => 0 }
     if (name.endsWith('/settings.js')) return { automationNumber: (key: string) => settings[key] ?? ({ llm_rollup_interval_ms: 120_000, db_gc_llm_calls_days: 90, llm_rollup_retention_hours: 2280 }[key]), createOperationsWorker: () => ({ start() {}, stop() {} }) }
     assert.equal(name, '../db/pool.js')
     return { pool: { connect: async () => client, query: async () => { throw new Error('must use locked connection') } } }

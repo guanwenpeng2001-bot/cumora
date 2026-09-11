@@ -5,8 +5,10 @@ import { getLlmCandidateClient } from './llm.js'
 import { validateRoleCallAuth } from './tenant-llm-context.js'
 import { fallbackReason, isLlmCancellation } from './agents/fallback.js'
 import { capturePricing, measuredUsage, type TokenUsage } from './agents/cost.js'
-import { recordLlmCall, classifyLlmCallError, type LlmCallContext, type LlmCallRecord } from './agents/llm-ledger.js'
+import { classifyLlmCallError, type LlmCallContext, type LlmCallRecord } from './agents/llm-ledger.js'
 import { getServerSettingsSnapshot, parseLlmConfig } from './settings.js'
+import { startAttempt, finishAttempt, recordRejectedDecision, type AttemptIdentity } from './models/ledger.js'
+import { withCallTrace } from './models/trace.js'
 
 export interface LlmAttemptState {
   units?: LlmCallRecord['units']
@@ -20,6 +22,8 @@ export interface LlmAttemptState {
   contextWindowSource?: 'catalog' | 'family' | 'unknown-fallback'
   /** Set before publishing output, executing a tool, or creating external state. */
   committed: boolean
+  attemptId?: string
+  traceId?: string
 }
 
 export interface LlmExecutionOptions<T> {
@@ -36,6 +40,7 @@ export interface LlmExecutionOptions<T> {
   transportRetry?: { maxRetries: number; shouldRetry: (error: unknown) => boolean }
   onRetry?: (reason: 'retry-without-images' | 'retry-provider-connection', candidate: RoleCallCandidate, error: unknown) => Promise<void>
   record?: (record: LlmCallRecord) => Promise<void>
+  decorateRecord?: (record: LlmCallRecord) => LlmCallRecord
   /** Transport observation is separate from the single authoritative ledger writer. */
   onAttempt?: (record: LlmCallRecord) => Promise<void>
   log?: (event: Record<string, unknown>) => void
@@ -46,9 +51,15 @@ export async function executeLlmPlan<T>(options: LlmExecutionOptions<T>): Promis
   const { plan, context, signal } = options
   await validateRoleCallAuth(plan)
   if (context.companyId !== plan.companyId || context.purpose !== plan.purpose) throw new Error('LLM plan context mismatch')
-  if (!plan.candidates.length) throw new Error('LLM candidate chain is empty')
+  if (!plan.candidates.length) {
+    if (!options.record) await recordRejectedDecision(context,'no_candidates',null,options.logicalCallId)
+    throw new Error('LLM candidate chain is empty')
+  }
   const candidates = plan.candidates.filter(candidate => candidate.available)
-  if (!candidates.length) throw new Error('LLM candidate chain has no available candidates')
+  if (!candidates.length) {
+    if (!options.record) await recordRejectedDecision(context,'no_available_candidates',plan.candidates[0]?.model ?? null,options.logicalCallId)
+    throw new Error('LLM candidate chain has no available candidates')
+  }
   const logicalCallId = options.logicalCallId ?? randomUUID()
   const checkAbort = () => { if (signal?.aborted) throw signal.reason ?? new DOMException('Aborted', 'AbortError') }
   // Freeze once per logical call. TTL expiry only kicks a background SELECT;
@@ -70,15 +81,34 @@ export async function executeLlmPlan<T>(options: LlmExecutionOptions<T>): Promis
     let error: unknown
     let failed = false
     let prepared = false
+    let identity: AttemptIdentity | undefined
+    let ledgerFailed = false
+    const attemptId = randomUUID()
+    const trace = { traceId: logicalCallId, attemptId } as import('./models/trace.js').CallTrace
+    state.attemptId = attemptId
+    state.traceId = logicalCallId
     try {
       const send = await options.prepare(candidate, state)
       await validateRoleCallAuth(plan)
       checkAbort()
+      if (!options.record) {
+        try {
+          identity = await startAttempt({ ...context, model: candidate.model, status: 'ok', latencyMs: 0,
+            extras: { ...context.extras, attemptId, traceId: logicalCallId, logicalCallId, attempt: attempt + 1,
+              requestedModel: plan.candidates[0]?.model ?? candidate.model, requestModel: candidate.requestModel,
+              route: candidate.route.id, routeKind: candidate.route.kind, platform: candidate.route.platform,
+              envSlot: candidate.route.env,
+              protocol: candidate.protocol, role: plan.role, revision: plan.revision, authorizationVersion: plan.authorizationVersion } })
+        } catch (e) { ledgerFailed = true; throw e }
+      }
+      await validateRoleCallAuth(plan)
+      checkAbort()
       prepared = true
-      value = await send()
+      value = await withCallTrace(trace, send)
       if (options.consume) value = await options.consume(value, state)
       checkAbort()
     } catch (err) {
+      if (ledgerFailed) throw err
       failed = true
       error = err
     }
@@ -101,10 +131,13 @@ export async function executeLlmPlan<T>(options: LlmExecutionOptions<T>): Promis
     const next = retry ? candidate : failed && reason && !state.committed && !cancelled ? candidates[index + 1] : undefined
     const status = failed ? classifyLlmCallError(error) : 'ok'
     const extras = {
-      ...context.extras, logicalCallId, attempt: ++attempt,
-      role: plan.role, purpose: plan.purpose, requestedModel: candidate.model,
+      ...context.extras, logicalCallId, attemptId, traceId: logicalCallId, attempt: ++attempt,
+      outputCommitted: state.committed,
+      gatewayRequestId: trace.gatewayRequestId, upstreamRequestId: trace.upstreamRequestId,
+      role: plan.role, purpose: plan.purpose, requestedModel: plan.candidates[0]?.model ?? candidate.model,
       requestModel: candidate.requestModel, actualModel: state.actualModel,
       route: candidate.route.id, routeKind: candidate.route.kind, platform: candidate.route.platform ?? null,
+      envSlot: candidate.route.env,
       protocol: state.protocol ?? candidate.protocol, plannedProtocol: candidate.protocol, usageProtocol: state.usageProtocol ?? null, revision: plan.revision, authorizationVersion: plan.authorizationVersion ?? null,
       contextWindow: state.contextWindow ?? null, contextWindowSource: state.contextWindowSource ?? null,
       status, failureStage: failed ? prepared ? 'execution' : 'prepare' : null, httpStatus: (error as { status?: number } | null)?.status ?? null,
@@ -114,15 +147,27 @@ export async function executeLlmPlan<T>(options: LlmExecutionOptions<T>): Promis
       usage: state.usage, rawUsage: state.rawUsage, measurement: state.usage ? 'measured' : 'unknown',
       sdkMaxRetries: options.sdkMaxRetries ?? null, sdkRetryPolicy: options.sdkMaxRetries === undefined ? 'client-default' : 'request-override', sdkRetriesIndividuallyObservable: false,
     }
-    const record: LlmCallRecord = {
+    let record: LlmCallRecord = {
       ...context, model: state.actualModel ?? candidate.model, usage: state.usage, units: state.units,
       pricing: pricing(state.actualModel ?? candidate.model, candidate.route.id),
       reasoningTokens: state.reasoningTokens, latencyMs: Date.now() - start, status,
       error: failed ? (error instanceof Error ? error.message : String(error)) : null, extras,
     }
-    // Snapshot the attempt now; persistence must not hold up the next hop or response.
-    void Promise.resolve().then(() => (options.record ?? recordLlmCall)(record))
-      .catch(error => { console.warn('[llm-execution] recorder failed', error instanceof Error ? error.message : String(error)) })
+    if (options.decorateRecord) record = options.decorateRecord(record)
+    if (!prepared) record.extras = { ...record.extras, recordKind: 'decision', attempt: 0 }
+    if (options.record) await options.record(record)
+    else {
+      // Preparation failures are decisions, not HTTP consumption attempts.
+      if (!identity) {
+        record.extras = { ...record.extras, recordKind: 'decision', attempt: 0 }
+        identity = await startAttempt(record)
+      }
+      const settlement=await finishAttempt(identity, record)
+      if (settlement?.pendingSettlement) {
+        record.extras={...record.extras,pendingSettlement:true}
+        if(value && typeof value==='object' && !Array.isArray(value)) value={...value,pendingSettlement:true}
+      }
+    }
     const log = options.log ?? ((event: Record<string, unknown>) => { if (failed) console.warn('[llm-execution]', JSON.stringify(event)) })
     log(extras)
     await options.onAttempt?.(record)
@@ -282,7 +327,8 @@ export async function executeTrackedText(ctx: LlmCallContext, api: 'responses' |
       const client = await getLlmCandidateClient(plan, candidate)
       return async () => {
         const resource = useChat ? client.chat.completions : client.responses
-        const response = await (resource.create as unknown as (a: unknown, o?: unknown) => Promise<TextResponse>).call(resource, outbound, { ...opts, signal })
+        const response = await (resource.create as unknown as (a: unknown, o?: unknown) => Promise<TextResponse>).call(resource, outbound, { ...opts, signal, maxRetries: 0,
+          headers: { 'X-Cumora-Attempt-Id': state.attemptId, traceparent: `00-${state.traceId?.replaceAll('-', '')}-${state.attemptId?.replaceAll('-', '').slice(0, 16)}-01` } })
         state.rawUsage = response.usage ?? null
         state.usage = measuredUsage(response.usage, useChat ? 'chat' : 'responses')
         state.actualModel = typeof response.model === 'string' ? response.model : null

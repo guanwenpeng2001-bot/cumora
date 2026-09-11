@@ -49,6 +49,8 @@ function fixture(env: Record<string, unknown> = {}) {
   })
   const fallback = compile(read('../agents/fallback.ts'), { '../settings.js': {} })
   const execution = compile(read('../llm-execution.ts'), {
+    './models/ledger.js': { startAttempt: async () => ({}), finishAttempt: async (_identity: unknown, rec: unknown) => recorder.recordLlmCall(rec) },
+    './models/trace.js': { withCallTrace: async (_trace: unknown, send: () => Promise<unknown>) => send() },
     './tenant-llm-context.js': { validateRoleCallAuth: async (plan: any) => { assert.equal(plan.authorizationVersion, undefined) } },
     './db/pool.js': { pool: { query: async () => { throw new Error('Unexpected executor DB access') } } },
     'node:crypto': { randomUUID }, './llm-resolver.js': {},
@@ -202,6 +204,7 @@ test('PUT /usage/pricing rejects invalid URL, calendar date and numbers with 400
     api: { put: (_path: string, fn: any) => { handler = fn } }, safe: (fn: any) => fn,
     requireSiteAdmin: async (req: any) => { if (!req.admin) throw new HttpError(403, 'admin required') }, HttpError,
     validateModelPricing: f.pricing.validateModelPricing, upsertModelPricing: f.pricing.upsertModelPricing,
+    pool:{query:async()=>({rows:[]})},
   })
   for (const invalid of [
     { sourceUrl: 'javascript:alert(1)' }, { sourceUrl: 'file:///secret' }, { sourceUrl: 'ftp://provider.invalid' },
@@ -216,7 +219,7 @@ test('PUT /usage/pricing rejects invalid URL, calendar date and numbers with 400
   assert.equal(f.calls.length, 0)
   let response: any
   await handler({ admin: true, body: { ...priceInput(), sourceUrl: 'http://provider.invalid/pricing', pricedAt: '2024-02-29' } }, { json: (value: any) => { response = value } })
-  assert.deepEqual(response, { ok: true })
+  assert.deepEqual(response, { ok: true, scope:'legacy_compatibility' })
   assert.equal(f.rows.get('priced-model').priced_at, '2024-02-29')
 })
 

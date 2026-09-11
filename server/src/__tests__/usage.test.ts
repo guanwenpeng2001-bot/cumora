@@ -140,18 +140,18 @@ test('non-hour-aligned trend retains returned values and fills UTC bucket bounda
 
 test('provider aggregation labels ledger platforms and does not family-override them', async () => {
   const usage = loadUsage(async () => ({ rows: [
-    { model: 'claude-sonnet-4-6', platform: 'antigravity', requests: '1', input_tokens: '1', output_tokens: '1', cost_usd: '0.1', cost_estimated: false, unknown_calls: '0', unpriced_calls: '0', quality_unknown_calls: '0', route: null, source: 'cloud' },
-    { model: 'glm-4.6', platform: 'zhipu', requests: '2', input_tokens: '2', output_tokens: '2', cost_usd: '0.2', cost_estimated: false, unknown_calls: '0', unpriced_calls: '0', quality_unknown_calls: '0', route: null, source: 'cloud' },
-    { model: 'weird', platform: 'custom-vendor', requests: '3', input_tokens: '3', output_tokens: '3', cost_usd: '0.3', cost_estimated: false, unknown_calls: '0', unpriced_calls: '0', quality_unknown_calls: '0', route: null, source: 'cloud' },
+    { model: 'claude-sonnet-4-6',provider_id: 'Antigravity', platform: 'antigravity', requests: '1', input_tokens: '1', output_tokens: '1', cost_usd: '0.1', cost_estimated: false, unknown_calls: '0', unpriced_calls: '0', quality_unknown_calls: '0', route: null, source: 'cloud' },
+    { model: 'glm-4.6',provider_id:'Zhipu', platform: 'zhipu', requests: '2', input_tokens: '2', output_tokens: '2', cost_usd: '0.2', cost_estimated: false, unknown_calls: '0', unpriced_calls: '0', quality_unknown_calls: '0', route: null, source: 'cloud' },
+    { model: 'weird',provider_id:'custom-vendor', platform: 'custom-vendor', requests: '3', input_tokens: '3', output_tokens: '3', cost_usd: '0.3', cost_estimated: false, unknown_calls: '0', unpriced_calls: '0', quality_unknown_calls: '0', route: null, source: 'cloud' },
   ] }))
   const rows = await usage.usageByProvider('tenant', { from: new Date(0), to: new Date(1) })
   assert.deepEqual(rows.map((r: { provider: string }) => r.provider), ['custom-vendor', 'Zhipu', 'Antigravity'])
 })
 
-test('model aggregation uses one model group across routes and sources', async () => {
+test('model aggregation preserves source and offering identity', async () => {
   const usage = loadUsage(async (sql) => {
-    assert.match(sql, /GROUP BY model\s+ORDER BY/)
-    return { rows: [{ model: 'gpt-5.5', route: null, platform: 'openai', source: 'mixed', requests: '2', input_tokens: '8', output_tokens: '4', cost_usd: '0.4', cost_estimated: true, unknown_calls: '1', unpriced_calls: '1', quality_unknown_calls: '0' }] }
+    assert.match(sql, /GROUP BY model, source_kind, source_id, source, provider_id, offering_id, effective_platform,actual_model,request_model,actual_model_state\s+ORDER BY/)
+    return { rows: [{ model: 'gpt-5.5', provider_id: 'OpenAI', route: null, platform: 'openai', source: 'mixed', requests: '2', input_tokens: '8', output_tokens: '4', cost_usd: '0.4', cost_estimated: true, unknown_calls: '1', unpriced_calls: '1', quality_unknown_calls: '0' }] }
   })
   const rows = await usage.usageByModel('tenant', { from: new Date(0), to: new Date(1) })
   assert.equal(rows.length, 1)
@@ -161,6 +161,13 @@ test('model aggregation uses one model group across routes and sources', async (
   assert.equal(rows[0].requests, 2)
   assert.equal(rows[0].unknownRequests, 1)
   assert.equal(rows[0].unpricedRequests, 1)
+})
+
+test('provider aggregation never upgrades a legacy platform or request name into provider evidence',async()=>{
+  const usage=loadUsage(async()=>({rows:[{model:'qwen-test',provider_id:null,platform:'openai',route:'gateway:openai',source:'cloud',
+    requests:'1',input_tokens:'10',output_tokens:'2',cost_usd:'0',quality_unknown_calls:'1'}]}))
+  const rows=await usage.usageByProvider('tenant',{from:new Date(0),to:new Date(1)})
+  assert.equal(rows[0].provider,'unknown')
 })
 
 test('agent source comes from the ledger, independently of current computer assignment', async () => {
@@ -245,8 +252,8 @@ test('usage log DTO preserves unknown actual models and retains requested and hi
     { model: 'requested', requested_model: 'requested', actual_model: 'provider-reported', status: 'ok' },
   ]
   const usage = loadUsage(async (sql) => {
-    if (sql.includes('COUNT(*)')) return { rows: [{ total: String(cases.length) }] }
-    assert.match(sql, /NULLIF\(l.extras->>'actualModel', ''\) AS actual_model/)
+    if (sql.includes(' AS total FROM llm_calls')) return { rows: [{ total: String(cases.length) }] }
+    assert.match(sql, /l.actual_model AS actual_model/)
     return { rows: cases.map((row, id) => ({ id: String(id), created_at: new Date(0), ...row })) }
   })
   const result = JSON.parse(JSON.stringify(await usage.usageLogs('tenant', { from: new Date(0), to: new Date(1) }, { page: 1, pageSize: 50 })))
@@ -275,7 +282,7 @@ test('dashboard labels requested-model fallback and distinguishes missing actual
   }
   visit2(ast)
   assert.ok(detailFn, 'LogAttemptDetails component source')
-  const js = ts.transpileModule(`${detailFn.getText(ast)}\nexports.render = (r) => (${cell.getText(ast)})`, {
+  const js = ts.transpileModule(`function money(value) { return value == null ? '—' : String(value) }\n${detailFn.getText(ast)}\nexports.render = (r) => (${cell.getText(ast)})`, {
     fileName: 'cell.tsx', compilerOptions: { jsx: ts.JsxEmit.ReactJSX, module: ts.ModuleKind.CommonJS },
   }).outputText
   const jsx = await import('react/jsx-runtime')
@@ -325,7 +332,7 @@ test('log pagination discloses the accessible last page including non-divisor si
       const queries: unknown[][] = []
       const usage = loadUsage(async (sql, params) => {
         queries.push(params)
-        return { rows: sql.includes('COUNT(*)') ? [{ total: String(total) }] : [] }
+        return { rows: sql.includes(' AS total FROM llm_calls') ? [{ total: String(total) }] : [] }
       })
       const result = await usage.usageLogs('tenant', { from: new Date(0), to: new Date(1) }, { page: lastLegalPage, pageSize })
       assert.equal(result.total, total)
@@ -404,7 +411,7 @@ test('usage logs expose frozen unit pricing without treating unit-only calls as 
   const units = { unit: 'image', quantity: 2 }
   const price = { unit: 'image', usdPerUnit: 0.071677, sourceUrl: 'https://example.com/pricing', pricedAt: '2026-09-11' }
   const usage = loadUsage(async (sql: string) => {
-    if (sql.includes('COUNT(*)')) return { rows: [{ total: '1' }] }
+    if (sql.includes(' AS total FROM llm_calls')) return { rows: [{ total: '1' }] }
     assert.match(sql, /AS token_measured/)
     return { rows: [{ id: 'media-hop', created_at: new Date('2026-09-11T00:00:00Z'), model: 'qwen-image-max',
       purpose: 'agent-image', source: 'cloud', measured: true, token_measured: false, unpriced: false,
