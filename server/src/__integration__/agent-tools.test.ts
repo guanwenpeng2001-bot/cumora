@@ -29,6 +29,8 @@ import { __setPodToolOverrideForTesting } from '../agents/runtime/pod-tools.js'
 import type { ToolResult } from '../agents/tools-shared.js'
 import { runAgentTurn } from '../agents/turn.js'
 import { runCli } from '../agents/cli.js'
+import { inprocClient } from '../agents/runtime/inproc-client.js'
+import { replyDraftId } from '../agents/auto-relay.js'
 import { tBash } from '../agents/tools-shared.js'
 
 const originalImageProvider = process.env.OPENAI_IMAGE_PROVIDER
@@ -881,15 +883,10 @@ test('[integration] auto-compaction: leading user message + last 2 pairs survive
 // E. Robustness invariants — easy to silently regress
 // ────────────────────────────────────────────────────────────────────────────
 
-test('[integration] fingerprint dedup: same inbox twice in a row → second wake skips the LLM call', async () => {
-  // turn.ts keeps a per-process `lastCompletedInbox` Map keyed by agentId.
-  // When the next wake fires with the same fingerprint (= comma-joined
-  // message ids), the loop should short-circuit BEFORE calling the LLM
-  // so we don't burn tokens replaying the exact same inbox. Without this
-  // dedup, every wake-bus broadcast (e.g. several humans typing in
-  // quick succession) would re-prompt the agent on stale inbox.
+test('[integration] completed input is consumed once; the next wake skips the LLM', async () => {
+  // Durable consumption prevents completed messages from returning on a wake.
   const { companyId, agentId, humanId, conversationId } = await seedDirect()
-  await postHuman({ conversationId, companyId, humanId, body: 'one and done' })
+  const inputId = await postHuman({ conversationId, companyId, humanId, body: 'one and done' })
 
   // Hop 1: model declares the turn done via set_turn_status. The single
   // LLM call captures both "the model produced something" and "the turn
@@ -902,58 +899,50 @@ test('[integration] fingerprint dedup: same inbox twice in a row → second wake
   await runAgentTurn(agentId)
   assert.equal(llm.responseCallCount(), 1, 'first wake calls the LLM once')
 
-  // Second wake with the exact same inbox state — fingerprint matches.
-  // Skip gates finish before createRun, so the second wake must not open
-  // a run row or consult the LLM.
+  const consumed = await pool.query('SELECT message_id FROM agent_message_consumptions WHERE agent_id = $1', [agentId])
+  assert.deepEqual(consumed.rows, [{ message_id: inputId }])
+  assert.equal((await inprocClient.loadInbox(agentId)).length, 0)
+
+  // The completed input stays out of subsequent wakes.
   await runAgentTurn(agentId)
-  assert.equal(llm.responseCallCount(), 1, 'second wake must NOT call the LLM again (fingerprint dedup)')
+  assert.equal(llm.responseCallCount(), 1, 'consumed input must not call the LLM again')
 
   const { rows } = await pool.query<{ status: string }>(
     `SELECT status FROM agent_runs WHERE agent_id = $1 ORDER BY started_at`,
     [agentId],
   )
-  assert.equal(rows.length, 1, 'fingerprint skip must not open a second run row')
+  assert.equal(rows.length, 1, 'consumed input must not open a second run row')
   assert.equal(rows[0].status, 'completed', 'first wake ran to completion')
 })
 
-test('[integration] conversation cursor advances after an explicit reply — inbox does not loop', async () => {
-  // The unread cursor (`conversation_reads.last_read_at`) MUST move past
-  // the message we just replied to, or the next wake re-loads it as
-  // unread and the agent enters an infinite-reply loop. cmdReply auto-
-  // acks the convo for the author as a side effect of posting; this
-  // test pins that invariant.
+test('[integration] sending creates delivery evidence; only completed input consumption clears the inbox', async () => {
   const { companyId, agentId, humanId, conversationId } = await seedDirect()
   const userMessageId = await postHuman({ conversationId, companyId, humanId, body: 'hello there' })
-  // Sanity: cursor starts before the message, so the agent sees 1 unread.
   await pool.query(
     `INSERT INTO conversation_reads (user_id, conversation_id, last_read_at)
-     VALUES ($1, $2, '1970-01-01T00:00:00Z'::timestamptz)
-     ON CONFLICT (user_id, conversation_id) DO UPDATE SET last_read_at = EXCLUDED.last_read_at`,
+     VALUES ($1, $2, '1970-01-01T00:00:00Z'::timestamptz)`,
     [agentId, conversationId],
   )
-
-  // Drive a reply directly via runCli — same code path the bash tool
-  // would shell into, but skips the subprocess.
   installLlmStub({})
-  const res = await runCli([
-    '--as', agentId,
-    'reply', conversationId, 'hi back',
-  ])
+  const res = await runCli(['--as', agentId, 'reply', conversationId, 'hi back'])
   assert.equal(res.ok, true, `runCli reply failed: ${res.text}`)
+  const delivery = res.sideEffects?.find(effect => effect.event === 'message.posted')
+  assert.equal(delivery?.conversationId, conversationId)
+  assert.equal(delivery?.draftId, replyDraftId('hi back'))
+  assert.ok(delivery?.messageId)
+  assert.ok((await inprocClient.loadInbox(agentId)).some(message => message.id === userMessageId),
+    'sending alone must retain the input for completion or retry')
+  const before = await pool.query('SELECT 1 FROM agent_message_consumptions WHERE agent_id = $1', [agentId])
+  assert.equal(before.rowCount, 0)
 
-  // Confirm the agent's last_read_at moved to AT or AFTER the human's
-  // message timestamp. (cmdReply writes NOW(); the message was inserted
-  // a few ms before, so >= is the safe assertion.)
-  const { rows } = await pool.query<{ last_read_at: Date }>(
-    `SELECT last_read_at FROM conversation_reads
-       WHERE user_id = $1 AND conversation_id = $2`,
+  await inprocClient.markConversationRead({ agentId, conversationId,
+    upToMessageId: userMessageId, consumedMessageIds: [userMessageId] })
+  const consumed = await pool.query('SELECT message_id FROM agent_message_consumptions WHERE agent_id = $1', [agentId])
+  assert.deepEqual(consumed.rows, [{ message_id: userMessageId }])
+  assert.equal((await inprocClient.loadInbox(agentId)).some(message => message.id === userMessageId), false)
+  const reads = await pool.query<{ last_read_at: Date }>(
+    'SELECT last_read_at FROM conversation_reads WHERE user_id = $1 AND conversation_id = $2',
     [agentId, conversationId],
   )
-  assert.equal(rows.length, 1, 'conversation_reads row exists for the agent')
-  const { rows: msgRow } = await pool.query<{ created_at: Date }>(
-    `SELECT created_at FROM messages WHERE id = $1`, [userMessageId],
-  )
-  const cursor = new Date(rows[0].last_read_at).getTime()
-  const userMsgAt = new Date(msgRow[0].created_at).getTime()
-  assert.ok(cursor >= userMsgAt, `cursor ${cursor} must be >= user message ts ${userMsgAt}`)
+  assert.equal(new Date(reads.rows[0].last_read_at).getTime(), 0, 'exact consumption does not advance a legacy high-water cursor')
 })

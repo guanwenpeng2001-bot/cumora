@@ -35,6 +35,7 @@ import { __setLlmClientOverrideForTesting } from '../llm.js'
 import { __setPodToolOverrideForTesting } from '../agents/runtime/pod-tools.js'
 import type { ToolResult } from '../agents/tools-shared.js'
 import { runAgentTurn } from '../agents/turn.js'
+import { replyDraftId } from '../agents/auto-relay.js'
 import { getServerSettingsSnapshot, getTurnBudgetPolicy, writeServerSettings } from '../settings.js'
 
 before(async () => {
@@ -271,6 +272,7 @@ async function messagesFromAgent(conversationId: string, agentId: string): Promi
 
 function bashReplyOutput(opts: {
   stdout: string
+  body: string
   conversationId: string
   messageId: string
   sequence?: number
@@ -281,6 +283,7 @@ function bashReplyOutput(opts: {
     stderr: '',
     exitCode: 0,
     sideEffects: [{
+      draftId: replyDraftId(opts.body),
       event: 'message.posted',
       command: 'reply',
       medium: 'chat',
@@ -396,6 +399,8 @@ test('[integration] normal direct reply: bash → cumora reply → message lands
       name: 'set_turn_status',
       argsJson: JSON.stringify({ status: 'done', reason: 'the reply has been posted', next_step: '' }),
     }),
+    // A posted reply still needs the semantic completion verdict.
+    streamWithJustText(JSON.stringify({ complete: true, reason: 'requested reply delivered', next_step: '' })),
   ])
   llm.install()
 
@@ -403,7 +408,7 @@ test('[integration] normal direct reply: bash → cumora reply → message lands
     bash: (parsed) => {
       // Stub treats every `cumora reply` call as if it really posted (the
       // real CLI does this via inproc DB write) and returns the typed CLI
-      // side effect the turn loop uses for double-post suppression.
+      // delivery evidence used by the turn completion and relay checks.
       const cmd = String(parsed.command ?? '')
       // For "explicit reply" tests we want production semantics: when
       // `cumora reply` is invoked, simulate a successful post so the next
@@ -422,7 +427,7 @@ test('[integration] normal direct reply: bash → cumora reply → message lands
           )
           return {
             ok: true,
-            output: bashReplyOutput({ stdout: `sent (${messageId}, seq 2)`, conversationId: convoId, messageId }),
+            output: bashReplyOutput({ stdout: `sent (${messageId}, seq 2)`, conversationId: convoId, messageId, body }),
             durationMs: 1,
             display: { name: 'bash', arg: cmd, status: 'ok · 1ms' , detail: '' },
           }
@@ -464,6 +469,8 @@ test('[integration] unsent assistant text is returned to the model instead of au
       name: 'set_turn_status',
       argsJson: JSON.stringify({ status: 'done', reason: 'the answer was posted', next_step: '' }),
     }),
+    // A posted reply still needs the semantic completion verdict.
+    streamWithJustText(JSON.stringify({ complete: true, reason: 'requested reply delivered', next_step: '' })),
   ])
   llm.install()
 
@@ -479,7 +486,7 @@ test('[integration] unsent assistant text is returned to the model instead of au
              VALUES ($1, $2, $3, 'text', $4, 2, $5)`,
           [messageId, convoId, agentId, body, companyId],
         )
-        return { ok: true, output: bashReplyOutput({ stdout: `sent (${messageId}, seq 2)`, conversationId: convoId, messageId }), durationMs: 1, display: { name: 'bash', arg: cmd, status: 'ok' , detail: '' } }
+        return { ok: true, output: bashReplyOutput({ stdout: `sent (${messageId}, seq 2)`, conversationId: convoId, messageId, body }), durationMs: 1, display: { name: 'bash', arg: cmd, status: 'ok' , detail: '' } }
       }
       return { ok: false, output: null, error: `unexpected bash invocation: ${cmd}`, durationMs: 0, display: { name: 'bash', arg: cmd, status: 'fail' , detail: '' } }
     },
@@ -489,7 +496,7 @@ test('[integration] unsent assistant text is returned to the model instead of au
 
   await runAgentTurn(agentId)
 
-  assert.equal(llm.callCount(), 3, 'plain assistant text should trigger a continuation hop')
+  assert.equal(llm.callCount(), 4, 'plain assistant text should trigger a continuation hop')
   const posted = await messagesFromAgent(conversationId, agentId)
   assert.equal(posted.length, 1)
   assert.equal(posted[0].body, answer)
@@ -534,7 +541,7 @@ test('[integration] declared assistant-text relay posts the exact draft to the d
            VALUES ($1, $2, $3, 'text', $4, 2, $5)`,
         [messageId, convoId, agentId, body, companyId],
       )
-      return { ok: true, output: bashReplyOutput({ stdout: `sent (${messageId}, seq 2)`, conversationId: convoId, messageId }), durationMs: 1, display: { name: 'bash', arg: cmd, status: 'ok', detail: '' } }
+      return { ok: true, output: bashReplyOutput({ stdout: `sent (${messageId}, seq 2)`, conversationId: convoId, messageId, body }), durationMs: 1, display: { name: 'bash', arg: cmd, status: 'ok', detail: '' } }
     },
     set_turn_status: turnStatusToolResult,
   })
@@ -548,7 +555,72 @@ test('[integration] declared assistant-text relay posts the exact draft to the d
   const ev = await eventsForAgent(agentId)
   assert.equal(ev.filter((e) => e.kind === 'turn.status_required').length, 1)
   assert.equal(ev.filter((e) => e.kind === 'turn.auto_relay').length, 1)
+  const runs = await pool.query('SELECT status FROM agent_runs WHERE agent_id = $1', [agentId])
+  assert.equal(runs.rows[0].status, 'completed')
+  const consumed = await pool.query('SELECT 1 FROM agent_message_consumptions WHERE agent_id = $1', [agentId])
+  assert.equal(consumed.rowCount, 1)
 })
+
+for (const scenario of ['different draft', 'different target', 'missing draft fingerprint', 'missing message receipt', 'relay without receipt'] as const) {
+  test(`[integration] declared relay requires exact delivery evidence: ${scenario}`, async () => {
+    const { companyId, agentId, humanId, conversationId } = await seedConvo()
+    const inputId = await postHumanMessage({ conversationId, companyId, humanId, body: 'send the final answer' })
+    let priorTarget = conversationId
+    if (scenario === 'different target') {
+      priorTarget = `direct-${randomUUID()}`
+      await pool.query(
+        `INSERT INTO conversations (id, kind, title, members, tag, company_id)
+         VALUES ($1, 'direct', 'Other conversation', $2::jsonb, 'human', $3)`,
+        [priorTarget, JSON.stringify([agentId, humanId]), companyId],
+      )
+    }
+    const draft = 'The final answer.'
+    const priorBody = scenario === 'different draft' ? 'Working on the answer.' : draft
+    makeLlmStub([
+      streamWithToolCall({ fcId: 'prior', callId: 'prior', name: 'bash',
+        argsJson: JSON.stringify({ command: `cumora reply ${priorTarget} '${priorBody}'` }) }),
+      streamWithJustText(draft),
+      streamWithToolCall({ fcId: 'status', callId: 'status', name: 'set_turn_status',
+        argsJson: JSON.stringify({ status: 'done', reason: 'deliver final answer',
+          assistant_text: 'reply', reply_conversation_id: conversationId }) }),
+    ]).install()
+    let sends = 0
+    makeToolStub({
+      bash: async parsed => {
+        const relay = sends++ > 0
+        const target = relay ? conversationId : priorTarget
+        const body = relay ? draft : priorBody
+        assert.equal(parsed.command, `cumora reply ${target} '${body}'${relay ? ' --continue' : ''}`)
+        const messageId = `m-${randomUUID()}`
+        await pool.query(
+          `INSERT INTO messages (id, conversation_id, author_id, kind, body, sequence, company_id)
+           VALUES ($1, $2, $3, 'text', $4, $5, $6)`,
+          [messageId, target, agentId, body, sends + 1, companyId],
+        )
+        const output = bashReplyOutput({ stdout: 'sent', body, conversationId: target, messageId })
+        const effects = output.sideEffects as Array<Record<string, unknown>>
+        if (!relay && scenario === 'missing draft fingerprint') delete effects[0].draftId
+        if (!relay && scenario === 'missing message receipt') delete effects[0].messageId
+        if (scenario === 'relay without receipt') output.sideEffects = []
+        return { ok: true, output, durationMs: 1, display: { name: 'bash', arg: '', status: 'ok', detail: '' } }
+      },
+      set_turn_status: turnStatusToolResult,
+    }).install()
+    await runAgentTurn(agentId)
+    assert.equal(sends, 2, 'an unrelated or incomplete prior receipt must not suppress delivery')
+    const posted = await messagesFromAgent(conversationId, agentId)
+    assert.equal(posted.at(-1)?.body, draft)
+    const runs = await pool.query('SELECT status FROM agent_runs WHERE agent_id = $1', [agentId])
+    const failed = scenario === 'relay without receipt'
+    assert.equal(runs.rows[0].status, failed ? 'failed' : 'completed')
+    const consumed = await pool.query(
+      'SELECT message_id FROM agent_message_consumptions WHERE agent_id = $1', [agentId],
+    )
+    assert.deepEqual(consumed.rows.map(row => row.message_id), failed ? [] : [inputId])
+    const events = await eventsForAgent(agentId)
+    assert.equal(events.filter(event => event.kind === 'turn.auto_relay_failed').length, failed ? 1 : 0)
+  })
+}
 
 test('[integration] declared assistant-text relay rejects a target outside the current inbox', async () => {
   const { companyId, agentId, humanId, conversationId } = await seedConvo({ kind: 'direct' })
@@ -594,10 +666,8 @@ test('[integration] declared assistant-text relay rejects a target outside the c
   assert.match(runs[0].error ?? '', /Rejected declared assistant-text relay target/)
 })
 
-test('[integration] auto-relay suppressed when model already called cumora reply this turn', async () => {
-  // The "double-reply" guard: model fires `cumora reply` in hop 1, then emits
-  // assistant text. Even if it asks to relay that draft, the typed CLI reply
-  // side effect from hop 1 keeps the runtime from double-posting.
+test('[integration] auto-relay deduplicates the same target and exact draft with a delivery receipt', async () => {
+  // Only the matching target, draft fingerprint and message receipt dedupe relay.
   const { companyId, agentId, humanId, conversationId } = await seedConvo({ kind: 'direct' })
   await postHumanMessage({ conversationId, companyId, humanId, body: 'do the thing' })
 
@@ -607,8 +677,8 @@ test('[integration] auto-relay suppressed when model already called cumora reply
       fcId: 'fc_1', callId: 'call_1', name: 'bash',
       argsJson: JSON.stringify({ command: `cumora reply ${conversationId} '${replyBody}'` }),
     }),
-    // Hop 2: model babbles more text but doesn't call any tool.
-    streamWithJustText('also — checking back in soon'),
+    // Hop 2: model emits the exact text already delivered.
+    streamWithJustText(replyBody),
     streamWithToolCall({
       fcId: 'fc_status',
       callId: 'call_status',
@@ -636,7 +706,7 @@ test('[integration] auto-relay suppressed when model already called cumora reply
              VALUES ($1, $2, $3, 'text', $4, 2, $5)`,
           [messageId, convoId, agentId, body, companyId],
         )
-        return { ok: true, output: bashReplyOutput({ stdout: `sent (${messageId}, seq 2)`, conversationId: convoId, messageId }), durationMs: 1, display: { name: 'bash', arg: cmd, status: 'ok' , detail: '' } }
+        return { ok: true, output: bashReplyOutput({ stdout: `sent (${messageId}, seq 2)`, conversationId: convoId, messageId, body }), durationMs: 1, display: { name: 'bash', arg: cmd, status: 'ok' , detail: '' } }
       }
       throw new Error(`unexpected bash invocation: ${cmd}`)
     },
@@ -652,6 +722,10 @@ test('[integration] auto-relay suppressed when model already called cumora reply
   const ev = await eventsForAgent(agentId)
   assert.equal(ev.filter((e) => e.kind === 'turn.status_required').length, 1)
   assert.equal(ev.filter((e) => e.kind === 'turn.auto_relay').length, 0)
+  const runs = await pool.query('SELECT status FROM agent_runs WHERE agent_id = $1', [agentId])
+  assert.equal(runs.rows[0].status, 'completed')
+  const consumed = await pool.query('SELECT 1 FROM agent_message_consumptions WHERE agent_id = $1', [agentId])
+  assert.equal(consumed.rowCount, 1)
 })
 
 test('[integration] unreliable CLI side-effect channel suppresses assistant-text auto-relay', async () => {
@@ -753,6 +827,8 @@ test('[integration] missing status after acknowledgement is handled by main-mode
       name: 'set_turn_status',
       argsJson: JSON.stringify({ status: 'done', reason: 'the panda image reply has been posted', next_step: '' }),
     }),
+    // A posted reply still needs the semantic completion verdict.
+    streamWithJustText(JSON.stringify({ complete: true, reason: 'requested reply delivered', next_step: '' })),
   ])
   llm.install()
 
@@ -781,6 +857,7 @@ test('[integration] missing status after acknowledgement is handled by main-mode
           output: bashReplyOutput({
             stdout: `sent (${messageId}, seq 2) · attached img "panda.png"`,
             conversationId: convoId,
+            body,
             messageId,
             attachment: true,
           }),
@@ -796,7 +873,7 @@ test('[integration] missing status after acknowledgement is handled by main-mode
 
   await runAgentTurn(agentId)
 
-  assert.equal(llm.callCount(), 4, 'the empty post-reaction hop should be continued by protocol nudge')
+  assert.equal(llm.callCount(), 5, 'the empty post-reaction hop should be continued by protocol nudge')
   const posted = await messagesFromAgent(conversationId, agentId)
   assert.equal(posted.length, 1, 'the agent should complete the image request after the nudge')
   assert.equal(posted[0].body, replyBody)
@@ -891,7 +968,7 @@ test('[integration] idle wake missing turn status is skipped instead of failed',
   assert.equal(ev.filter((e) => e.kind === 'turn.protocol_violation').length, 0)
 })
 
-test('[integration] user-visible reply without final turn status is inferred complete', async () => {
+test('[integration] user-visible reply without final turn status fails without consuming the inbox', async () => {
   const { companyId, agentId, humanId, conversationId } = await seedConvo({ kind: 'direct' })
   await postHumanMessage({ conversationId, companyId, humanId, body: 'send me a short reply' })
 
@@ -922,7 +999,7 @@ test('[integration] user-visible reply without final turn status is inferred com
       )
       return {
         ok: true,
-        output: bashReplyOutput({ stdout: `sent (${messageId}, seq 2)`, conversationId: convoId, messageId }),
+        output: bashReplyOutput({ stdout: `sent (${messageId}, seq 2)`, conversationId: convoId, messageId, body }),
         durationMs: 1,
         display: { name: 'bash', arg: cmd, status: 'ok', detail: '' },
       }
@@ -932,7 +1009,7 @@ test('[integration] user-visible reply without final turn status is inferred com
 
   await runAgentTurn(agentId)
 
-  assert.equal(llm.callCount(), 4, 'two status nudges, then infer from visible reply')
+  assert.equal(llm.callCount(), 4, 'two status nudges, then fail the missing completion declaration')
   const posted = await messagesFromAgent(conversationId, agentId)
   assert.equal(posted.length, 1)
   assert.equal(posted[0].body, replyBody)
@@ -941,13 +1018,14 @@ test('[integration] user-visible reply without final turn status is inferred com
     [agentId],
   )
   assert.equal(runs.length, 1)
-  assert.equal(runs[0].status, 'completed')
-  assert.match(runs[0].summary, /Turn status inferred: done/)
-  assert.equal(runs[0].error, null)
+  assert.equal(runs[0].status, 'failed')
+  assert.ok(runs[0].error)
+  const consumed = await pool.query('SELECT 1 FROM agent_message_consumptions WHERE agent_id = $1', [agentId])
+  assert.equal(consumed.rowCount, 0)
   const ev = await eventsForAgent(agentId)
   assert.equal(ev.filter((e) => e.kind === 'turn.status_required').length, 2)
-  assert.equal(ev.filter((e) => e.kind === 'turn.status_inferred').length, 1)
-  assert.equal(ev.filter((e) => e.kind === 'turn.protocol_violation').length, 0)
+  assert.equal(ev.filter((e) => e.kind === 'turn.status_inferred').length, 0)
+  assert.equal(ev.filter((e) => e.kind === 'turn.protocol_violation').length, 1)
 })
 
 test('[integration] missing model usage is observable and uses local token estimate', async () => {
@@ -999,6 +1077,8 @@ test('[integration] structured turn status done terminates without an extra no-t
       name: 'set_turn_status',
       argsJson: JSON.stringify({ status: 'done', reason: 'the reply has been posted', next_step: '' }),
     }),
+    // A posted reply still needs the semantic completion verdict.
+    streamWithJustText(JSON.stringify({ complete: true, reason: 'requested reply delivered', next_step: '' })),
   ])
   llm.install()
 
@@ -1016,7 +1096,7 @@ test('[integration] structured turn status done terminates without an extra no-t
       )
       return {
         ok: true,
-        output: bashReplyOutput({ stdout: `sent (${messageId}, seq 2)`, conversationId: convoId, messageId }),
+        output: bashReplyOutput({ stdout: `sent (${messageId}, seq 2)`, conversationId: convoId, messageId, body }),
         durationMs: 1,
         display: { name: 'bash', arg: cmd, status: 'ok', detail: '' },
       }
@@ -1027,7 +1107,7 @@ test('[integration] structured turn status done terminates without an extra no-t
 
   await runAgentTurn(agentId)
 
-  assert.equal(llm.callCount(), 2, 'status=done should end the turn without a probing no-tool hop')
+  assert.equal(llm.callCount(), 3, 'status=done should end the turn without a probing no-tool hop')
   const posted = await messagesFromAgent(conversationId, agentId)
   assert.equal(posted.length, 1)
   assert.equal(posted[0].body, replyBody)
@@ -1118,6 +1198,8 @@ test('[integration] structured turn status continue keeps the loop alive until a
       name: 'set_turn_status',
       argsJson: JSON.stringify({ status: 'done', reason: 'the panda image reply has been posted', next_step: '' }),
     }),
+    // A posted reply still needs the semantic completion verdict.
+    streamWithJustText(JSON.stringify({ complete: true, reason: 'requested reply delivered', next_step: '' })),
   ])
   llm.install()
 
@@ -1146,6 +1228,7 @@ test('[integration] structured turn status continue keeps the loop alive until a
           output: bashReplyOutput({
             stdout: `sent (${messageId}, seq 2) · attached img "panda.png"`,
             conversationId: convoId,
+            body,
             messageId,
             attachment: true,
           }),
@@ -1161,7 +1244,7 @@ test('[integration] structured turn status continue keeps the loop alive until a
 
   await runAgentTurn(agentId)
 
-  assert.equal(llm.callCount(), 4)
+  assert.equal(llm.callCount(), 5)
   const posted = await messagesFromAgent(conversationId, agentId)
   assert.equal(posted.length, 1)
   assert.equal(posted[0].body, replyBody)
@@ -1214,6 +1297,8 @@ test('[integration] reaction-only terminal done is semantically rejected and the
       name: 'set_turn_status',
       argsJson: JSON.stringify({ status: 'done', reason: 'the group photo reply has been posted', next_step: '' }),
     }),
+    // A posted reply still needs the semantic completion verdict.
+    streamWithJustText(JSON.stringify({ complete: true, reason: 'requested reply delivered', next_step: '' })),
   ])
   llm.install()
 
@@ -1255,6 +1340,7 @@ test('[integration] reaction-only terminal done is semantically rejected and the
           output: bashReplyOutput({
             stdout: `sent (${messageId}, seq 2) · attached img "team.png"`,
             conversationId: convoId,
+            body,
             messageId,
             attachment: true,
           }),
@@ -1269,7 +1355,7 @@ test('[integration] reaction-only terminal done is semantically rejected and the
 
   await runAgentTurn(agentId)
 
-  assert.equal(llm.callCount(), 5, 'semantic verifier adds one LLM check before continuation')
+  assert.equal(llm.callCount(), 6, 'semantic verifier rejects the reaction, then verifies the delivered photo')
   const posted = await messagesFromAgent(conversationId, agentId)
   assert.equal(posted.length, 1, 'reaction-only completion must not end the turn')
   assert.equal(posted[0].body, replyBody)
@@ -1281,7 +1367,51 @@ test('[integration] reaction-only terminal done is semantically rejected and the
   assert.match(replyHopInput, /realistic group photo|真实/)
 })
 
-test('[integration] action-only terminal done is semantically verified before the inbox cursor advances', async () => {
+test('[integration] a progress reply cannot bypass semantic completion verification', async () => {
+  const { companyId, agentId, humanId, conversationId } = await seedConvo()
+  const inputId = await postHumanMessage({ conversationId, companyId, humanId, body: 'What is 6 times 7?' })
+  const llm = makeLlmStub([
+    streamWithToolCall({ fcId: 'progress', callId: 'progress', name: 'bash',
+      argsJson: JSON.stringify({ command: `cumora reply ${conversationId} 'Checking now.'` }) }),
+    streamWithToolCall({ fcId: 'early', callId: 'early', name: 'set_turn_status',
+      argsJson: JSON.stringify({ status: 'done', reason: 'acknowledged the request' }) }),
+    streamWithJustText(JSON.stringify({ complete: false, reason: 'progress is not the requested answer', next_step: 'send the answer' })),
+    streamWithToolCall({ fcId: 'answer', callId: 'answer', name: 'bash',
+      argsJson: JSON.stringify({ command: `cumora reply ${conversationId} '42.'` }) }),
+    streamWithToolCall({ fcId: 'done', callId: 'done', name: 'set_turn_status',
+      argsJson: JSON.stringify({ status: 'done', reason: 'answer delivered' }) }),
+    streamWithJustText(JSON.stringify({ complete: true, reason: 'answer delivered', next_step: '' })),
+  ])
+  llm.install()
+  let sends = 0
+  makeToolStub({
+    bash: async parsed => {
+      const body = sends++ === 0 ? 'Checking now.' : '42.'
+      assert.equal(parsed.command, `cumora reply ${conversationId} '${body}'`)
+      const consumed = await pool.query('SELECT 1 FROM agent_message_consumptions WHERE agent_id = $1', [agentId])
+      assert.equal(consumed.rowCount, 0, 'even the rejected terminal declaration must not consume input')
+      const messageId = `m-${randomUUID()}`
+      await pool.query(
+        `INSERT INTO messages (id, conversation_id, author_id, kind, body, sequence, company_id)
+         VALUES ($1, $2, $3, 'text', $4, $5, $6)`,
+        [messageId, conversationId, agentId, body, sends + 1, companyId],
+      )
+      return { ok: true, output: bashReplyOutput({ stdout: 'sent', body, conversationId, messageId }),
+        durationMs: 1, display: { name: 'bash', arg: '', status: 'ok', detail: '' } }
+    },
+    set_turn_status: turnStatusToolResult,
+  }).install()
+  await runAgentTurn(agentId)
+  assert.equal(llm.callCount(), 6, 'four main-model hops and two semantic checks')
+  assert.deepEqual((await messagesFromAgent(conversationId, agentId)).map(message => message.body), ['Checking now.', '42.'])
+  const events = await eventsForAgent(agentId)
+  assert.equal(events.filter(event => event.kind === 'turn.completion_rejected').length, 1)
+  assert.equal(events.filter(event => event.kind === 'turn.completion_verified').length, 1)
+  const consumed = await pool.query('SELECT message_id FROM agent_message_consumptions WHERE agent_id = $1', [agentId])
+  assert.deepEqual(consumed.rows, [{ message_id: inputId }])
+})
+
+test('[integration] action-only terminal done records consumption after semantic verification', async () => {
   const { companyId, agentId, humanId, conversationId } = await seedConvo({ kind: 'group' })
   const askingMessageId = await postHumanMessage({
     conversationId,
@@ -1343,12 +1473,12 @@ test('[integration] action-only terminal done is semantically verified before th
   const ev = await eventsForAgent(agentId)
   assert.equal(ev.filter((e) => e.kind === 'turn.completion_verified').length, 1)
   assert.equal(ev.filter((e) => e.kind === 'turn.completion_rejected').length, 0)
-  const { rows: reads } = await pool.query<{ last_read_message_id: string | null }>(
-    `SELECT last_read_message_id FROM conversation_reads WHERE user_id = $1 AND conversation_id = $2`,
-    [agentId, conversationId],
+  const { rows: reads } = await pool.query<{ message_id: string }>(
+    `SELECT message_id FROM agent_message_consumptions WHERE agent_id = $1 AND message_id = $2`,
+    [agentId, askingMessageId],
   )
-  assert.equal(reads.length, 1, 'verified action-only completion advances the inbox cursor')
-  assert.equal(reads[0].last_read_message_id, askingMessageId)
+  assert.equal(reads.length, 1, 'verified action-only completion records exact input consumption')
+  assert.equal(reads[0].message_id, askingMessageId)
 })
 
 test('[integration] multi-hop tool use: hop1 bash informational → hop2 cumora reply → message posted', async () => {
@@ -1370,6 +1500,8 @@ test('[integration] multi-hop tool use: hop1 bash informational → hop2 cumora 
       name: 'set_turn_status',
       argsJson: JSON.stringify({ status: 'done', reason: 'the board ids have been posted', next_step: '' }),
     }),
+    // A posted reply still needs the semantic completion verdict.
+    streamWithJustText(JSON.stringify({ complete: true, reason: 'requested reply delivered', next_step: '' })),
   ])
   llm.install()
 
@@ -1388,7 +1520,7 @@ test('[integration] multi-hop tool use: hop1 bash informational → hop2 cumora 
              VALUES ($1, $2, $3, 'text', $4, 2, $5)`,
           [messageId, convoId, agentId, body, companyId],
         )
-        return { ok: true, output: bashReplyOutput({ stdout: `sent (${messageId}, seq 2)`, conversationId: convoId, messageId }), durationMs: 1, display: { name: 'bash', arg: cmd, status: 'ok' , detail: '' } }
+        return { ok: true, output: bashReplyOutput({ stdout: `sent (${messageId}, seq 2)`, conversationId: convoId, messageId, body }), durationMs: 1, display: { name: 'bash', arg: cmd, status: 'ok' , detail: '' } }
       }
       throw new Error(`unexpected: ${cmd}`)
     },
@@ -1425,6 +1557,8 @@ test('[integration] tool failure: function_call_output carries error, agent reco
       name: 'set_turn_status',
       argsJson: JSON.stringify({ status: 'done', reason: 'the tool failure was reported', next_step: '' }),
     }),
+    // A posted reply still needs the semantic completion verdict.
+    streamWithJustText(JSON.stringify({ complete: true, reason: 'requested reply delivered', next_step: '' })),
   ])
   llm.install()
 
@@ -1443,7 +1577,7 @@ test('[integration] tool failure: function_call_output carries error, agent reco
              VALUES ($1, $2, $3, 'text', $4, 2, $5)`,
           [messageId, convoId, agentId, body, companyId],
         )
-        return { ok: true, output: bashReplyOutput({ stdout: `sent (${messageId}, seq 2)`, conversationId: convoId, messageId }), durationMs: 1, display: { name: 'bash', arg: cmd, status: 'ok' , detail: '' } }
+        return { ok: true, output: bashReplyOutput({ stdout: `sent (${messageId}, seq 2)`, conversationId: convoId, messageId, body }), durationMs: 1, display: { name: 'bash', arg: cmd, status: 'ok' , detail: '' } }
       }
       throw new Error(`unexpected: ${cmd}`)
     },
@@ -1542,6 +1676,8 @@ test('[integration] response.completed.output:[] with streamed tool call — pen
       name: 'set_turn_status',
       argsJson: JSON.stringify({ status: 'done', reason: 'the recovered reply has been posted', next_step: '' }),
     }),
+    // A posted reply still needs the semantic completion verdict.
+    streamWithJustText(JSON.stringify({ complete: true, reason: 'requested reply delivered', next_step: '' })),
   ])
   llm.install()
 
@@ -1560,7 +1696,7 @@ test('[integration] response.completed.output:[] with streamed tool call — pen
              VALUES ($1, $2, $3, 'text', $4, 2, $5)`,
           [messageId, convoId, agentId, body, companyId],
         )
-        return { ok: true, output: bashReplyOutput({ stdout: `sent (${messageId}, seq 2)`, conversationId: convoId, messageId }), durationMs: 1, display: { name: 'bash', arg: cmd, status: 'ok' , detail: '' } }
+        return { ok: true, output: bashReplyOutput({ stdout: `sent (${messageId}, seq 2)`, conversationId: convoId, messageId, body }), durationMs: 1, display: { name: 'bash', arg: cmd, status: 'ok' , detail: '' } }
       }
       throw new Error(`unexpected: ${cmd}`)
     },
