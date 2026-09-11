@@ -31,7 +31,11 @@ function runtime(redis: IORedis, hget = redis.hget.bind(redis)): InProcRuntimeCl
   }) as InProcRuntimeClient
 }
 
-test('worklog claims on isolated Redis', async t => {
+test('worklog claims on isolated Redis', {
+  // The isolated stack only exists on developer machines; CI's shared
+  // service Redis must not be touched by this concurrent-claim test.
+  skip: process.env.INTEGRATION_DATABASE_URL !== 'postgres://postgres:cumora_test@localhost:15432/cumora_test',
+}, async t => {
   const clients = [0, 1].map(() => new IORedis('redis://127.0.0.1:16379', {
     lazyConnect: true, retryStrategy: () => null, maxRetriesPerRequest: 0,
   }))
