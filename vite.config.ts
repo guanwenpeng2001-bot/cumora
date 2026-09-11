@@ -13,6 +13,8 @@ export default defineConfig({
   // The renderer uses relative URLs through the Vite proxy, but commands
   // copied from the UI run outside that proxy and need the API origin.
   define: {
+    __CUMORA_GITHUB_OWNER__: JSON.stringify(process.env.CUMORA_GITHUB_OWNER?.trim() || 'guanwenpeng2001-bot'),
+    __CUMORA_GITHUB_REPO__: JSON.stringify(process.env.CUMORA_GITHUB_REPO?.trim() || 'cumora'),
     'import.meta.env.VITE_CUMORA_DEV_API_TARGET': JSON.stringify(HTTP_TARGET),
   },
   resolve: {
