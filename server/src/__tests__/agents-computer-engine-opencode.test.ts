@@ -213,7 +213,7 @@ test('opencode run resumes a session and uses an honest fallback model label', {
   assert.equal(result.exitCode, 0, result.error)
   assert.equal(result.sessionId, 'ses_existing')
   assert.equal(result.model, null, 'the stream does not name an unpinned provider model')
-  assert.equal(hops[0]?.model, 'opencode', 'do not invent a provider/model id')
+  assert.equal(hops[0]?.model, null, 'do not invent a provider/model id — the daemon supplies its resolved model')
   const argv = (await fakeLog(f))[0]?.argv ?? []
   assert.equal(argv[argv.indexOf('--session') + 1], 'ses_existing')
   assert.equal(getAdapter('opencode').startSession?.({ home: f.home, env: f.env, onLog: () => {} }) ?? null, null)

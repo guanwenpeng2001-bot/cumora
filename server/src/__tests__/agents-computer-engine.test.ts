@@ -1193,7 +1193,7 @@ test('a Grok ACP turn still settles when no model is announced', { skip: IS_WIN 
 
   assert.equal(result.exitCode, 0)
   assert.equal(result.model, null, 'with nothing announced and nothing pinned there is no model to report')
-  assert.equal(hops[0].model, 'grok', 'the hop keeps its last-resort label')
+  assert.equal(hops[0].model, null, 'no announced model lands as null; the daemon labels the hop')
 })
 
 
