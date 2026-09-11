@@ -44,7 +44,7 @@ test('K8s templates render server namespace consistently for RBAC and agent URLs
     for (const namespace of ['default', 'cumora-staging']) {
       const rendered = template.replaceAll('$' + '{CUMORA_NAMESPACE}', namespace)
       const docs = loadAll(rendered).filter(Boolean)
-      assert.equal(docs.length, variant === 'gke' ? 8 : 7)
+      assert.equal(docs.length, 8, 'OrbStack includes the uploads PVC; GKE includes the PDB')
       for (const doc of docs) {
         if (!doc.kind.startsWith('Cluster')) assert.equal(doc.metadata.namespace, namespace)
       }

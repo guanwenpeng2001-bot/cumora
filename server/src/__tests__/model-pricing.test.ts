@@ -49,6 +49,7 @@ function fixture(env: Record<string, unknown> = {}) {
   })
   const fallback = compile(read('../agents/fallback.ts'), { '../settings.js': {} })
   const execution = compile(read('../llm-execution.ts'), {
+    './tenant-llm-context.js': { validateRoleCallAuth: async (plan: any) => { assert.equal(plan.authorizationVersion, undefined) } },
     './db/pool.js': { pool: { query: async () => { throw new Error('Unexpected executor DB access') } } },
     'node:crypto': { randomUUID }, './llm-resolver.js': {},
     './llm.js': { getLlmCandidateClient: async () => ({}) }, './agents/cost.js': cost,

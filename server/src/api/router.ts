@@ -10,6 +10,8 @@ import {
   storageKeyFromPublicUrl, messageAttachmentStorageKey,
 } from '../storage.js'
 import { pool } from '../db/pool.js'
+import { createReadinessCheck } from '../readiness.js'
+import { redis } from '../redis.js'
 import { CH_MESSAGE_NEW, CH_REACTIONS, CH_CONVO_UPDATED, CH_DOCS, CH_TYPING, CH_CALENDAR_EVENTS, CH_BOARDS, CH_STATUS, CH_WORKSPACES, publish } from '../redis.js'
 import { enqueueBroadcast, nudgeRealtimeOutbox, withOutboxTransaction } from '../realtime-outbox.js'
 import { enqueueWorkspaceCleanup, nudgeWorkspaceCleanupWorker } from '../workspace-cleanup.js'
@@ -1046,21 +1048,19 @@ api.put('/usage/pricing', safe(async (req, res) => {
 // shedding capacity exactly when it was needed. Point the livenessProbe here.
 api.get('/livez', (_req, res) => { res.json({ ok: true, ts: Date.now() }) })
 
-// Readiness: "can this pod serve?" — checks DB reachability, but FAILS FAST.
-// Capped at 1s so the probe gets a deterministic 200/503 instead of hanging on
-// a busy pool until its own 2s deadline (which read as a flaky timeout and could
-// trip both replicas at once under load). A NotReady pod is only pulled from
-// rotation — never killed — so it rejoins as soon as the DB frees up.
+// Readiness uses the application's clients; gateway outages must not block
+// direct-provider fallback. Bound the response and coalesce outstanding work.
+const dependenciesReady = createReadinessCheck(async () => {
+  const query = { text: 'SELECT 1', query_timeout: 1000 }
+  const results = await Promise.allSettled([
+    pool.query(query),
+    redis.ping().then(reply => { if (reply !== 'PONG') throw new Error('Redis not ready') }),
+  ])
+  if (results.some(result => result.status === 'rejected')) throw new Error('Dependencies unavailable')
+})
 api.get('/health', async (_req, res) => {
-  try {
-    await Promise.race([
-      pool.query('SELECT 1'),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('health db check timed out')), 1000)),
-    ])
-    res.json({ ok: true, ts: Date.now() })
-  } catch (e) {
-    res.status(503).json({ ok: false, error: String(e) })
-  }
+  if (await dependenciesReady()) res.json({ ok: true, ts: Date.now() })
+  else res.status(503).json({ ok: false, error: 'Dependencies unavailable' })
 })
 
 /* GET /api/og?url=<encoded url> — Open-Graph / link-preview proxy.

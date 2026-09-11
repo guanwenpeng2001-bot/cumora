@@ -5,6 +5,39 @@ export interface BudgetRuleInput {
   ceiling: number
 }
 
+/** Shared by BYOA and managed turns. Three missed 2s probes, each bounded to 5s. */
+export const TURN_SAFETY_PROBE = { intervalMs: 2000, timeoutMs: 5000, failures: 3 } as const
+
+export async function boundedSafetyProbe<T>(work: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([work, new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new DOMException('Safety probe timed out', 'TimeoutError')), TURN_SAFETY_PROBE.timeoutMs)
+    })])
+  } finally { clearTimeout(timer) }
+}
+
+function transientSafetyFailure(error: unknown): boolean {
+  const e = error as { status?: number; name?: string; code?: string; message?: string; cause?: unknown } | null
+  if (!e || typeof e !== 'object') return false
+  if (typeof e.status === 'number') return e.status >= 500 && e.status <= 599
+  if (e.name === 'TimeoutError') return true
+  if (/^(ECONNRESET|ECONNREFUSED|ECONNABORTED|ETIMEDOUT|EPIPE|ENETUNREACH|EHOSTUNREACH|EAI_AGAIN|ENOTFOUND|UND_ERR_(CONNECT_TIMEOUT|HEADERS_TIMEOUT|BODY_TIMEOUT|SOCKET))$/.test(e.code ?? '')) return true
+  // pg's connection/transport timeouts do not consistently carry an error code.
+  if (/^(Connection terminated unexpectedly|Connection terminated due to connection timeout|timeout exceeded when trying to connect|Query read timeout)$/i.test(e.message ?? '')) return true
+  if (e.name === 'TypeError' && /fetch failed|failed to fetch|network/i.test(e.message ?? '')) return true
+  return e.cause !== undefined && e.cause !== error && transientSafetyFailure(e.cause)
+}
+
+/** Only transport failures earn grace; an explicit refusal never does. */
+export class TurnSafetyGrace {
+  private failures = 0
+  success(): void { this.failures = 0 }
+  shouldStop(error: unknown): boolean {
+    return !transientSafetyFailure(error) || ++this.failures >= TURN_SAFETY_PROBE.failures
+  }
+}
+
 export function parseBudgetRule(value: unknown): BudgetRuleInput {
   if (!value || typeof value !== 'object') throw new Error('invalid budget rule')
   const r = value as Record<string, unknown>

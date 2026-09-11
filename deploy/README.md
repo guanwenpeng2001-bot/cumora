@@ -1,5 +1,9 @@
 # Docker 自托管部署
 
+**支持前提：纯 BYOA（不安装 Kubernetes）部署不在支持范围。** 即使主要使用 BYOA，也需要可用的 Kubernetes 集群、server 可访问的 kubeconfig 或 ServiceAccount、命名空间内 Pod/PVC 生命周期权限，以及用于安装预检/监控的节点读取权限。托管 agent 还需要可拉取的 agent-computer 镜像、节点 `/dev/fuse` 和 FUSE device plugin（`devic.es/fuse`）、可用 StorageClass，以及 Pod 到 runtime API 的网络连通性。server 依赖 PostgreSQL、Redis 与已执行的 schema migration；上传文件需要持久卷（单副本）或 R2（多副本）。
+
+工作区 Pod/PVC 清理始终执行；公开旧开关 `workspace_runtime_cleanup_enabled` 已移除，历史 DB 行无需迁移。暂停 worker 使用 setting `workspace_cleanup_interval_ms=0`（启动环境变量为 `WORKSPACE_CLEANUP_INTERVAL_MS=0`），任务保留待处理，恢复间隔后重试。
+
 基础层 `docker-compose.yml` 独立运行 Cumora。只有显式叠加 `docker-compose.gateway.yml` 才创建 sub2api 服务并要求网关引导凭据。以下命令中的 `config` 仅解析配置,不连接数据库、不运行迁移、不启动或重建容器。
 
 ## 服务与持久化身份
@@ -123,7 +127,7 @@ scheduler 的优先级为 sub2api DB 设置 → env → 当前值。环境变量
 
 配置检查优先用 `config --quiet` / `config --services`,避免输出展开后的真实机密。隔离验证应使用临时目录中的 Compose 副本和 fake `.env`,同时清理 shell 的网关/provider 变量;不能仅给 `--env-file` 传空文件却仍从仓库 `.env` 读取服务机密。
 
-本次部署定义将 server 容器探针指向 `/api/livez`,其处理器只检查进程响应、不查网关或数据库。`/api/health` 继续作为数据库 readiness 检查使用。配置验收可确认探针与依赖不绑定网关,真实网关故障与 Pod 连通性仍须另行在隔离环境实测。
+Compose server 容器探针只请求 `/api/health`，由应用共享 PG/Redis 客户端执行有界 readiness 检查。K8s 的 startup/liveness 仍使用只检查进程响应的 `/api/livez`，readiness 使用 `/api/health`。两者都不把网关可用性当作硬就绪条件，网关故障不会阻断 `.env` 直连兜底入口。
 
 后续发布先完成源码/制品和 schema 兼容核验,再按获准窗口应用目标服务。server 启动必须继续等待一次性 migrate 成功,失败时先查迁移日志,不能绕过门槛。回退恢复原文件组合、固定镜像及运行值;保留原卷、账号、session 和数据库,数据库回退遵循 schema gate,不删历史迁移或改 checksum。本次配置实施不启动、停止或重建任何容器。
 
@@ -174,17 +178,21 @@ BYOA 首次配对命令应带 `--server https://<your-server>`，同源网页生
 
 ## 部署健康与共享存储检查
 
-两份 K8s 模板都显式设置 `CUMORA_REQUIRE_R2=true`，并用非可选 Secret key 引用四个核心 R2 变量。缺 key 时 Kubernetes 阻止容器启动，空值/非法 endpoint 在 storage 初始化时失败，避免落到 Pod 本地文件系统。Compose 不设置此强制开关，继续使用 `cumora-uploads`。Deploy workflow 的迁移 Job 对实际 Secret 注入的环境执行 `storage-precheck.ts`，成功后才执行迁移；候选 Pod 上同样重申强制开关。此门只验证配置，不证明对象存储权限、历史附件迁移或远端可达性；发布 smoke 还需抽查历史附件和新上传下载。
+GKE 多副本模板显式设置 `CUMORA_REQUIRE_R2=true`，并用非可选 Secret key 引用四个核心 R2 变量。缺 key 时 Kubernetes 阻止容器启动，空值/非法 endpoint 在 storage 初始化时失败。Compose 使用 `cumora-uploads` 持久卷。
 
-web 镜像的 HEALTHCHECK 校验 nginx 能返回实际 `index.html`。Compose server 使用独立依赖探针，检查数据库 `SELECT 1`、Redis 认证 `PING` 和 API 的 livez/health；8 秒总限时，输出不含连接凭据。K8s startup/liveness 仍只用 livez，readiness 仍用 health，不因数据库故障反复杀进程。使用新镜像后可手动运行：
+OrbStack 模板提供免 R2 的单副本方案：`replicas: 1`、`Recreate` 更新策略、10Gi `ReadWriteOnce` uploads PVC 挂载到 `/app/server/uploads`，并显式设置 `CUMORA_REQUIRE_R2=false`。需要默认 StorageClass 与持久单节点存储；更新期间会短暂中断。**本地 uploads 卷不能扩到多副本/多节点，也不要配置 HPA。** 切换到 GKE 多副本前须把历史附件迁到 R2，验证上传下载；修改副本数不能替代迁移。已有 Pod 本地附件不会自动复制到新 PVC，应用配置前需在停写维护窗口备份并迁入，不能直接覆盖现有数据。
+
+用 `CUMORA_NAMESPACE=<namespace> node scripts/render-k8s.mjs orbstack` 渲染，先创建 namespace/Secret 并单独完成迁移，再 apply。免 R2 时 Secret 不配置 R2 核心变量；完整 R2 配置仍优先选择 R2。运行 `storage-precheck.ts` 时使用与单副本 Pod 相同的环境并设置 `CUMORA_REQUIRE_R2=false`，缺省 R2 时输出 `storage preflight: local`。现有 GKE Deploy workflow 在迁移 Job 和候选 Pod 中强制 R2，继续只用于 GKE，多副本门禁不放宽；不要把它直接套用于本地 PVC 变体。preflight 只验证配置，不验证 PVC Bound、写权限、对象存储权限或历史附件迁移。
+
+web 镜像的 HEALTHCHECK 校验 nginx 能返回实际 `index.html`。Compose 的 Node 探针仅发起一次 `/api/health` HTTP 请求（2 秒限时），不另建 PG/Redis 连接或重复请求 livez。应用 `/api/health` 使用共享连接执行 `SELECT 1` 和 `PING`，1 秒响应限时，合并未完成检查以避免连接池排队累积；不可用时返回脱敏的 503。K8s startup/liveness 仍只用 livez，不因数据库或 Redis 故障反复杀进程。
 
 ```sh
 docker exec cumora-server node server/src/scripts/dependency-readiness.mjs
-# 仅适用本 Compose gateway（共享 PG/Redis，数据库名 sub2api）：
+# 显式附加网关存活诊断；失败只输出警告，不改变 Cumora readiness 退出码：
 docker exec cumora-server node server/src/scripts/dependency-readiness.mjs --gateway
 ```
 
-sub2api 自带 `/health` 仍仅代表进程存活；独立检查增加共享数据库/Redis/API 可达证据，不修改网关源码。`healthy` 不证明账号授权、余额、模型、图片、SSE 或端到端业务可用。远程独立网关需在其自身网络用其依赖配置另行验证，不能套用共享 Compose 探针。
+sub2api 的 `/health` 仅代表其 HTTP 存活，不证明其数据库、Redis、账号授权、余额、模型、图片、SSE 或端到端业务可用。网关独立依赖与业务诊断应在其自身环境运行；不作为 Cumora 或 `.env` 兜底的硬就绪条件。
 
 ## 可执行备份与恢复演练
 

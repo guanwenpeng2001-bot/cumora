@@ -1,6 +1,7 @@
 import type { ResponseInputItem } from 'openai/resources/responses/responses'
 import { resolveRoleCall } from '../../llm-resolver.js'
-import { automationNumber, getTurnBudgetPolicy } from '../../settings.js'
+import { automationNumber, getTurnBudgetPolicy, getServerSettingsSnapshot } from '../../settings.js'
+import { isDeterministicModelFailure, readModelFailureState, saveModelFailureBackoff } from '../model-failure-backoff.js'
 import type { LlmCallContext, LlmCallRecord } from '../llm-ledger.js'
 import { getPersona } from '../personas.js'
 import { enforceModelPolicy, realTaskModel } from '../model-policy.js'
@@ -29,7 +30,9 @@ function publicStreamEvent(event: Record<string, unknown>): Record<string, unkno
 }
 
 export async function executeRuntimeStream(body: RuntimeStreamRequest, context: LlmCallContext, signal: AbortSignal, emit: RuntimeStreamEmit) {
+  const attempts: LlmCallRecord[] = []
   const onAttempt = async (record: LlmCallRecord) => {
+    attempts.push(record)
     const extras = record.extras ?? {}
     const publicExtras = Object.fromEntries([
       'logicalCallId', 'attempt', 'role', 'purpose', 'requestedModel', 'requestModel', 'actualModel',
@@ -43,17 +46,28 @@ export async function executeRuntimeStream(body: RuntimeStreamRequest, context: 
       extras: { ...context.extras, ...publicExtras } })
   }
   if (body.purpose === 'agent-turn') {
+    const configuration = await readModelFailureState(context.companyId!, context.agentId!)
     const plan = await resolveRuntimeBrainPlan(context, signal)
-    const result = await executeAgentTurnHop({ plan, context, signal, input: body.input as ResponseInputItem[],
-      instructions: body.instructions, tools: body.tools!,
-      wallTimeoutMs: automationNumber('agent_stream_wall_timeout_ms'),
-      idleTimeoutMs: automationNumber('agent_stream_idle_timeout_ms'), onAttempt,
-      compactionPolicy: getTurnBudgetPolicy(),
-      requestEvent: data => emit('request', data),
-      retryEvent: (kind, data) => emit('retry', { kind, data: { ...data, reason: 'Provider attempt retry' } }),
-      streamEvent: event => emit('delta', publicStreamEvent(event as unknown as Record<string, unknown>)),
-    })
-    return { ...result, state: { ...result.state, responseTextByPart: [...result.state.responseTextByPart] } }
+    try {
+      const result = await executeAgentTurnHop({ plan, context, signal, input: body.input as ResponseInputItem[],
+        instructions: body.instructions, tools: body.tools!,
+        wallTimeoutMs: automationNumber('agent_stream_wall_timeout_ms'),
+        idleTimeoutMs: automationNumber('agent_stream_idle_timeout_ms'), onAttempt,
+        compactionPolicy: getTurnBudgetPolicy(),
+        requestEvent: data => emit('request', data),
+        retryEvent: (kind, data) => emit('retry', { kind, data: { ...data, reason: 'Provider attempt retry' } }),
+        streamEvent: event => emit('delta', publicStreamEvent(event as unknown as Record<string, unknown>)),
+      })
+      return { ...result, state: { ...result.state, responseTextByPart: [...result.state.responseTextByPart] } }
+    } catch (error) {
+      if (!signal.aborted && configuration && configuration.revision === getServerSettingsSnapshot().revision
+        && isDeterministicModelFailure(attempts)) {
+        // Persist before delivering failure to the Pod, so the next probe (or a
+        // replacement Pod) cannot replay the retained inbox during cooldown.
+        await saveModelFailureBackoff(context.companyId!, context.agentId!, configuration)
+      }
+      throw error
+    }
   }
   return executeAuxiliaryStream({ purpose: body.purpose, companyId: context.companyId ?? null, agentId: context.agentId!,
     instructions: body.instructions, input: body.input as ResponseInputItem[], outputTokens: body.outputTokens!, signal, onAttempt,

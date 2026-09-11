@@ -2162,6 +2162,8 @@ export const zhCN: Partial<Record<keyof typeof en, string>> = {
   'settings.attemptDetails': '尝试详情',
   'settings.requestedModel': '请求模型',
   'settings.actualModel': '实际模型',
+  'settings.requestedModelFallback': '请求',
+  'settings.actualModelMissing': '实际模型未返回',
   'settings.ledgerId': '台账 ID',
   'settings.sanitizedReason': '脱敏原因',
   'settings.failureStage': '失败阶段',

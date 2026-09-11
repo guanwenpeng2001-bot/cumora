@@ -19,6 +19,7 @@
  */
 import type { ResponseInputItem, ResponseStreamEvent } from 'openai/resources/responses/responses'
 import { env } from '../env.js'
+import { TurnSafetyGrace, TURN_SAFETY_PROBE, boundedSafetyProbe } from '../turn-safety-policy.js'
 import { storage, UPLOAD_DIR } from '../storage.js'
 import { resolveRoleCall, type RoleCallPlan } from '../llm-resolver.js'
 import { executeLlmPlan, responsesToChat } from '../llm-execution.js'
@@ -1710,17 +1711,21 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
     const signal = options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal
     let checkingSafety = false
     let safetyCancelled = false
+    const safetyGrace = new TurnSafetyGrace()
     const safetyTimer = setInterval(() => {
       if (checkingSafety || signal.aborted) return
       checkingSafety = true
-      void runtime.validateTurn(agentId, admission.generation).then(valid => {
+      void boundedSafetyProbe(runtime.validateTurn(agentId, admission.generation)).then(valid => {
+        safetyGrace.success()
         if (!valid) {
           safetyCancelled = true
           controller.abort(new DOMException('Emergency stop', 'AbortError'))
         }
-      }).catch(() => controller.abort(new DOMException('Safety connection lost', 'AbortError')))
+      }).catch(error => {
+        if (safetyGrace.shouldStop(error)) controller.abort(new DOMException('Safety connection lost', 'AbortError'))
+      })
         .finally(() => { checkingSafety = false })
-    }, 2000)
+    }, TURN_SAFETY_PROBE.intervalMs)
     safetyTimer.unref()
     const timer = policy.timeoutMs > 0
       ? setTimeout(() => controller.abort(new DOMException('Managed turn deadline exceeded', 'TimeoutError')), policy.timeoutMs)

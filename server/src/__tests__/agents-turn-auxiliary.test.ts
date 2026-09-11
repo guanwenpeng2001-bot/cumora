@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import ts from 'typescript'
+import { TurnSafetyGrace, TURN_SAFETY_PROBE, boundedSafetyProbe } from '../turn-safety-policy.js'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { compactHistoryWithSummary } from '../agents/turn-compaction.js'
 import * as compaction from '../agents/turn-compaction.js'
@@ -201,6 +202,7 @@ test('managed turn deadline freezes policy once, propagates cancellation and cle
   const policy = Object.freeze({ maxHops: 7, timeoutMs: 25 })
   const timer = { unref() {} }
   const turn = compile(wrapper.getText(ast), {}, {
+    TurnSafetyGrace, TURN_SAFETY_PROBE, boundedSafetyProbe,
     withServerSettingsSnapshot: (work: () => unknown) => work(),
     runtime: { admitTurn: async () => ({ allowed: true }) },
     getTurnBudgetPolicy: () => { reads++; return policy },
@@ -225,6 +227,7 @@ test('managed turn deadline zero schedules no timer and preserves caller cancell
   const wrapper = ast.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'runAgentTurn')!
   const caller = new AbortController()
   const turn = compile(wrapper.getText(ast), {}, {
+    TurnSafetyGrace, TURN_SAFETY_PROBE, boundedSafetyProbe,
     withServerSettingsSnapshot: (work: () => unknown) => work(),
     runtime: { admitTurn: async () => ({ allowed: true }) },
     getTurnBudgetPolicy: () => ({ timeoutMs: 0, maxHops: 200 }),
@@ -359,6 +362,7 @@ test('managed turn shares a complete snapshot across hops and auxiliary reads; n
   const revisions: string[] = []
   const turn = compile(wrapper.getText(ast), {}, {
     withServerSettingsSnapshot: realCapture,
+    TurnSafetyGrace, TURN_SAFETY_PROBE, boundedSafetyProbe,
     runtime: { admitTurn: async () => ({ allowed: true }) },
     getTurnBudgetPolicy: () => ({ timeoutMs: 0, revision: f.settings.getServerSettingsSnapshot().revision }),
     runAgentTurnWithBudget: async (_id: string, _options: unknown, policy: { revision: string }) => {

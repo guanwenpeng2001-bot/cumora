@@ -13,7 +13,8 @@ const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.Modu
 function cluster() {
   const state = {
     cap: 40, used: 0, activeLeases: 0, maxLeases: 0, locks: 0, releases: 0,
-    nodeError: false, malformedPods: false, denyPlacement: false, existingPhase: '',
+    podPhases: undefined as string[] | undefined,
+    nodeError: false, podError: false, malformedPods: false, denyPlacement: false, existingPhase: '',
     deleteError: false, lockError: false, unlockError: false, destroyed: 0, denyAfterHealth: false, lookupError: false, warnings: [] as string[],
     manifests: [] as string[], commands: [] as string[][], alerts: [] as unknown[],
     onApply: undefined as (() => void) | undefined,
@@ -71,7 +72,8 @@ function cluster() {
               else out = JSON.stringify({ items: [{ status: { capacity: { 'devic.es/fuse': String(state.cap) } } }] })
             } else if (command[0] === 'get' && command[1] === 'pods') {
               if (command.includes('--no-headers')) out = ''
-              else out = state.malformedPods ? 'not json' : JSON.stringify({ items: Array.from({ length: state.used }, () => ({ status: { phase: 'Running' } })) })
+              else if (state.podError) { code = 1; err = 'Forbidden' }
+              else out = state.malformedPods ? 'not json' : JSON.stringify({ items: (state.podPhases ?? Array.from({ length: state.used }, () => 'Running')).map(phase => ({ status: { phase } })) })
             } else if (command[0] === 'get' && command[1] === 'pod') {
               out = JSON.stringify({ status: { phase: state.existingPhase } })
               if (state.denyAfterHealth) state.denyPlacement = true
@@ -132,21 +134,44 @@ function cluster() {
   return { state, replica }
 }
 
-test('zero, unavailable and malformed capacity all refuse a new Pod without a Pod apply', async () => {
-  for (const failure of ['zero', 'unavailable', 'malformed']) {
+test('unknown or exhausted node FUSE capacity does not veto ordinary Pod creation', async () => {
+  for (const failure of ['zero', 'unavailable', 'exhausted']) {
     const c = cluster()
-    if (failure === 'zero') c.state.cap = 0
-    if (failure === 'unavailable') c.state.nodeError = true
-    if (failure === 'malformed') c.state.malformedPods = true
+    c.state.cap = failure === 'exhausted' ? 1 : 0
+    c.state.used = 2
+    c.state.nodeError = failure === 'unavailable'
+    const r = c.replica()
+    await r.api.getClusterFuseUtilization()
+    c.state.commands.length = 0
+    assert.equal((await r.api.ensurePod('agent')).created, true, failure)
+    assert.equal(c.state.manifests.length, 1)
+    assert.ok(!c.state.commands.some(command => command[1] === 'nodes'), 'ordinary admission never samples nodes')
+  }
+})
+
+test('unreadable or malformed Pod lists refuse creation and release the admission lease', async () => {
+  for (const failure of ['unreadable', 'malformed']) {
+    const c = cluster()
+    c.state.podError = failure === 'unreadable'
+    c.state.malformedPods = failure === 'malformed'
     const result = await c.replica().api.ensurePod('agent')
-    assert.equal(result.ok, false, failure)
     assert.equal(!result.ok && result.code, 'capacity_denied', failure)
     assert.equal(c.state.manifests.length, 0)
     assert.equal(c.state.locks, c.state.releases)
   }
 })
 
-test('threshold and cap updates govern the next admission while cached samples retain raw cluster capacity', async () => {
+test('unknown, non-positive or non-integer app limits refuse new Pods', async () => {
+  for (const cap of ['0', '-1', 'NaN', 'Infinity', '1.5', '']) {
+    const c = cluster(), r = c.replica()
+    r.settings.pod_admission_max = cap
+    const result = await r.api.ensurePod('agent')
+    assert.equal(!result.ok && result.code, 'capacity_denied', cap)
+    assert.equal(c.state.manifests.length, 0)
+  }
+})
+
+test('app cap governs admission independently of cached FUSE samples and legacy threshold', async () => {
   const c = cluster()
   c.state.used = 8
   const r = c.replica()
@@ -157,23 +182,25 @@ test('threshold and cap updates govern the next admission while cached samples r
   assert.equal(cached.cap, 10)
   assert.equal(cached.ratio, 0.8)
   r.settings.pod_fuse_threshold = '0.8'
-  assert.equal((await r.api.ensurePod('denied')).ok, false)
+  assert.equal((await r.api.ensurePod('below-cap')).ok, true)
+  c.state.used = 10
+  assert.equal((await r.api.ensurePod('at-cap')).ok, false)
   r.settings.pod_admission_max = '20'
   r.settings.pod_idle_ms = '120000'
   assert.equal((await r.api.ensurePod('allowed')).ok, true)
-  assert.match(c.state.manifests[0], /name: CUMORA_AGENT_IDLE_MS\s+value: "120000"/)
+  assert.match(c.state.manifests[1], /name: CUMORA_AGENT_IDLE_MS\s+value: "120000"/)
   assert.equal(c.state.commands.some(command => command[0] === 'delete'), false)
 })
 
 test('independent replicas serialize fresh reads and Pod applies across the last admission slot', async () => {
   const c = cluster()
-  c.state.used = 35
+  c.state.used = 39
   const replicas = [c.replica(), c.replica(), c.replica()]
   await Promise.all(replicas.map(r => r.api.getClusterFuseUtilization()))
   const results = await Promise.all(replicas.map((r, i) => r.api.ensurePod('agent-' + i)))
   assert.equal(results.filter(r => r.created).length, 1)
   assert.equal(results.filter(r => !r.ok && r.code === 'capacity_denied').length, 2)
-  assert.equal(c.state.used, 36)
+  assert.equal(c.state.used, 40)
   assert.equal(c.state.maxLeases, 1)
   assert.equal(c.state.locks, 1)
   assert.equal(c.state.releases, 3)
@@ -300,15 +327,16 @@ test('PVC idle retention zero keeps live agents while preserving orphan and depa
     ['live-pvc', 'gone-pvc', 'orphan-pvc'])
 })
 
-test('FUSE denial gives actionable plugin guidance and recovers after capacity is advertised', async () => {
+test('FUSE monitoring gives actionable plugin guidance and recovers after capacity is advertised', async () => {
   const c = cluster()
   const r = c.replica()
   c.state.cap = 0
-  const denied = await r.api.ensurePod('agent')
-  assert.match(denied.reason, /generic-device-plugin.note.*kubectl describe nodes/)
-  assert.ok(c.state.warnings.some(w => w.includes('FUSE admission denied')))
-  c.state.cap = 40
+  const sample = await r.api.getClusterFuseUtilization()
+  assert.equal(sample.capacityKnown, false)
+  assert.match(sample.capacityError!, /generic-device-plugin.note.*kubectl describe nodes/)
   assert.equal((await r.api.ensurePod('agent')).created, true)
+  c.state.cap = 40
+  assert.equal((await r.api.getClusterFuseUtilization()).capacityKnown, true)
 })
 
 test('busy or failed admission lease returns bounded capacity denial and releases the connection', async () => {
@@ -401,4 +429,16 @@ test('Pod URL rewriting is limited to local deployments and respects gateway pat
   assert.doesNotMatch(result.reason, /malformed-secret-password/)
   assert.ok(c.state.manifests.length > 0)
   assert.doesNotMatch(c.state.manifests.join('\n'), /DATABASE_URL|REDIS_URL|malformed-secret-password/)
+})
+
+
+test('fresh Pending and Running demand counts toward app cap while terminal Pods release slots', async () => {
+  const c = cluster(), r = c.replica()
+  r.settings.pod_admission_max = '2'
+  c.state.podPhases = ['Pending', 'Running', 'Succeeded', 'Failed']
+  assert.equal((await r.api.ensurePod('full')).ok, false)
+  c.state.podPhases = ['Pending', 'Succeeded', 'Failed']
+  assert.equal((await r.api.ensurePod('free')).created, true)
+  c.state.podPhases = ['Pending', 'Unknown']
+  assert.equal((await r.api.ensurePod('uncertain')).ok, false)
 })

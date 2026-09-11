@@ -236,8 +236,8 @@ export const env = {
    * /dev/fuse count: GKE can expose hundreds of logical FUSE slots per
    * node, but CPU, memory, API-server churn, and provider concurrency
    * are the real production ceiling. The orchestrator admits new pods
-   * against min(cluster fuse capacity, this value). Set <=0 to rely on
-   * the cluster resource only.
+   * against this positive limit and fresh Pending/Running Pod counts.
+   * Invalid or non-positive values refuse new Pods.
    */
   AGENT_POD_ADMISSION_MAX: Number(process.env.AGENT_POD_ADMISSION_MAX ?? 40),
   /**
@@ -441,11 +441,6 @@ export const env = {
   /** Durable external-resource cleanup after workspace deletion. Set the
    * interval to 0 to leave jobs queued for a separately invoked worker. */
   WORKSPACE_CLEANUP_INTERVAL_MS: Number(process.env.WORKSPACE_CLEANUP_INTERVAL_MS ?? 60_000),
-  /** Legacy compatibility value. Workspace Pod/PVC cleanup is mandatory;
-   * pause WORKSPACE_CLEANUP_INTERVAL_MS instead to leave jobs pending. */
-  WORKSPACE_RUNTIME_CLEANUP_ENABLED: ['1', 'true', 'yes', 'on'].includes(
-    (process.env.WORKSPACE_RUNTIME_CLEANUP_ENABLED ?? '').toLowerCase(),
-  ),
   /** Interval between poll-expiration sweeps. Defaults to 60s. The sweep
    *  flips polls past their expiresAt to closed and broadcasts the close
    *  event. Set to 0 to disable (polls then stay open forever even after

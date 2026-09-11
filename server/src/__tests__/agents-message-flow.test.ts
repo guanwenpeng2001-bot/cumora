@@ -4,7 +4,7 @@ import { test } from 'node:test'
 import ts from 'typescript'
 import { TurnMessageConsumption } from '../agents/message-consumption.js'
 import { hasDraftDelivery, replyDraftId, resolveDeclaredAutoRelayTarget } from '../agents/auto-relay.js'
-import { enqueueWakeJob, claimWakeJobs, finishWakeJob, renewWakeJob } from '../agents/wake-queue.js'
+import { enqueueWakeJob, claimFairWakeJobs, finishWakeJob, renewWakeJob } from '../agents/wake-queue.js'
 import { agentMessageConsumptionsChecksum } from '../db/migrations/0017-agent-message-consumptions.js'
 import { SCHEMA_MIGRATIONS } from '../db/migrations/manifest.js'
 import { wakeQueueFixture } from './wake-queue-fixture.js'
@@ -135,10 +135,10 @@ for (const delivered of [true, false]) test(`email reply ${delivered ? 'success'
 test('worker death retains a leased payload and expired owners cannot ack or renew its reclaim', async () => {
   const f = wakeQueueFixture(), queue = 'q'
   await enqueueWakeJob(f.store, queue, 'm', { body: 'durable' }, 0)
-  const [first] = await claimWakeJobs(f.store, queue, 0, 10)
+  const [first] = await claimFairWakeJobs(f.store, queue, 0, 10)
   assert.equal(f.hash('q:jobs').size, 1)
-  assert.deepEqual(await claimWakeJobs(f.store, queue, 299_999, 10), [])
-  const [second] = await claimWakeJobs(f.store, queue, 300_000, 10)
+  assert.deepEqual(await claimFairWakeJobs(f.store, queue, 299_999, 10), [])
+  const [second] = await claimFairWakeJobs(f.store, queue, 300_000, 10)
   assert.notEqual(first.token, second.token)
   await finishWakeJob(f.store, queue, first)
   await renewWakeJob(f.store, queue, first, 900_000)

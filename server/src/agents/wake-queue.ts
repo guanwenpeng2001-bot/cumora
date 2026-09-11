@@ -95,25 +95,6 @@ export async function enqueueWakeJob(store: WakeQueueStore, queue: string, id: s
   id, JSON.stringify({ ...payload, _revision: randomUUID() }), dueAt, replace ? '1' : '0')
 }
 
-/** Claim leaves the payload durable and moves its due time to the lease expiry. */
-export async function claimWakeJobs(store: WakeQueueStore, queue: string, now: number, limit: number): Promise<ClaimedWakeJob[]> {
-  const result = await store.eval(`
-    local ids = redis.call('ZRANGEBYSCORE', KEYS[2], 0, ARGV[1], 'LIMIT', 0, ARGV[2])
-    local jobs = {}
-    for i, id in ipairs(ids) do
-      local raw = redis.call('HGET', KEYS[1], id)
-      if raw then
-        local token = ARGV[4] .. ':' .. i
-        redis.call('HSET', KEYS[3], id, token)
-        redis.call('ZADD', KEYS[2], tonumber(ARGV[1]) + tonumber(ARGV[3]), id)
-        table.insert(jobs, cjson.encode({id=id, raw=raw, token=token}))
-      else redis.call('ZREM', KEYS[2], id) end
-    end
-    return jobs
-  `, 3, `${queue}:jobs`, `${queue}:due`, `${queue}:processing`, now, limit, LEASE_MS, randomUUID()) as string[]
-  return result.map(raw => JSON.parse(raw) as ClaimedWakeJob)
-}
-
 export async function finishWakeJob(store: WakeQueueStore, queue: string, job: ClaimedWakeJob, remember = true): Promise<void> {
   const finished = await store.eval(`
     if redis.call('HGET', KEYS[3], ARGV[1]) ~= ARGV[2]

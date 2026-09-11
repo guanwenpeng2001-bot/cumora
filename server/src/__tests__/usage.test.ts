@@ -255,7 +255,7 @@ test('usage log DTO preserves unknown actual models and retains requested and hi
   assert.equal(result.items[0].httpStatus, 401)
 })
 
-test('dashboard renders unknown actual model in both log cell and details while retaining requested model', async () => {
+test('dashboard labels requested-model fallback and distinguishes missing actual model in cell and details', async () => {
   const source = readFileSync(new URL('../../../src/desktop/UsageDashboard.tsx', import.meta.url), 'utf8')
   const ast = ts.createSourceFile('UsageDashboard.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
   let cell: ts.JsxElement | undefined
@@ -280,7 +280,8 @@ test('dashboard renders unknown actual model in both log cell and details while 
   }).outputText
   const jsx = await import('react/jsx-runtime')
   const { renderToStaticMarkup } = await import('react-dom/server')
-  const labels: Record<string, string> = { 'settings.actualModel': '实际模型', 'settings.requestedModel': '请求模型' }
+  const labels: Record<string, string> = { 'settings.actualModel': '实际模型', 'settings.requestedModel': '请求模型',
+    'settings.requestedModelFallback': '请求', 'settings.actualModelMissing': '实际模型未返回' }
   const exports: Record<string, any> = {}
   new Function('exports', 'require', 'unknown', 'translate', 't', 'locale', 'cn', 'td', 'useState', 'modelPlatformLabel', js)(
     exports, () => jsx, '未知', (_locale: string, key: string) => labels[key] ?? key,
@@ -289,7 +290,8 @@ test('dashboard renders unknown actual model in both log cell and details while 
   )
   for (const actualModel of [null, undefined, '']) {
     const html = renderToStaticMarkup(exports.render({ actualModel, requestedModel: 'requested-only', model: 'legacy-only' }))
-    assert.match(html, /^<td[^>]*>未知<details/)
+    assert.match(html, /^<td[^>]*><div>请求: requested-only<\/div>/)
+    assert.match(html, /实际模型未返回<\/div><details/)
     assert.match(html, /实际模型: 未知/)
     assert.match(html, /请求模型: requested-only/)
     assert.doesNotMatch(html, /legacy-only/)
@@ -297,6 +299,13 @@ test('dashboard renders unknown actual model in both log cell and details while 
   const html = renderToStaticMarkup(exports.render({ actualModel: 'provider-reported', requestedModel: 'requested-only' }))
   assert.match(html, /^<td[^>]*>provider-reported<details/)
   assert.match(html, /实际模型: provider-reported/)
+  assert.doesNotMatch(html, /实际模型未返回/)
+  const legacy = renderToStaticMarkup(exports.render({ model: 'legacy-request' }))
+  assert.match(legacy, /请求: legacy-request/)
+  assert.match(legacy, /实际模型未返回/)
+  const unknown = renderToStaticMarkup(exports.render({}))
+  assert.match(unknown, /请求: 未知/)
+  assert.match(unknown, /实际模型未返回/)
 })
 
 test('direct platform labels use known routes, respect explicit platforms and ignore env slot names', () => {

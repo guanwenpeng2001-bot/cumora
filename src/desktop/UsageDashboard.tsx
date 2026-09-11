@@ -522,7 +522,10 @@ function UsageDashboardContent() {
                 <td className={cn(td, 'whitespace-nowrap')}>{new Date(r.createdAt).toLocaleString()}</td>
                 <td className={td}>{r.agentName ?? '—'}</td>
                 <td className={cn(td, 'font-mono')}>
-                  {r.actualModel || unknown}
+                  {r.actualModel || <>
+                    <div>{translate(locale, 'settings.requestedModelFallback')}: {r.requestedModel || r.model || unknown}</div>
+                    <div className="text-[10px] font-sans text-slate-500">{translate(locale, 'settings.actualModelMissing')}</div>
+                  </>}
                   <LogAttemptDetails r={r} locale={locale} t={t} unknown={unknown} />
                 </td>
                 <td className={td}>{tokensMeasured(r) ? fmtTokens(r.inputTokens) : unknown}</td>

@@ -43,6 +43,7 @@ export function fixture(behavior: (request: any, signal?: AbortSignal) => AsyncI
   let clientOverride: (() => Promise<any>) | null = null
   const llm = { getLlmCandidateClient: async () => clientOverride ? clientOverride() : ({ responses: { create }, chat: { completions: { create } } }) }
   const execution = compile(read('../llm-execution.ts'), {
+    './tenant-llm-context.js': { validateRoleCallAuth: async (plan: any) => { assert.equal(plan.authorizationVersion, undefined) } },
     './db/pool.js': { pool: { query: async () => { throw new Error('Unexpected auxiliary DB access') } } },
     'node:crypto': { randomUUID }, './llm-resolver.js': resolver, './llm.js': llm,
     './agents/fallback.js': fallback, './agents/cost.js': cost, './settings.js': settings,

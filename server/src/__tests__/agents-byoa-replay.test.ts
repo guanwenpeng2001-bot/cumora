@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
 import ts from 'typescript'
+import { TurnSafetyGrace, TURN_SAFETY_PROBE } from '../turn-safety-policy.js'
 
 function source(path: string) {
   return ts.createSourceFile(path, readFileSync(new URL(path, import.meta.url), 'utf8'), ts.ScriptTarget.Latest, true)
@@ -26,6 +27,7 @@ function turnFixture(result: { exitCode: number; error?: string } | Error, cance
   let cancellation: Promise<void> | undefined
   const runner = compile(`return new class { ${methods('../agents/computer/daemon.ts', 'AgentRunner',
     ['runTurn', 'maybeAgendaTurn', 'admitSafety', 'emergencyCancel', 'finishCancelledTurn', 'ackSeen', 'assertRunning'])} }`, {
+    TurnSafetyGrace, TURN_SAFETY_PROBE,
     api: async () => admissionStopped && ++admissionCalls > 1
       ? { allowed: false, generation: '1', reason: 'emergency_stop' }
       : { allowed: true, generation: '0' },

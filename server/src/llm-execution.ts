@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { pool } from './db/pool.js'
 import { resolveRoleCall, type RoleCallPlan, type RoleCallCandidate, type RoleCallAgent } from './llm-resolver.js'
 import { getLlmCandidateClient } from './llm.js'
+import { validateRoleCallAuth } from './tenant-llm-context.js'
 import { fallbackReason, isLlmCancellation } from './agents/fallback.js'
 import { capturePricing, measuredUsage, type TokenUsage } from './agents/cost.js'
 import { recordLlmCall, classifyLlmCallError, type LlmCallContext, type LlmCallRecord } from './agents/llm-ledger.js'
@@ -43,6 +44,7 @@ export interface LlmExecutionOptions<T> {
 /** Owns the complete application hop, including consumption, with exactly one record. */
 export async function executeLlmPlan<T>(options: LlmExecutionOptions<T>): Promise<T> {
   const { plan, context, signal } = options
+  await validateRoleCallAuth(plan)
   if (context.companyId !== plan.companyId || context.purpose !== plan.purpose) throw new Error('LLM plan context mismatch')
   if (!plan.candidates.length) throw new Error('LLM candidate chain is empty')
   const candidates = plan.candidates.filter(candidate => candidate.available)
@@ -60,6 +62,7 @@ export async function executeLlmPlan<T>(options: LlmExecutionOptions<T>): Promis
   let transportRetryCount = 0
   for (let index = 0; index < candidates.length; index++) {
     checkAbort()
+    await validateRoleCallAuth(plan)
     const candidate = candidates[index]!
     const state: LlmAttemptState = { usage: null, rawUsage: null, actualModel: null, committed: false }
     const start = Date.now()
@@ -69,6 +72,7 @@ export async function executeLlmPlan<T>(options: LlmExecutionOptions<T>): Promis
     let prepared = false
     try {
       const send = await options.prepare(candidate, state)
+      await validateRoleCallAuth(plan)
       checkAbort()
       prepared = true
       value = await send()

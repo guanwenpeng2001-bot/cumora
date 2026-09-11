@@ -605,10 +605,11 @@ test('Pod worker timer disables, re-enables and reschedules without cancelling o
 
 test('operations settings preserve defaults, validate bounds and allow inheritance', async () => {
   const f = fixture()
+  f.data.set('workspace_runtime_cleanup_enabled', 'false')
   await f.settings.loadServerSettings()
   const defaults: Record<string, string> = {
     email_retry_interval_ms: '60000', email_gc_interval_ms: '86400000', db_gc_interval_ms: '300000',
-    workspace_cleanup_interval_ms: '60000', workspace_runtime_cleanup_enabled: 'false',
+    workspace_cleanup_interval_ms: '60000',
     poll_sweep_interval_ms: '60000', llm_rollup_interval_ms: '120000',
     chrome_pvc_gc_interval_ms: '3600000', chrome_pvc_gc_idle_days: '30',
     db_gc_batch: '10000', db_gc_ws_tickets_days: '1', db_gc_agent_log_days: '30',
@@ -622,13 +623,16 @@ test('operations settings preserve defaults, validate bounds and allow inheritan
   }
   for (const [key, value] of Object.entries({ email_retry_interval_ms: '-1', db_gc_batch: '0',
     workspace_cleanup_batch: '33', db_gc_llm_calls_days: '1.5', llm_rollup_interval_ms: '2147483648',
-    workspace_runtime_cleanup_enabled: 'maybe', llm_rollup_retention_hours: '-1' })) {
+    llm_rollup_retention_hours: '-1' })) {
     await assert.rejects(f.settings.writeServerSettings({ [key]: value }))
   }
-  await f.settings.writeServerSettings({ db_gc_llm_calls_days: '0', llm_rollup_interval_ms: '0', workspace_runtime_cleanup_enabled: 'true' })
+  await f.settings.writeServerSettings({ db_gc_llm_calls_days: '0', llm_rollup_interval_ms: '0', workspace_cleanup_interval_ms: '0' })
   assert.equal(f.settings.automationNumber('db_gc_llm_calls_days'), 0)
   assert.equal(f.settings.automationNumber('llm_rollup_interval_ms'), 0)
-  assert.equal(f.settings.automationEnabled('workspace_runtime_cleanup_enabled'), true)
+  assert.equal(f.settings.automationNumber('workspace_cleanup_interval_ms'), 0)
+  assert.ok(!f.settings.getServerSettingsSnapshot().definitions!.some(def => def.key === 'workspace_runtime_cleanup_enabled'))
+  await assert.rejects(f.settings.writeServerSettings({ workspace_runtime_cleanup_enabled: 'true' }))
+  assert.equal(f.data.get('workspace_runtime_cleanup_enabled'), 'false', 'legacy DB row is preserved without migration')
   await f.settings.writeServerSettings(Object.fromEntries(Object.keys(defaults).map(key => [key, null])))
   for (const [key, value] of Object.entries(defaults)) assert.equal(f.settings.getServerSetting(key), value)
 })

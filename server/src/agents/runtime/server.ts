@@ -43,6 +43,7 @@ import { buildRuntimeArgv } from './cli-argv.js'
 import type { RuntimeTokenUsage, RuntimeTriageReport } from './client.js'
 import { attachFsEndpoints } from './fs-endpoints.js'
 import { inprocClient } from './inproc-client.js'
+import { admitModelFailureRetry } from '../model-failure-backoff.js'
 import { type AgentRuntimeClaims, verifyAgentToken } from './jwt.js'
 import { attachWakeStream, } from './wake-bus.js'
 import { serveRuntimeText } from './llm-proxy.js'
@@ -155,7 +156,7 @@ runtimeRouter.post('/turn-valid', withAgent(async (c, req, res) => {
 }))
 
 runtimeRouter.post('/turn-admission', withAgent(async (c, _req, res) => {
-  res.json(await turnAdmission(c.companyId, c.sub))
+  res.json(await admitModelFailureRetry(c.companyId, c.sub, await turnAdmission(c.companyId, c.sub)))
 }))
 runtimeRouter.post('/stop-confirmed', withAgent(async (c, req, res) => {
   if (typeof req.body?.generation !== 'string' || !/^\d+$/.test(req.body.generation)) { res.status(400).json({ error: 'invalid generation' }); return }

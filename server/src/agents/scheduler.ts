@@ -40,6 +40,7 @@ import { triageDisposition, deferTriage, type TriageDisposition } from './triage
 import type { AgentTurnOptions } from './turn.js'
 import { recipientsForRoute, routeMessage } from './routing.js'
 import { Semaphore } from '../concurrency.js'
+import { turnAdmission } from '../turn-safety.js'
 
 /** Bounds how many recipients the wake fan-out triages + wakes at once
  *  (per replica). See env.WAKE_FANOUT_CONCURRENCY — this is the
@@ -141,24 +142,25 @@ async function postWakeRetryExhaustedNotice(
   conversationId: string | null,
   attempt: number,
   failureReason: string,
+  failureClass: WakeFailureClass,
 ): Promise<void> {
   if (!conversationId) return
   try {
     const result = await inprocClient.postSystemNotice({
       conversationId,
       agentId,
-      noticeKind: 'ensure_pod_retry_exhausted',
-      text: 'Managed agent wake could not complete after ' + Math.max(0, attempt - 1) +
+      noticeKind: `${failureClass}_retry_exhausted`,
+      text: `Agent ${failureClass === 'triage' ? 'inbox triage' : failureClass.replaceAll('_', ' ')} could not complete after ` + Math.max(0, attempt - 1) +
         ' retries. The message remains in the inbox; please try again later or contact an administrator. ' +
         'Last error: ' + failureReason.slice(0, 300),
-      dedupeKey: 'ensure_pod_retry_exhausted:' + agentId + ':' + conversationId,
+      dedupeKey: failureClass + '_retry_exhausted:' + agentId + ':' + conversationId,
       dedupeTtlSec: 3600,
     })
     if (result.posted) {
-      console.warn('[scheduler] posted ensurePod exhaustion notice for ' + agentId + ' in ' + conversationId)
+      console.warn(`[scheduler] posted ${failureClass} exhaustion notice for ` + agentId + ' in ' + conversationId)
     }
   } catch (err) {
-    console.warn('[scheduler] failed to post ensurePod exhaustion notice for ' + agentId + ':',
+    console.warn(`[scheduler] failed to post ${failureClass} exhaustion notice for ` + agentId + ':',
       err instanceof Error ? err.message : err)
   }
 }
@@ -180,7 +182,7 @@ async function scheduleWakeRetry(
     : WAKE_RETRY_MAX_ATTEMPTS
   if (attempt > maxAttempts) {
     if (reason === 'message.new') {
-      await postWakeRetryExhaustedNotice(agentId, conversationId, attempt, failureReason)
+      await postWakeRetryExhaustedNotice(agentId, conversationId, attempt, failureReason, failureClass)
     }
     void notifyAlert({
       label: 'scheduler.wake_retry_exhausted',
@@ -1000,9 +1002,15 @@ export async function triageWakeRecipient(
   agentId: string,
   durableDelivery: { conversationId: string; messageId: string } | null = null,
 ): Promise<WakeOptions | null> {
+  let phase = 'triage'
   try {
     const persona = await inprocClient.loadPersona(agentId)
     if (!persona) return null
+    // Capture before reading/classifying this batch. Receipt transactions still
+    // reject a stop or generation change that races with triage.
+    const safety = await turnAdmission(persona.companyId, agentId)
+    if (!safety.allowed) throw new Error(`triage admission deferred: ${safety.reason}`)
+    const safetyGeneration = safety.generation
     let inbox = await inprocClient.loadInbox(agentId)
     if (inbox.length === 0) return null
     if (durableDelivery) {
@@ -1015,12 +1023,15 @@ export async function triageWakeRecipient(
         // mirrors the BYOA daemon's system-only snapshot+ack path and prevents
         // the terminal notice from replaying forever or resurfacing after a
         // later re-invite. Other unread work remains eligible for normal triage.
+        phase = 'triage receipt'
         await inprocClient.markConversationRead({
           agentId,
+          safetyGeneration,
           conversationId: terminal.conversation_id,
           upToMessageId: terminal.id,
           consumedMessageIds: [terminal.id],
         })
+        phase = 'triage'
         console.log(`[scheduler] ${agentId} acknowledged durable departure notice ${terminal.id}`)
         inbox = inbox.filter((row) => row.id !== terminal.id)
         if (inbox.length === 0) return null
@@ -1040,17 +1051,21 @@ export async function triageWakeRecipient(
     const contextBoundary = inboxTriageBoundary(context)
     if (disposition.outcome === 'defer') return { triageDeferred: disposition, triageBoundary, contextBoundary }
     if (disposition.outcome === 'ignore' && disposition.ackAllowed) {
+      phase = 'triage receipt'
       const seen = new Map<string, string>()
       for (const row of inbox) seen.set(row.conversation_id, row.id)
       await Promise.all([...seen].map(([conversationId, upToMessageId]) =>
-        inprocClient.markConversationRead({ agentId, conversationId, upToMessageId,
+        inprocClient.markConversationRead({ agentId, conversationId, upToMessageId, safetyGeneration,
           consumedMessageIds: inbox.filter(row => row.conversation_id === conversationId).map(row => row.id) })))
       console.log(`[scheduler] ${agentId} message.new skipped by inbox triage: ${verdict.reason}`)
       return null
     }
     return { triageNote: renderTriageNote(verdict), triageBoundary, contextBoundary }
   } catch (err) {
-    const reason = err instanceof Error ? err.message : String(err)
+    const detail = err instanceof Error ? err.message : String(err)
+    const reason = phase === 'triage receipt'
+      ? `triage receipt rejected: ${detail.includes('turn stopped') ? 'stale safety generation or emergency stop; retaining unfinished inputs' : detail}`
+      : detail
     console.warn(`[scheduler] ${agentId} inbox triage unavailable; deferred: ${reason}`)
     return { triageDeferred: { ...deferTriage('fail-closed', reason, 'payload-unavailable'), retryAt: Date.now() + automationNumber('triage_backoff_base_ms') } }
   }

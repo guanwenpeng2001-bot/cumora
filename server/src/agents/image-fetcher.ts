@@ -62,6 +62,8 @@ export interface ImageBytesOk {
 export type ImageBytesResult = ImageBytesOk | ImageFetchFailure
 
 export interface ImageFetchOptions {
+  /** Server-generated provider results only; never set for user input URLs. */
+  networkPolicy?: 'dashscope-result'
   signal?: AbortSignal
   maxBytes?: number
   timeoutMs?: number
@@ -93,6 +95,7 @@ interface ImageFetchDependencies {
 }
 
 interface RequiredImageFetchOptions {
+  networkPolicy?: ImageFetchOptions['networkPolicy']
   signal?: AbortSignal
   maxBytes: number
   timeoutMs: number
@@ -231,7 +234,8 @@ async function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T
 async function resolveImageTarget(
   url: URL,
   signal: AbortSignal,
-  lookup: ImageFetchDependencies['lookup'],
+  dependencies: ImageFetchDependencies,
+  networkPolicy?: ImageFetchOptions['networkPolicy'],
 ): Promise<ResolvedImageTarget> {
   if ((url.protocol !== 'http:' && url.protocol !== 'https:') || url.username || url.password) {
     throw new BlockedImageUrlError('unsupported image URL')
@@ -245,7 +249,10 @@ async function resolveImageTarget(
   const literalFamily = isIP(hostname)
   const addresses = literalFamily
     ? [{ address: hostname, family: literalFamily as 4 | 6 }]
-    : await abortable(lookup(hostname), signal)
+    : await abortable(networkPolicy === 'dashscope-result' && url.protocol === 'https:' && !url.port
+        && DASHSCOPE_RESULT_HOSTS.has(hostname)
+      ? resolveDashscopeResult(hostname, signal, dependencies.request)
+      : dependencies.lookup(hostname), signal)
 
   if (addresses.length === 0) throw new Error('image hostname resolved to no addresses')
 
@@ -310,6 +317,33 @@ const productionDependencies: ImageFetchDependencies = {
   request: requestPinnedImage,
 }
 
+// Exact provider-owned buckets observed in DashScope responses. Do not allow
+// arbitrary OSS buckets: they can be created by users. Unknown hosts retain
+// the default resolver and SSRF checks, including on every redirect hop.
+const DASHSCOPE_RESULT_HOSTS = new Set([
+  'dashscope-7c2c.oss-cn-shanghai.aliyuncs.com',
+  'dashscope-a717.oss-accelerate.aliyuncs.com',
+])
+
+async function resolveDashscopeResult(
+  hostname: string, signal: AbortSignal, request: ImageFetchDependencies['request'],
+): Promise<readonly ResolvedAddress[]> {
+  // VPNs can intercept even explicit UDP DNS. Query AliDNS over verified TLS
+  // at its fixed public address; never accept fake/private IPs as an exception.
+  const url = new URL(`https://dns.alidns.com/resolve?name=${encodeURIComponent(hostname)}&type=A`)
+  const response = await abortable(request({ url, hostname: url.hostname, address: '223.5.5.5', family: 4 }, signal), signal)
+  try {
+    if (response.status !== 200) throw new Error('provider DNS request failed')
+    const bytes = await readBodyWithCap(response, 16 * 1024, signal)
+    if (!bytes) throw new Error('provider DNS response too large')
+    const body = JSON.parse(bytes.toString()) as { Status?: number; Answer?: { type: number; data: string }[] }
+    if (body.Status !== 0 || !Array.isArray(body.Answer)) throw new Error('provider DNS answer unavailable')
+    return body.Answer.filter(answer => answer.type === 1).map(answer => ({ address: answer.data, family: 4 }))
+  } finally {
+    response.cancel()
+  }
+}
+
 function headerValue(headers: IncomingHttpHeaders, name: string): string | undefined {
   const value = headers[name]
   return Array.isArray(value) ? value[0] : value
@@ -359,7 +393,7 @@ async function fetchImageBytesWithDependencies(
   const signal = options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal
   try {
     for (let redirects = 0; ; redirects += 1) {
-      const target = await resolveImageTarget(current, signal, dependencies.lookup)
+      const target = await resolveImageTarget(current, signal, dependencies, options.networkPolicy)
       const response = await abortable(dependencies.request(target, signal), signal)
       const location = headerValue(response.headers, 'location')
 
@@ -430,6 +464,7 @@ export async function fetchImageBytes(
 ): Promise<ImageBytesResult> {
   if (imageFetchOverrideForTesting) return await imageFetchOverrideForTesting(url, options)
   return await fetchImageBytesWithDependencies(url, {
+    networkPolicy: options.networkPolicy,
     signal: options.signal,
     maxBytes: options.maxBytes ?? MAX_IMAGE_BYTES,
     timeoutMs: options.timeoutMs ?? FETCH_TIMEOUT_MS,
@@ -469,6 +504,7 @@ export async function _fetchImageBytesForTest(
   dependencies: ImageFetchDependencies,
 ): Promise<ImageBytesResult> {
   return await fetchImageBytesWithDependencies(url, {
+    networkPolicy: options.networkPolicy,
     signal: options.signal,
     maxBytes: options.maxBytes ?? MAX_IMAGE_BYTES,
     timeoutMs: options.timeoutMs ?? FETCH_TIMEOUT_MS,

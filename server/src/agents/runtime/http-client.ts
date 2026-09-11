@@ -28,6 +28,7 @@ import type {
   WorkTaskType,
 } from './client.js'
 import { notifyAlert } from '../../alerting.js'
+import { TURN_SAFETY_PROBE } from '../../turn-safety-policy.js'
 
 /** Per-process failure counter for the busy heartbeat. The heartbeat
  *  must not crash a turn on a transient Redis hiccup, but a SUSTAINED
@@ -78,7 +79,7 @@ export class HttpRuntimeClient implements AgentRuntimeClient {
   private safetyGeneration = '0'
 
   async validateTurn(_agentId: string, generation: string): Promise<boolean> {
-    const result = await this.call<{ valid: boolean }>('POST', '/turn-valid', { generation }, 5000)
+    const result = await this.call<{ valid: boolean }>('POST', '/turn-valid', { generation }, TURN_SAFETY_PROBE.timeoutMs)
     return result.valid
   }
 
@@ -94,7 +95,7 @@ export class HttpRuntimeClient implements AgentRuntimeClient {
 
   private async call<T>(method: 'GET' | 'POST', path: string, body?: unknown, timeoutMs = this.timeoutMs): Promise<T> {
     const ctrl = new AbortController()
-    const timer = setTimeout(() => ctrl.abort(), timeoutMs)
+    const timer = setTimeout(() => ctrl.abort(new DOMException('Runtime request timed out', 'TimeoutError')), timeoutMs)
     try {
       const res = await this.fetchImpl(`${this.baseUrl}${path}`, {
         method,
@@ -106,11 +107,15 @@ export class HttpRuntimeClient implements AgentRuntimeClient {
         body: body !== undefined ? JSON.stringify(body) : undefined,
         signal: ctrl.signal,
       })
+      if (res.status === 401 || res.status === 403) {
+        void res.body?.cancel().catch(() => {})
+        throw Object.assign(new Error(`runtime ${method} ${path} → ${res.status}`), { status: res.status })
+      }
       const text = await res.text()
       if (!res.ok) {
         let msg = text
         try { msg = (JSON.parse(text) as { error?: string }).error ?? text } catch { /* keep raw */ }
-        throw new Error(`runtime ${method} ${path} → ${res.status}: ${msg}`)
+        throw Object.assign(new Error(`runtime ${method} ${path} → ${res.status}: ${msg}`), { status: res.status })
       }
       return text.length === 0 ? (undefined as unknown as T) : (JSON.parse(text) as T)
     } finally {

@@ -192,11 +192,16 @@ ceiling (default `40`) before creating agent pods. Keep that lower
 than the advertised FUSE count so bursts are bounded by Cumora's real
 CPU, memory, API-server, and provider concurrency budget.
 
-The cluster-wide FUSE ceiling is enforced fail-closed. The checked-in
-manifests bind the server ServiceAccount to a narrow `ClusterRole` with only
-`nodes: [get, list]`, in addition to the namespaced Pod/PVC Role. If the node
-or Pod capacity read still fails, admission is refused with a readable reason;
-`AGENT_POD_ADMISSION_MAX` is never bypassed.
+Ordinary admission uses a positive integer `AGENT_POD_ADMISSION_MAX` and a
+fresh Pending/Running Pod count under the cross-replica PostgreSQL admission
+lock (Unknown Pods also count conservatively). Unreadable/invalid Pod lists or
+an unknown/non-positive app limit refuse creation. Node FUSE capacity is only
+installation/monitoring evidence; missing capacity does not veto admission.
+Kubernetes still schedules the unchanged `devic.es/fuse: 1` request/limit;
+Pending Pods retain wake retries and scheduling diagnostics. The narrow
+`nodes: [get, list]` ClusterRole remains for monitoring. Legacy
+`pod_fuse_threshold` no longer reduces the app limit; monitoring alerts use
+`cluster_monitor_ratio_min`.
 
 On **GKE Autopilot**: the plugin DaemonSet works but Autopilot may
 reject `securityContext.capabilities.add: [SYS_ADMIN]` depending on
@@ -288,3 +293,24 @@ kubectl logs agent-<id>
 - **Monitoring** — both Pods (server + agent) log to stdout/stderr
   which GKE auto-collects to Cloud Logging. Set up alerting on
   agent_runs.status='failed' or kubelet's container_restart_count.
+
+
+## Single-replica local uploads alternative
+
+`cumora-server.orbstack.yaml` is an explicit single-node, single-replica variant:
+10Gi ReadWriteOnce uploads PVC at `/app/server/uploads`, `Recreate` updates (brief
+downtime), and `CUMORA_REQUIRE_R2=false`. It requires a default StorageClass,
+persistent single-node storage, Kubernetes/FUSE setup and Pod/PVC RBAC. A pure
+BYOA deployment without Kubernetes is unsupported. Local uploads must not scale
+to multiple replicas or nodes; do not attach an HPA. Back up uploads with the
+DB; preserve and migrate existing local files before first use of this PVC.
+
+Render using `CUMORA_NAMESPACE=default node scripts/render-k8s.mjs orbstack`.
+Run the separate migration with the intended Secret environment; run
+`CUMORA_REQUIRE_R2=false node --import tsx server/src/scripts/storage-precheck.ts`
+first. With R2 keys omitted it reports `storage preflight: local`; a complete R2
+configuration still selects R2. This config check does not prove PVC binding or
+write access. The GKE Deploy workflow intentionally forces R2 in its migration
+Job and candidate Pod and is not the local variant's deployment path. GKE's
+multi-replica template continues to require R2; migrate historical uploads and
+verify downloads before switching to it.

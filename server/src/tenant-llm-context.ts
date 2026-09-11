@@ -51,7 +51,22 @@ function capTtlMap<K, V>(map: Map<K, V>, max: number, expired: (value: V) => boo
 
 /** Freeze the resolved owner keys onto a plan object without putting credentials in the public DTO. */
 export function bindRoleCallAuth(plan: object, context: TenantLlmContext): void {
+  assertTenantLlmContextCurrent(context)
   planAuth.set(plan, context)
+}
+
+export function assertTenantLlmContextCurrent(context: TenantLlmContext): void {
+  const current = contexts.get(context.companyId)?.context
+  if (context.generation !== (generations.get(context.companyId) ?? 0)
+    || context.baseURL !== sub2apiOpenAIBaseURL()
+    || current && current.authorizationVersion !== context.authorizationVersion) {
+    throw new TenantLlmAccessError('Tenant LLM authorization changed; resolve the plan again')
+  }
+}
+
+/** Applies to every hop, including direct fallback; discovery cannot grant access. */
+export async function validateRoleCallAuth(plan: { companyId: string | null; authorizationVersion?: string }): Promise<void> {
+  if (plan.authorizationVersion) await contextForRoleCallPlan(plan)
 }
 
 /** Reuse the context resolved with this plan unless authorization has rotated. */
@@ -66,6 +81,7 @@ export async function contextForRoleCallPlan(plan: {
     && bound.authorizationVersion === plan.authorizationVersion
     && bound.generation === (generations.get(plan.companyId) ?? 0)
     && bound.baseURL === sub2apiOpenAIBaseURL()) {
+    assertTenantLlmContextCurrent(bound)
     return bound
   }
   const context = await resolveTenantLlmContext(plan.companyId)
@@ -120,7 +136,7 @@ export async function resolveTenantLlmContext(companyId: string, userId?: string
           SELECT 1 FROM company_members cm WHERE cm.company_id = c.id AND cm.user_id = $2
         ))`, values: [companyId, userId ?? null], query_timeout: 500 } as import('pg').QueryConfig & { query_timeout: number },
   ), 500)
-  if (generation !== (generations.get(companyId) ?? 0)) return resolveTenantLlmContext(companyId, userId)
+  if (generation !== (generations.get(companyId) ?? 0)) throw new TenantLlmAccessError('Tenant LLM authorization changed during identity lookup')
   const row = rows[0]
   if (!row) throw new TenantLlmAccessError('Company not found or access denied')
   const context: TenantLlmContext = {
@@ -187,6 +203,7 @@ export async function tenantModelSnapshot(context: TenantLlmContext, refresh = f
 /** Business routes use only this authorization version; refresh never blocks a warm call. */
 export async function tenantRoutingSnapshot(context: TenantLlmContext, signal?: AbortSignal): Promise<TenantModelSnapshot | null> {
   signal?.throwIfAborted()
+  assertTenantLlmContextCurrent(context)
   const existing = snapshots.get(context.companyId)
   const previous = existing?.authorizationVersion === context.authorizationVersion ? existing : null
   // Warm catalog: return the snapshot and do not start another /models round-trip.
@@ -195,7 +212,7 @@ export async function tenantRoutingSnapshot(context: TenantLlmContext, signal?: 
   // Background discovery can fail after the caller has returned or cancelled.
   void refresh.catch(() => {})
   if (previous && !hasExpiredMembership(previous)) return previous
-  // Discovery has a 15s HTTP deadline. Cold/expired routes must finish discovery
-  // or raise a retryable timeout, never become an unavailable plan.
-  return waitForLlmResolution(refresh, 16_000, signal)
+  // Discovery is advisory. Cold/expired catalogs never block explicit routes or
+  // configured direct fallback; a later call can use the background result.
+  return null
 }

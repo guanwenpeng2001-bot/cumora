@@ -77,9 +77,10 @@ services:
       migrate:
         condition: service_completed_successfully
     healthcheck:
+      # HTTP-only: /api/health checks the application's shared PG/Redis clients.
       test: ["CMD", "node", "server/src/scripts/dependency-readiness.mjs"]
       interval: 10s
-      timeout: 10s
+      timeout: 3s
       retries: 12
       # Match the k8s startupProbe budget (~300s). Schema verification retries
       # with exponential backoff plus bounded connection timeouts can exceed

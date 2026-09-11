@@ -40,6 +40,7 @@ import { mergeWakeTurnOptions, parseWakeData } from './wake-options.js'
 
 interface RunnerState {
   busy: boolean
+  hasPendingInbox: boolean
   inboxDeferred: { messageIds: string[]; retryAt: number } | null
   pendingRerun: boolean
   shuttingDown: boolean
@@ -56,6 +57,7 @@ interface RunnerState {
 }
 
 const state: RunnerState = {
+  hasPendingInbox: false,
   inboxDeferred: null,
   busy: false, pendingRerun: false, shuttingDown: false,
   lastActivityAt: Date.now(),
@@ -137,6 +139,9 @@ async function drain(agentId: string, options: AgentTurnOptions | null = null): 
       // Schedule outside runAgentTurn's AsyncLocalStorage snapshot: the retry
       // must capture the next revision, not inherit this turn's settings.
       if (state.inboxDeferred) deferInboxDrain(agentId, state.inboxDeferred)
+      // Failed/admission-deferred inputs still need the next probe, even when
+      // the only wake was the cold-start drain (no SSE wake ever arrived).
+      state.hasPendingInbox = (await runtime.loadInbox(agentId)).length > 0
       state.lastActivityAt = Date.now()
     } while (state.pendingRerun && !state.shuttingDown)
   } catch (err) {
@@ -154,7 +159,9 @@ async function drain(agentId: string, options: AgentTurnOptions | null = null): 
 /** Periodic self-heal for the managed Pod. A wake can be lost while the
  * server is restarting or while the first loadInbox call fails; the inbox is
  * durable, so probing it is enough to re-enter the normal serialized drain
- * path without creating another turn when the fingerprint is unchanged. */
+ * path. runAgentTurn's server admission checks persisted model-configuration
+ * cooldown on every probe/wake, including after a Pod restart; configuration
+ * changes release that gate without waiting for the cooldown to expire. */
 function stopInboxProbe(): void {
   if (inboxProbeTimer) {
     clearInterval(inboxProbeTimer)
@@ -169,6 +176,7 @@ function startInboxProbe(agentId: string, intervalMs = 30_000): void {
     inboxProbeInFlight = true
     try {
       const inbox = await runtime.loadInbox(agentId)
+      state.hasPendingInbox = inbox.length > 0
       if (inbox.length > 0 && !state.busy) void drain(agentId)
     } catch (err) {
       console.warn('[pod-agent] inbox probe failed:',
@@ -317,7 +325,7 @@ function startIdleWatcher(
   const tickMs = Math.min(5_000, Math.max(500, Math.floor(Math.min(idleMs, noWorkMs) / 10)))
   const tick = setInterval(() => {
     // Keep the in-memory deferred boundary alive until its scheduled retry.
-    if (state.inboxDeferred) return
+    if (state.inboxDeferred || state.hasPendingInbox) return
     const reason = decidePodExit(state, bootedAt, Date.now(), idleMs, noWorkMs)
     if (reason !== null) {
       clearInterval(tick)

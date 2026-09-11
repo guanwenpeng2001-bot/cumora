@@ -1,4 +1,4 @@
-/** K8s explicitly requires shared object storage; Compose keeps local uploads. */
+/** Multi-replica K8s requires R2; single-replica PVC and Compose allow local uploads. */
 export const REQUIRED_R2_KEYS = ['R2_ENDPOINT', 'R2_BUCKET', 'R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY'] as const
 
 export function checkStorageConfig(config: Record<string, string | undefined>): 'r2' | 'local' {

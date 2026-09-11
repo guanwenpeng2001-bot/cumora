@@ -21,16 +21,38 @@ export function wakeQueueFixture() {
     const jobs = hash(keys[0]), due = sorted(keys[1]), processing = hash(keys[2])
     if (script.includes('ZRANGEBYSCORE')) {
       assert.doesNotMatch(script, /HDEL/, 'claim must retain payload through worker failure')
-      const result: string[] = []
-      for (const [id, score] of [...due].sort((a, b) => a[1] - b[1])) {
-        if (score > Number(args[0]) || result.length >= Number(args[1])) continue
+      const now = Number(args[0]), limit = Number(args[1])
+      const ordered = [...due].sort((a, b) => a[1] - b[1] || a[0].localeCompare(b[0]))
+      const eligible = ordered.filter(([, score]) => score >= 0 && score <= now)
+      const offset = Number(args[4]) >= eligible.length ? 0 : Number(args[4])
+      const window = eligible.slice(offset, offset + 512)
+      const groups = new Map<string, { id: string; raw: string }[]>()
+      for (const [id] of window) {
         const raw = jobs.get(id)
         if (!raw) { due.delete(id); continue }
-        const token = `${args[3]}:${result.length + 1}`
-        processing.set(id, token); due.set(id, Number(args[0]) + Number(args[2]))
-        result.push(JSON.stringify({ id, raw, token }))
+        let group = id
+        try {
+          const payload = JSON.parse(raw)
+          group = `${payload.companyId ?? ''}:${payload.conversationId ?? payload.agentId ?? id}`
+        } catch { /* Invalid payloads are grouped by job id, like Lua. */ }
+        if (!groups.has(group)) groups.set(group, [])
+        groups.get(group)!.push({ id, raw })
       }
-      return result
+      const result: { id: string; raw: string; token: string }[] = []
+      for (let round = 0; result.length < limit; round++) {
+        let more = false
+        for (const group of groups.values()) {
+          const job = group[round]
+          if (!job || result.length >= limit) continue
+          more = true
+          const token = `${args[3]}:${result.length + 1}`
+          processing.set(job.id, token); due.set(job.id, now + Number(args[2]))
+          result.push({ ...job, token })
+        }
+        if (!more) break
+      }
+      return JSON.stringify({ jobs: result, cursor: offset + window.length - result.length,
+        pending: eligible.length, oldestAgeMs: Math.max(0, now - (ordered[0]?.[1] ?? now)) })
     }
     const id = String(args[0])
     if (script.includes('HEXISTS')) {

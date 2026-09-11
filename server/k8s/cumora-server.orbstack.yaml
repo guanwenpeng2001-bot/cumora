@@ -1,4 +1,9 @@
-# cumora-server — OrbStack / local-dev manifest.
+# cumora-server — single-replica OrbStack / local-dev manifest with uploads PVC.
+# Local uploads MUST NOT scale to multiple replicas or nodes. Recreate avoids
+# overlapping writers during updates (brief downtime). No HPA for this variant.
+# Requires a default StorageClass with persistent single-node storage; back up
+# the uploads PVC with PostgreSQL. For HA/multiple nodes migrate uploads to R2
+# and use the GKE template; changing replicas alone is unsupported.
 #
 # For production GKE, use `cumora-server.gke.yaml` instead; that one
 # has the Cloud SQL Proxy sidecar, Workload Identity annotation,
@@ -14,7 +19,7 @@
 #
 #   export CUMORA_NAMESPACE=default # set to the server ServiceAccount namespace
 #   # Create the namespace and required Secrets in that namespace first.
-#   envsubst '${CUMORA_NAMESPACE}' < server/k8s/cumora-server.orbstack.yaml | kubectl apply -f -
+#   node scripts/render-k8s.mjs orbstack | kubectl apply -f -
 # This is a template: render CUMORA_NAMESPACE before applying. Using kubectl -n
 # alone cannot rewrite the cluster-scoped binding's ServiceAccount subject.
 # FUSE device plugin is required; see server/k8s/generic-device-plugin.note.
@@ -53,7 +58,7 @@ rules:
   resources: ["persistentvolumeclaims"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 ---
-# Nodes are cluster-scoped, so the FUSE admission probe needs a narrow
+# Nodes are cluster-scoped, so the FUSE monitoring probe needs a narrow
 # ClusterRole in addition to the namespaced Pod Role above.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -90,6 +95,17 @@ roleRef:
   name: cumora-server-agent-pods
   apiGroup: rbac.authorization.k8s.io
 ---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  namespace: ${CUMORA_NAMESPACE}
+  name: cumora-uploads
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 10Gi
+---
 # Deployment — run `npm run migrate` once before applying this manifest.
 # Application replicas only verify the immutable migration ledger and never
 # execute DDL while starting.
@@ -101,6 +117,8 @@ metadata:
   labels: { app: cumora-server }
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels: { app: cumora-server }
   template:
@@ -108,30 +126,24 @@ spec:
       labels: { app: cumora-server }
     spec:
       serviceAccountName: cumora-server
+      volumes:
+      - name: uploads
+        persistentVolumeClaim: { claimName: cumora-uploads }
       containers:
       - name: server
         image: quay.io/yetoneful/cumora-server:dev
         imagePullPolicy: IfNotPresent
         ports:
         - { name: http, containerPort: 5181 }
+        volumeMounts:
+        - { name: uploads, mountPath: /app/server/uploads }
         envFrom:
         - secretRef: { name: cumora }
         env:
-        # Shared storage is mandatory; empty values also fail at server startup.
+        # storage-precheck accepts local mode; omit all R2 keys from the Secret
+        # to use this volume. Complete R2 configuration still selects R2.
         - name: CUMORA_REQUIRE_R2
-          value: "true"
-        - name: R2_ENDPOINT
-          valueFrom:
-            secretKeyRef: { name: cumora, key: R2_ENDPOINT, optional: false }
-        - name: R2_BUCKET
-          valueFrom:
-            secretKeyRef: { name: cumora, key: R2_BUCKET, optional: false }
-        - name: R2_ACCESS_KEY_ID
-          valueFrom:
-            secretKeyRef: { name: cumora, key: R2_ACCESS_KEY_ID, optional: false }
-        - name: R2_SECRET_ACCESS_KEY
-          valueFrom:
-            secretKeyRef: { name: cumora, key: R2_SECRET_ACCESS_KEY, optional: false }
+          value: "false"
         # The agent-computer pod reaches the server via this URL.
         # When server runs IN the cluster, use the service DNS;
         # when server runs on the host, agents reach it via
@@ -140,14 +152,12 @@ spec:
           value: "http://cumora-server.${CUMORA_NAMESPACE}.svc.cluster.local:5181/runtime"
         - name: CUMORA_AGENT_NAMESPACE
           value: "${CUMORA_NAMESPACE}"
-        - name: WORKSPACE_RUNTIME_CLEANUP_ENABLED
-          value: "true"
         # In-cluster PG is also reachable via the service URL above
         # for the agent FUSE driver's HTTP traffic; PG itself lives
         # on the host in dev (host.docker.internal:5432, set in the
         # Secret's DATABASE_URL).
         # Startup waits for the schema gate's bounded DB retry budget. Liveness
-        # only checks the process; readiness checks DB reachability and keeps a
+        # only checks the process; readiness checks PG/Redis reachability and keeps a
         # booting or degraded pod out of service without killing it.
         startupProbe:
           httpGet: { path: /api/livez, port: http }

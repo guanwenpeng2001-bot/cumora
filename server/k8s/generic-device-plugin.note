@@ -35,13 +35,12 @@
 # advertises /dev/fuse (800 slots per node in prod) plus a handful of other generic devices
 # (audio, tun, kvm) which we don't use but don't hurt.
 #
-# Without positive devic.es/fuse capacity the orchestrator refuses new Pods
-# with capacity_denied and installation guidance. This includes Docker Desktop:
-# enabling Kubernetes alone does not install a FUSE device plugin. Admission
-# remains fail-closed if /dev/fuse is unavailable, the API/RBAC read fails, or
-# capacity is exhausted. After fixing the plugin, the next wake reads capacity
-# again; missing-capacity failures are not cached.
+# Missing devic.es/fuse is an installation fault surfaced by monitoring and
+# Kubernetes Pending/FailedScheduling diagnostics. Docker Desktop Kubernetes
+# alone does not install this plugin. Ordinary app admission does not sample
+# nodes: it requires a positive app limit, a fresh readable Pod list and the
+# cross-replica admission lock. Kubernetes enforces the device request/limit.
 # Verify /dev/fuse exists on worker nodes and positive capacity/allocatable in
-# kubectl describe nodes. For Forbidden, check nodes get/list and namespaced
-# pods get/list permissions for the server ServiceAccount. The ClusterRoleBinding
+# kubectl describe nodes. For monitoring Forbidden errors, check nodes get/list;
+# for admission errors, check namespaced pods get/list. ClusterRoleBinding's
 # subject namespace must match the server namespace (render CUMORA_NAMESPACE).

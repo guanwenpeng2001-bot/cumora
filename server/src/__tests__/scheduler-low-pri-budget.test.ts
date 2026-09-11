@@ -9,7 +9,7 @@ import { test, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import ts from 'typescript'
-import { enqueueWakeJob, claimWakeJobs, finishWakeJob, renewWakeJob } from '../agents/wake-queue.js'
+import { enqueueWakeJob, claimFairWakeJobs as claimWakeJobs, finishWakeJob, renewWakeJob } from '../agents/wake-queue.js'
 import { wakeQueueFixture } from './wake-queue-fixture.js'
 
 // Run production declarations against in-memory I/O, without importing the

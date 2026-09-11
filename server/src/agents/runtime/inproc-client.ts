@@ -145,7 +145,8 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
     const persona = await getPersona(agentId)
     if (!persona?.companyId) return { allowed: false, generation: '0', reason: 'missing_agent' }
     const { turnAdmission } = await import('../../turn-safety.js')
-    return turnAdmission(persona.companyId, agentId)
+    const { admitModelFailureRetry } = await import('../model-failure-backoff.js')
+    return admitModelFailureRetry(persona.companyId, agentId, await turnAdmission(persona.companyId, agentId))
   }
 
   async confirmStopped(agentId: string, generation: string): Promise<void> {

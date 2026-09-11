@@ -20,6 +20,7 @@
  */
 
 import { execFile, spawn } from 'node:child_process'
+import { TurnSafetyGrace, TURN_SAFETY_PROBE } from '../../turn-safety-policy.js'
 import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, constants as FS_CONSTANTS, type FSWatcher, watch } from 'node:fs'
 import { chmod, copyFile, lstat, mkdir, open, readdir, readFile, realpath, rename, rm, stat, truncate, writeFile } from 'node:fs/promises'
@@ -644,8 +645,12 @@ async function api<T>(serverUrl: string, path: string, init: RequestInit): Promi
     signal: init.signal ?? AbortSignal.timeout(HTTP_TIMEOUT_MS),
   })
   if (!res.ok) {
+    if (res.status === 401 || res.status === 403) {
+      void res.body?.cancel().catch(() => {})
+      throw Object.assign(new Error(`${init.method ?? 'GET'} ${path} → HTTP ${res.status}`), { status: res.status })
+    }
     const body = await res.text().catch(() => '')
-    throw new Error(`${init.method ?? 'GET'} ${path} → HTTP ${res.status} ${body.slice(0, 200)}`)
+    throw Object.assign(new Error(`${init.method ?? 'GET'} ${path} → HTTP ${res.status} ${body.slice(0, 200)}`), { status: res.status })
   }
   return res.json() as Promise<T>
 }
@@ -3036,17 +3041,21 @@ export class AgentRunner {
     this.activeTurn = turn
     let activeBackgroundBrief: WakeBackgroundBrief | null = null
     let safetyChecking = false
+    const safetyGrace = new TurnSafetyGrace()
     const safetyTimer = setInterval(() => {
       if (safetyChecking || this.cancellingSafety) return
       safetyChecking = true
       void api<{ valid: boolean }>(this.cfg.serverUrl, '/runtime/turn-valid', {
         method: 'POST', headers: { Authorization: `Bearer ${this.token}` },
-        body: JSON.stringify({ generation: this.safetyGeneration }), signal: AbortSignal.timeout(5000),
+        body: JSON.stringify({ generation: this.safetyGeneration }), signal: AbortSignal.timeout(TURN_SAFETY_PROBE.timeoutMs),
       }).then(result => {
+        safetyGrace.success()
         if (!result.valid) void this.emergencyCancel(this.safetyGeneration).catch(console.error)
-      }).catch(() => { void this.emergencyCancel(this.safetyGeneration, 'safety_validation_failed').catch(console.error) })
+      }).catch(error => {
+        if (safetyGrace.shouldStop(error)) void this.emergencyCancel(this.safetyGeneration, 'safety_validation_failed').catch(console.error)
+      })
         .finally(() => { safetyChecking = false })
-    }, 2000)
+    }, TURN_SAFETY_PROBE.intervalMs)
     safetyTimer.unref()
     try {
       do {

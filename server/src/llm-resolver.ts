@@ -1,6 +1,6 @@
 import { getServerSettingsSnapshot, parseLlmConfig, readLlmModelTarget, LLM_ROLES, type LlmRole, type LlmProtocol, type ServerSettingsSnapshot } from './settings.js'
 import { resolveDirectLlmEnv, type DirectLlmSlot } from './env.js'
-import { resolveTenantLlmContext, tenantRoutingSnapshot, waitForLlmResolution, bindRoleCallAuth } from './tenant-llm-context.js'
+import { resolveTenantLlmContext, tenantRoutingSnapshot, waitForLlmResolution, bindRoleCallAuth, TenantLlmAccessError } from './tenant-llm-context.js'
 import { sub2apiRoutingConfigured, sub2apiConfigured, pickPlatformForModel, supportsGatewayImages, gatewayCatalogHasImages, dashscopeMediaRole, supportsDashscopeChatAudio, keyedPlatforms, type Platform } from './sub2api.js'
 import { parseAgentModelConfig, REASONING_EFFORTS } from './agents/model-config.js'
 
@@ -70,7 +70,7 @@ export async function resolveRoleCall(company: string | null, domain: RoleCallPl
   const context = company && sub2apiRoutingConfigured() ? await waitForLlmResolution(resolveTenantLlmContext(company), 500, signal) : null
   const discovery = role !== 'embed' && context && keyedPlatforms(context.keys).length ? await tenantRoutingSnapshot(context, signal) : null
   if (context && discovery && context.authorizationVersion !== discovery.authorizationVersion) {
-    return resolveRoleCall(company, domain, role, purpose, agent, snapshot, signal)
+    throw new TenantLlmAccessError('Tenant LLM authorization changed during resolution')
   }
   if (context && !discovery && role !== 'embed') diagnostics.push('discovery:pending')
   const available = context ? keyedPlatforms(context.keys) : []
@@ -99,10 +99,6 @@ export async function resolveRoleCall(company: string | null, domain: RoleCallPl
     const preferred = pickPlatformForModel(modelsByPlatform, translated.requestModel, available)
     const membership = available.filter(p => [...modelsByPlatform[p] ?? []].some(id => id.trim().toLowerCase() === translated.requestModel.trim().toLowerCase()))
     const routes = [...new Set([preferred, ...membership])].filter(p => available.includes(p))
-    if (!routes.length && available.some(p => {
-      const status = discovery?.platforms[p]
-      return !status || status.status === 'timeout' || status.status === 'unavailable'
-    })) throw new DOMException('LLM model discovery pending; resolve again', 'TimeoutError')
     return (routes.length ? routes : [preferred]).map(platformHint => ({ ...entry, platformHint }))
   })
   const candidates = expanded.map(({ model, target, platformHint }): RoleCallCandidate => {
@@ -118,6 +114,10 @@ export async function resolveRoleCall(company: string | null, domain: RoleCallPl
     const protocol = translated.protocol ?? explicit?.protocol ?? (kind === 'direct' ? direct.protocol as LlmProtocol : role === 'image' ? 'images' : role === 'audio' ? 'chat' : role === 'embed' ? 'embeddings' : platform === 'zhipu' ? 'chat' : 'responses')
     const gatewaySupported = role !== 'image' || kind !== 'gateway' || protocol === 'images' && supportsGatewayImages(translated.requestModel)
     const platformDiscovery = kind === 'gateway' && platform && discovery ? discovery.platforms[platform] : undefined
+    const discoveryPending = kind === 'gateway' && !explicit && !available.includes(platform!) && available.some(p => {
+      const status = discovery?.platforms[p]
+      return !status || status.status === 'timeout' || status.status === 'unavailable'
+    })
     const catalogKnown = Boolean(platformDiscovery && (platformDiscovery.ok || platformDiscovery.stale))
     const gatewayGroupReady = role !== 'image' || kind !== 'gateway' || !gatewaySupported || !catalogKnown
       || gatewayCatalogHasImages(platform ? modelsByPlatform[platform] : undefined)
@@ -146,7 +146,7 @@ export async function resolveRoleCall(company: string | null, domain: RoleCallPl
         maxOutputTokens: max === undefined ? undefined : Math.min(max, metadata?.maxOutputTokens ?? max, contextWindow ?? max), contextWindow,
         reasoningHeadroom: role === 'brain' ? undefined : readInteger('support_reasoning_headroom', 0, 0) } : {},
       capabilities: { tools: metadata?.tools, vision: metadata?.vision },
-      diagnostic: !gatewaySupported ? 'gateway-image-model-unsupported' : !audioSupported ? 'dashscope-audio-requires-native-protocol' : !compatible ? 'incompatible-capability' : kind === 'direct' && !direct.configured ? 'direct-unconfigured' : kind === 'gateway' && !context?.keys[platform!] ? 'gateway-unprovisioned' : !gatewayGroupReady ? 'gateway-image-group-unavailable' : undefined,
+      diagnostic: discoveryPending ? 'gateway-discovery-pending' : !gatewaySupported ? 'gateway-image-model-unsupported' : !audioSupported ? 'dashscope-audio-requires-native-protocol' : !compatible ? 'incompatible-capability' : kind === 'direct' && !direct.configured ? 'direct-unconfigured' : kind === 'gateway' && !context?.keys[platform!] ? 'gateway-unprovisioned' : !gatewayGroupReady ? 'gateway-image-group-unavailable' : undefined,
     }
   })
   const seen = new Set<string>()
@@ -156,6 +156,7 @@ export async function resolveRoleCall(company: string | null, domain: RoleCallPl
     seen.add(key)
     return true
   })
+  signal?.throwIfAborted()
   const resolved = freeze({ ...plan, candidates: unique, diagnostics: [...new Set(diagnostics)] })
   if (context) bindRoleCallAuth(resolved, context)
   return resolved

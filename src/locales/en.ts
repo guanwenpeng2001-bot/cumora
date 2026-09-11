@@ -2160,6 +2160,8 @@ export const en = {
   'settings.attemptDetails': 'Attempt details',
   'settings.requestedModel': 'Requested model',
   'settings.actualModel': 'Actual model',
+  'settings.requestedModelFallback': 'Requested',
+  'settings.actualModelMissing': 'Actual model not returned',
   'settings.ledgerId': 'Ledger ID',
   'settings.sanitizedReason': 'Sanitized reason',
   'settings.failureStage': 'Failure stage',

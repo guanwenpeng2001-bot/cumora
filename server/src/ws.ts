@@ -25,6 +25,7 @@ import {
 } from './documents/rooms.js'
 import { randomUUID } from 'node:crypto'
 import { WsDispatch } from './ws-dispatch.js'
+import { resyncWsClients, trackWsRecoveryScope, type RecoveryEvent } from './ws-recovery.js'
 
 interface AuthedSocket {
   ws: WebSocket
@@ -32,8 +33,8 @@ interface AuthedSocket {
   /** Stable per-socket id used as the Yjs update origin. Lets the room
    *  manager echo-suppress on this client's own outbound updates. */
   originId: string
-  /** Set of company_ids this user is a member of. Refreshed on connect; the
-   *  WS bridge uses it to filter Redis events tagged with `companyId`. */
+  /** Conservative recovery scope, updated on joins and targeted invalidations.
+   * Business delivery always uses fresh authorization queries. */
   companies: Set<string>
   /** Active doc subscriptions on this socket. Released on close. */
   docSubs: Map<string, DocSubscriber>
@@ -144,11 +145,11 @@ async function loadMemberships(userId: string): Promise<Set<string>> {
   return new Set(rows.map((r) => r.company_id))
 }
 
-interface RoutedRedisEvent {
+interface RoutedRedisEvent extends RecoveryEvent {
   type?: string
   companyId?: string
   conversationId?: string
-  message?: { id?: string }
+  message?: { id?: string; deliveryRecipientId?: string }
   mentionedIds?: string[]
   recipientUserIds?: string[]
 }
@@ -930,18 +931,6 @@ export function attachWebSocket(httpServer: Server) {
     console.log(`[ws] subscribed to ${count} redis channels`)
   })
 
-  const resync = () => {
-    // No event identifiers/payload are exposed on lookup failure or overflow.
-    // Reconnect's hello drives the existing REST reconciliation in all stores.
-    for (const c of clients) {
-      if (c.ws.readyState !== c.ws.OPEN) continue
-      try {
-        c.ws.send(JSON.stringify({ type: 'sync.required', reason: 'realtime_backlog',
-          recovery: 'reconnect_then_rest', messages: '/api/conversations/:id/messages?limit=500&before=:oldestSequence' }))
-        c.ws.close(1013, 'REST sync required; reconnect')
-      } catch { c.ws.terminate() }
-    }
-  }
   const dispatch = new WsDispatch<{ event: RoutedRedisEvent; payload: string }>(async (batch, expired) => {
     // Targeted workspace frames keep their specialized authorization rules.
     const isRoom = (e: RoutedRedisEvent) => !!e.conversationId &&
@@ -960,6 +949,7 @@ export function attachWebSocket(httpServer: Server) {
     for (const { event, payload } of batch) {
       for (const c of clients) {
         if (!recipients.get(event)?.has(c.userId) || c.ws.readyState !== c.ws.OPEN) continue
+        if (event.companyId) c.companies.add(event.companyId)
         if (c.ws.bufferedAmount > WS_MAX_BUFFERED_BYTES) {
           if (c.ws.bufferedAmount > WS_TERMINATE_BUFFERED_BYTES) c.ws.terminate()
           else c.ws.close(1013, 'REST sync required; reconnect')
@@ -968,7 +958,7 @@ export function attachWebSocket(httpServer: Server) {
         try { c.ws.send(payload) } catch { c.ws.terminate() }
       }
     }
-  }, resync)
+  }, batch => resyncWsClients(clients, batch))
   const metrics = setInterval(() => {
     console.log('[ws.dispatch]', JSON.stringify(dispatch.snapshot()))
   }, 10_000)
@@ -978,9 +968,8 @@ export function attachWebSocket(httpServer: Server) {
   sub.on('message', (channel, payload) => {
     // Doc channels are room-scoped, not company-scoped — skip them here.
     if (channel === 'cumora:doc.update' || channel === 'cumora:doc.awareness') return
-    // Tenant-aware fan-out: only deliver an event to a socket if the event's
-    // companyId is in the socket's set of memberships. Untagged events are
-    // dropped (no leakage), since every publisher is expected to tag.
+    // Scope recovery from server events; business delivery still queries live
+    // permissions in the dispatcher. Untagged events are dropped.
     let event: RoutedRedisEvent
     try {
       event = JSON.parse(payload) as RoutedRedisEvent
@@ -995,6 +984,7 @@ export function attachWebSocket(httpServer: Server) {
       return
     }
 
+    trackWsRecoveryScope(clients, event)
     const routeKey = event.conversationId
       ? `${companyId}:conversation:${event.conversationId}`
       : `${companyId}:workspace`

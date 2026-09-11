@@ -92,20 +92,12 @@ export function __isLlmTestOverrideActive(): boolean {
   return testLlmOverride !== null
 }
 
-interface LlmClientOptions {
-  /** The caller owns an explicit hop chain and must avoid a second wrapper. */
-  skipModelFallback?: boolean
-}
-
-function prepareLlmClient(client: OpenAI, _options: LlmClientOptions): OpenAI {
-  return client
-}
-
 /** A resolved candidate is one route; it never contains an application retry chain. */
 export async function getLlmCandidateClient(plan: RoleCallPlan, candidate: RoleCallCandidate): Promise<OpenAI> {
   if (process.env.CUMORA_RUNTIME_CLIENT === 'http') throw new Error('Provider clients are server-only')
   if (testLlmOverride) return testLlmOverride(plan.companyId)
   if (!candidate.available) throw new Error(candidate.diagnostic ?? 'LLM candidate unavailable')
+  if (plan.authorizationVersion) await contextForRoleCallPlan(plan)
   if (candidate.route.kind === 'gateway') {
     if (!plan.companyId || !candidate.route.platform) throw new Error('Missing tenant LLM route')
     const now = Date.now()
@@ -239,24 +231,24 @@ function buildSub2apiClient(baseURL: string, keys: ApiKeyMap, tenant: string): O
 /** Build (and cache) the OpenAI client for this tenant. Async because
  *  resolving the tenant's owner_user_id + sub2api_api_key is a DB hop.
  *  Lookup failures propagate without changing the credential source. */
-export async function getLlmClient(tenant: string | null, options: LlmClientOptions = {}): Promise<OpenAI> {
+export async function getLlmClient(tenant: string | null): Promise<OpenAI> {
   if (process.env.CUMORA_RUNTIME_CLIENT === 'http') throw new Error('Provider clients are server-only')
   if (testLlmOverride) return testLlmOverride(tenant)
   // No tenant context → legacy. Gate on the base URL only (not the
   // admin key): agent pods route per-platform without admin rights.
-  if (!tenant || !sub2apiRoutingConfigured()) return prepareLlmClient(legacyClient(), options)
+  if (!tenant || !sub2apiRoutingConfigured()) return legacyClient()
 
   const context = await resolveTenantLlmContext(tenant)
   const cached = cache.get(tenant)
   if (cached && cached.authorizationVersion === context.authorizationVersion && Date.now() - cached.mintedAt < CACHE_TTL_MS) {
-    return prepareLlmClient(cached.client, options)
+    return cached.client
   }
   const client = keyedPlatforms(context.keys).length
     ? buildSub2apiClient(context.baseURL, context.keys, tenant)
     : legacyClient()
   capTtlMap(cache, CLIENT_CACHE_MAX, entry => Date.now() - entry.mintedAt >= CACHE_TTL_MS)
   cache.set(tenant, { client, mintedAt: Date.now(), authorizationVersion: context.authorizationVersion })
-  return prepareLlmClient(client, options)
+  return client
 }
 
 /** Drop a tenant's cached client. Call from tier-change handlers so the
@@ -264,10 +256,6 @@ export async function getLlmClient(tenant: string | null, options: LlmClientOpti
 export function invalidateLlmClient(tenant: string): void {
   cache.delete(tenant)
   candidateClients.delete(tenant)
-  invalidateTenantModelSnapshot(tenant)
-}
-
-export function invalidateModelRouteCache(tenant: string): void {
   invalidateTenantModelSnapshot(tenant)
 }
 
@@ -308,11 +296,6 @@ function legacyClient(): OpenAI {
   return resource([]) as OpenAI
 }
 
-/** Dedicated client for image generation (avatars, agent `cumora image`).
- *  Text calls and image calls often need different providers (e.g. Kimi
- *  for text, DashScope for images). When OPENAI_IMAGE_BASE_URL and
- *  OPENAI_IMAGE_API_KEY are both set, images go there; otherwise fall
- *  back to the shared legacy client (previous behavior). */
 /** DashScope (Alibaba Bailian) native text2image shim, shaped like OpenAI's
  *  images.generate. DashScope's OpenAI-compatible mode does NOT expose
  *  /images/generations — image models only exist on the native async task
@@ -334,28 +317,6 @@ function dashscopeImageClient(apiKey: string, base: string, progress?: (stage: '
 
   function dashscopeHttpError(message: string, status: number): Error & { status: number } {
     return Object.assign(new Error(message), { status })
-  }
-
-  // Download result images here, inside the client, and hand them back as
-  // base64. The generic executeImage downloader applies an SSRF blocklist;
-  // behind a fake-ip VPN (Clash) the OSS result host resolves into the
-  // blocked ranges, so that path answers 'download failed (blocked)' even
-  // though this server can reach the URL fine. Pre-downloading sidesteps it.
-  async function inlineImages(data: { url?: string }[], limits = { maxBytes: 20 * 1024 * 1024, timeoutMs: 30_000 }) {
-    const out: { url?: string; b64_json?: string }[] = []
-    for (const item of data) {
-      if (!item.url) { out.push(item); continue }
-      try {
-        const resp = await fetch(item.url, { signal: requestSignal(limits.timeoutMs) })
-        if (!resp.ok) { out.push(item); continue }
-        const length = Number(resp.headers.get('content-length') ?? '0')
-        if (length > limits.maxBytes) { out.push(item); continue }
-        const buf = Buffer.from(await resp.arrayBuffer())
-        if (!buf.length || buf.length > limits.maxBytes) { out.push(item); continue }
-        out.push({ b64_json: buf.toString('base64') })
-      } catch { out.push(item) }
-    }
-    return out
   }
 
   // qwen-image*, z-image* and the wan2.x-image series live on the synchronous
@@ -382,7 +343,7 @@ function dashscopeImageClient(apiKey: string, base: string, progress?: (stage: '
     }
     const data = (body.output?.choices ?? []).flatMap(choice => (choice.message?.content ?? []).flatMap(c => c.image ? [{ url: c.image }] : []))
     if (!data.length) throw new Error(`dashscope multimodal-generation returned no image: ${JSON.stringify(body).slice(0, 300)}`)
-    return { data: await inlineImages(data), usage: body.usage, model: body.model }
+    return { data, usage: body.usage, model: body.model }
   }
 
   async function generateAsync(model: string, prompt: string, size?: string, n?: number) {
@@ -425,7 +386,7 @@ function dashscopeImageClient(apiKey: string, base: string, progress?: (stage: '
       if (state === 'SUCCEEDED') {
         const data = (status.output?.results ?? []).flatMap(result => result.url ? [{ url: result.url }] : [])
         if (!data.length) throw new Error('dashscope task succeeded with no result url')
-        return { data: await inlineImages(data), usage: status.usage, model: status.model }
+        return { data, usage: status.usage, model: status.model }
       }
       if (state === 'FAILED' || state === 'CANCELED') {
         throw dashscopeHttpError(`dashscope task ${state}: ${status.output?.message ?? 'no message'}`, 400)
@@ -442,22 +403,6 @@ function dashscopeImageClient(apiKey: string, base: string, progress?: (stage: '
   }
 
   return { images: { generate } } as unknown as OpenAI
-}
-
-let _imageClient: OpenAI | null = null
-export function getImageClient(): OpenAI {
-  if (process.env.CUMORA_RUNTIME_CLIENT === 'http') throw new Error('Image generation must use runtime CLI')
-  if (_imageClient) return _imageClient
-  const { apiKey, baseURL, protocol, configured } = resolveDirectLlmEnv('image')
-  if (!configured) throw new Error('Direct image LLM is not configured')
-  if (protocol === 'dashscope-image' && apiKey) {
-    _imageClient = dashscopeImageClient(apiKey, baseURL)
-  } else if (baseURL && apiKey) {
-    _imageClient = new OpenAI({ apiKey, baseURL, maxRetries: 0, timeout: SDK_TIMEOUT_MS })
-  } else {
-    _imageClient = legacyClient()
-  }
-  return _imageClient
 }
 
 export const GATEWAY_IMAGE_NO_ACCOUNTS_MESSAGE =
@@ -540,7 +485,9 @@ export async function executeImage<T>(context: LlmCallContext,
         let buffer: Buffer
         if (first.b64_json) buffer = Buffer.from(first.b64_json, 'base64')
         else {
-          const fetched = await fetchImageBytes(first.url!, { maxBytes: 20 * 1024 * 1024, timeoutMs: 30_000, signal })
+          // Provider results (including gateway-forwarded OSS URLs) alone opt in.
+          const fetched = await fetchImageBytes(first.url!, { maxBytes: 20 * 1024 * 1024, timeoutMs: 30_000, signal,
+            networkPolicy: 'dashscope-result' })
           signal?.throwIfAborted()
           if (!fetched.ok) throw new Error(`image API download failed (${fetched.reason})`)
           buffer = fetched.buffer

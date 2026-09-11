@@ -66,7 +66,7 @@ rules:
   resources: ["persistentvolumeclaims"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 ---
-# Nodes are cluster-scoped, so the FUSE admission probe needs a narrow
+# Nodes are cluster-scoped, so the FUSE monitoring probe needs a narrow
 # ClusterRole in addition to the namespaced Pod/PVC Role above.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -189,8 +189,6 @@ spec:
         # reachable from the cluster (and pull-secret-able if private).
         - name: CUMORA_AGENT_COMPUTER_IMAGE
           value: "${AR_REGION}-docker.pkg.dev/${GCP_PROJECT}/${AR_REPO}/agent-computer:${IMAGE_TAG}"
-        - name: WORKSPACE_RUNTIME_CLEANUP_ENABLED
-          value: "true"
         # Pull secrets the orchestrator attaches to each agent Pod
         # spec. Comma-separated. Must exist in CUMORA_AGENT_NAMESPACE.
         - name: CUMORA_AGENT_PULL_SECRETS
@@ -199,7 +197,7 @@ spec:
         # Workload Identity SA via CUMORA_AGENT_SERVICE_ACCOUNT
         # (defaults to namespace `default` SA when unset).
         # Startup waits for the schema gate's bounded DB retry budget. Liveness
-        # only checks the process; readiness checks DB reachability and keeps a
+        # only checks the process; readiness checks PG/Redis reachability and keeps a
         # booting or degraded pod out of service without killing it.
         startupProbe:
           httpGet: { path: /api/livez, port: http }

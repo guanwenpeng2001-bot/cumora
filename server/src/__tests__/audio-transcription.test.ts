@@ -40,6 +40,7 @@ function fixture(statuses: (number | Error)[] = [], gateway = false, content: un
     return { model: 'actual-asr', choices: [{ message: { content } }], usage: { prompt_tokens: 12, completion_tokens: 8, seconds: 12.5, secret: 'SECRET_AUDIO_AND_TRANSCRIPT' } }
   } })
   const execution = compile(read('../llm-execution.ts'), {
+    './tenant-llm-context.js': { validateRoleCallAuth: async (plan: any) => { assert.equal(plan.authorizationVersion, gateway ? 'owner-v1' : undefined) } },
     './db/pool.js': { pool: { query: async () => { throw new Error('Unexpected audio test DB access') } } },
     'node:crypto': { randomUUID }, './llm-resolver.js': resolver, './llm.js': { getLlmCandidateClient },
     './agents/fallback.js': fallback, './agents/cost.js': cost, './settings.js': settings,

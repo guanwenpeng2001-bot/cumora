@@ -80,9 +80,10 @@ test('credential-free production Pod imports, refreshes policy and boots on an i
     await refreshModelPricing(true);
     const { env } = await import('./server/src/env.ts');
     assert.equal(env.AGENT_RUNTIME_SECRET, '');
-    const { getLlmClient, getImageClient } = await import('./server/src/llm.ts');
+    const { getLlmClient, getLlmCandidateClient, executeImage } = await import('./server/src/llm.ts');
     await assert.rejects(getLlmClient('isolated-company'), /server-only/);
-    assert.throws(() => getImageClient(), /runtime CLI/);
+    await assert.rejects(getLlmCandidateClient({}, {}), /server-only/);
+    await assert.rejects(executeImage({}, {}, async () => { throw new Error('unexpected storage'); }), /runtime CLI/);
     await import('./server/src/agents/runtime/pod-agent.ts');
     console.log('ISOLATED_IMPORTS_VERIFIED');
   `

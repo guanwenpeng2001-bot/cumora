@@ -18,7 +18,7 @@ test('K8s storage rejects each absent or whitespace R2 key, permits local Compos
   assert.throws(() => checkStorageConfig({ ...complete, R2_ENDPOINT: 'file:///tmp/bucket' }), /HTTP/)
 })
 
-test('rendered K8s templates require shared storage; GKE aligns AR images, identity and proxy probe', async () => {
+test('rendered K8s templates distinguish single-replica uploads PVC from GKE shared storage', async () => {
   const { renderK8s } = await import(new URL('../../../scripts/render-k8s.mjs', import.meta.url).href)
   const values = { CUMORA_NAMESPACE: 'acceptance-ns', AR_REGION: 'us-west2', GCP_PROJECT: 'acceptance-project', AR_REPO: 'cumora', IMAGE_TAG: '0594315', SQL_CONNECTION_NAME: 'acceptance-project:us-west2:pg' }
   for (const mode of ['gke', 'orbstack']) {
@@ -27,14 +27,29 @@ test('rendered K8s templates require shared storage; GKE aligns AR images, ident
     const docs = loadAll(rendered)
     const pod = docs.find((d: any) => d.kind === 'Deployment').spec.template.spec
     const server = pod.containers.find((c: any) => c.name === 'server')
-    assert.equal(server.env.find((e: any) => e.name === 'CUMORA_REQUIRE_R2').value, 'true')
-    for (const key of REQUIRED_R2_KEYS) assert.deepEqual(server.env.find((e: any) => e.name === key).valueFrom.secretKeyRef, { name: 'cumora', key, optional: false })
     if (mode === 'gke') {
+      assert.equal(server.env.find((e: any) => e.name === 'CUMORA_REQUIRE_R2').value, 'true')
+      for (const key of REQUIRED_R2_KEYS) assert.deepEqual(server.env.find((e: any) => e.name === key).valueFrom.secretKeyRef, { name: 'cumora', key, optional: false })
       assert.equal(server.image, 'us-west2-docker.pkg.dev/acceptance-project/cumora/server:0594315')
       assert.equal(server.env.find((e: any) => e.name === 'CUMORA_AGENT_COMPUTER_IMAGE').value, 'us-west2-docker.pkg.dev/acceptance-project/cumora/agent-computer:0594315')
       assert.equal(pod.imagePullSecrets, undefined)
       assert.equal(server.env.find((e: any) => e.name === 'CUMORA_AGENT_PULL_SECRETS').value, '')
       assert.ok(pod.containers.find((c: any) => c.name === 'cloud-sql-proxy').args.includes('--http-address=0.0.0.0'))
+    }
+    if (mode === 'orbstack') {
+      const deployment = docs.find((d: any) => d.kind === 'Deployment')
+      assert.equal(deployment.spec.replicas, 1)
+      assert.deepEqual(deployment.spec.strategy, { type: 'Recreate' })
+      const config = Object.fromEntries(server.env.filter((e: any) => e.value !== undefined).map((e: any) => [e.name, e.value]))
+      assert.equal(config.CUMORA_REQUIRE_R2, 'false')
+      assert.equal(checkStorageConfig(config), 'local', 'the actual variant env passes storage-precheck without R2')
+      assert.ok(!server.env.some((e: any) => REQUIRED_R2_KEYS.includes(e.name)))
+      const mount = server.volumeMounts.find((m: any) => m.mountPath === '/app/server/uploads')
+      const volume = pod.volumes.find((v: any) => v.name === mount.name)
+      const pvc = docs.find((d: any) => d.kind === 'PersistentVolumeClaim' && d.metadata.name === volume.persistentVolumeClaim.claimName)
+      assert.deepEqual(pvc.spec.accessModes, ['ReadWriteOnce'])
+      assert.equal(pvc.spec.resources.requests.storage, '10Gi')
+      assert.equal(pvc.metadata.namespace, values.CUMORA_NAMESPACE)
     }
     assert.throws(() => renderK8s(template, {}), /Missing/)
     assert.throws(() => renderK8s(template, { ...values, CUMORA_NAMESPACE: 'bad\nvalue' }), /unsafe/)

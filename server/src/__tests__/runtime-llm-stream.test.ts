@@ -21,7 +21,9 @@ async function serverFixture(t: TestContext, behavior: Parameters<typeof fixture
   const f = fixture(behavior, protocol, 500)
   const adapter = compile(read('../agents/runtime/llm-stream-execution.ts'), {
     '../../llm-resolver.js': f.resolver,
-    '../../settings.js': { automationNumber: () => 1000, getTurnBudgetPolicy: () => DEFAULT_COMPACTION_POLICY },
+    '../../settings.js': { automationNumber: () => 1000, getTurnBudgetPolicy: () => DEFAULT_COMPACTION_POLICY,
+      getServerSettingsSnapshot: f.settings.getServerSettingsSnapshot },
+    '../model-failure-backoff.js': { readModelFailureState: async () => null },
     '../personas.js': { getPersona: async () => ({ companyId: context.companyId, model: 'same' }) },
     '../turn.js': f.turn,
     '../model-policy.js': { realTaskModel: (m: string) => m, enforceModelPolicy: (m: string) => m },

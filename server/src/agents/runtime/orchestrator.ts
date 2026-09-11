@@ -490,26 +490,15 @@ spec:
 /** Exported for tests — production callers go through ensurePod. */
 export const _testing = { podManifest, podUrl, yamlQuote, dnsLabelValue, chromeProfilePvcManifest, chromeProfilePvcName }
 
-// ─── cluster-wide FUSE admission control ─────────────────────────────
-//
-// Triggered by the FUSE-cap incident on 2026-05-20: agent pods request
-// `devic.es/fuse: 1` (one slot per pod), and each prod node advertises
-// 800 slots via the generic-device-plugin DaemonSet. The app-level
-// admission cap is intentionally lower (AGENT_POD_ADMISSION_MAX,
-// default 40) because CPU, memory, API-server churn, and provider
-// concurrency are the real production ceiling.
-//
-// `ensurePod` must REFUSE rather than blindly apply when the cluster
-// is near saturation. Refusing lets pending wakes survive in their
-// inbox (message.new) or get retried by their scheduler (idle /
-// scanner); blowing past the cap, conversely, leaves pods stuck in
-// FailedScheduling for tens of minutes with no recovery.
+// ─── cluster-wide FUSE monitoring ───────────────────────────────────
+// Device capacity is diagnostic only. Kubernetes schedules devic.es/fuse;
+// ordinary admission uses a positive app cap and fresh Pod counts under a lease.
 
 export interface ClusterFuseUtilization {
   /** Number of cumora-agent pods currently using a fuse slot
    *  (Pending + Running, excluding Succeeded/Failed). */
   used: number
-  /** Effective admission cap: min(cluster `devic.es/fuse` capacity,
+  /** Monitoring ceiling: min(cluster `devic.es/fuse` capacity,
    *  AGENT_POD_ADMISSION_MAX when that env is positive). */
   cap: number
   /** used / cap. 0 when cap is 0 (no nodes report fuse). */
@@ -558,8 +547,7 @@ let fuseUtilCache: FuseUtilCache | null = null
 const FUSE_CACHE_TTL_MS = 10_000
 
 /** Sample (or read from cache) the cluster's cumora-agent fuse usage.
- *  Fails closed: a missing/invalid capacity sample is not evidence that
- *  capacity is available, so callers must refuse new Pod admission. */
+ *  Missing device capacity is diagnostic only; admission reads Pods separately. */
 export async function getClusterFuseUtilization(appCap = automationNumber('pod_admission_max')): Promise<ClusterFuseUtilization> {
   const now = Date.now()
   if (fuseUtilCache && now - fuseUtilCache.ts < FUSE_CACHE_TTL_MS) {
@@ -575,8 +563,7 @@ export async function getClusterFuseUtilization(appCap = automationNumber('pod_a
     ),
   ])
   if (nodes.code !== 0 || pods.code !== 0) {
-    // Do not turn an RBAC/API-server failure into Infinity: that would
-    // bypass both the cluster ceiling and AGENT_POD_ADMISSION_MAX.
+    // Surface failed monitoring samples instead of reporting healthy capacity.
     const detail = [nodes, pods]
       .filter((r) => r.code !== 0)
       .map((r) => (r.err || r.out).trim().slice(0, 240))
@@ -600,8 +587,7 @@ export async function getClusterFuseUtilization(appCap = automationNumber('pod_a
   }
   const parsed = parseClusterFuse(nodes.out, pods.out)
   if (parsed.cap <= 0) {
-    // A successful response with no advertised fuse capacity is still
-    // unusable for admission; treat missing device-plugin data as unknown.
+    // Missing device-plugin data needs installation guidance, not an admission veto.
     return {
       used: parsed.used,
       cap: 0,
@@ -619,15 +605,13 @@ export async function getClusterFuseUtilization(appCap = automationNumber('pod_a
 /** Test-only — clear the in-memory cache so tests don't poison each other. */
 export function _resetFuseUtilCacheForTests(): void { fuseUtilCache = null }
 
-/** Bump cached `used` after a successful spawn, so back-to-back
- *  `ensurePod` calls within the cache TTL see the increment without
- *  waiting for the next refresh. No-op if the cache is empty. */
+/** Keep diagnostic samples current after a spawn. Admission never uses them. */
 function bumpFuseUtilUsedOnSpawn(): void {
   if (fuseUtilCache) fuseUtilCache.used++
 }
 
 // PostgreSQL advisory locks are process-independent, unlike inFlight and the
-// fuse cache. Hold this lease across the fresh capacity read and the Pod apply
+// fuse cache. Hold this lease across the fresh Pod count and the Pod apply
 // so two cumora-server replicas cannot both pass check-before-spawn at once.
 const POD_ADMISSION_LOCK_KEY = 7_643_178_926_307n
 
@@ -1090,37 +1074,37 @@ async function ensurePodImpl(agentId: string, signal: AbortSignal, initialTriage
 
   // `kubectl apply` is the write path. Retry on transient errors;
   // 45s timeout because validation + admission webhooks can be slow
-  // when an image-pull-credential webhook runs. The fresh capacity read
+  // when an image-pull-credential webhook runs. The fresh Pod count
   // and this mutation share a PostgreSQL lease across server replicas.
   const admission = await withPodAdmissionLease(async () => {
-    // Do not use this replica's pre-lease cache: another replica may have
-    // created a Pod while this one was waiting for the global lease.
-    fuseUtilCache = null
+    // Always read Pod demand inside the lease: another replica may have
+    // created a Pod since this replica's last diagnostic sample.
     const { settings } = getServerSettingsSnapshot()
-    const threshold = Number(settings.pod_fuse_threshold)
-    const fuse = await getClusterFuseUtilization(Number(settings.pod_admission_max))
-    if (!fuse.capacityKnown) {
-      console.warn(`[orchestrator] ${agentId} FUSE admission denied: ${fuse.capacityError}`)
-      return {
-        podApply: null,
-        denied: {
-          created: false as const,
-          ok: false as const,
-          code: 'capacity_denied' as const,
-          reason: 'cluster fuse capacity unavailable; refusing Pod admission: ' + (fuse.capacityError ?? 'unknown read failure'),
-        },
+    const cap = Number(settings.pod_admission_max)
+    let used = 0
+    let reason = ''
+    if (!Number.isSafeInteger(cap) || cap <= 0) {
+      reason = 'positive pod_admission_max is required; refusing Pod admission'
+    } else {
+      const pods = await kubectlWithRetry(['get', 'pods', '-l', 'app=cumora-agent', '-o', 'json'],
+        { timeoutMs: 10_000, signal })
+      try {
+        if (pods.code !== 0) throw new Error('Pod list unavailable')
+        const items = JSON.parse(pods.out)?.items
+        if (!Array.isArray(items) || items.some(p => !['Pending', 'Running', 'Succeeded', 'Failed', 'Unknown'].includes(p?.status?.phase))) {
+          throw new Error('Invalid Pod list')
+        }
+        // Unknown still represents outstanding demand; never undercount it.
+        used = items.filter(p => !['Succeeded', 'Failed'].includes(p.status.phase)).length
+        if (used >= cap) reason = `Pod admission limit reached: ${used}/${cap}`
+      } catch {
+        reason = 'Pod list unavailable or invalid; refusing Pod admission; check API connectivity and namespaced pods get/list RBAC'
       }
     }
-    if (fuse.cap <= 0 || fuse.ratio >= threshold) {
-      return {
-        podApply: null,
-        denied: {
-          created: false as const,
-          ok: false as const,
-          code: 'capacity_denied' as const,
-          reason: 'cluster fuse saturated: ' + fuse.used + '/' + fuse.cap + ' (' + Math.round(fuse.ratio * 100) + '% ≥ ' + Math.round(threshold * 100) + '% threshold)',
-        },
-      }
+    if (reason) {
+      return { podApply: null, denied: {
+        created: false as const, ok: false as const, code: 'capacity_denied' as const, reason,
+      } }
     }
     progress.value = 'unknown'
     return {
