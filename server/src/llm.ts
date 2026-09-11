@@ -336,6 +336,28 @@ function dashscopeImageClient(apiKey: string, base: string, progress?: (stage: '
     return Object.assign(new Error(message), { status })
   }
 
+  // Download result images here, inside the client, and hand them back as
+  // base64. The generic executeImage downloader applies an SSRF blocklist;
+  // behind a fake-ip VPN (Clash) the OSS result host resolves into the
+  // blocked ranges, so that path answers 'download failed (blocked)' even
+  // though this server can reach the URL fine. Pre-downloading sidesteps it.
+  async function inlineImages(data: { url?: string }[], limits = { maxBytes: 20 * 1024 * 1024, timeoutMs: 30_000 }) {
+    const out: { url?: string; b64_json?: string }[] = []
+    for (const item of data) {
+      if (!item.url) { out.push(item); continue }
+      try {
+        const resp = await fetch(item.url, { signal: requestSignal(limits.timeoutMs) })
+        if (!resp.ok) { out.push(item); continue }
+        const length = Number(resp.headers.get('content-length') ?? '0')
+        if (length > limits.maxBytes) { out.push(item); continue }
+        const buf = Buffer.from(await resp.arrayBuffer())
+        if (!buf.length || buf.length > limits.maxBytes) { out.push(item); continue }
+        out.push({ b64_json: buf.toString('base64') })
+      } catch { out.push(item) }
+    }
+    return out
+  }
+
   // qwen-image*, z-image* and the wan2.x-image series live on the synchronous
   // multimodal-generation API (measured against the live endpoint: the async
   // text2image task API answers them with 'url error'). Classic wanx*/wan*
@@ -360,7 +382,7 @@ function dashscopeImageClient(apiKey: string, base: string, progress?: (stage: '
     }
     const data = (body.output?.choices ?? []).flatMap(choice => (choice.message?.content ?? []).flatMap(c => c.image ? [{ url: c.image }] : []))
     if (!data.length) throw new Error(`dashscope multimodal-generation returned no image: ${JSON.stringify(body).slice(0, 300)}`)
-    return { data, usage: body.usage, model: body.model }
+    return { data: await inlineImages(data), usage: body.usage, model: body.model }
   }
 
   async function generateAsync(model: string, prompt: string, size?: string, n?: number) {
@@ -403,7 +425,7 @@ function dashscopeImageClient(apiKey: string, base: string, progress?: (stage: '
       if (state === 'SUCCEEDED') {
         const data = (status.output?.results ?? []).flatMap(result => result.url ? [{ url: result.url }] : [])
         if (!data.length) throw new Error('dashscope task succeeded with no result url')
-        return { data, usage: status.usage, model: status.model }
+        return { data: await inlineImages(data), usage: status.usage, model: status.model }
       }
       if (state === 'FAILED' || state === 'CANCELED') {
         throw dashscopeHttpError(`dashscope task ${state}: ${status.output?.message ?? 'no message'}`, 400)
