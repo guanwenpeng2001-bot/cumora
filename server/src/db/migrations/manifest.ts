@@ -102,7 +102,11 @@ export const SCHEMA_MIGRATIONS = [
     name: '0017_agent_message_consumptions',
     checksum: '86d9248919580d966126e5fdcf5aebf58175e1079b92fd0e8790f94cd8914ba6',
   },
-  { version: 18, name: '0018_turn_safety', checksum: '37f7dc9cf2989d0b54218aa8ea6f30d5e47387a5e33ace1447c2ab3950c9bdb4' },
+  {
+    version: 18,
+    name: '0018_turn_safety',
+    checksum: '37f7dc9cf2989d0b54218aa8ea6f30d5e47387a5e33ace1447c2ab3950c9bdb4',
+  },
 ] as const satisfies readonly MigrationMetadata[]
 
 /** This build intentionally supports one exact schema range. Expand/contract
