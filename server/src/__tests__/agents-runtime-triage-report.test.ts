@@ -42,12 +42,13 @@ function daemonFixture(result: any, options: { payload?: any; backoffUntil?: num
       return reports.length <= (options.deliveryFails ?? 0) ? null : { ok: true }
     },
     usageFromClaude: (usage: any) => ({ inputTokens: usage.input_tokens, cachedInputTokens: 0, cacheCreationTokens: 0, outputTokens: usage.output_tokens }),
+    redactProviderSecret: (value: unknown) => value,
     console: { warn: (message: string) => warnings.push(message) },
   })
   const runner = new Runner()
   Object.assign(runner, { triageBackoffUntil: options.backoffUntil ?? 0, cfg: { serverUrl: 'fake' }, agent: { id: 'a' }, triageModel: () => 'requested-model',
     triageModelPin: () => 'requested-model', engineEnv: () => ({}),
-    teardown: { signal: new AbortController().signal }, stopped: false,
+    teardown: { signal: new AbortController().signal }, stopped: false, provider: null,
     adapter: { id: 'codex', classify: async () => { calls++; if (result instanceof Error) throw result; return result } },
   })
   return { reports, warnings, calls: () => calls, run: () => runner.inboxTriage('token', new Map([['c', 'm1']])) }
