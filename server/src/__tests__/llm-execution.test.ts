@@ -16,6 +16,7 @@ const allowed = new Set([
   'llm-execution.ts', 'llm.ts', 'llm-resolver.ts', 'settings.ts', 'env.ts',
   'managed-pod-settings.ts', 'tenant-llm-context.ts', 'sub2api.ts', 'novita.ts',
   'model-pricing.ts', 'agents/llm-ledger.ts', 'agents/cost.ts', 'agents/token-usage.ts',
+  'agents/agenda.ts', 'agents/inbox-triage.ts', 'agents/reasoning.ts', 'agents/triage-core.ts',
   'agents/fallback.ts', 'agents/model-config.ts', 'agents/embeddings.ts',
 ])
 const root = new URL('../', import.meta.url)
@@ -31,6 +32,9 @@ const isolatedProcess = { env: {
 const compiled = new Map<string, string>()
 let modules = new Map<string, any>()
 function load(relative: string): any {
+  if (relative === 'redis.ts') return { redis: {} }
+  if (relative === 'agents/runtime/inproc-client.ts') return { inprocClient: { peekWorklog: async () => [], humanRecentlyActive: async () => false } }
+  if (relative === 'agents/observability.ts') return { recordTriage: async () => {} }
   if (relative === 'db/pool.ts') return { pool }
   if (relative === 'agents/image-fetcher.ts') return { fetchImageBytes: async () => ({ ok: true, buffer: Buffer.from('image-bytes') }) }
   assert.ok(allowed.has(relative), `Unexpected module: ${relative}`)
@@ -47,7 +51,7 @@ function load(relative: string): any {
   new Function('exports', 'require', 'process', output)(exports, (name: string) => {
     if (name === 'dotenv/config') return {}
     if (name === 'openai') return { __esModule: true, default: FixtureOpenAI }
-    if (name === 'node:crypto') return nativeRequire(name)
+    if (name === 'node:crypto' || name === 'node:async_hooks') return nativeRequire(name)
     assert.ok(name.startsWith('.'), `Unexpected dependency: ${name}`)
     const url = new URL(name.replace(/\.js$/, '.ts'), new URL(relative, root))
     return load(url.href.slice(root.href.length))
@@ -1100,3 +1104,75 @@ for (const model of ['qwen-image-plus', 'wanx-v1']) test('deep-1: gateway DashSc
   assert.deepEqual(row.rawUsage, { input_tokens: 5, output_tokens: 8 })
   assert.equal(row.nextCandidate, null)
 })
+
+for (const domain of ['managed', 'byoa'] as const) {
+  test(`cerebellum priority: agent > computer > role > env (${domain})`, async () => {
+    const resolver = load('llm-resolver.ts')
+    const snapshot = load('settings.ts').getServerSettingsSnapshot()
+    const resolve = (agent: any, captured = snapshot) => resolver.resolveRoleCall(null, domain, 'support', 'agenda', agent, captured)
+    const agent = { model: 'local-main', modelConfig: { cerebellumModel: ' cloud-small ', effort: 'high', fallbackModels: ['brain-only'] }, computerSupportModel: 'computer-small' }
+    const explicit = await resolve(agent)
+    assert.equal(explicit.candidates[0].model, 'cloud-small')
+    assert.equal(explicit.candidates[0].source, 'agent')
+    assert.ok(!explicit.candidates.some((c: any) => c.model === 'brain-only'))
+    const computer = await resolve({ computerSupportModel: 'computer-small' })
+    assert.equal(computer.candidates[0].model, 'computer-small')
+    assert.equal(computer.candidates[0].source, 'computer')
+    assert.equal((await resolve({})).candidates[0].model, 'same')
+    const configured = { ...snapshot, settings: { ...snapshot.settings, llm_config: JSON.stringify({ version: 1, roles: [{ role: 'support', models: ['global-small'] }] }) } }
+    assert.equal((await resolve({}, configured)).candidates[0].model, 'global-small')
+    assert.equal((await resolve(agent, configured)).candidates[0].model, 'cloud-small')
+    assert.equal((await resolve({ computerSupportModel: 'computer-small' }, configured)).candidates[0].model, 'computer-small')
+    const brain = await resolver.resolveRoleCall(null, domain, 'brain', 'agent-turn', agent, snapshot)
+    if (domain === 'byoa') assert.equal(brain.candidates.length, 0)
+    else assert.equal(brain.candidates[0].model, 'local-main')
+    settings = {}
+    await refreshServerSettings(true)
+    const envPlan = await resolve({}, load('settings.ts').getServerSettingsSnapshot())
+    assert.equal(envPlan.candidates[0].model, 'same')
+    assert.match(envPlan.candidates[0].source, /env/)
+  })
+}
+
+for (const purpose of ['inbox-triage', 'agenda', 'synthetic-wake-gate', 'palette', 'gender']) {
+  test(`${purpose} executes the tenant-scoped agent cerebellum model`, async () => {
+    const originalQuery = pool.query
+    let pin = 'agent-small'
+    pool.query = async (sql, values) => {
+      if (sql.includes('SELECT p.model_config')) {
+        assert.deepEqual(values, ['agent-a', 'company-a'])
+        assert.match(sql, /p.company_id = \$2/)
+        return { rows: [{ model_config: { cerebellumModel: pin }, computer_support_model: 'computer-small' }] }
+      }
+      return originalQuery(sql, values)
+    }
+    const client = await getTrackedLlmClient({ role: 'support', purpose, companyId: 'company-a', agentId: 'agent-a' })
+    await client.responses.create({ model: 'same', input: 'classify', max_output_tokens: 100 })
+    assert.equal(sent[0].args.model, 'agent-small')
+    pin = ''
+    await client.responses.create({ model: 'same', input: 'classify', max_output_tokens: 100 })
+    assert.equal(sent[1].args.model, 'computer-small')
+  })
+}
+
+for (const classifier of ['inbox', 'agenda', 'synthetic']) {
+  test(`real ${classifier} classifier uses the agent cloud model through the executor`, async () => {
+    const originalQuery = pool.query
+    pool.query = async (sql, values) => sql.includes('SELECT p.model_config')
+      ? { rows: [{ model_config: { cerebellumModel: 'classifier-small' }, computer_support_model: null }] }
+      : originalQuery(sql, values)
+    create = async () => ({ ...success('classifier-small'), output_text: JSON.stringify({ actionable: false, act: false, focus: '', reason: 'quiet', note: '', promptNote: '' }) })
+    const persona = { id: 'agent-a', name: 'Atlas', role: 'Ops', style: '', model: null, companyId: 'company-a' }
+    if (classifier === 'agenda') {
+      await load('agents/agenda.ts').classifyAgendaActionable({ agentId: persona.id, companyId: persona.companyId, persona,
+        agenda: { cards: [{ id: 'card-a', board_id: 'b', board_title: 'Ops', column_id: 'todo', column_title: 'Todo', title: 'Review', description: null, assignee_id: persona.id, mentions: [], updated_at: '2026-09-11T00:00:00Z' }], events: [], stalls: [] } })
+    } else if (classifier === 'synthetic') {
+      await load('agents/inbox-triage.ts').gateSyntheticWake({ agentId: persona.id, companyId: persona.companyId, personaName: persona.name, kind: 'idle', brief: 'review', signals: 'due' })
+    } else {
+      const row = { id: 'message-a', conversation_id: 'group-a', company_id: persona.companyId, conversation_title: 'Team', conversation_kind: 'group', author_id: 'agent-b', author_kind: 'agent', author_name: 'Bob', body: 'team, please each weigh in', kind: 'text', sequence: 1, created_at: '2026-09-11T00:00:00Z' }
+      await load('agents/inbox-triage.ts').classifyInboxTriage({ agentId: persona.id, companyId: persona.companyId, persona, inbox: [row], context: [{ ...row, is_unread: true, is_self: false, reactions: [] }] })
+    }
+    assert.equal(sent.length, 1, 'classifier must reach the real executor')
+    assert.equal(sent[0].args.model, 'classifier-small')
+  })
+}

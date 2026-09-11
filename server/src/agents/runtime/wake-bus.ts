@@ -44,8 +44,11 @@ import { redis, sub as redisSub } from '../../redis.js'
  *            DB round-trip. The message is ALSO in the messages
  *            table — that's the fallback path when the pod is
  *            idle / disconnected. */
-export type WakeEvent = WakeEventBase & (WakeKindWake | WakeKindSteer)
+export type WakeEvent = WakeEventBase & (WakeKindWake | WakeKindSteer | WakeKindStop)
+interface WakeKindStop { kind: 'stop'; generation: string }
+
 type WakeEventPayload =
+  | Omit<WakeEventBase & WakeKindStop, 'id' | 'at'>
   | Omit<WakeEventBase & WakeKindWake, 'id' | 'at'>
   | Omit<WakeEventBase & WakeKindSteer, 'id' | 'at'>
 

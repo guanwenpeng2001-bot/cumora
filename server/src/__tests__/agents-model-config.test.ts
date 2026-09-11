@@ -6,7 +6,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { parseAgentModelConfig, agentTurnChain } from '../agents/model-config.js'
+import { parseAgentModelConfig, validateAgentModelConfig, agentTurnChain } from '../agents/model-config.js'
 
 // ── parseAgentModelConfig ─────────────────────────────────────────────────
 
@@ -65,4 +65,11 @@ test('agentTurnChain: nothing to follow → null (client-side global fallback ha
   assert.equal(agentTurnChain('k3', null, []), null)
   assert.equal(agentTurnChain('k3', null, ['k3']), null)
   assert.equal(agentTurnChain('k3', {}, ['k3']), null)
+})
+
+test('cerebellum writes trim models and clear inheritance; invalid values are rejected', () => {
+  assert.deepEqual(validateAgentModelConfig({ cerebellumModel: ' cloud-small ' }), { cerebellumModel: 'cloud-small' })
+  assert.equal(validateAgentModelConfig({ cerebellumModel: '  ' }), null)
+  assert.throws(() => validateAgentModelConfig({ cerebellumModel: 123 }), /cerebellumModel/)
+  assert.equal(parseAgentModelConfig({ cerebellumModel: 123 }), null)
 })

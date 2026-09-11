@@ -15,13 +15,12 @@
  * switching embedding models changes the vector space, so a silent
  * fallback would corrupt semantic memory recall (see fallback.ts).
  */
-import type { PoolClient, QueryConfig } from 'pg'
+import type { PoolClient } from 'pg'
 import { pool } from './db/pool.js'
-import { env, resolveDirectLlmEnv, defaultOpenAIImageModel } from './env.js'
+import { env, defaultOpenAIImageModel } from './env.js'
 import type { ByoaPolicyValues } from './agents/computer/runtime-policy.js'
 import type { CompactionPolicy } from './agents/turn-compaction.js'
-import { parseApiKeyMap, sub2apiOpenAIBaseURL } from './sub2api.js'
-import { DIRECT_LLM_SLOTS, getManagedPodSettings, installManagedPodSettings, type ManagedPodSettings } from './managed-pod-settings.js'
+import { getManagedPodSettings, installManagedPodSettings, type ManagedPodSettings } from './managed-pod-settings.js'
 
 export interface SettingDef {
   key: string
@@ -77,7 +76,7 @@ export const SETTING_DEFS: readonly SettingDef[] = [
   { key: 'agent_stream_idle_timeout_ms', pod: true, defaultValue: '240000', type: 'integer', min: 1, max: 2147483647, scope: 'managed', effect: 'next-turn', unit: 'milliseconds', envKeys: ['CUMORA_AGENT_STREAM_IDLE_TIMEOUT_MS'], envValue: () => process.env.CUMORA_AGENT_STREAM_IDLE_TIMEOUT_MS ?? '240000', description: 'Maximum silence between main-hop stream events. Slow-thinking models need a higher value; short-SLA tenants a lower one. Independent of agent_turn_timeout_ms.' },
   { key: 'agent_stream_wall_timeout_ms', pod: true, defaultValue: '360000', type: 'integer', min: 1, max: 2147483647, scope: 'managed', effect: 'next-turn', unit: 'milliseconds', envKeys: ['CUMORA_AGENT_STREAM_WALL_TIMEOUT_MS'], envValue: () => process.env.CUMORA_AGENT_STREAM_WALL_TIMEOUT_MS ?? '360000', description: 'Maximum wall-clock time for one main-hop stream, even if tokens keep arriving. Must be >= agent_stream_idle_timeout_ms.' },
   { key: 'idle_enabled', type: 'boolean', defaultValue: 'true', scope: 'server', effect: 'next-tick', envKeys: ['ENABLE_IDLE'], envValue: () => process.env.ENABLE_IDLE ?? 'true' },
-  { key: 'idle_interval_ms', type: 'integer', defaultValue: '900000', min: 0, max: 2147483647, unit: 'milliseconds', scope: 'server', effect: 'next-tick', envKeys: ['IDLE_INTERVAL_MS'], envValue: () => process.env.IDLE_INTERVAL_MS ?? '900000' },
+  { key: 'idle_interval_ms', type: 'integer', defaultValue: '300000', min: 0, max: 2147483647, unit: 'milliseconds', scope: 'server', effect: 'next-tick', envKeys: ['IDLE_INTERVAL_MS'], envValue: () => process.env.IDLE_INTERVAL_MS ?? '300000', description: 'Agenda and idle heartbeat interval for all companies; default 5 minutes. Each tick checks one quiet agent per company. 0 pauses heartbeats. Changes restart the interval without interrupting an active tick; wake budgets, recovery probes and deferred retries keep their own timing.' },
   { key: 'idle_min_quiet_min', type: 'integer', defaultValue: '25', min: 0, max: 525600, scope: 'server', effect: 'next-tick', envKeys: ['IDLE_MIN_QUIET_MIN'], envValue: () => process.env.IDLE_MIN_QUIET_MIN ?? '25' },
   { key: 'stall_min_ms', type: 'integer', defaultValue: '300000', min: 0, max: 2147483647, unit: 'milliseconds', scope: 'server', effect: 'next-tick', envKeys: ['CUMORA_STALL_MIN_MS'], envValue: () => process.env.CUMORA_STALL_MIN_MS ?? '300000', description: 'A conversation is stalled only after this much silence. Must be <= stall_max_ms.' },
   { key: 'stall_max_ms', type: 'integer', defaultValue: '21600000', min: 0, max: 2147483647, unit: 'milliseconds', scope: 'server', effect: 'next-tick', envKeys: ['CUMORA_STALL_MAX_MS'], envValue: () => process.env.CUMORA_STALL_MAX_MS ?? '21600000', description: 'Do not resurrect conversations quieter than this. Must be >= stall_min_ms.' },
@@ -281,46 +280,20 @@ function podPolicy(policy: ServerSettingsSnapshot): ServerSettingsSnapshot {
 }
 
 async function readManagedPodSettings(base: ManagedPodSettings): Promise<ManagedPodSettings> {
-  // One statement gives policy and owner identity the same MVCC snapshot.
-  const { rows } = await pool.query<{
-    settings: { key: string; value: string }[]
-    owner_user_id: string; sub2api_api_key: string | null; authorization_version: string
-  }>({
-    text: `SELECT c.owner_user_id, u.sub2api_api_key, u.xmin::text AS authorization_version,
-             COALESCE((SELECT jsonb_agg(jsonb_build_object('key', s.key, 'value', s.value))
-               FROM server_settings s WHERE s.key = ANY($3::text[])), '[]'::jsonb) AS settings
-           FROM participants p JOIN companies c ON c.id = p.company_id
-           JOIN users u ON u.id = c.owner_user_id
-          WHERE p.id = $1 AND c.id = $2`,
-    values: [base.agentId, base.gateway.companyId, [...SETTING_DEFS.filter(def => def.pod).map(def => def.key), REVISION_KEY]],
-    query_timeout: 5_000,
-  } as QueryConfig & { query_timeout: number })
-  const row = rows[0]
-  if (!row) throw new Error('Managed Pod owner identity unavailable')
-  return {
-    ...base, source: 'db', policy: podPolicy(makeSnapshot(row.settings, base.defaults, base.policy.inheritedSources)),
-    gateway: {
-      companyId: base.gateway.companyId, ownerId: row.owner_user_id, generation: 0,
-      authorizationVersion: `${row.owner_user_id}:${row.authorization_version}:0:${base.gateway.baseURL}`,
-      keys: parseApiKeyMap(row.sub2api_api_key), baseURL: base.gateway.baseURL,
-    },
-  }
+  const { callRuntimeLlm } = await import('./agents/runtime/llm-http.js')
+  const next = await callRuntimeLlm<ManagedPodSettings>('settings', {}, { timeoutMs: 5_000 })
+  if (next.agentId !== base.agentId || next.companyId !== base.companyId) throw new Error('Managed Pod configuration identity mismatch')
+  return next
 }
 
-/** Called only by the main service; runtime-only credentials stay outside public settings. */
-export async function createManagedPodBootstrap(agentId: string, companyId: string, mapURL: (url: string) => string): Promise<ManagedPodSettings> {
-  const base: ManagedPodSettings = {
-    version: 1, agentId, source: 'bootstrap', policy: podPolicy(getServerSettingsSnapshot()),
+/** Main service only. The runtime JWT authorizes the policy refresh endpoint. */
+export async function createManagedPodBootstrap(agentId: string, companyId: string, _mapURL?: (url: string) => string): Promise<ManagedPodSettings> {
+  if (process.env.CUMORA_RUNTIME_CLIENT === 'http') throw new Error('Bootstrap creation is server-only')
+  await refreshServerSettings(true)
+  return { version: 2, agentId, companyId, source: 'bootstrap',
+    policy: podPolicy(getServerSettingsSnapshot()),
     defaults: Object.fromEntries(SETTING_DEFS.filter(def => def.pod).map(def => [def.key, settingEnvValue(def)])),
-    gateway: { companyId, ownerId: '', authorizationVersion: '', generation: 0, keys: {}, baseURL: mapURL(sub2apiOpenAIBaseURL()) },
-    direct: Object.fromEntries(DIRECT_LLM_SLOTS.map(slot => {
-      const direct = resolveDirectLlmEnv(slot)
-      return [slot, { ...direct, baseURL: mapURL(direct.baseURL) }]
-    })) as ManagedPodSettings['direct'],
   }
-  // A failed owner read must not be mistaken for an unprovisioned owner.
-  const next = await readManagedPodSettings(base)
-  return { ...next, source: 'bootstrap', policy: { ...next.policy, source: 'bootstrap' } }
 }
 
 function installPodBootstrap(): ManagedPodSettings | null {
@@ -360,7 +333,7 @@ function installPodBootstrap(): ManagedPodSettings | null {
 /** Install bootstrap before the first turn, then wait at most five seconds. */
 export async function initializeManagedPodSettings(waitMs = 5_000): Promise<void> {
   installPodBootstrap()
-  if (!snapshot) installSnapshot(Object.freeze({ ...makeSnapshot([]), source: 'env' }))
+  if (!snapshot) throw new Error('Managed Pod requires a policy bootstrap')
   let timer: ReturnType<typeof setTimeout> | undefined
   try {
     await Promise.race([loadServerSettings(), new Promise<void>(resolve => { timer = setTimeout(resolve, waitMs) })])
@@ -391,6 +364,7 @@ export async function refreshServerSettings(force = false): Promise<void> {
           installSnapshot(next.policy)
         }
       } else {
+        if (process.env.CUMORA_RUNTIME_CLIENT === 'http') throw new Error('Managed Pod requires a policy bootstrap')
         const { rows } = await pool.query<{ key: string; value: string }>('SELECT key, value FROM server_settings')
         const next = makeSnapshot(rows)
         if (startedGeneration === generation) installSnapshot(next)

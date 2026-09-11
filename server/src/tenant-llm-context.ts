@@ -1,4 +1,3 @@
-import { getManagedPodSettings } from './managed-pod-settings.js'
 import { pool } from './db/pool.js'
 import { parseApiKeyMap, listKeyModelsWithStatus, keyedPlatforms, sub2apiOpenAIBaseURL, sub2apiRoutingConfigured, type ApiKeyMap, type KeyModelsResult } from './sub2api.js'
 
@@ -106,13 +105,7 @@ export function invalidateTenantModelSnapshot(companyId?: string): void {
 /** Main-service requests read the committed owner; Pods read their refreshed identity snapshot.
  * xmin changes even for same-key tier updates; no credentials enter public DTOs. */
 export async function resolveTenantLlmContext(companyId: string, userId?: string): Promise<TenantLlmContext> {
-  const managed = getManagedPodSettings()
-  if (managed) {
-    if (managed.gateway.companyId !== companyId || userId !== undefined) {
-      throw new TenantLlmAccessError('Managed Pod identity does not authorize this request')
-    }
-    return managed.gateway
-  }
+  if (process.env.CUMORA_RUNTIME_CLIENT === 'http') throw new TenantLlmAccessError('Tenant credentials are server-only')
   const generation = generations.get(companyId) ?? 0
   generations.set(companyId, generation)
   const cached = contexts.get(companyId)
@@ -173,7 +166,7 @@ export async function tenantModelSnapshot(context: TenantLlmContext, refresh = f
         && !!old && lastSuccessAt !== null && Date.now() - lastSuccessAt < MAX_STALE_MS
       return [platform, { ...result, models: stale ? old.models : result.models, stale, lastSuccessAt }] as const
     }))
-    const current = getManagedPodSettings()?.gateway ?? contexts.get(companyId)?.context
+    const current = contexts.get(companyId)?.context
     if (context.generation !== (generations.get(companyId) ?? 0)
       || current && current.authorizationVersion !== authorizationVersion) {
       throw new TenantLlmAccessError('Tenant LLM authorization changed during discovery')

@@ -122,7 +122,7 @@ async function nextWithTimeout<T>(
 
 export async function consumeResponseStream<T>(
   stream: AsyncIterable<T>,
-  onEvent: (event: T) => void,
+  onEvent: (event: T) => unknown,
   opts: ConsumeStreamOptions = {},
 ): Promise<void> {
   const idleTimeoutMs = opts.idleTimeoutMs ?? RESPONSE_STREAM_IDLE_TIMEOUT_MS
@@ -153,7 +153,14 @@ export async function consumeResponseStream<T>(
       throw err
     }
     if (result.done) return
-    onEvent(result.value)
+    try {
+      await nextWithTimeout(Promise.resolve(onEvent(result.value)).then(() => ({ done: false, value: undefined })),
+        Math.max(1, deadline - Date.now()), 'wall', opts.signal)
+    } catch (err) {
+      abortStream(stream)
+      if (err instanceof ResponseStreamTimeoutError) opts.abortRequest?.(err)
+      throw err
+    }
   }
 }
 

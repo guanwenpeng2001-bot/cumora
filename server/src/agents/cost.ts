@@ -20,7 +20,7 @@
  *  (uncached) counts as the provider reports them: `inputTokens` excludes the
  *  cached portion; `cachedInputTokens` is the cache-READ portion (cheap);
  *  `cacheCreationTokens` is the cache-WRITE portion (a premium over input). */
-import { captureDbPricing } from '../model-pricing.js'
+import { captureDbPricing, modelPricingSeeds, seedPriceFor } from '../model-pricing.js'
 import { createHash } from 'node:crypto'
 
 import type { TokenUsage } from './token-usage.js'
@@ -37,33 +37,15 @@ export interface ModelPrice {
   source?: 'env' | 'database' | 'legacy' | 'compatibility'
   sourceUrl?: string | null
   pricedAt?: string | null
+  note?: string | null
   version?: string
   matchedModel?: string
   match?: 'exact' | 'route' | 'alias' | 'fallback'
   unpriced?: string
 }
 
-// Seeded prices — ALL treated as ESTIMATES (verified: false). The claude tiers
-// are Anthropic's published list prices to the best of our knowledge (cache-read
-// ≈ 0.1× input, cache-write ≈ 1.25× input), but we can't verify at runtime that
-// they're current for the EXACT model variant in use (e.g. a specific 4.x), and
-// the gpt-5.* ids are Cumora's internal cloud aliases whose true upstream rate we
-// don't know at all. So nothing here is presented as authoritative: a figure is
-// only `verified` (non-estimated) when the OPERATOR supplies the real contracted
-// rate via CUMORA_MODEL_PRICES_JSON. Everything else surfaces as an estimate.
-const SEED_PRICES: Record<string, ModelPrice> = {
-  'gpt-5.5':      { inPer1M: 2.5, cachedInPer1M: 0.25, cacheWritePer1M: 2.5, outPer1M: 10, verified: false },
-  'gpt-5.4-mini': { inPer1M: 0.25, cachedInPer1M: 0.025, cacheWritePer1M: 0.25, outPer1M: 2, verified: false },
-  // Claude — Anthropic published list prices (input / cache-read = "cache hits &
-  // refreshes" / 5m cache-write / output, per 1M). Explicit aliases below preserve
-  // legacy variants. Legacy Opus 4.1 ($15/$75) differs from current Opus (4.5–4.8)
-  // ($5/$25). Haiku here = Haiku 4.5 ($1/$5); Sonnet 4.x = $3/$15.
-  'claude-opus-4-1': { inPer1M: 15, cachedInPer1M: 1.5, cacheWritePer1M: 18.75, outPer1M: 75, verified: false },
-  'claude-opus':   { inPer1M: 5, cachedInPer1M: 0.5, cacheWritePer1M: 6.25, outPer1M: 25, verified: false },
-  'claude-sonnet': { inPer1M: 3, cachedInPer1M: 0.3, cacheWritePer1M: 3.75, outPer1M: 15, verified: false },
-  'claude-haiku':  { inPer1M: 1, cachedInPer1M: 0.1, cacheWritePer1M: 1.25, outPer1M: 5, verified: false },
-}
-
+// Official seed provenance and native-unit media notes live in model-pricing.ts.
+// Published list prices remain estimates for subscriptions and reseller routes.
 // Unknown models have no billable rate; preserve the missing-price reason.
 const FALLBACK_PRICE: ModelPrice = { inPer1M: 0, cachedInPer1M: 0, cacheWritePer1M: 0, outPer1M: 0, verified: false, unpriced: 'no-price' }
 
@@ -119,6 +101,40 @@ const PRICE_ALIASES: Record<string, string> = {
   'claude-opus-4-5': 'claude-opus', 'claude-opus-4-6': 'claude-opus',
   'claude-opus-4-7': 'claude-opus', 'claude-opus-4-8': 'claude-opus',
   'claude-opus-4-1-20250805': 'claude-opus-4-1',
+  'claude-opus-4-6-thinking': 'claude-opus',
+  'gemini-3.8-flash-high': 'gemini-3.8-flash',
+  'gemini-3.7-flash-high': 'gemini-3.7-flash',
+  'gemini-3.1-pro-high': 'gemini-3.1-pro-preview',
+  'gpt-5.5-2026-04-23': 'gpt-5.5',
+  'qwen3-asr-flash-2025-09-08': 'qwen3-asr-flash',
+  'qwen3-asr-flash-2026-02-10': 'qwen3-asr-flash',
+  'qwen3-asr-flash-filetrans-2025-11-17': 'qwen3-asr-flash-filetrans',
+  'qwen3-asr-flash-realtime-2025-10-27': 'qwen3-asr-flash-realtime',
+  'qwen3-asr-flash-realtime-2026-02-10': 'qwen3-asr-flash-realtime',
+  'fun-asr-2025-11-07': 'fun-asr', 'fun-asr-2025-08-25': 'fun-asr',
+  'fun-asr-mtl-2025-08-25': 'fun-asr-mtl',
+  'fun-asr-realtime-2025-11-07': 'fun-asr-realtime',
+  'qwen-image-max-2025-12-30': 'qwen-image-max',
+  'qwen-image-plus-2026-01-09': 'qwen-image-plus',
+  'qwen-image-2.0-2026-03-03': 'qwen-image-2.0',
+  'qwen-image-2.0-pro-2026-03-03': 'qwen-image-2.0-pro',
+  'qwen-image-2.0-pro-2026-04-22': 'qwen-image-2.0-pro',
+  'qwen-image-2.0-pro-2026-06-22': 'qwen-image-2.0-pro',
+  'gpt-image-2-2026-04-21': 'gpt-image-2',
+  'qwen3-coder-plus-2025-09-23': 'qwen3-coder-plus',
+  'qwen3-coder-plus-2025-07-22': 'qwen3-coder-plus',
+  'qwen3-coder-flash-2025-07-28': 'qwen3-coder-flash',
+
+}
+
+// Only known provider namespaces are removable. A reseller's rate is an API
+// equivalent estimate, never a verified bill. Do not strip arbitrary suffixes:
+// realtime/highspeed/pro/region suffixes can select a different price.
+function priceAlias(id: string): string | undefined {
+  if (Object.hasOwn(PRICE_ALIASES, id)) return PRICE_ALIASES[id]
+  const bare = id.replace(/^(?:openai|anthropic|google|models|qwen|dashscope|zhipu|minimax|moonshot|deepseek|orcarouter|novita)\//, '')
+  if (bare !== id) return seedPriceFor(bare) ? bare : Object.hasOwn(PRICE_ALIASES, bare) ? PRICE_ALIASES[bare] : undefined
+  return undefined
 }
 
 /** Freeze the menu before sending, including prices for returned model IDs.
@@ -133,16 +149,16 @@ export function capturePricing(): (model: string | null | undefined, route?: str
     let p = routeKey ? lookup(routeKey) : null
     let matchedModel = p ? routeKey : id
     let match: ModelPrice['match'] = p ? 'route' : 'exact'
-    p ??= lookup(id) ?? (Object.hasOwn(SEED_PRICES, id) ? { ...SEED_PRICES[id]!, source: 'legacy' } : null)
-    const alias = Object.hasOwn(PRICE_ALIASES, id) ? PRICE_ALIASES[id] : undefined
+    p ??= lookup(id) ?? seedPriceFor(id)
+    const alias = priceAlias(id)
     if (!p && alias) {
-      p = lookup(alias) ?? { ...SEED_PRICES[alias]!, source: 'compatibility' }
+      p = lookup(alias) ?? seedPriceFor(alias)
       matchedModel = alias
       match = 'alias'
-      p = { ...p, verified: false }
+      if (p) p = { ...p, verified: false, source: p.source ?? 'compatibility' }
     }
     if (!p) { p = { ...FALLBACK_PRICE, source: 'compatibility' }; match = 'fallback'; matchedModel = '' }
-    const price = { ...p, matchedModel, match }
+    const price: ModelPrice = { ...p, source: p.source ?? 'legacy', matchedModel, match }
     return Object.freeze({ ...price, version: p.version ?? priceVersion(price) })
   }
 }
@@ -172,7 +188,7 @@ export function modelPriceTable(): Array<{
     rows.push({ model, inPer1M: p.inPer1M, cachedInPer1M: p.cachedInPer1M, cacheWritePer1M: p.cacheWritePer1M, outPer1M: p.outPer1M, estimated: p.verified !== true })
   }
   for (const model of Object.keys(legacyEnvPrices())) add(model)
-  for (const model of Object.keys(SEED_PRICES)) add(model)
+  for (const { model } of modelPricingSeeds()) add(model)
   return rows
 }
 

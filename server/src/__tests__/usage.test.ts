@@ -188,7 +188,10 @@ test('metadata distinguishes retained raw logs from a 92-day summary and reports
 
 test('all usage endpoints map input errors to HTTP 400 without changing other error handling', async () => {
   const router = readFileSync(new URL('../api/router.ts', import.meta.url), 'utf8')
-  const helper = router.slice(router.indexOf('function safeUsage('), router.indexOf('/** Usage dashboard —'))
+  const ast = ts.createSourceFile('router.ts', router, ts.ScriptTarget.Latest, true)
+  const declaration = ast.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'safeUsage')
+  assert.ok(declaration, 'safeUsage helper exists')
+  const helper = declaration.getText(ast)
   const js = ts.transpileModule(helper + '\nexports.safeUsage = safeUsage', { compilerOptions: { module: ts.ModuleKind.CommonJS } }).outputText
   class HttpError extends Error { constructor(public status: number, message: string) { super(message) } }
   const exports: Record<string, any> = {}

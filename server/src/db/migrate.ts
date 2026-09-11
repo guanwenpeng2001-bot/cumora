@@ -62,6 +62,7 @@ import { SUB2API_SYNC_SQL, sub2apiSyncChecksum } from './migrations/0012-sub2api
 import { USAGE_ROLLUP_V2_SQL, usageRollupV2Checksum } from './migrations/0013-usage-rollup-v2.js'
 import { RUNTIME_CALL_ID_INDEX_SQL, runtimeCallIdIndexChecksum } from './migrations/0014-runtime-call-id-index.js'
 import { ENGINE_DEFAULTS_SQL, engineDefaultsChecksum } from './migrations/0015-engine-defaults.js'
+import { TURN_SAFETY_SQL, turnSafetyChecksum } from './migrations/0018-turn-safety.js'
 import { AGENT_MESSAGE_CONSUMPTIONS_SQL, agentMessageConsumptionsChecksum } from './migrations/0017-agent-message-consumptions.js'
 import { AGENT_PROVIDER_PROFILE_SQL, agentProviderProfileChecksum } from './migrations/0016-agent-provider-profile.js'
 
@@ -2696,6 +2697,12 @@ const VERSIONED_MIGRATIONS: readonly VersionedMigration[] = [
     sourceChecksum: agentMessageConsumptionsChecksum(),
     transactional: true,
     up: async (client) => { await client.query(AGENT_MESSAGE_CONSUMPTIONS_SQL) },
+  },
+  {
+    ...SCHEMA_MIGRATIONS[17],
+    sourceChecksum: turnSafetyChecksum(),
+    transactional: true,
+    up: async (client) => { await client.query(TURN_SAFETY_SQL) },
   },
 ]
 

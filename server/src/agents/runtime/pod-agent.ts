@@ -29,7 +29,6 @@
  *   2  bad invocation (missing env)
  *   3  unrecoverable stream error (couldn't connect after N retries)
  */
-import { pool } from '../../db/pool.js'
 import { initializeManagedPodSettings } from '../../settings.js'
 import { runAgentTurn, type AgentTurnOptions } from '../turn.js'
 import { runtime } from './select.js'
@@ -64,6 +63,8 @@ const state: RunnerState = {
 }
 
 let activeTurnController: AbortController | null = null
+let pendingStopGeneration: string | null = null
+let activeGeneration = '0'
 
 // Consumed once by the first drain, including cold-start inbox catch-up.
 // Inbox changes invalidate the scheduler decision inside runAgentTurn.
@@ -125,6 +126,7 @@ async function drain(agentId: string, options: AgentTurnOptions | null = null): 
       try {
         activeTurnController = new AbortController()
         await runAgentTurn(agentId, { ...turnOptions, signal: activeTurnController.signal,
+          onTurnAdmitted: generation => { activeGeneration = generation; process.env.CUMORA_TURN_GENERATION = generation },
           onInboxDeferred: deferred => { state.inboxDeferred = deferred } })
         console.log(`[pod-agent] turn ok · ${Date.now() - started}ms`)
       } catch (err) {
@@ -141,6 +143,11 @@ async function drain(agentId: string, options: AgentTurnOptions | null = null): 
     console.warn('[pod-agent] inbox admission failed:', err instanceof Error ? err.message : String(err))
   } finally {
     state.busy = false
+    if (pendingStopGeneration) {
+      const generation = pendingStopGeneration
+      pendingStopGeneration = null
+      void runtime.confirmStopped(agentId, generation).catch(console.error)
+    }
   }
 }
 
@@ -203,6 +210,19 @@ async function connectStream(agentId: string, url: string, token: string): Promi
   for await (const evt of parseSseStream(res.body as unknown as AsyncIterable<unknown>)) {
     if (state.shuttingDown) break
     if (evt.event === 'ready') continue
+    if (evt.event === 'stop') {
+      if (!evt.data) throw new Error('Runtime stop event is missing its payload')
+      const { generation } = JSON.parse(evt.data ?? '{}') as { generation: string }
+      if (typeof generation !== 'string' || !/^\d+$/.test(generation) || BigInt(generation) <= BigInt(activeGeneration)) continue
+      activeTurnController?.abort(new DOMException('Emergency stop', 'AbortError'))
+      pendingStopGeneration = generation
+      state.pendingRerun = false
+      if (!state.busy) {
+        pendingStopGeneration = null
+        void runtime.confirmStopped(agentId, generation).catch(console.error)
+      }
+      continue
+    }
     if (evt.event === 'wake') {
       // Mark "the server has told us there's work" — gates the
       // no-work-exit fast path. A bootstrap drain (line 151) does
@@ -331,12 +351,6 @@ async function gracefulExit(reason: string, finalStatus: 'resting' | null): Prom
       console.warn(`[pod-agent] failed to set status=${finalStatus}:`, err instanceof Error ? err.message : String(err))
     }
   }
-  // Settings refreshes may still hold a connection. Bound pool shutdown
-  // so a stuck read doesn't keep the Pod alive past its idle bedtime.
-  await Promise.race([
-    pool.end().catch(() => { /* swallow */ }),
-    new Promise<void>((r) => setTimeout(r, 2000)),
-  ])
   process.exit(0)
 }
 

@@ -14,7 +14,6 @@
  */
 import type { AgentRuntimeClient } from './client.js'
 import { HttpRuntimeClient } from './http-client.js'
-import { inprocClient } from './inproc-client.js'
 
 function pick(): AgentRuntimeClient {
   if (process.env.CUMORA_RUNTIME_CLIENT === 'http') {
@@ -25,7 +24,18 @@ function pick(): AgentRuntimeClient {
     }
     return new HttpRuntimeClient({ baseUrl, token })
   }
-  return inprocClient
+  // All runtime methods are asynchronous. Delay the server graph until a
+  // method is invoked, avoiding both Pod imports and top-level-await cycles.
+  return new Proxy({} as AgentRuntimeClient, {
+    get(_target, key) {
+      if (key === 'then') return undefined
+      return async (...args: unknown[]) => {
+        const { inprocClient } = await import('./inproc-client.js')
+        const method = Reflect.get(inprocClient, key) as (...values: unknown[]) => unknown
+        return method.apply(inprocClient, args)
+      }
+    },
+  })
 }
 
 export const runtime: AgentRuntimeClient = pick()

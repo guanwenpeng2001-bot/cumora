@@ -216,3 +216,13 @@ test('API rejects invalid profile ids without echoing credentials or inserting a
   assert.equal((await f.request({ ...input, providerProfile: 'work' })).status, 400)
   assert.equal(f.inserts.length, 0)
 })
+
+test('cloud cerebellum persists for managed agents and BYOA profiles without changing local fastModel', async () => {
+  for (const byoa of [false, true]) {
+    const f = fixture(byoa)
+    await f.createAgentRecord({ ...input, ...(byoa ? { computerId: 'local-test', engine: 'claude', providerProfile: 'work' } : {}),
+      fastModel: 'local-small', modelConfig: { cerebellumModel: 'cloud-small' } })
+    assert.deepEqual(f.records[0].model_config, { cerebellumModel: 'cloud-small' })
+    assert.equal(f.inserts[0][9], 'local-small')
+  }
+})

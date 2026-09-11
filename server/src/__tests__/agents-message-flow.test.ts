@@ -130,7 +130,9 @@ test('worker death retains a leased payload and expired owners cannot ack or ren
 })
 
 test('migration receipt schema matches the appended immutable manifest', () => {
-  assert.equal(agentMessageConsumptionsChecksum(), SCHEMA_MIGRATIONS.at(-1)?.checksum)
+  const entry = SCHEMA_MIGRATIONS.find((m) => m.name.startsWith('0017_'))
+  assert.ok(entry, '0017 receipt migration is registered')
+  assert.equal(agentMessageConsumptionsChecksum(), entry.checksum)
 })
 
 function runtimeMethod(name: string, pool: unknown) {
@@ -175,13 +177,22 @@ test('200 deferred messages cannot hide a new human from work selection or the i
 
 test('exact consumption writes cannot advance a cursor over an unread gap, including legacy one-message calls', async () => {
   const ids: string[][] = []
-  const client = runtimeMethod('markConversationRead', { query: async (sql: string, values: any[]) => {
+  const handler = async (sql: string, values: any[]) => {
+    if (/^(BEGIN|COMMIT|ROLLBACK)$/i.test(sql.trim())) return { rows: [] }
+    if (sql.includes('FROM companies c JOIN participants p')) return { rows: [{ company_id: 'co' }] }
+    if (sql.includes('FROM company_turn_safety')) return { rows: [{ paused: false, generation: '0' }] }
     assert.match(sql, /m.id = ANY\(\$3::text\[\]\)/)
     assert.match(sql, /p.company_id = c.company_id/)
     assert.match(sql, /ON CONFLICT DO NOTHING/)
     assert.doesNotMatch(sql, /INSERT INTO conversation_reads|UPDATE conversation_reads/)
     ids.push(values[2])
-  } })
+    return { rows: [] }
+  }
+  const fakePool = {
+    query: handler,
+    connect: async () => ({ query: handler, release: () => {} }),
+  }
+  const client = runtimeMethod('markConversationRead', fakePool)
   await client.markConversationRead({ agentId: 'a', conversationId: 'c', upToMessageId: 'newer', consumedMessageIds: ['older', 'newer'] })
   await client.markConversationRead({ agentId: 'a', conversationId: 'c', upToMessageId: 'latest' })
   assert.deepEqual(ids, [['older', 'newer'], ['latest']])

@@ -16,6 +16,7 @@
  * `/api` because the cookie-auth middleware on /api would reject these
  * (and we don't want pods sharing the human session cookie path).
  */
+import { turnAdmission, confirmStopped, canAcknowledge } from '../../turn-safety.js'
 import { json, type NextFunction, type Request, type Response, Router } from 'express'
 import { publicBodyParserError } from '../../body-parser-errors.js'
 import { AGENDA_CLASSIFIER_ERROR, claimStallNudge, classifyAgendaActionable, gatherAgentAgenda, renderAgendaBrief } from '../agenda.js'
@@ -44,6 +45,11 @@ import { attachFsEndpoints } from './fs-endpoints.js'
 import { inprocClient } from './inproc-client.js'
 import { type AgentRuntimeClaims, verifyAgentToken } from './jwt.js'
 import { attachWakeStream, } from './wake-bus.js'
+import { serveRuntimeText } from './llm-proxy.js'
+import { serveRuntimeStream } from './llm-stream.js'
+import { executeRuntimeStream, resolveRuntimeBrainPlan } from './llm-stream-execution.js'
+import { executeTrackedText } from '../../llm-execution.js'
+import { automationNumber, createManagedPodBootstrap, withServerSettingsSnapshot } from '../../settings.js'
 
 export type { WakeEvent } from './wake-bus.js'
 
@@ -143,7 +149,75 @@ runtimeRouter.use((req, res, next) => {
   runtimeJsonParser(req, res, next)
 })
 
+runtimeRouter.post('/turn-valid', withAgent(async (c, req, res) => {
+  if (typeof req.body?.generation !== 'string') { res.status(400).json({ error: 'generation required' }); return }
+  res.json({ valid: await canAcknowledge(c.companyId, req.body.generation) })
+}))
+
+runtimeRouter.post('/turn-admission', withAgent(async (c, _req, res) => {
+  res.json(await turnAdmission(c.companyId, c.sub))
+}))
+runtimeRouter.post('/stop-confirmed', withAgent(async (c, req, res) => {
+  if (typeof req.body?.generation !== 'string' || !/^\d+$/.test(req.body.generation)) { res.status(400).json({ error: 'invalid generation' }); return }
+  await confirmStopped(c.companyId, c.sub, req.body.generation)
+  res.json({ ok: true })
+}))
+
 // ─── wake stream: server pushes events to the agent's long-running pod ─
+
+runtimeRouter.post('/llm/text', withAgent(async (c, req, res) => {
+  await serveRuntimeText({ agentId: c.sub, companyId: c.companyId }, req, res, {
+    timeoutMs: automationNumber('agent_stream_wall_timeout_ms'),
+    authorize: async context => {
+      const runs = await withRuntimeAgentRunAuthorization({ agentId: c.sub, companyId: c.companyId,
+        runIds: context.runId ? [context.runId] : [], task: async () => true })
+      if (!runs.authorized) return false
+      if (context.conversationId) {
+        const conversations = await withRuntimeConversationAuthorization({ agentId: c.sub, companyId: c.companyId,
+          conversationIds: [context.conversationId], task: async () => true })
+        if (!conversations.authorized) return false
+      }
+      return isRuntimeAgentAuthorized(c)
+    },
+    execute: executeTrackedText,
+  })
+}))
+
+runtimeRouter.post('/llm/brain-plan', withAgent(async (c, _req, res) => {
+  res.json(await resolveRuntimeBrainPlan({ companyId: c.companyId, agentId: c.sub, purpose: 'agent-turn' }))
+}))
+
+runtimeRouter.post('/llm/settings', withAgent(async (c, _req, res) => {
+  res.json(await createManagedPodBootstrap(c.sub, c.companyId))
+}))
+
+runtimeRouter.post('/llm/stream', withAgent(async (c, req, res) => {
+  await serveRuntimeStream({ agentId: c.sub, companyId: c.companyId }, req, res, {
+    timeoutMs: automationNumber('agent_stream_wall_timeout_ms'),
+    authorize: async context => {
+      const runs = await withRuntimeAgentRunAuthorization({ agentId: c.sub, companyId: c.companyId,
+        runIds: context.runId ? [context.runId] : [], task: async () => true })
+      if (!runs.authorized) return false
+      if (context.conversationId) {
+        const conversations = await withRuntimeConversationAuthorization({ agentId: c.sub, companyId: c.companyId,
+          conversationIds: [context.conversationId], task: async () => true })
+        if (!conversations.authorized) return false
+      }
+      return isRuntimeAgentAuthorized(c)
+    }, execute: (body, context, signal, emit) => withServerSettingsSnapshot(() => executeRuntimeStream(body, context, signal, emit)),
+  })
+}))
+
+runtimeRouter.post('/notices/failure-count', withAgent(async (c, req, res) => {
+  const conversationId = req.body?.conversationId
+  if (typeof conversationId !== 'string' || !conversationId || conversationId.length > 256) {
+    res.status(400).json({ error: 'conversationId required' }); return
+  }
+  const gate = await withRuntimeConversationAuthorization({ agentId: c.sub, companyId: c.companyId,
+    conversationIds: [conversationId], task: () => inprocClient.incrementFailureNoticeCount(c.sub, conversationId) })
+  if (!gate.authorized) { res.status(403).json({ error: 'not a member of that conversation' }); return }
+  res.json({ count: gate.result })
+}))
 
 runtimeRouter.get('/wake-stream', withAgent(async (c, _req, res) => {
   await attachWakeStream(c.sub, res, {
@@ -168,6 +242,7 @@ attachFsEndpoints(runtimeRouter, withAgent)
 // and inject the token's pinned agentId so a compromised pod can't
 // impersonate another agent.
 runtimeRouter.post('/cli', withAgent(async (c, req, res) => {
+  if (!await canAcknowledge(c.companyId, req.get('X-Turn-Generation'))) { res.status(409).json({ error: 'turn stopped' }); return }
   const body = req.body as { argv?: unknown } | undefined
   const argv = Array.isArray(body?.argv) ? body!.argv.filter((x): x is string => typeof x === 'string') : null
   if (!argv) { res.status(400).json({ error: 'argv (string[]) required' }); return }
@@ -445,6 +520,8 @@ runtimeRouter.post('/typing', withAgent(async (c, req, res) => {
 // ─── observability ──────────────────────────────────────────────────
 
 runtimeRouter.post('/runs', withAgent(async (c, req, res) => {
+  const admission = await turnAdmission(c.companyId, c.sub)
+  if (!admission.allowed) { res.status(423).json({ error: admission.reason }); return }
   const body = req.body as {
     trigger?: Record<string, unknown>
     inputMessageIds?: string[]
@@ -911,6 +988,7 @@ runtimeRouter.get('/worklog/peek', withAgent(async (c, req, res) => {
 // a mid-turn steer drain, so the next wake's loadInbox doesn't surface
 // them again. agentId from JWT (c.sub).
 runtimeRouter.post('/conversation/mark-read', withAgent(async (c, req, res) => {
+  if (!await canAcknowledge(c.companyId, req.get('X-Turn-Generation'))) { res.status(409).json({ error: 'turn stopped' }); return }
   const body = req.body as { conversationId?: string; upToMessageId?: string; consumedMessageIds?: string[] } | undefined
   if (!body?.conversationId || !body.upToMessageId) {
     res.status(400).json({ error: 'conversationId and upToMessageId required' }); return
@@ -930,6 +1008,7 @@ runtimeRouter.post('/conversation/mark-read', withAgent(async (c, req, res) => {
       conversationId: body.conversationId as string,
       upToMessageId: body.upToMessageId as string,
       consumedMessageIds: body.consumedMessageIds,
+      safetyGeneration: req.get('X-Turn-Generation'),
     }, client),
   })
   if (!gate.authorized) { res.status(403).json({ error: 'message is not readable in that conversation' }); return }

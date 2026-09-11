@@ -28,6 +28,14 @@ export const sub = new IORedis(env.REDIS_URL, {
   lazyConnect,
 })
 
+if (lazyConnect) {
+  for (const client of [redis, sub]) {
+    client.connect = () => Promise.reject(new Error('Redis access is forbidden in managed Pods'))
+    client.sendCommand = () => { throw new Error('Redis access is forbidden in managed Pods') }
+    client.duplicate = () => { throw new Error('Redis access is forbidden in managed Pods') }
+  }
+}
+
 redis.on('error', (e) => console.error('[redis]', e))
 sub.on('error', (e) => console.error('[redis sub]', e))
 

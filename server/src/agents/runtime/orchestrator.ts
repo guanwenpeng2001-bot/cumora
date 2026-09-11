@@ -21,13 +21,11 @@
  * correctly whether the server itself runs in-cluster or on a dev
  * laptop.
  */
-import { randomBytes } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { env } from '../../env.js'
 import { pool } from '../../db/pool.js'
 import type { ManagedPodSettings } from '../../managed-pod-settings.js'
-import { createManagedPodBootstrap, getBrainModel, getSupportModel, getCompactionModel, getServerSettingsSnapshot, automationNumber, startAutomationTimer } from '../../settings.js'
-import { agentReasoningEffort, agentMaxOutputTokens, supportReasoningEffort, supportReasoningHeadroom } from '../reasoning.js'
+import { createManagedPodBootstrap, getServerSettingsSnapshot, automationNumber, startAutomationTimer } from '../../settings.js'
 import { inprocClient } from './inproc-client.js'
 import { signAgentToken } from './jwt.js'
 import { notifyAlert } from '../../alerting.js'
@@ -48,11 +46,11 @@ const KUBECTL = process.env.CUMORA_KUBECTL ?? 'kubectl'
  *  context is named differently). */
 const KUBECTL_CONTEXT = process.env.CUMORA_KUBECTL_CONTEXT
   ?? (env.NODE_ENV === 'production' ? '' : 'orbstack')
-// The upstream :dev fallback with IfNotPresent can reuse an old image without
-// this fork's bootstrap/settings contract. Deploy a built fork image and set
-// CUMORA_AGENT_COMPUTER_IMAGE to its immutable tag/digest; Compose does not build it.
-const IMAGE = process.env.CUMORA_AGENT_COMPUTER_IMAGE
-  ?? 'quay.io/yetoneful/cumora-agent-computer:dev'
+// Development fallback requires the local image on each target node.
+const IMAGE = process.env.CUMORA_AGENT_COMPUTER_IMAGE?.trim() || 'cumora-agent-computer:dev'
+if (!process.env.CUMORA_AGENT_COMPUTER_IMAGE?.trim()) {
+  console.warn('[orchestrator] CUMORA_AGENT_COMPUTER_IMAGE is unset; using local tag cumora-agent-computer:dev. Production must configure a built fork image with an immutable tag/digest.')
+}
 /** TTL of the JWT minted at Pod-spawn time. Pods live up to
  *  CUMORA_AGENT_IDLE_MS without restart, so the JWT lives longer than
  *  the idle ceiling to avoid mid-life expiry. */
@@ -340,15 +338,10 @@ function podManifest(args: {
   token: string
   image: string
   serverUrl: string
-  openaiKey: string
   bootstrap?: ManagedPodSettings
-  /** Legacy direct bootstrap projection; gateway identity is separate. */
-  openaiBaseUrl: string
   idleMs: number
   noWorkMs: number
 }): string {
-  // Satisfy the image's production-secret gate without sharing the server's signing authority.
-  const podLocalSecret = randomBytes(32).toString('hex')
   const indent = (s: string): string => s.split('\n').map((l) => `              ${l}`).join('\n')
   const pullSecretsBlock = PULL_SECRETS.length === 0 ? '' : `
   imagePullSecrets:
@@ -443,56 +436,8 @@ ${args.initialTriage ? `    - name: CUMORA_AGENT_INITIAL_WAKE
 ${indent(args.token)}
 ${args.bootstrap ? `    - name: CUMORA_MANAGED_POD_BOOTSTRAP
       value: ${yamlQuote(JSON.stringify(args.bootstrap))}
-` : ''}    - name: OPENAI_API_KEY
-      value: |-
-${indent(args.openaiKey)}
-    - name: OPENAI_BASE_URL
-      value: |-
-${indent(podUrl(args.openaiBaseUrl))}
-    - name: AGENT_RUNTIME_SECRET
-      value: ${yamlQuote(podLocalSecret)}
-    - name: REDIS_URL
-      value: |-
-${indent(podUrl(env.REDIS_URL))}
-    - name: NOVITA_API_KEY
-      value: |-
-${indent(env.NOVITA_API_KEY)}
-    - name: NOVITA_BASE_URL
-      value: |-
-${indent(podUrl(env.NOVITA_BASE_URL))}
-    - name: ORCAROUTER_API_KEY
-      value: |-
-${indent(env.ORCAROUTER_API_KEY)}
-    - name: ORCAROUTER_BASE_URL
-      value: |-
-${indent(podUrl(env.ORCAROUTER_BASE_URL))}
-    - name: DATABASE_URL
-      value: |-
-${indent(podUrl(env.DATABASE_URL))}
-    - name: SUB2API_INTERNAL_URL
-      value: |-
-${indent(podUrl(env.SUB2API_INTERNAL_URL))}
-    - name: OPENAI_MODEL
-      value: |-
-${indent(getBrainModel())}
-    - name: OPENAI_MODEL_SUPPORT
-      value: |-
-${indent(getSupportModel())}
-    - name: OPENAI_COMPACTION_MODEL
-      value: |-
-${indent(getCompactionModel())}
-    - name: CUMORA_REASONING_EFFORT
-      value: |-
-${indent(agentReasoningEffort() ?? 'low')}
-    - name: CUMORA_AGENT_MAX_OUTPUT_TOKENS
-      value: |-
-${indent(String(agentMaxOutputTokens()))}
-    - name: CUMORA_SUPPORT_REASONING_EFFORT
-      value: |-
-${indent(supportReasoningEffort() ?? 'low')}
-    - name: CUMORA_SUPPORT_REASONING_HEADROOM
-      value: |-
-${indent(String(supportReasoningHeadroom()))}
+` : ''}    - name: CUMORA_RUNTIME_CLIENT
+      value: "http"
   # Spot/Preemptible toleration: GKE Spot VM nodes are tainted
   # cloud.google.com/gke-spot=true:NoSchedule by default so cluster-
   # critical pods don't accidentally land on them. Agent pods are
@@ -938,7 +883,7 @@ export async function ensurePod(agentId: string, initialTriage?: InitialInboxTri
       return { ...result, applyState: progress.value }
     } catch {
       console.warn(`[orchestrator] ${agentId} Pod preparation failed; check Pod URL/bootstrap configuration`)
-      return { created: false, ok: false, applyState: progress.value, code: 'pod_apply_failed', reason: 'Pod preparation failed; check Pod URL/bootstrap configuration, including SUB2API_PUBLIC_URL for Compose and CUMORA_POD_HOST_REWRITE for local Kubernetes' }
+      return { created: false, ok: false, applyState: progress.value, code: 'pod_apply_failed', reason: 'Pod preparation failed; check Pod URL/bootstrap configuration, including AGENT_RUNTIME_SERVER_URL and CUMORA_POD_HOST_REWRITE for local Kubernetes' }
     } finally {
       if (watchdogTimer) clearTimeout(watchdogTimer)
       inFlight.delete(agentId)
@@ -1093,7 +1038,7 @@ async function ensurePodImpl(agentId: string, signal: AbortSignal, initialTriage
     ttlSeconds: TOKEN_TTL_SECONDS,
   })
 
-  const bootstrap = await createManagedPodBootstrap(agentId, persona.companyId, podUrl)
+  const bootstrap = await createManagedPodBootstrap(agentId, persona.companyId)
 
   // Re-read immediately before the first Kubernetes mutation. This closes the
   // scheduler-to-orchestrator and preparation-time race: moving the Agent to a
@@ -1139,8 +1084,6 @@ async function ensurePodImpl(agentId: string, signal: AbortSignal, initialTriage
     serverUrl: env.AGENT_RUNTIME_SERVER_URL,
     bootstrap,
     initialTriage: resolvedTriage,
-    openaiKey: bootstrap.direct.text.apiKey,
-    openaiBaseUrl: bootstrap.direct.text.baseURL,
     idleMs: automationNumber('pod_idle_ms'),
     noWorkMs: automationNumber('pod_no_work_ms'),
   })

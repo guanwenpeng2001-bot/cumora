@@ -32,6 +32,8 @@ jobs:
           echo "CUMORA_BUILD_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
       - run: npm ci --ignore-scripts
       - name: Build then pack in staging
+        env:
+          CUMORA_DEFAULT_SERVER: ${{ vars.CUMORA_DEFAULT_SERVER }}
         run: |
           export CUMORA_CLI_OUTDIR="$RUNNER_TEMP/agent-cli-package/dist"
           npm run build --prefix agent-cli

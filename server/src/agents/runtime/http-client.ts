@@ -58,6 +58,11 @@ export interface HttpClientOptions {
 }
 
 export class HttpRuntimeClient implements AgentRuntimeClient {
+  async incrementFailureNoticeCount(_agentId: string, conversationId: string): Promise<number> {
+    const result = await this.call<{ count: number }>('POST', '/notices/failure-count', { conversationId })
+    if (!Number.isSafeInteger(result?.count) || result.count < 1) throw new Error('Invalid runtime failure notice count')
+    return result.count
+  }
   private readonly baseUrl: string
   private readonly token: string
   private readonly fetchImpl: typeof fetch
@@ -70,14 +75,32 @@ export class HttpRuntimeClient implements AgentRuntimeClient {
     this.timeoutMs = opts.timeoutMs ?? 30_000
   }
 
-  private async call<T>(method: 'GET' | 'POST', path: string, body?: unknown): Promise<T> {
+  private safetyGeneration = '0'
+
+  async validateTurn(_agentId: string, generation: string): Promise<boolean> {
+    const result = await this.call<{ valid: boolean }>('POST', '/turn-valid', { generation }, 5000)
+    return result.valid
+  }
+
+  async admitTurn(_agentId: string) {
+    const result = await this.call<{ allowed: boolean; generation: string; reason: string | null }>('POST', '/turn-admission', {})
+    this.safetyGeneration = result.generation
+    return result
+  }
+
+  async confirmStopped(_agentId: string, generation: string): Promise<void> {
+    await this.call('POST', '/stop-confirmed', { generation })
+  }
+
+  private async call<T>(method: 'GET' | 'POST', path: string, body?: unknown, timeoutMs = this.timeoutMs): Promise<T> {
     const ctrl = new AbortController()
-    const timer = setTimeout(() => ctrl.abort(), this.timeoutMs)
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs)
     try {
       const res = await this.fetchImpl(`${this.baseUrl}${path}`, {
         method,
         headers: {
           'Authorization': `Bearer ${this.token}`,
+          'X-Turn-Generation': this.safetyGeneration,
           ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
         },
         body: body !== undefined ? JSON.stringify(body) : undefined,

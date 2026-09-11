@@ -1,3 +1,5 @@
+import { AgentRunner } from '../agents/computer/daemon.js'
+import { effectiveCostUsd, priceFor, usageFromClaude } from '../agents/cost.js'
 /**
  * Contract tests for BYOA Codex usage reporting.
  *
@@ -22,6 +24,20 @@ import { getAdapter, type EngineHopReport, type EngineRunResult } from '../agent
 const IS_WIN = process.platform === 'win32'
 const ORIGINAL_PATH = process.env.PATH
 const ORIGINAL_UNSANDBOXED = process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED
+// Exercise the real daemon assembly without starting a daemon or sending HTTP.
+function assembleHop(report: EngineHopReport, resolvedModel = 'gpt-5.5') {
+  const rows: Array<{ model: string; usage: ReturnType<typeof usageFromClaude>; extras?: Record<string, unknown> }> = []
+  const runner = {
+    adapter: { id: 'codex' }, currentRunId: null, lastWakeConvo: null,
+    engineModel: () => resolvedModel,
+    hopUsageOf: (usage: EngineHopReport['usage']) => usageFromClaude(usage as unknown as Record<string, unknown>),
+    reporter: { push: (row: typeof rows[number]) => rows.push(row) },
+  } as unknown as AgentRunner
+  AgentRunner.prototype['onEngineHop'].call(runner, report, 'agent-turn')
+  assert.equal(rows.length, 1)
+  return rows[0]
+}
+
 const tempDirs: string[] = []
 const liveSessions: Array<{ stop(): void | Promise<void> }> = []
 
@@ -191,7 +207,20 @@ test('codex exec --json reports turn.completed usage as one hop without reading 
     cache_creation_input_tokens: 5,
   })
   assert.equal(hops.length, 1, 'codex exec publishes one hop per turn, like gemini')
-  assert.equal(hops[0].model, 'codex', 'no CLI model → last-resort engine id, never a guessed slug')
+  assert.equal(hops[0].model, null, 'no CLI model → daemon supplies its resolved engine model')
+  const row = assembleHop(hops[0])
+  assert.equal(row.model, 'gpt-5.5')
+  assert.equal(row.extras?.route, 'byoa:codex')
+  assert.equal(row.extras?.platform, undefined)
+  assert.equal(row.extras?.callId, undefined)
+  const price = priceFor(row.model, String(row.extras?.route))
+  assert.notEqual(price.match, 'fallback')
+  const cost = effectiveCostUsd(row.model, row.usage, price)
+  assert.ok(cost.usd > 0)
+  assert.equal(cost.estimated, true)
+  assert.equal(assembleHop(hops[0], 'gpt-6-astra').model, 'gpt-6-astra')
+  const unknown = assembleHop(hops[0], 'unlisted-local-model')
+  assert.equal(priceFor(unknown.model, String(unknown.extras?.route)).unpriced, 'no-price')
   assert.deepEqual(hops[0].usage, res.usage)
   assert.equal(hops[0].hopIndex, 1)
   assert.equal(hops[0].toolUses, 1)
@@ -213,6 +242,7 @@ test('codex exec takes actualModel from CLI output when present', async () => {
 
   assert.equal(res.model, 'gpt-5.4', 'the pin is not actualModel')
   assert.equal(hops[0].model, 'gpt-5.4')
+  assert.equal(assembleHop(hops[0]).model, 'gpt-5.4')
 })
 
 test('a zero-usage Codex exec failure does not invent a hop', async () => {
@@ -299,7 +329,8 @@ test('a Codex app-server turn reports usage with no model pin', { skip: IS_WIN }
     cache_creation_input_tokens: 5,
   })
   assert.equal(hops.length, 1)
-  assert.equal(hops[0].model, 'codex')
+  assert.equal(hops[0].model, null)
+  assert.equal(assembleHop(hops[0]).model, 'gpt-5.5')
   assert.deepEqual(hops[0].usage, result.usage)
 })
 
@@ -308,4 +339,5 @@ test('a Codex app-server turn uses the CLI-reported model as actualModel', { ski
   assert.equal(result.exitCode, 0, result.error)
   assert.equal(result.model, 'gpt-5.4')
   assert.equal(hops[0].model, 'gpt-5.4')
+  assert.equal(assembleHop(hops[0]).model, 'gpt-5.4')
 })

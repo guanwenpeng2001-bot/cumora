@@ -1,3 +1,4 @@
+import { TurnSafetyPanel } from '@/desktop/TurnSafetyPanel'
 import { useEffect, useMemo, useState } from 'react'
 import { Avatar } from '@/components/Avatar'
 import { MeView } from '@/desktop/MeView'
@@ -124,6 +125,7 @@ export function MobileMe() {
       </div>
 
       <div className="flex-1 overflow-y-auto pb-20">
+        <div className="px-4 pt-4"><TurnSafetyPanel /></div>
         <Section title={t('mobileMe.settings')}>
           <button type="button" onClick={() => setShowSettings(true)}
             className="w-full rounded-[12px] border border-ink-100 bg-cloud p-3.5 text-left text-[13px] font-semibold text-skype-deep focus-visible:ring-2 focus-visible:ring-skype">

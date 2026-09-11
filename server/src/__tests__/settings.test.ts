@@ -476,6 +476,81 @@ test('Pod tunables validate new input, retain valid writes and support inheritan
   assert.equal(f.settings.getServerSetting('pod_gc_interval_ms'), '60000')
 })
 
+test('agenda heartbeat defaults to five minutes and preserves env and runtime overrides', async () => {
+  for (const [processEnv, expected] of [
+    [{}, '300000'], [{ IDLE_INTERVAL_MS: '60000' }, '60000'],
+    [{ IDLE_INTERVAL_MS: '0' }, '0'], [{ IDLE_INTERVAL_MS: 'invalid' }, '300000'],
+  ] as Array<[Record<string, string>, string]>) {
+    const f = fixture(undefined, processEnv)
+    await f.settings.loadServerSettings()
+    assert.equal(f.settings.getServerSetting('idle_interval_ms'), expected)
+    const def = f.settings.SETTING_DEFS.find(d => d.key === 'idle_interval_ms')!
+    assert.equal(def.defaultValue, '300000')
+    assert.equal(def.scope, 'server')
+    assert.equal(def.effect, 'next-tick')
+    assert.match(def.description!, /Agenda.*5 minutes/)
+    await f.settings.writeServerSettings({ idle_interval_ms: '600000' })
+    assert.equal(f.settings.automationNumber('idle_interval_ms'), 600000)
+    await f.settings.writeServerSettings({ idle_interval_ms: null })
+    assert.equal(f.settings.getServerSetting('idle_interval_ms'), expected)
+    for (const value of ['-1', '1.5', '2147483648']) {
+      assert.throws(() => f.settings.validateServerSettings({ idle_interval_ms: value }))
+    }
+  }
+})
+
+test('agenda heartbeat waits five minutes, reschedules live and pauses without overlapping active work', async () => {
+  const clock = { now: 0, ticks: [] as Array<() => void> }
+  const f = fixture(clock)
+  await f.settings.loadServerSettings()
+  const held = deferred<void>()
+  let runs = 0
+  const flush = () => new Promise<void>(resolve => setImmediate(resolve))
+  f.settings.startAutomationTimer('idle_enabled', 'idle_interval_ms', async () => {
+    runs++
+    if (runs === 1) await held.promise
+  })
+  for (const now of [60000, 299999]) {
+    clock.now = now
+    clock.ticks[0]()
+    await flush()
+    assert.equal(runs, 0)
+  }
+  clock.now = 300000
+  clock.ticks[0]()
+  await flush()
+  assert.equal(runs, 1)
+  await f.settings.writeServerSettings({ idle_interval_ms: '600000' })
+  clock.ticks[0]()
+  clock.now = 900000
+  clock.ticks[0]()
+  await flush()
+  assert.equal(runs, 1)
+  held.resolve()
+  await flush()
+  clock.ticks[0]()
+  await flush()
+  assert.equal(runs, 2)
+  for (const pause of [{ idle_interval_ms: '0' }, { idle_enabled: 'false', idle_interval_ms: '300000' }] as Array<Record<string, string>>) {
+    await f.settings.writeServerSettings(pause)
+    clock.ticks[0]()
+    clock.now += 1000000
+    clock.ticks[0]()
+    await flush()
+    assert.equal(runs, 2)
+  }
+  await f.settings.writeServerSettings({ idle_enabled: 'true', idle_interval_ms: null })
+  clock.ticks[0]()
+  clock.now += 299999
+  clock.ticks[0]()
+  await flush()
+  assert.equal(runs, 2)
+  clock.now++
+  clock.ticks[0]()
+  await flush()
+  assert.equal(runs, 3)
+})
+
 test('Pod worker timer disables, re-enables and reschedules without cancelling or overlapping an in-flight tick', async () => {
   const clock = { now: 1000, ticks: [] as Array<() => void> }
   const f = fixture(clock)

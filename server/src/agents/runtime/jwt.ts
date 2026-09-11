@@ -44,6 +44,7 @@ function fromB64url(s: string): Buffer {
 }
 
 function sign(headerB64: string, payloadB64: string): string {
+  if (process.env.CUMORA_RUNTIME_CLIENT === 'http') throw new Error('Runtime JWT signing authority is server-only')
   const mac = createHmac('sha256', env.AGENT_RUNTIME_SECRET)
   mac.update(`${headerB64}.${payloadB64}`)
   return b64url(mac.digest())

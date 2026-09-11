@@ -6,7 +6,6 @@
  *  environment win over those in `.env` (dotenv default), so deployment
  *  doesn't need a file. */
 import 'dotenv/config'
-import { getManagedPodSettings } from './managed-pod-settings.js'
 
 function required(name: string, fallback?: string): string {
   const v = process.env[name] ?? fallback
@@ -43,7 +42,7 @@ export const env = {
   NODE_ENV: process.env.NODE_ENV ?? 'development',
   DATABASE_URL: required('DATABASE_URL', `postgres://${process.env.USER ?? 'postgres'}@localhost:5432/cumora`),
   REDIS_URL: required('REDIS_URL', 'redis://localhost:6379'),
-  get OPENAI_API_KEY(): string { return getManagedPodSettings()?.direct.text.apiKey ?? (process.env.OPENAI_API_KEY ?? '') },
+  get OPENAI_API_KEY(): string { return (process.env.OPENAI_API_KEY ?? '') },
   /**
    * "Brain" model — the agent's main reasoning loop and convene speech.
    * Default model used when an agent's `participants.model` is NULL.
@@ -72,20 +71,20 @@ export const env = {
    * `novita/<model>` model id is translated at the settings boundary to the
    * direct Novita route. Without credentials that candidate is unavailable.
    */
-  get NOVITA_API_KEY(): string { return getManagedPodSettings()?.direct.novita.apiKey ?? (process.env.NOVITA_API_KEY ?? '') },
+  get NOVITA_API_KEY(): string { return (process.env.NOVITA_API_KEY ?? '') },
   /** Novita's OpenAI-compatible Chat Completions base. Override for a
    *  self-hosted proxy or a pinned API version. */
-  get NOVITA_BASE_URL(): string { return getManagedPodSettings()?.direct.novita.baseURL ?? ((process.env.NOVITA_BASE_URL ?? 'https://api.novita.ai/openai').replace(/\/+$/, '')) },
+  get NOVITA_BASE_URL(): string { return ((process.env.NOVITA_BASE_URL ?? 'https://api.novita.ai/openai').replace(/\/+$/, '')) },
   /**
    * OrcaRouter LLM API key. Optional — when unset, agents configured with a
    * `orcarouter/<model>` model id is translated at the settings boundary to the
    * direct OrcaRouter route. Without credentials that candidate is unavailable.
    */
-  get ORCAROUTER_API_KEY(): string { return getManagedPodSettings()?.direct.orcarouter.apiKey ?? (process.env.ORCAROUTER_API_KEY ?? '') },
+  get ORCAROUTER_API_KEY(): string { return (process.env.ORCAROUTER_API_KEY ?? '') },
   /** OrcaRouter's OpenAI-compatible Responses base. OrcaRouter speaks the
    *  Responses API natively, so the `orcarouter/<model>` route is a pure
    *  base-URL swap (no Chat-Completions translation, unlike Novita). */
-  get ORCAROUTER_BASE_URL(): string { return getManagedPodSettings()?.direct.orcarouter.baseURL ?? ((process.env.ORCAROUTER_BASE_URL ?? 'https://api.orcarouter.ai/v1').replace(/\/+$/, '')) },
+  get ORCAROUTER_BASE_URL(): string { return ((process.env.ORCAROUTER_BASE_URL ?? 'https://api.orcarouter.ai/v1').replace(/\/+$/, '')) },
   /**
    * Webhook URL for process-level alerts (unhandledRejection /
    * uncaughtException). Currently expects a Discord-compatible
@@ -119,7 +118,7 @@ export const env = {
    * standalone thought (instead of only reacting to incoming messages).
    * Set to 0 to disable.
    */
-  IDLE_INTERVAL_MS: Number(process.env.IDLE_INTERVAL_MS ?? 15 * 60_000),
+  IDLE_INTERVAL_MS: Number(process.env.IDLE_INTERVAL_MS ?? 5 * 60_000),
   /** Min minutes since an agent last spoke before they're eligible for an idle tick. */
   IDLE_MIN_QUIET_MIN: Number(process.env.IDLE_MIN_QUIET_MIN ?? 25),
   /** for distributed deploys, identify this instance in logs / pubsub */
@@ -193,7 +192,7 @@ export const env = {
    * source, so a prod deploy left on it would let anyone forge runtime
    * JWTs and impersonate any agent/tenant.
    */
-  AGENT_RUNTIME_SECRET: process.env.AGENT_RUNTIME_SECRET ?? DEV_AGENT_RUNTIME_SECRET,
+  AGENT_RUNTIME_SECRET: process.env.CUMORA_RUNTIME_CLIENT === 'http' ? '' : process.env.AGENT_RUNTIME_SECRET ?? DEV_AGENT_RUNTIME_SECRET,
   /**
    * Full URL the agent-runner pod uses to reach the cumora server's
    * `/runtime` API (note the trailing path). From OrbStack K8s a pod
@@ -353,9 +352,9 @@ export const env = {
    * unmapped, leave user without group" — useful for staged rollout
    * (the user has a sub2api account but can't call upstream yet).
    */
-  get SUB2API_INTERNAL_URL(): string { return getManagedPodSettings()?.gateway.baseURL ?? sub2apiInternalURL },
+  get SUB2API_INTERNAL_URL(): string { return sub2apiInternalURL },
   set SUB2API_INTERNAL_URL(value: string) { sub2apiInternalURL = value },
-  get SUB2API_PUBLIC_URL(): string { return getManagedPodSettings()?.gateway.baseURL ?? ((process.env.SUB2API_PUBLIC_URL ?? '').replace(/\/+$/, '')) },
+  get SUB2API_PUBLIC_URL(): string { return ((process.env.SUB2API_PUBLIC_URL ?? '').replace(/\/+$/, '')) },
   SUB2API_ADMIN_KEY:    process.env.SUB2API_ADMIN_KEY ?? '',
   // Legacy single-value tier mapping (pre platform-split). Still honored as
   // the last-resort fallback in tierGroups().
@@ -527,7 +526,8 @@ export function readEnvTierPlatformGroups(tier: 'free' | 'pro' | 'max'): Record<
 // JWT with a value anyone can read in the repo — a full agent/tenant
 // impersonation bypass. Fail closed, loudly, at startup rather than serve
 // forgeable tokens.
-if (env.NODE_ENV === 'production') {
+// HTTP Pods only present a scoped token; they never sign or verify runtime JWTs.
+if (env.NODE_ENV === 'production' && process.env.CUMORA_RUNTIME_CLIENT !== 'http') {
   if (env.AGENT_RUNTIME_SECRET === DEV_AGENT_RUNTIME_SECRET) {
     console.error(
       '[env] AGENT_RUNTIME_SECRET is still the dev default in production. ' +
@@ -550,8 +550,7 @@ export function normalizeLlmEndpoint(value: string): string {
 
 /** Protected env is read only here; public plans carry source names, never keys. */
 export function resolveDirectLlmEnv(slot: DirectLlmSlot) {
-  const managed = getManagedPodSettings()
-  if (managed) return managed.direct[slot]
+  if (process.env.CUMORA_RUNTIME_CLIENT === 'http') throw new Error('Provider credentials are unavailable in managed Pods')
   const prefix = slot === 'text' ? 'OPENAI' : slot === 'novita' || slot === 'orcarouter' ? slot.toUpperCase() : `OPENAI_${slot.toUpperCase()}`
   const ownKey = (process.env[`${prefix}_API_KEY`] ?? '').trim()
   const imageKey = (process.env.OPENAI_IMAGE_API_KEY ?? '').trim()

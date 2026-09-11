@@ -599,6 +599,8 @@ export const en = {
   'agent.engineManagedNote': 'This agent runs on your own computer — model parameters are managed by its engine and are not editable here.',
   'agent.mcEffort': 'Reasoning effort',
   'agent.mcFollowGlobal': 'Follow global',
+  'agent.cerebellumModel': 'Cerebellum model',
+  'agent.cerebellumHint': 'Cloud inbox triage, agenda classification and other support tasks. Blank follows the computer engine default where applicable, then global support. Independent of the local engine fastModel.',
   'agent.mcContextWindow': 'Context window',
   'agent.mcContextWindowPh': 'Follow model default',
   'agent.mcMaxTokens': 'Max output tokens',

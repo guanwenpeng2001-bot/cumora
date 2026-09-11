@@ -1,3 +1,4 @@
+import { TurnSafetyPanel } from './TurnSafetyPanel'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, type ApiModelGroup, type ApiModelRole, type ApiModelRoutePreview, type ApiModelSettings, type ApiSettingDefinition } from '@/api/client'
 import { modelPlatformLabel } from '@/lib/modelPlatforms'
@@ -180,6 +181,7 @@ function RuntimeSettingsContent() {
   }, [snapshot])
   const domains = [ ['automation', 'settings.automationWake'], ['triage', 'settings.cerebellumTriage'], ['pod', 'settings.podSafety'], ['turn', 'settings.compactionTurn'], ['operations', 'settings.operationsRetention'], ['byoa', 'settings.byoaRuntimePolicy'] ] as const
   return <div className="space-y-6">
+    <TurnSafetyPanel budgets />
     <p className="text-[12px] text-ink-500">{translate(zh ? 'zh-CN' : 'en', 'settings.onlySiteAdminsCanWriteGlobalSettingsSavingInstalls')}</p>
     {!isAdmin && <p>{translate(zh ? 'zh-CN' : 'en', 'settings.globalSettingsRequireSiteAdminAccess')}</p>}
     {error && <p role="alert" className="text-coral-deep">{error}</p>}

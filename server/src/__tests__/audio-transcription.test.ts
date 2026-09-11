@@ -30,7 +30,7 @@ function fixture(statuses: (number | Error)[] = [], gateway = false, content: un
     './agents/model-config.js': { REASONING_EFFORTS: new Set(['none']) },
   })
   const fallback = compile(read('../agents/fallback.ts'), { '../settings.js': {} })
-  const cost = compile(read('../agents/cost.ts'), { './token-usage.js': compile(read('../agents/token-usage.ts'), {}), '../model-pricing.js': { captureDbPricing: () => () => null, refreshModelPricing: async () => {} }, 'node:crypto': { createHash } })
+  const cost = compile(read('../agents/cost.ts'), { './token-usage.js': compile(read('../agents/token-usage.ts'), {}), '../model-pricing.js': { captureDbPricing: () => () => null, refreshModelPricing: async () => {}, seedPriceFor: () => null }, 'node:crypto': { createHash } })
   const getLlmCandidateClient = async (plan: any, candidate: any) => ({ post: async (path: string, options: any) => {
     requests.push({ path, options, company: plan.companyId, route: candidate.route })
     if (sdk) return sdk.post(path, options)
@@ -40,6 +40,7 @@ function fixture(statuses: (number | Error)[] = [], gateway = false, content: un
     return { model: 'actual-asr', choices: [{ message: { content } }], usage: { prompt_tokens: 12, completion_tokens: 8, secret: 'SECRET_AUDIO_AND_TRANSCRIPT' } }
   } })
   const execution = compile(read('../llm-execution.ts'), {
+    './db/pool.js': { pool: { query: async () => { throw new Error('Unexpected audio test DB access') } } },
     'node:crypto': { randomUUID }, './llm-resolver.js': resolver, './llm.js': { getLlmCandidateClient },
     './agents/fallback.js': fallback, './agents/cost.js': cost, './settings.js': settings,
     './agents/llm-ledger.js': { recordLlmCall: async (r: any) => records.push(r), classifyLlmCallError: (e: any) => e?.status === 429 ? 'rate_limited' : 'failed' },

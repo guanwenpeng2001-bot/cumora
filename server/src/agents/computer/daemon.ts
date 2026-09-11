@@ -98,7 +98,20 @@ const SESSIONS_DIR = join(CONFIG_DIR, 'sessions')
 // session-resume above. Self-update (voluntary) doesn't use this — it waits for
 // idle instead (never interrupts work). Override via CUMORA_SHUTDOWN_GRACE_MS.
 const SHUTDOWN_GRACE_MS = Number(process.env.CUMORA_SHUTDOWN_GRACE_MS) || 15_000
-const DEFAULT_SERVER = process.env.CUMORA_SERVER_URL || 'https://api.cumora.ai'
+declare const __CUMORA_DEFAULT_SERVER__: string | undefined
+const DEFAULT_SERVER = typeof __CUMORA_DEFAULT_SERVER__ !== 'undefined' ? __CUMORA_DEFAULT_SERVER__ : undefined
+
+/** Explicit CLI input, saved pairing, runtime override, then release-baked default. */
+export function resolveComputerServer(server?: string, saved?: string, runtime = process.env.CUMORA_SERVER_URL, baked = DEFAULT_SERVER): string {
+  const value = server !== undefined ? server.trim() : saved?.trim() || runtime?.trim() || baked?.trim()
+  if (!value) throw new Error('No Cumora server configured. Pass --server <url> when pairing (or configure CUMORA_SERVER_URL).')
+  let url: URL
+  try { url = new URL(value) } catch { throw new Error('Invalid --server URL: expected an absolute HTTP(S) URL.') }
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) {
+    throw new Error('Invalid --server URL: expected an HTTP(S) URL without credentials.')
+  }
+  return value.replace(/\/+$/, '')
+}
 const TOKEN_REFRESH_SKEW_MS = 5 * 60 * 1000 // refresh 5min before expiry
 const AGENT_POLL_MS = BYOA_SYNC_INTERVALS.resourceSyncMs
 const HEARTBEAT_MS = BYOA_SYNC_INTERVALS.policyHeartbeatMs
@@ -602,7 +615,7 @@ function parseArgs(argv: string[]): {
     else if (argv[i].startsWith('--pair=')) out.pair = argv[i].slice('--pair='.length)
     else if (argv[i] === '--provider') out.provider = argv[++i] || ''
     else if (argv[i].startsWith('--provider=')) out.provider = argv[i].slice('--provider='.length)
-    else if (argv[i] === '--server') out.server = argv[++i]
+    else if (argv[i] === '--server') out.server = argv[++i] ?? ''
     else if (argv[i].startsWith('--server=')) out.server = argv[i].slice('--server='.length)
     else if (argv[i] === '--engine') out.engine = argv[++i]
     else if (argv[i].startsWith('--engine=')) out.engine = argv[i].slice('--engine='.length)
@@ -654,12 +667,12 @@ async function api<T>(serverUrl: string, path: string, init: RequestInit): Promi
  *  for a server that stops answering rather than refusing (see HTTP_TIMEOUT_MS):
  *  an abort throws, so it lands in the catch and the turn proceeds. */
 async function runtimeBest(
-  serverUrl: string, path: string, token: string, body: unknown,
+  serverUrl: string, path: string, token: string, body: unknown, generation?: string,
 ): Promise<unknown> {
   try {
     const res = await fetch(`${serverUrl}/runtime${path}`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}`, ...(generation ? { 'X-Turn-Generation': generation } : {}) },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
     })
@@ -910,7 +923,7 @@ function helpText(): string {
     'Setup:',
     '  --pair <code>        pair this machine to your account (code from',
     '                       Cumora -> You -> Computers -> Add a computer)',
-    '  --server <url>       Cumora server URL (default: ' + DEFAULT_SERVER + ')',
+    '  --server <url>       Cumora server URL (saved config, CUMORA_SERVER_URL, or release-baked default; otherwise required)',
     '  --engine <id>        force an engine: ' + ENGINE_IDS.join(' | ') + '',
     '',
     'Background service:',
@@ -1692,12 +1705,41 @@ export function resolveTriageModel(
 }
 
 export class AgentRunner {
+  private safetyGeneration = '0'
+  private turnCancelled = false
+  private cancellingSafety = false
+  private async admitSafety(token: string, initial = false): Promise<boolean> {
+    const admission = await api<{ allowed: boolean; generation: string; reason?: string }>(this.cfg.serverUrl, '/runtime/turn-admission', {
+      method: 'POST', headers: { Authorization: `Bearer ${token}` }, body: '{}',
+    })
+    if (initial && !admission.allowed && admission.reason === 'emergency_stop') {
+      await runtimeBest(this.cfg.serverUrl, '/stop-confirmed', token, { generation: admission.generation })
+    }
+    if (!initial && this.safetyGeneration !== admission.generation) return false
+    if (initial) this.safetyGeneration = admission.generation
+    return admission.allowed && !this.turnCancelled
+  }
+
+  private async emergencyCancel(generation: string): Promise<void> {
+    if (this.cancellingSafety || this.stopped) return
+    this.cancellingSafety = true
+    this.turnCancelled = true
+    this.pendingRerun = false
+    this.teardown.abort(new DOMException('Emergency stop', 'AbortError'))
+    await this.engineSession?.stop({ force: true })
+    await this.activeTurn
+    this.engineSession = null
+    this.teardown = new AbortController()
+    await runtimeBest(this.cfg.serverUrl, '/stop-confirmed', this.token, { generation })
+    this.cancellingSafety = false
+  }
+
   /** Aborted once in stop(). Handed to every one-shot `adapter.run(...)` so the
    *  engine child dies with its runner, the way the persistent session already
    *  does. Without it those children were orphaned: they keep the `cumora` IPC
    *  shim on PATH, so they go on posting AS the agent
    *  while the replacement runner independently answers the same messages. */
-  private readonly teardown = new AbortController()
+  private teardown = new AbortController()
   private token = ''
   private tokenExpiresAt = 0
   private home: string
@@ -1836,7 +1878,7 @@ export class AgentRunner {
    *  without having to pull the prompt body back. */
   private onEngineHop(report: EngineHopReport, purpose: PendingHop['purpose']): void {
     try {
-      const extras: Record<string, unknown> = {}
+      const extras: Record<string, unknown> = { route: `byoa:${this.adapter.id}` }
       if (typeof report.hopIndex === 'number') extras.hopIndex = report.hopIndex
       if (typeof report.toolUses === 'number') extras.toolUses = report.toolUses
       if (typeof report.textChars === 'number') extras.textChars = report.textChars
@@ -1845,7 +1887,7 @@ export class AgentRunner {
         purpose,
         runId: this.currentRunId,
         conversationId: this.lastWakeConvo,
-        model: report.model,
+        model: report.model || this.engineModel() || this.adapter.id,
         usage: this.hopUsageOf(report.usage),
         latencyMs: report.latencyMs ?? 0,
         status: 'ok',
@@ -2177,7 +2219,7 @@ export class AgentRunner {
       if (requestAbort.signal.aborted) return { exitCode: 70, error: 'runtime IPC request cancelled' }
       const res = await fetch(`${this.cfg.serverUrl}/runtime/cli`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}`, 'X-Turn-Generation': this.safetyGeneration },
         body: JSON.stringify({ argv }),
         signal: requestAbort.signal,
       })
@@ -2572,9 +2614,10 @@ export class AgentRunner {
    *  every INBOX_POLL_MS. markConversationRead is monotonic, so this never
    *  regresses a cursor the engine already advanced further via `cumora reply`. */
   private async ackSeen(token: string, seen: Map<string, string>): Promise<void> {
+    if (this.turnCancelled || this.teardown.signal.aborted) return
     if (seen.size === 0) return
     await Promise.all([...seen].map(([conversationId, upToMessageId]) =>
-      runtimeBest(this.cfg.serverUrl, '/conversation/mark-read', token, { conversationId, upToMessageId }),
+      runtimeBest(this.cfg.serverUrl, '/conversation/mark-read', token, { conversationId, upToMessageId }, this.safetyGeneration),
     ))
   }
 
@@ -2747,6 +2790,7 @@ export class AgentRunner {
    *  anti-loop) + a throttle so the 20s poll doesn't hammer it. Runs through the
    *  SAME persistent engine; isolated from the chat path so it can't break it. */
   private async maybeAgendaTurn(token: string): Promise<void> {
+    if (this.turnCancelled || !await this.admitSafety(token)) return
     const now = Date.now()
     if (now - this.lastTurnEndedAt < AGENDA_QUIET_MS) return
     if (now - this.lastAgendaCheckAt < AGENDA_CHECK_MS) return
@@ -2795,6 +2839,8 @@ export class AgentRunner {
         this.memoryDigest(),
         runtimeGet<{ roster: string }>(this.cfg.serverUrl, '/roster', token).then((r) => r?.roster ?? '').catch(() => ''),
       ])
+      this.assertRunning()
+      if (!await this.admitSafety(token)) throw new Error('Turn admission denied')
       this.assertRunning()
       const result = await this.runWithSessionRecovery(this.agendaDelta(ag.brief, memoryDigest, roster))
       exitCode = result.exitCode
@@ -2965,7 +3011,7 @@ export class AgentRunner {
    *  (e.g. a turn that only ever fires via 'poll' means SSE wakes aren't
    *  arriving and you're eating up to INBOX_POLL_MS of delay). */
   private async runTurn(reason: string): Promise<void> {
-    if (this.stopped || this.teardown.signal.aborted) return
+    if (this.stopped || this.cancellingSafety || this.teardown.signal.aborted) return
     if (this.busy) {
       this.pendingRerun = true
       console.log(`[computer] ${this.agent.id} turn busy — coalescing (${reason})`)
@@ -2976,6 +3022,19 @@ export class AgentRunner {
     const turn = new Promise<void>((resolve) => { finishTurn = resolve })
     this.activeTurn = turn
     let activeBackgroundBrief: WakeBackgroundBrief | null = null
+    let safetyChecking = false
+    const safetyTimer = setInterval(() => {
+      if (safetyChecking || this.cancellingSafety) return
+      safetyChecking = true
+      void api<{ valid: boolean }>(this.cfg.serverUrl, '/runtime/turn-valid', {
+        method: 'POST', headers: { Authorization: `Bearer ${this.token}` },
+        body: JSON.stringify({ generation: this.safetyGeneration }), signal: AbortSignal.timeout(5000),
+      }).then(result => {
+        if (!result.valid) void this.emergencyCancel(this.safetyGeneration).catch(console.error)
+      }).catch(() => { void this.emergencyCancel(this.safetyGeneration).catch(console.error) })
+        .finally(() => { safetyChecking = false })
+    }, 2000)
+    safetyTimer.unref()
     try {
       do {
         this.pendingRerun = false
@@ -2993,6 +3052,8 @@ export class AgentRunner {
         const turnStart = Date.now()
         await this.ensureToken()
         const token = this.token
+        this.turnCancelled = false
+        if (!await this.admitSafety(token, true)) break
         // Consume the wake's conversation, so a later turn that reuses no wake
         // can't flash phantom "typing" in whatever conversation last woke us.
         // (The fallback below is derived from CURRENTLY unread messages, so it
@@ -3166,6 +3227,8 @@ export class AgentRunner {
           const delta = turnBackgroundBrief
             ? this.manualBriefDelta(turnBackgroundBrief, memoryDigest, digest, roster)
             : this.chatDelta(memoryDigest, triageNote, digest, roster)
+          if (!await this.admitSafety(token)) throw new Error('Turn admission denied')
+          this.assertRunning()
           const result = await this.runWithSessionRecovery(delta)
           exitCode = result.exitCode
           turnUsage = result.usage
@@ -3285,10 +3348,11 @@ export class AgentRunner {
       console.error(`[computer] ${this.agent.id} turn aborted (will retry on next wake/poll):`,
         redactProviderSecret(err instanceof Error ? err.message : String(err), this.provider))
     } finally {
-      try { await this.applyPendingResources() }
+      try { if (!this.turnCancelled) await this.applyPendingResources() }
       finally {
         this.busy = false
         if (this.activeTurn === turn) this.activeTurn = null
+        clearInterval(safetyTimer)
         finishTurn()
       }
     }
@@ -3314,6 +3378,13 @@ export class AgentRunner {
         this.kickTurn('reconnect-catchup') // cold-start / reconnect catch-up
         for await (const evt of parseSseStream(res.body as unknown as AsyncIterable<unknown>)) {
           if (this.stopped) break
+          if (evt.event === 'stop') {
+            if (!evt.data) throw new Error('Runtime stop event is missing its payload')
+            const { generation } = JSON.parse(evt.data ?? '{}') as { generation: string }
+            if (typeof generation !== 'string' || !/^\d+$/.test(generation) || BigInt(generation) <= BigInt(this.safetyGeneration)) continue
+            void this.emergencyCancel(generation).catch(console.error)
+            continue
+          }
           if (evt.event === 'wake' || evt.event === 'steer') {
             // 'wake': normal new-activity nudge. 'steer': a peer posted while we
             // were mid-turn. We can't inject into the running engine (claude -p
@@ -4472,7 +4543,6 @@ async function runDoctor(providerId?: string): Promise<void> {
 export async function runComputerDaemon(argv: string[]): Promise<void> {
   const args = parseArgs(argv)
   if (args.provider !== undefined && !args.doctor) throw new Error('--provider requires --doctor')
-  const serverUrl = (args.server || DEFAULT_SERVER).replace(/\/+$/, '')
   if (args.help) { console.log(helpText()); return }
   if (args.version) { console.log(CURRENT_VERSION); return }
   if (args.doctor) { await runDoctor(args.provider); return }
@@ -4481,6 +4551,8 @@ export async function runComputerDaemon(argv: string[]): Promise<void> {
   if (args.status) { await printStatus(); return }
   if (args.logs) { await tailLogs(); return }
   if (args.uninstallService) { await uninstallService(); return }
+  const savedConfig = await loadConfig()
+  const serverUrl = resolveComputerServer(args.server, savedConfig?.serverUrl)
   // Pair first (saves config) so a combined `--pair … --install-service` can
   // pair AND hand off to the supervisor in one paste.
   if (args.pair) {
@@ -4489,8 +4561,7 @@ export async function runComputerDaemon(argv: string[]): Promise<void> {
   // Installing the service is terminal: it writes the supervisor (which runs
   // the daemon itself) and exits — we don't ALSO run a foreground daemon here.
   if (args.installService) {
-    const cfg = await loadConfig()
-    await installService(args.server ? serverUrl : (cfg?.serverUrl ?? serverUrl))
+    await installService(serverUrl)
     return
   }
   // Re-paired on a machine already managed by the background service: reload
@@ -4501,5 +4572,5 @@ export async function runComputerDaemon(argv: string[]): Promise<void> {
     console.log(`[computer] re-paired — reloaded the background service with the new config. (No foreground daemon needed; you can close this terminal.)`)
     return
   }
-  await doRun(args.server ? serverUrl : undefined)
+  await doRun(serverUrl)
 }

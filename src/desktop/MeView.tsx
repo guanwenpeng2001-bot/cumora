@@ -1,3 +1,4 @@
+import { TurnSafetyPanel } from './TurnSafetyPanel'
 import { useCallback, useEffect, useState } from 'react'
 import { type ApiProject, type ApiQuotaSnapshot, type ApiQuotaWindow, api, getPairingServerOrigin, getServerOrigin, isPairingServerLoopback } from '@/api/client'
 import { AppearancePicker, ChatLayoutPicker } from '@/components/AppearancePicker'
@@ -1514,6 +1515,7 @@ export function MeView({ initialTab = 'profile' }: { initialTab?: Tab } = {}) {
           </div>
         </div>
 
+        <TurnSafetyPanel />
         <DaemonUpgradeBanner onJump={() => setTab('computers')} />
 
         <div className="flex flex-wrap gap-1 mb-7 border-b border-ink-100">

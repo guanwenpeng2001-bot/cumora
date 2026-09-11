@@ -6,8 +6,8 @@
 
 | 层 | 服务 | 容器名 | 端口 | 说明 |
 |---|---|---|---|---|
-| 基础 | db | cumora-postgres | 5432 | pgvector/pgvector:pg16;外部卷 `cumora-pgdata` |
-| 基础 | redis | cumora-redis | 6379 | redis:7;外部卷 `cumora-redis-data` |
+| 基础 | db | cumora-postgres | 仅 Compose 网络 5432 | pgvector/pgvector:pg16;外部卷 `cumora-pgdata` |
+| 基础 | redis | cumora-redis | 仅 Compose 网络 6379 | redis:7;外部卷 `cumora-redis-data` |
 | 基础 | migrate | cumora-migrate | — | server 镜像;一次性执行 `npm run migrate` |
 | 基础 | server | cumora-server | 5181 | API、调度器、orchestrator;等待 migrate 成功退出 |
 | 基础 | web | cumora-web | 8080 | nginx SPA;反代 `/api`、`/runtime`（含 SSE）、`/ws`、`/uploads` |
@@ -24,6 +24,35 @@ sub2api 继续复用 db 内独立的 `sub2api` 数据库及 Redis 逻辑库 1。
 3. 浏览器入口、server 内部地址和 Pod 地址分别验证。`SUB2API_INTERNAL_URL` 是 server 的网关根 URL(不附 `/v1`),本 Compose 网络内可使用 `http://sub2api:8080`。实际值由 `.env` 提供,可选层不硬编码运行地址。
 4. 当前 Pod URL 转换会把上述内部前缀替换为 `SUB2API_PUBLIC_URL`,因此该变量虽然名为 PUBLIC,也必须是 **Pod 可达的集群/内部根 URL**。Compose 服务 DNS 不自动跨入 K8s;不要给 Pod 仅在 Compose 内可解析的地址。优先使用 Pod 可达的内部服务或内部入口,避免带短请求超时的公网 Ingress。浏览器管理入口若另有地址,单独记录,不能拿它替代 Pod 可达性验证。
 5. T36 启动快照及后续刷新沿用映射后的 gateway 地址与租户凭据;管理 key 不应传入 Pod。纯 env 的各 direct endpoint 同样必须从 server/Pod 可达。Pod 访问 Cumora server 的地址也需按实际集群网络核验。
+
+## DB/Redis 密码与本地端口
+
+基础层不发布 Postgres/Redis 宿主端口。宿主开发进程需要连接时，显式叠加开发文件；其绑定固定为 `127.0.0.1`，不会监听 `0.0.0.0` 或 IPv6 通配地址：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.dev.yml config --quiet
+# 同时使用网关：
+docker compose -f docker-compose.yml -f docker-compose.gateway.yml -f docker-compose.dev.yml config --quiet
+```
+
+后续启动时也须使用相同文件列表。可在 `.env` 设置 `POSTGRES_HOST_PORT` / `REDIS_HOST_PORT`（默认 5432 / 6379）；这两个变量仅影响开发叠加文件。容器间始终使用 `db:5432` / `redis:6379`。移除开发叠加文件后，下次应用配置将取消宿主端口发布；依赖原宿主地址的外部客户端需先迁移。
+
+`.env` 必须设置非空 `POSTGRES_PASSWORD` 和 `REDIS_PASSWORD`，缺失或空值会使 `compose config` 失败。`.env.example` 中的 `cumora` / `cumora-redis-dev` 仅为本地开发示例，不是 Compose 回退值。部署时分别生成独立随机密码，例如运行两次 `openssl rand -hex 32`。当前 Compose 将原始密码拼入连接 URL，不自动做百分号编码，因此密码使用 URL 非保留字符 `A-Z a-z 0-9 - . _ ~`，推荐 64 位十六进制；不要使用 `@ : / # % $` 或空白。不要仅对密码变量做 URL 编码，否则数据库原始密码与 URL 解码后的密码可能不同。
+
+Postgres 初始化、server/migrate 的 `DATABASE_URL` 和 sub2api 的 `DATABASE_PASSWORD` 共用 `POSTGRES_PASSWORD`。Redis 启用 `requirepass`，健康检查通过 `REDISCLI_AUTH` 认证并检查 `PONG`；server 的 `REDIS_URL` 使用逻辑库 0，sub2api 的 `REDIS_PASSWORD` 使用相同密码并保留逻辑库 1。migrate 不使用 Redis。宿主运行的 server/脚本需自行同步 `.env` 中的 `DATABASE_URL` / `REDIS_URL` 密码与开发端口，示例见 `.env.example`；不要依赖所有 dotenv 加载器都会展开嵌套变量。Shell 同名变量优先于 `.env`，改密前应清除旧的覆盖值。
+
+## 已有卷升级：用户需手动执行的改密步骤
+
+**修改 `POSTGRES_PASSWORD` 不会修改已有 `cumora-pgdata` 卷中的角色密码。必须对现有实例执行 `ALTER USER`，不能通过删除或重新初始化卷来改密。** 以下操作仅供用户在维护窗口手动执行，本次配置修改和静态校验不执行它们。
+
+1. 备份数据库、私密配置及 sub2api 的 `/app/data/config.yaml`，保留原部署文件列表、项目名、镜像与卷。记录所有使用 `postgres` 角色或 Redis 的客户端（包括宿主进程及网关）。暂停相关客户端写入，安排连接中断窗口；不要先重建仍带旧密码的客户端。
+2. 准备两个新密码。通过现有管理员访问方式连接当前 Postgres，例如 `docker exec -it cumora-postgres psql -U postgres -d postgres`。此命令使用容器内 Unix socket；若既有认证策略要求凭据，使用现有凭据或已有管理员连接，不要放宽认证。
+3. 在交互式 psql 中执行 `\password postgres`，按提示输入两次新的 `POSTGRES_PASSWORD`。这是 psql 安全交互的角色改密入口，会执行对应的 `ALTER USER postgres WITH PASSWORD '新密码';` 操作，避免把明文密码写入命令行或 SQL 历史。不要直接复制含占位符的 SQL。`cumora` 和 `sub2api` 使用同一角色，因此只需改一次；旧连接可能仍存活，必须用新连接验证。
+4. 将相同的新 Postgres 密码和独立的新 Redis 密码写入仓库私密 `.env`，同步宿主客户端的两个 URL，检查 shell 没有旧值覆盖。既有 sub2api 数据卷可能保存旧密码：同步其 `/app/data/config.yaml` 中 `database.password`、`redis.password`（如存在），保留其余配置；当前 fork 支持环境变量覆盖，但仍应核对实际部署镜像的行为，避免以后移除环境变量时恢复旧凭据。
+5. 使用原项目名和完整文件列表执行 `docker compose ... config --quiet`（将 `...` 换成实际 `-f` 参数），通过后在维护窗口按新配置重建 db/redis 与相关客户端，保留原卷。Redis 密码来自启动参数，已有 Redis 卷无需 SQL 改密；必须重建 Redis 才能应用 `requirepass`，仅 restart 不更新容器配置。无需执行 `CONFIG SET` / `CONFIG REWRITE`。server 仍须经过 migrate 成功退出的门槛；启用网关时同步更新 sub2api。
+6. 验证 Postgres 通过 TCP 使用新密码建立连接成功、旧密码被拒绝（socket 或 `pg_isready` 不能证明密码已更新）；验证 Redis 无认证被拒绝、新密码 `PING` 返回 `PONG`，以及 server、migrate 和启用时的 sub2api 均正常连接。可通过 `docker exec -it cumora-redis redis-cli --askpass ping` 交互验证 Redis。基础层应无 DB/Redis 宿主监听，开发层只应监听 `127.0.0.1`。检查历史数据仍在，保留备份直到验收完成。
+
+如需回退，Postgres 角色密码不会随 Compose 文件回退；需通过仍可用的管理员连接再次交互改密，并同步所有客户端配置。Redis 的认证配置也要与客户端一起应用，不能只恢复旧 URL。不要删除卷，不要使用 `down -v`。
 
 ## 形态一:纯 env 独立运行
 
@@ -132,3 +161,12 @@ node scripts/rollback-precheck.mjs <rollback-image-manifest.ts>
 发布验收还必须在隔离环境验证“准确回滚镜像 × 候选迁移后的数据库”，包括旧镜像重新启动的 schema gate 和关键读写。审计中的旧范围 13–14 无法接受 schema 15；当前版本可能继续增长，须每次重新读取制品，不能复用该数字或仅比较镜像标签。
 
 若无通过验证的回滚制品，发布方案应明确采用向前修复，不得承诺 undo 能恢复服务。可选长期策略为经过验证的扩展/收缩迁移兼容窗口，或构建兼容新 schema 的专用回滚制品；扩大支持范围、数据降级/恢复和自动发布失败分支属于需用户决定的 schema 政策，本次不改变。数据库备份恢复涉及停写及备份之后的数据损失，不能当作镜像回退自动执行。
+
+
+## 自有服务器与 fork 发布坐标
+
+托管 agent Pod 的 API server 必须在生产显式设置 `CUMORA_AGENT_COMPUTER_IMAGE`，指向包含本 fork 代码的不可变 tag 或 digest。未设置或空白时，orchestrator 会 warn 并使用本地约定 `cumora-agent-computer:dev`，不再使用上游 quay 镜像。该默认仅用于开发：需自行构建并将镜像加载到每个目标 Kubernetes 节点；`IfNotPresent` 在节点缺图时仍可能尝试默认 registry，tag 本身不保证离线。Compose 不负责构建该 agent 镜像，生产缺 env 不属于完成部署配置。
+
+GitHub 发布坐标由 `CUMORA_GITHUB_OWNER` / `CUMORA_GITHUB_REPO` 覆盖，空值默认保持 `guanwenpeng2001-bot/cumora`。Electron 构建与 Vite 前端构建使用构建环境变量；API server 在启动环境中配置相同值，用于查找 CLI Releases。自有仓库需提供对应 CLI tag/tgz 和桌面更新制品；更换坐标不会自动复制 Releases。变量需注入实际构建或 server 进程，仅写宿主机 `.env` 不保证传入容器。详见 `docs/RELEASE.md`。
+
+BYOA 首次配对命令应带 `--server https://<your-server>`，同源网页生成的命令已显式带入地址。daemon 的优先级为显式参数 → 本地配对配置 → 运行时 `CUMORA_SERVER_URL` → Release 构建时 bake 的 `CUMORA_DEFAULT_SERVER`；全部缺失则报错退出。CLI Release workflow 可从同名 repository variable bake 默认服务器，未配置时不内置上游地址。

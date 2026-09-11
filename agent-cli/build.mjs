@@ -44,7 +44,7 @@ const result = await build({
   legalComments: 'none',
   metafile: true,
   write: false,
-  define: { __CUMORA_VERSION__: JSON.stringify(version), __CUMORA_RELEASE__: 'true' },
+  define: { __CUMORA_VERSION__: JSON.stringify(version), __CUMORA_RELEASE__: 'true', __CUMORA_DEFAULT_SERVER__: JSON.stringify(process.env.CUMORA_DEFAULT_SERVER?.trim() || '') },
   plugins: [tsExtFix],
 })
 const forbidden = Object.keys(result.metafile.inputs).filter((input) =>

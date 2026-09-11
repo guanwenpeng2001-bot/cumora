@@ -34,6 +34,7 @@ trap 'rm -f "$TMP"' EXIT
 STATUS=$(curl -sS -o "$TMP" -w '%{http_code}' \
   --max-time "${CUMORA_CLI_TIMEOUT:-600}" \
   -H "Authorization: Bearer $CUMORA_AGENT_RUNTIME_TOKEN" \
+  -H "X-Turn-Generation: ${CUMORA_TURN_GENERATION:-0}" \
   -H 'Content-Type: application/json' \
   -d "{\"argv\":$ARGV_JSON}" \
   "$CUMORA_AGENT_RUNTIME_URL/cli") || {

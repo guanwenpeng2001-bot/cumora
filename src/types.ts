@@ -96,6 +96,7 @@ export interface Computer {
 /** Per-agent model settings (participants.model_config). All fields
  *  optional — absent means "inherit the global role's setting". */
 export interface AgentModelConfig {
+  cerebellumModel?: string
   effort?: string
   contextWindow?: number
   maxOutputTokens?: number
@@ -121,12 +122,12 @@ export interface Participant {
   systemPrompt?: string
   /** big-brain (main) model override; null/undefined = use system default */
   model?: string | null
-  /** Advanced per-agent model settings (managed agents only; BYOA is
-   *  engine-managed). Mirrors server/src/agents/model-config.ts. */
+  /** Advanced model settings. cerebellumModel also applies to BYOA cloud calls.
+   *  Mirrors server/src/agents/model-config.ts. */
   modelConfig?: AgentModelConfig | null
   /** Local Claude credential/endpoint profile id; independent of modelConfig. */
   providerProfile?: string | null
-  /** small-brain (fast/auxiliary) model override */
+  /** Local engine fast/auxiliary model override; independent of cloud cerebellum. */
   fastModel?: string | null
   /** id of the Computer this agent runs on (null/undefined = Cumora Cloud) */
   computerId?: string | null

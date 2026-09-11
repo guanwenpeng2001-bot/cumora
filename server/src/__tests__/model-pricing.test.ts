@@ -49,6 +49,7 @@ function fixture(env: Record<string, unknown> = {}) {
   })
   const fallback = compile(read('../agents/fallback.ts'), { '../settings.js': {} })
   const execution = compile(read('../llm-execution.ts'), {
+    './db/pool.js': { pool: { query: async () => { throw new Error('Unexpected executor DB access') } } },
     'node:crypto': { randomUUID }, './llm-resolver.js': {},
     './llm.js': { getLlmCandidateClient: async () => ({}) }, './agents/cost.js': cost,
     './agents/llm-ledger.js': { ...recorder, classifyLlmCallError: () => 'failed' }, './agents/fallback.js': fallback, './settings.js': {},
@@ -241,7 +242,7 @@ test('pricing menu exposes the same effective source, version and rates as accou
   const legacy = menu.find((r: any) => r.model === 'gpt-5.5')
   assert.equal(legacy.source, 'legacy')
   assert.equal(legacy.verified, false)
-  assert.match(legacy.note, /兼容估算/)
+  assert.match(legacy.note, /官方刊例参考，按备注档位估算/)
 })
 
 test('first call freezes seed prices without waiting for DB; refresh applies to the next call', async () => {
@@ -333,4 +334,128 @@ test('env pricing parses once per change and captured calls retain the old immut
   f.environment.CUMORA_MODEL_PRICES_JSON = '{}'
   assert.equal(f.cost.priceFor('env-only').unpriced, 'no-price')
   assert.equal(f.parses(), initial + 3)
+})
+
+
+test('BYOA resolved GPT model reaches ledger seed pricing as estimated cost', async () => {
+  const f = fixture()
+  await f.pricing.refreshModelPricing(true)
+  for (const model of ['gpt-5.5', 'unlisted-local-model']) {
+    await f.recorder.recordLlmCall({ companyId: 'company-a', purpose: 'agent-turn',
+      source: 'byoa-codex', model, usage, latencyMs: 10, status: 'ok', extras: { route: 'byoa:codex' } })
+    const row = f.ledger.at(-1)
+    assert.equal(row[14], true, 'seed prices and missing prices are always estimates')
+    assert.equal(row[15], true, 'CLI token counts remain measured')
+    const extras = JSON.parse(row[19])
+    assert.equal(extras.route, 'byoa:codex')
+    assert.equal(extras.platform, undefined)
+    if (model === 'gpt-5.5') {
+      assert.equal(row[13], 5)
+      assert.equal(extras.unpriced, undefined)
+    } else {
+      assert.equal(row[13], 0)
+      assert.equal(extras.unpriced, 'no-price')
+    }
+  }
+})
+
+
+test('official seeds cover configured token families with dated provenance and correct cache tiers', async () => {
+  const f = fixture()
+  await f.pricing.refreshModelPricing(true)
+  const expected: Array<[string, number, number, number, number]> = [
+    ['gpt-6-astra', 10, 1, 12.5, 50], ['gpt-5.5', 5, 0.5, 5, 30],
+    ['gpt-5.4-mini', 0.75, 0.075, 0.75, 4.5], ['deepseek-flash', 0.3, 0.006, 0.3, 1.2],
+    ['deepseek-v4-flash', 0.3, 0.006, 0.3, 1.2], ['deepseek-v4-pro', 1.32, 0.044, 1.32, 3.96],
+    ['gemini-3.8-flash', 0.75, 0.075, 0.75, 3.75], ['grok-4.6', 2, 0.5, 2, 6],
+    ['MiniMax-M2.7', 0.3, 0.06, 0.375, 1.2], ['MiniMax-M2.7-highspeed', 0.6, 0.06, 0.375, 2.4],
+    ['GLM-5.3', 1.4, 0.26, 0, 4.4], ['claude-sonnet-5', 2, 0.2, 2.5, 10],
+    ['qwen-max', 0.345, 0.345, 0.345, 1.377], ['text-embedding-v4', 0.072, 0, 0, 0],
+    ['text-embedding-3-small', 0.02, 0, 0, 0],
+    ['qwen3-coder-plus', 0.574, 0.0574, 0.7175, 2.294],
+    ['qwen3-coder-flash', 0.144, 0.0144, 0.18, 0.574],
+  ]
+  for (const [model, ...rates] of expected) {
+    const p = f.cost.priceFor(model)
+    assert.deepEqual([p.inPer1M, p.cachedInPer1M, p.cacheWritePer1M, p.outPer1M], rates, model)
+    assert.equal(p.pricedAt, '2026-09-11', model)
+    assert.match(p.sourceUrl, /^https:\/\//, model)
+    assert.equal(p.verified, false, model)
+    assert.equal(p.unpriced, undefined, model)
+  }
+  assert.equal(f.cost.effectiveCostUsd('deepseek-flash', usage).usd, 0.3)
+  assert.equal(f.cost.effectiveCostUsd('deepseek-flash', { ...usage, inputTokens: 0, cachedInputTokens: 1_000_000 }).usd, 0.006)
+  const free = f.cost.priceFor('glm-4.7-flash')
+  assert.equal(free.inPer1M + free.outPer1M, 0)
+  assert.equal(free.unpriced, undefined, 'officially free is distinct from missing pricing')
+})
+
+test('provider prefixes and explicit snapshots resolve without pricing unknown family variants', async () => {
+  const f = fixture()
+  await f.pricing.refreshModelPricing(true)
+  for (const [model, canonical] of [
+    ['orcarouter/deepseek-v4-flash', 'deepseek-v4-flash'],
+    ['novita/deepseek-v4-flash-vision-exp', 'deepseek-v4-flash-vision-exp'],
+    ['openai/gpt-6-astra', 'gpt-6-astra'], ['openai/gpt-5.5-2026-04-23', 'gpt-5.5'],
+    ['anthropic/claude-opus-4-1-20250805', 'claude-opus-4-1'],
+    ['claude-opus-4-6-thinking', 'claude-opus'],
+    ['google/gemini-3.8-flash-high', 'gemini-3.8-flash'],
+    ['zhipu/GLM-5.3', 'glm-5.3'], ['minimax/MiniMax-M2.7-highspeed', 'minimax-m2.7-highspeed'],
+    ['dashscope/qwen3-asr-flash-2025-09-08', 'qwen3-asr-flash'],
+    ['fun-asr-2025-11-07', 'fun-asr'], ['qwen/z-image-turbo', 'z-image-turbo'],
+    ['qwen-image-2.0-pro-2026-04-22', 'qwen-image-2.0-pro'],
+  ]) {
+    const p = f.cost.priceFor(model)
+    assert.equal(p.match, 'alias', model)
+    assert.equal(p.matchedModel, canonical, model)
+    assert.equal(p.verified, false, model)
+    assert.equal(p.inPer1M, f.cost.priceFor(canonical).inPer1M, model)
+    assert.equal(p.note, f.cost.priceFor(canonical).note, model)
+  }
+  for (const model of ['gpt-6-secret', 'gpt-6-astra-pro', 'qwen3-asr-flash-unknown', 'fun-asr-premium',
+    'z-image-ultra', 'z-image-turbo-premium', 'glm-5.3-unpublished', 'MiniMax-M2.7-unknown',
+    'gemini-3.8-flash-unknown', 'unknown/gpt-6-astra', 'x-gpt-6-astra', 'openai/toString',
+    'k3', 'k3-256k', 'kimi-for-coding', 'codex', 'antigravity', 'chatgpt-web/extra-high']) {
+    assert.equal(f.cost.priceFor(model).unpriced, 'no-price', model)
+  }
+  await f.pricing.upsertModelPricing(priceInput('openai/gpt-6-astra', 17))
+  await f.pricing.upsertModelPricing(priceInput('direct:openai/openai/gpt-6-astra', 19))
+  assert.equal(f.cost.priceFor('openai/gpt-6-astra').inPer1M, 17)
+  assert.equal(f.cost.priceFor('openai/gpt-6-astra', 'direct:openai').inPer1M, 19)
+})
+
+test('native media prices survive seeding as notes, never as invented token rates', async () => {
+  const f = fixture()
+  await f.pricing.refreshModelPricing(true)
+  const media = ['qwen3-asr-flash', 'qwen3-asr-flash-filetrans', 'qwen3-asr-flash-realtime',
+    'fun-asr', 'fun-asr-mtl', 'fun-asr-realtime', 'whisper-1', 'z-image-turbo',
+    'qwen-image', 'qwen-image-plus', 'qwen-image-max', 'qwen-image-2.0', 'qwen-image-2.0-pro',
+    'wan2.6-image', 'wan2.7-image', 'wan2.7-image-pro', 'gpt-image-2']
+  const cold = new Map(media.map(model => [model, f.cost.priceFor(model)]))
+  await f.pricing.seedModelPricing()
+  const table = await f.pricing.modelPricingTable()
+  for (const model of media) {
+    const p = f.cost.priceFor(model)
+    assert.equal(p.unpriced, cold.get(model).unpriced, model)
+    assert.equal(p.note, cold.get(model).note, model)
+    assert.equal(p.inPer1M + p.outPer1M + p.cachedInPer1M + p.cacheWritePer1M, 0, model)
+    assert.match(table.find((r: any) => r.model === model).note, /\[unit:/, model)
+    assert.match(p.note, /USD/, model)
+    assert.equal(p.pricedAt, '2026-09-11', model)
+    await f.recorder.recordLlmCall({ companyId: 'company-a', purpose: 'agent-turn', model, usage,
+      latencyMs: 10, status: 'ok' })
+    const row = f.ledger.at(-1)
+    assert.equal(row[13], 0, 'token counts cannot stand in for seconds or images')
+    assert.ok(JSON.parse(row[19]).unpriced, model)
+  }
+  for (const seed of f.pricing.modelPricingSeeds()) {
+    const stored = f.rows.get(seed.model)
+    assert.equal(stored.source_url, seed.sourceUrl, seed.model)
+    assert.equal(stored.priced_at, seed.pricedAt, seed.model)
+    assert.equal(stored.input_per_1m, seed.inPer1M, seed.model)
+    assert.equal(stored.output_per_1m, seed.outPer1M, seed.model)
+  }
+  const seeds = f.pricing.modelPricingSeeds()
+  seeds[0].inPer1M = 999
+  assert.equal(f.pricing.seedPriceFor('gpt-6-astra').inPer1M, 10)
 })

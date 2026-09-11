@@ -397,7 +397,8 @@ test('Pod URL rewriting is limited to local deployments and respects gateway pat
   assert.equal(explicit.api.podUrl('redis://redis:6379'), 'redis://host.docker.internal:6379')
   local.env.DATABASE_URL = 'malformed-secret-password'
   const result = await local.api.ensurePod('agent')
-  assert.equal(!result.ok && result.code, 'pod_apply_failed')
+  assert.equal(result.created, true)
   assert.doesNotMatch(result.reason, /malformed-secret-password/)
-  assert.equal(c.state.manifests.length, 0)
+  assert.ok(c.state.manifests.length > 0)
+  assert.doesNotMatch(c.state.manifests.join('\n'), /DATABASE_URL|REDIS_URL|malformed-secret-password/)
 })

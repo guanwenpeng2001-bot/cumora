@@ -4,7 +4,7 @@ import { resolveTenantLlmContext, tenantRoutingSnapshot, waitForLlmResolution, b
 import { sub2apiRoutingConfigured, sub2apiConfigured, pickPlatformForModel, supportsGatewayImages, gatewayCatalogHasImages, dashscopeMediaRole, supportsDashscopeChatAudio, keyedPlatforms, type Platform } from './sub2api.js'
 import { parseAgentModelConfig, REASONING_EFFORTS } from './agents/model-config.js'
 
-export interface RoleCallAgent { id?: string; model?: string | null; modelConfig?: unknown; model_config?: unknown }
+export interface RoleCallAgent { id?: string; model?: string | null; modelConfig?: unknown; model_config?: unknown; computerSupportModel?: string | null }
 export interface RoleCallCandidate {
   model: string
   requestModel: string
@@ -41,17 +41,24 @@ function freeze<T>(value: T): T {
 /** Resolves one immutable call plan; no clients, credentials or attempts escape into previews. */
 export async function resolveRoleCall(company: string | null, domain: RoleCallPlan['domain'], role: LlmRole, purpose: string, agent?: RoleCallAgent, captured?: ServerSettingsSnapshot, signal?: AbortSignal): Promise<RoleCallPlan> {
   signal?.throwIfAborted()
+  if (process.env.CUMORA_RUNTIME_CLIENT === 'http') {
+    if (role !== 'brain' || purpose !== 'agent-turn') throw new Error('Managed Pod LLM plans must be resolved by the runtime executor')
+    const { callRuntimeLlm } = await import('./agents/runtime/llm-http.js')
+    return callRuntimeLlm<RoleCallPlan>('brain-plan', {}, { signal })
+  }
   const snapshot = captured ?? getServerSettingsSnapshot()
   const diagnostics: string[] = [...(snapshot.diagnostics ?? [])]
   const plan: RoleCallPlan = { companyId: company, domain, role, purpose, agentId: agent?.id, revision: snapshot.revision,
     routable: sub2apiRoutingConfigured(), provisionable: sub2apiConfigured(), candidates: [], diagnostics }
-  if (domain === 'byoa') return freeze({ ...plan, diagnostics: ['byoa-engine-managed'] })
+  if (domain === 'byoa' && role !== 'support') return freeze({ ...plan, diagnostics: ['byoa-engine-managed'] })
   if (!LLM_ROLES.includes(role)) return freeze({ ...plan, diagnostics: ['invalid-role'] })
   const config = parseLlmConfig(snapshot.settings.llm_config ?? '')
   const selected = config.roles.find(r => r.role === role && role !== 'embed' && r.purpose === purpose) ?? config.roles.find(r => r.role === role && r.purpose === undefined)
   const mc = role === 'brain' ? parseAgentModelConfig(agent?.modelConfig ?? agent?.model_config) : null
   const inherited = snapshot.settings[`${role}_model`]?.trim() ?? ''
-  const primary = role === 'brain' && agent?.model?.trim() ? agent.model.trim() : selected?.models[0] ?? inherited
+  const supportOverride = role === 'support' ? parseAgentModelConfig(agent?.modelConfig ?? agent?.model_config)?.cerebellumModel
+    || agent?.computerSupportModel?.trim() : undefined
+  const primary = supportOverride || (role === 'brain' && agent?.model?.trim() ? agent.model.trim() : selected?.models[0] ?? inherited)
   const fallbacks = mc?.fallbackModels ?? selected?.models.slice(1) ?? (snapshot.settings[`${role}_fallback_models`] ?? '').split(',')
   const models = primary ? [...new Set([primary, ...(role === 'embed' ? [] : fallbacks)].map(m => m.trim()).filter(Boolean))] : []
   if (!primary) diagnostics.push(`missing-primary:${role}`)
@@ -126,7 +133,7 @@ export async function resolveRoleCall(company: string | null, domain: RoleCallPl
         endpointSource: kind === 'gateway' ? 'sub2api-env' : direct.endpointSource,
         credentialSource: kind === 'gateway' ? 'owner-key-map' : direct.keySource },
       protocol, available: compatible && gatewaySupported && audioSupported && gatewayGroupReady && (kind === 'gateway' ? Boolean(context?.baseURL && platform && context.keys[platform] && platformDiscovery?.status !== 'unauthorized' && platformDiscovery?.status !== 'empty') : direct.configured),
-      source: target ? 'llm_config:env_after_chain' : role === 'brain' && ((model === primary && agent?.model?.trim()) || (model !== primary && mc?.fallbackModels)) ? 'agent' : selected ? `${snapshot.sources.llm_config}:llm_config` : `${snapshot.sources[sourceKey] ?? 'env'}:${sourceKey}`,
+      source: model === primary && supportOverride ? (parseAgentModelConfig(agent?.modelConfig ?? agent?.model_config)?.cerebellumModel ? 'agent' : 'computer') : target ? 'llm_config:env_after_chain' : role === 'brain' && ((model === primary && agent?.model?.trim()) || (model !== primary && mc?.fallbackModels)) ? 'agent' : selected ? `${snapshot.sources.llm_config}:llm_config` : `${snapshot.sources[sourceKey] ?? 'env'}:${sourceKey}`,
       parameterSources: { effort: mc?.thinking !== undefined || mc?.effort !== undefined ? 'agent' : metadata?.thinking !== undefined || metadata?.effort !== undefined ? 'llm_config' : effortKey,
         maxOutputTokens: mc?.maxOutputTokens !== undefined ? 'agent:model-cap' : metadata?.maxOutputTokens !== undefined ? 'llm_config' : role === 'brain' ? 'agent_max_output_tokens' : 'caller-budget',
         contextWindow: metadata?.contextWindow !== undefined ? 'llm_config:model-cap' : mc?.contextWindow !== undefined ? 'agent' : 'unspecified' },

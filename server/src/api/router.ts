@@ -1,3 +1,5 @@
+import { parseBudgetRule } from '../turn-safety-policy.js'
+import { safetySnapshot, saveBudget, removeBudget, emergencyStop, resumeTurns } from '../turn-safety.js'
 import { resolveRoleCall } from '../llm-resolver.js'
 import { Router, json, type Request, type Response, type NextFunction } from 'express'
 import { isProviderProfileId } from '../agents/computer/provider-profiles.js'
@@ -787,6 +789,37 @@ function safeUsage(handler: (req: Request & AuthedRequest, res: Response) => Pro
     }
   })
 }
+
+// Tenant members may stop work; only tenant owners/admins may resume or change limits.
+api.get('/company/turn-safety', safe(async (req, res) => {
+  const { companyId } = await requireCompany(req)
+  res.json(await safetySnapshot(companyId))
+}))
+api.post('/agents/stop-all', safe(async (req, res) => {
+  const { companyId, userId } = await requireCompany(req)
+  res.json(await emergencyStop(companyId, userId))
+}))
+api.post('/company/turn-safety/resume', safe(async (req, res) => {
+  const { companyId, userId } = await requireCompanyRole(req)
+  await resumeTurns(companyId, userId)
+  res.json({ ok: true })
+}))
+api.put('/company/turn-safety/budgets', safe(async (req, res) => {
+  const { companyId, userId } = await requireCompanyRole(req)
+  let rule: ReturnType<typeof parseBudgetRule>
+  try { rule = parseBudgetRule(req.body) } catch (e) { throw new HttpError(400, (e as Error).message) }
+  if (rule.agentId) {
+    const agent = await pool.query(`SELECT 1 FROM participants WHERE id = $1 AND company_id = $2 AND kind = 'agent' AND departed_at IS NULL`, [rule.agentId, companyId])
+    if (!agent.rowCount) throw new HttpError(400, 'agent does not belong to this company')
+  }
+  await saveBudget(companyId, userId, rule)
+  res.json({ ok: true })
+}))
+api.delete('/company/turn-safety/budgets/:id', safe(async (req, res) => {
+  const { companyId, userId } = await requireCompanyRole(req)
+  await removeBudget(companyId, userId, String(req.params.id))
+  res.json({ ok: true })
+}))
 
 /** Usage dashboard — pure reads over the llm_calls ledger, tenant-scoped. */
 api.get('/usage/summary', safeUsage(async (req, res) => {

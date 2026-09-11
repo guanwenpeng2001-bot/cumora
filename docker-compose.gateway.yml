@@ -32,12 +32,13 @@ services:
       DATABASE_HOST: db
       DATABASE_PORT: "5432"
       DATABASE_USER: postgres
-      DATABASE_PASSWORD: cumora
+      DATABASE_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       DATABASE_DBNAME: sub2api
       DATABASE_SSLMODE: disable
       # Shared redis, separate logical db (cumora uses db 0).
       REDIS_HOST: redis
       REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
       REDIS_DB: "1"
       ADMIN_EMAIL: admin@cumora.local
       # Interpolated from the repo-root .env (compose's own substitution,

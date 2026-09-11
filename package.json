@@ -148,15 +148,7 @@
       "output": "release",
       "buildResources": "build"
     },
-    "publish": [
-      {
-        "provider": "github",
-        "owner": "guanwenpeng2001-bot",
-        "repo": "cumora",
-        "releaseType": "release",
-        "publishAutoUpdate": true
-      }
-    ],
+    "extends": "./scripts/electron-publish.cjs",
     "mac": {
       "category": "public.app-category.productivity",
       "icon": "build/icons/icon.icns",

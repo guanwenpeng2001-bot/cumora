@@ -11,34 +11,118 @@ export interface ModelPricingRow extends ModelPrice {
   updatedAt: string
 }
 
-interface PricingSeed {
+interface PricingSeed extends ModelPrice {
   model: string
-  inPer1M: number
-  cachedInPer1M: number
-  cacheWritePer1M: number
-  outPer1M: number
-  note?: string
+  note: string
   sourceUrl: string
   pricedAt: string
 }
 
-// Preserve the pre-T33 reference menu, not a claim of current official rates.
-// Subscription equivalents and cache-write approximations remain estimates.
-// Official references: https://developers.openai.com/api/docs/pricing,
-// https://api-docs.deepseek.com/quick_start/pricing, https://platform.moonshot.ai/docs/pricing,
-// https://help.aliyun.com/zh/model-studio/models. Admin edits select the applicable rate.
+const CHECKED_AT = '2026-09-11'
+const OPENAI = 'https://developers.openai.com/api/docs/pricing'
+const ALIBABA = 'https://www.alibabacloud.com/help/en/model-studio/model-pricing'
+const DEEPSEEK = 'https://api-docs.deepseek.com/quick_start/pricing/'
+const CLAUDE = 'https://platform.claude.com/docs/en/about-claude/pricing'
+const GOOGLE = 'https://ai.google.dev/gemini-api/docs/pricing'
+const MINIMAX = 'https://platform.minimax.io/docs/guides/pricing-paygo'
+const ZHIPU = 'https://docs.z.ai/guides/overview/pricing'
+const XAI = 'https://docs.x.ai/developers/pricing'
+
+// One reference menu for both cold-start lookup and the existing DB seed path.
+// USD, standard online API rates; no batch, subscription or reseller discounts.
+// The fixed token schema cannot select context/time tiers or meter seconds/images.
+// Record those restrictions and native-unit media prices in the existing note.
+function tokenSeed(model: string, input: number, cached: number, write: number, output: number,
+  sourceUrl: string, note = '标准在线 API；缓存写入未单列时按普通输入估算'): PricingSeed {
+  return { model, inPer1M: input, cachedInPer1M: cached, cacheWritePer1M: write, outPer1M: output,
+    sourceUrl, pricedAt: CHECKED_AT, note, verified: false }
+}
+function mediaSeed(model: string, unit: 'second' | 'image' | 'modality-token', note: string, sourceUrl = ALIBABA): PricingSeed {
+  return { ...tokenSeed(model, 0, 0, 0, 0, sourceUrl, `[unit:${unit}] ${note}；现有台账未支持此计量，非免费`),
+    unpriced: unit === 'second' ? 'duration-pricing-unavailable' : 'image-pricing-unavailable' }
+}
+const DEEPSEEK_NOTE = '峰时参考：周一至周五 UTC 01–04/06–10；谷时输入/缓存/输出减半；缓存写入按普通输入估算'
+const GOOGLE_NOTE = '标准文本价；2026-12-31 前促销，2027-01-01 起输入/缓存/输出翻倍；缓存存储 $0.50/M token/小时另计，写入按输入估算'
 const PRICING_SEED: PricingSeed[] = [
-  { model: 'k3', inPer1M: 0.95, cachedInPer1M: 0.19, cacheWritePer1M: 1.19, outPer1M: 4.0, note: '订阅制(Kimi Code)无单价;此为 k2.7-code 刊例等效参考', sourceUrl: 'https://platform.moonshot.ai/docs/pricing', pricedAt: '2026-09-09' },
-  { model: 'kimi-for-coding', inPer1M: 0.95, cachedInPer1M: 0.19, cacheWritePer1M: 1.19, outPer1M: 4.0, note: '同上,订阅等效参考', sourceUrl: 'https://platform.moonshot.ai/docs/pricing', pricedAt: '2026-09-09' },
-  { model: 'deepseek-v4-flash', inPer1M: 0.14, cachedInPer1M: 0.014, cacheWritePer1M: 0.175, outPer1M: 0.28, sourceUrl: 'https://platform.deepseek.com/docs/pricing', pricedAt: '2026-09-09' },
-  { model: 'deepseek-v4-pro', inPer1M: 0.435, cachedInPer1M: 0.0435, cacheWritePer1M: 0.54, outPer1M: 0.87, sourceUrl: 'https://platform.deepseek.com/docs/pricing', pricedAt: '2026-09-09' },
-  { model: 'gpt-5.5', inPer1M: 2.5, cachedInPer1M: 0.25, cacheWritePer1M: 2.5, outPer1M: 10, sourceUrl: 'https://openai.com/api/pricing', pricedAt: '2026-09-09' },
-  { model: 'gpt-5.4-mini', inPer1M: 0.25, cachedInPer1M: 0.025, cacheWritePer1M: 0.25, outPer1M: 2, sourceUrl: 'https://openai.com/api/pricing', pricedAt: '2026-09-09' },
-  { model: 'qwen-max', inPer1M: 2.5, cachedInPer1M: 0.25, cacheWritePer1M: 3.13, outPer1M: 7.5, note: '百炼刊例(qwen3.8-max 档)', sourceUrl: 'https://help.aliyun.com/zh/model-studio/models', pricedAt: '2026-09-09' },
-  { model: 'text-embedding-v4', inPer1M: 0.05, cachedInPer1M: 0, cacheWritePer1M: 0, outPer1M: 0, sourceUrl: 'https://help.aliyun.com/zh/model-studio/models', pricedAt: '2026-09-09' },
-  { model: 'qwen-image-max', inPer1M: 0, cachedInPer1M: 0, cacheWritePer1M: 0, outPer1M: 0, note: '图像按张计费,非 token 计量', sourceUrl: 'https://help.aliyun.com/zh/model-studio/models', pricedAt: '2026-09-09' },
-  { model: 'qwen3-asr-flash', inPer1M: 0, cachedInPer1M: 0, cacheWritePer1M: 0, outPer1M: 0, note: 'ASR 按时长计费,非 token 计量', sourceUrl: 'https://help.aliyun.com/zh/model-studio/models', pricedAt: '2026-09-09' },
+  tokenSeed('gpt-6-astra', 10, 1, 12.5, 50, OPENAI, '标准价，输入≤272K；长上下文输入/缓存/写入×2，输出×1.5'),
+  tokenSeed('gpt-5.6-sol', 4, 0.4, 5, 20, OPENAI, '标准短上下文价；促销至少至2026-11-21；长上下文输入/缓存/写入×2，输出×1.5'),
+  tokenSeed('gpt-5.6-terra', 2, 0.2, 2.5, 12, OPENAI, '标准短上下文价；长上下文输入/缓存/写入×2，输出×1.5'),
+  tokenSeed('gpt-5.6-luna', 0.2, 0.02, 0.25, 1.2, OPENAI, '标准短上下文价；长上下文输入/缓存/写入×2，输出×1.5'),
+  tokenSeed('gpt-5.5', 5, 0.5, 5, 30, 'https://developers.openai.com/api/docs/models/gpt-5.5', '标准价，输入≤272K；长上下文输入×2/输出×1.5；缓存写入按普通输入估算'),
+  tokenSeed('gpt-5.4-mini', 0.75, 0.075, 0.75, 4.5, 'https://developers.openai.com/api/docs/models/gpt-5.4-mini'),
+  tokenSeed('text-embedding-3-small', 0.02, 0, 0, 0, 'https://developers.openai.com/api/docs/models/text-embedding-3-small', '仅输入计费；无缓存/输出计费'),
+  tokenSeed('deepseek-flash', 0.3, 0.006, 0.3, 1.2, DEEPSEEK, DEEPSEEK_NOTE),
+  tokenSeed('deepseek-v4-flash', 0.3, 0.006, 0.3, 1.2, DEEPSEEK, `官方已映射 DeepSeek-V4.1-Flash；${DEEPSEEK_NOTE}`),
+  tokenSeed('deepseek-v4-flash-vision-exp', 0.3, 0.006, 0.3, 1.2, DEEPSEEK, `官方已映射 DeepSeek-V4.1-Flash；${DEEPSEEK_NOTE}`),
+  tokenSeed('deepseek-v4-pro', 1.32, 0.044, 1.32, 3.96, DEEPSEEK, `${DEEPSEEK_NOTE}；2026-09-14 北京12:00起官方将改为Flash价，需复核种子`),
+  tokenSeed('claude-opus-4-1', 15, 1.5, 18.75, 75, CLAUDE, 'Opus 4.1；5分钟缓存写入；仅存量云平台提供'),
+  tokenSeed('claude-opus', 5, 0.5, 6.25, 25, CLAUDE, 'Opus 4.5–4.8兼容档；5分钟缓存写入'),
+  tokenSeed('claude-sonnet', 3, 0.3, 3.75, 15, CLAUDE, 'Sonnet 4.5/4.6兼容档；5分钟缓存写入'),
+  tokenSeed('claude-haiku', 1, 0.1, 1.25, 5, CLAUDE, 'Haiku 4.5兼容档；5分钟缓存写入'),
+  tokenSeed('claude-opus-5', 5, 0.5, 6.25, 25, CLAUDE, '标准价；5分钟缓存写入'),
+  tokenSeed('claude-sonnet-5', 2, 0.2, 2.5, 10, CLAUDE, '标准价；5分钟缓存写入'),
+  tokenSeed('claude-fable-5', 10, 1, 12.5, 50, CLAUDE, '标准价；5分钟缓存写入'),
+  tokenSeed('claude-fable-5-1', 10, 0.25, 12.5, 50, CLAUDE, '标准价；5分钟缓存写入'),
+  tokenSeed('claude-mythos-5', 10, 1, 12.5, 50, CLAUDE, '限量供应；5分钟缓存写入'),
+  tokenSeed('claude-mythos-5-1', 10, 0.25, 12.5, 50, CLAUDE, '限量供应；5分钟缓存写入'),
+  tokenSeed('gemini-3.8-flash', 0.75, 0.075, 0.75, 3.75, GOOGLE, GOOGLE_NOTE),
+  tokenSeed('gemini-3.7-flash', 0.75, 0.075, 0.75, 3.75, GOOGLE, GOOGLE_NOTE),
+  tokenSeed('gemini-3.1-pro-preview', 2, 0.2, 2, 12, GOOGLE, '标准价，输入≤200K；长上下文输入/缓存×2，输出×1.5；缓存存储$4.50/M token/小时另计；写入按输入估算'),
+  tokenSeed('gemini-2.5-pro', 1.25, 0.125, 1.25, 10, GOOGLE, '标准价，输入≤200K；长上下文输入/缓存×2，输出×1.5；缓存存储$4.50/M token/小时另计；写入按输入估算'),
+  tokenSeed('gemini-2.5-flash-lite', 0.1, 0.01, 0.1, 0.4, GOOGLE, '标准文本/图片/视频价；音频输入$0.30/M；缓存存储$1/M token/小时另计；写入按输入估算'),
+  tokenSeed('grok-4.6', 2, 0.5, 2, 6, XAI, '标准价，输入<200K；≥200K输入/缓存/输出×2；写入按输入估算'),
+  tokenSeed('grok-4.5', 2, 0.3, 2, 6, XAI, '标准价，输入<200K；≥200K输入/缓存/输出×2；写入按输入估算'),
+  tokenSeed('grok-4.3', 1.25, 0.2, 1.25, 2.5, XAI, '标准价，输入<200K；≥200K输入/缓存/输出×2；写入按输入估算'),
+  tokenSeed('minimax-m3', 0.3, 0.06, 0.3, 1.2, MINIMAX, '标准价，输入≤512K；>512K输入/缓存/输出×2；写入按输入估算'),
+  tokenSeed('minimax-m2.7', 0.3, 0.06, 0.375, 1.2, MINIMAX),
+  tokenSeed('minimax-m2.7-highspeed', 0.6, 0.06, 0.375, 2.4, MINIMAX),
+  tokenSeed('minimax-m2.5', 0.3, 0.03, 0.375, 1.2, MINIMAX),
+  tokenSeed('minimax-m2.5-highspeed', 0.6, 0.03, 0.375, 2.4, MINIMAX),
+  tokenSeed('minimax-m2.1', 0.3, 0.03, 0.375, 1.2, MINIMAX),
+  tokenSeed('minimax-m2', 0.3, 0.03, 0.375, 1.2, MINIMAX),
+  ...([
+    ['glm-5.3-flash', 0.15, 0.03, 0.5], ['glm-5.3', 1.4, 0.26, 4.4],
+    ['glm-5.2', 1.4, 0.26, 4.4], ['glm-5.1', 1.4, 0.26, 4.4],
+    ['glm-5', 1, 0.2, 3.2], ['glm-4.7', 0.6, 0.11, 2.2],
+    ['glm-4.7-flashx', 0.07, 0.01, 0.4], ['glm-4.6', 0.6, 0.11, 2.2],
+    ['glm-4.5', 0.6, 0.11, 2.2], ['glm-4.5-air', 0.2, 0.03, 1.1],
+    ['glm-4.7-flash', 0, 0, 0], ['glm-4.5-flash', 0, 0, 0],
+  ] as const).map(([model, input, cached, output]) => tokenSeed(model, input, cached, 0, output, ZHIPU, 'Z.AI国际标准价；缓存写入限时免费')),
+  tokenSeed('qwen-max', 0.345, 0.345, 0.345, 1.377, ALIBABA, '北京/中国内地；未公开缓存折扣，缓存读写按普通输入估算；非qwen3.8-max'),
+  tokenSeed('qwen3-coder-plus', 0.574, 0.0574, 0.7175, 2.294, ALIBABA, '北京；输入≤32K基础档，长上下文阶梯另计；5分钟显式缓存读10%/写125%；隐式缓存读20%；缓存来源https://help.aliyun.com/zh/model-studio/context-cache'),
+  tokenSeed('qwen3-coder-flash', 0.144, 0.0144, 0.18, 0.574, ALIBABA, '北京；输入≤32K基础档，长上下文阶梯另计；5分钟显式缓存读10%/写125%；隐式缓存读20%；缓存来源https://help.aliyun.com/zh/model-studio/context-cache'),
+  tokenSeed('text-embedding-v4', 0.072, 0, 0, 0, ALIBABA, '北京；仅输入计费；新加坡$0.07/M token'),
+  tokenSeed('kimi-k3', 3, 3, 3, 15, ALIBABA, '百炼国际代理价；月之暗面动态价表未能提取；缓存读写按输入估算；不能映射Kimi Code订阅别名k3'),
+  tokenSeed('kimi-k2.7-code', 0.95, 0.95, 0.95, 4, ALIBABA, '百炼国际代理价；缓存读写按输入估算；不能映射kimi-for-coding订阅'),
+  mediaSeed('qwen3-asr-flash', 'second', '北京输入CNY 0.00022/秒（国际站USD 0.000032/秒）；新加坡USD 0.000035/秒；输出免费'),
+  mediaSeed('qwen3-asr-flash-filetrans', 'second', '北京输入CNY 0.00022/秒（USD 0.000032/秒）；新加坡USD 0.000035/秒；输出免费'),
+  mediaSeed('qwen3-asr-flash-realtime', 'second', '北京输入CNY 0.00033/秒（USD 0.000047/秒）；新加坡USD 0.00009/秒；输出免费'),
+  mediaSeed('fun-asr', 'second', '北京输入CNY 0.00022/秒（USD 0.000032/秒）；新加坡USD 0.000035/秒；输出免费'),
+  mediaSeed('fun-asr-mtl', 'second', '北京输入CNY 0.00022/秒（USD 0.000032/秒）；新加坡USD 0.000035/秒；输出免费'),
+  mediaSeed('fun-asr-realtime', 'second', '北京输入CNY 0.00033/秒（USD 0.000047/秒）；新加坡USD 0.00009/秒；输出免费'),
+  mediaSeed('whisper-1', 'second', '输入USD 0.006/分钟，即USD 0.0001/秒', 'https://developers.openai.com/api/docs/models/whisper-1'),
+  mediaSeed('qwen-image-max', 'image', '输出北京USD 0.071677/张；新加坡USD 0.075/张；输入免费'),
+  mediaSeed('qwen-image-2.0-pro', 'image', '输出北京USD 0.071676/张；新加坡USD 0.075/张；输入免费'),
+  mediaSeed('qwen-image-2.0', 'image', '输出北京USD 0.028671/张；新加坡USD 0.035/张；输入免费'),
+  mediaSeed('qwen-image-plus', 'image', '输出北京USD 0.028671/张；新加坡USD 0.03/张；输入免费'),
+  mediaSeed('qwen-image', 'image', '输出北京/新加坡USD 0.035/张；输入免费'),
+  mediaSeed('wan2.7-image-pro', 'image', '输出北京USD 0.068761/张；新加坡USD 0.075/张；输入免费'),
+  mediaSeed('wan2.7-image', 'image', '输出北京USD 0.027504/张；新加坡USD 0.03/张；输入免费'),
+  mediaSeed('wan2.6-image', 'image', '输出北京USD 0.028671/张；新加坡USD 0.03/张；输入免费'),
+  mediaSeed('z-image-turbo', 'image', '北京USD 0.01434/张（prompt_extend=false）或0.02868/张（true）；新加坡USD 0.015/0.03/张；输入免费'),
+  mediaSeed('gpt-image-2', 'modality-token', '标准：文本输入/缓存USD 5/1.25每M token；图像输入/缓存/输出USD 8/2/30每M token；需区分模态，不能用合并token计价', OPENAI),
 ]
+
+/** Copies keep callers from changing the seed used on the next server boot. */
+export function modelPricingSeeds(): PricingSeed[] {
+  return PRICING_SEED.map(s => ({ ...s }))
+}
+export function seedPriceFor(model: string): Readonly<ModelPrice> | null {
+  const seed = PRICING_SEED.find(s => s.model === model)
+  if (!seed) return null
+  const { model: _model, ...price } = seed
+  return Object.freeze(price)
+}
 
 const NOTE_PREFIX = '[cumora-pricing:v1:'
 const noteFor = (kind: 'env' | 'legacy' | 'admin', note: string | null): string =>
@@ -97,6 +181,9 @@ function dbRowPrice(r: DbRow): Readonly<ModelPrice> {
     cacheWritePer1M: Number(r.cache_write_per_1m), outPer1M: Number(r.output_per_1m),
     verified: r.note?.startsWith(noteFor('env', null)) === true,
     source: r.note?.startsWith(noteFor('admin', null)) ? 'database' : r.note?.startsWith(noteFor('env', null)) ? 'env' : 'legacy',
+    note: publicNote(r.note),
+    unpriced: [r.input_per_1m, r.cached_input_per_1m, r.cache_write_per_1m, r.output_per_1m].every(n => Number(n) === 0)
+      ? seedPriceFor(r.model.trim().toLowerCase())?.unpriced : undefined,
     sourceUrl: r.source_url, pricedAt: r.priced_at ? new Date(r.priced_at).toISOString().slice(0, 10) : null,
   }
   if (!validModelPrice(p)) throw new Error(`Invalid model price: ${r.model}`)
@@ -106,6 +193,7 @@ function dbRowPrice(r: DbRow): Readonly<ModelPrice> {
 
 /** Refresh failures and stale SELECTs cannot replace a newer edit or snapshot. */
 export async function refreshModelPricing(force = false): Promise<void> {
+  if (process.env.CUMORA_RUNTIME_CLIENT === 'http') return
   if (!force && (Date.now() < retryAfter || (snapshot && Date.now() - snapshotAt < REFRESH_MS))) return
   if (!force && pendingRefresh) return pendingRefresh
   const sequence = ++refreshSequence
@@ -146,7 +234,7 @@ export async function modelPricingTable(): Promise<ModelPricingRow[]> {
     const price = dbRowPrice(r)
     return {
       ...price, model: r.model,
-      note: price.source === 'legacy' ? `兼容估算，非当前官方报价；${publicNote(r.note) ?? ''}` : publicNote(r.note),
+      note: price.source === 'legacy' ? `${price.pricedAt === CHECKED_AT ? '官方刊例参考，按备注档位估算' : '兼容估算，非当前官方报价'}；${publicNote(r.note) ?? ''}` : publicNote(r.note),
       sourceUrl: price.sourceUrl ?? null, pricedAt: price.pricedAt ?? null,
       updatedAt: new Date(r.updated_at).toISOString(),
     }

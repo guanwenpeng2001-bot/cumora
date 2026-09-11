@@ -103,6 +103,7 @@ function prepareLlmClient(client: OpenAI, _options: LlmClientOptions): OpenAI {
 
 /** A resolved candidate is one route; it never contains an application retry chain. */
 export async function getLlmCandidateClient(plan: RoleCallPlan, candidate: RoleCallCandidate): Promise<OpenAI> {
+  if (process.env.CUMORA_RUNTIME_CLIENT === 'http') throw new Error('Provider clients are server-only')
   if (testLlmOverride) return testLlmOverride(plan.companyId)
   if (!candidate.available) throw new Error(candidate.diagnostic ?? 'LLM candidate unavailable')
   if (candidate.route.kind === 'gateway') {
@@ -239,6 +240,7 @@ function buildSub2apiClient(baseURL: string, keys: ApiKeyMap, tenant: string): O
  *  resolving the tenant's owner_user_id + sub2api_api_key is a DB hop.
  *  Lookup failures propagate without changing the credential source. */
 export async function getLlmClient(tenant: string | null, options: LlmClientOptions = {}): Promise<OpenAI> {
+  if (process.env.CUMORA_RUNTIME_CLIENT === 'http') throw new Error('Provider clients are server-only')
   if (testLlmOverride) return testLlmOverride(tenant)
   // No tenant context → legacy. Gate on the base URL only (not the
   // admin key): agent pods route per-platform without admin rights.
@@ -418,6 +420,7 @@ function dashscopeImageClient(apiKey: string, base: string, progress?: (stage: '
 
 let _imageClient: OpenAI | null = null
 export function getImageClient(): OpenAI {
+  if (process.env.CUMORA_RUNTIME_CLIENT === 'http') throw new Error('Image generation must use runtime CLI')
   if (_imageClient) return _imageClient
   const { apiKey, baseURL, protocol, configured } = resolveDirectLlmEnv('image')
   if (!configured) throw new Error('Direct image LLM is not configured')
@@ -465,6 +468,7 @@ export function mapImageGenerationError(error: unknown, plan?: RoleCallPlan): un
 export async function executeImage<T>(context: LlmCallContext,
   args: { prompt: string; size: '1024x1024' | '1536x1024' | '1024x1536'; n?: number },
   store: (buffer: Buffer) => Promise<T>, options: { signal?: AbortSignal } = {}): Promise<T> {
+  if (process.env.CUMORA_RUNTIME_CLIENT === 'http') throw new Error('Image generation must use runtime CLI')
   const { signal } = options
   signal?.throwIfAborted()
   if (!args.prompt.trim()) throw new Error('Image prompt is empty')
@@ -559,6 +563,7 @@ export function validateAudioInput(audio: unknown, format: unknown = 'webm'): { 
 
 /** Chat input_audio retains the existing data-URL protocol on gateway and env routes. */
 export async function transcribeAudio(audioBase64: unknown, format: unknown = 'webm', companyId: string | null = null, options: { signal?: AbortSignal; deadlineAt?: number } = {}): Promise<string> {
+  if (process.env.CUMORA_RUNTIME_CLIENT === 'http') throw new Error('Audio transcription must use the server API')
   const clip = validateAudioInput(audioBase64, format)
   const remaining = Math.max(0, Math.min(60_000, (options.deadlineAt ?? Date.now() + 60_000) - Date.now()))
   const signal = AbortSignal.any([...(options.signal ? [options.signal] : []), AbortSignal.timeout(remaining)])

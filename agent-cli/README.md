@@ -24,8 +24,7 @@ Then start the daemon (after pairing, the config is saved):
 cumora agent computer [--server <your-server-url>]
 ```
 
-`--server` is optional; it defaults to `https://api.cumora.ai`. Pass it when
-you self-host.
+首次配对请传 `--server <your-server-url>`。后续优先使用显式 `--server`、已保存的配对配置、运行时 `CUMORA_SERVER_URL`，最后才使用 Release 构建时 bake 的 `CUMORA_DEFAULT_SERVER`。均未设置时以非零状态退出，不连接上游默认服务器。`--help`、`--version` 和本地管理命令不要求服务器配置。
 
 Requires **Node ≥ 18** and a supported CLI on your `PATH`. Secure mode supports
 Claude Code **≥ 2.1.248** on macOS/Linux/WSL2 and Codex **≥ 0.138.0** on

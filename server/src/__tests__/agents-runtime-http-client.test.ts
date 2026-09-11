@@ -26,6 +26,20 @@ import assert from 'node:assert/strict'
 import { HttpRuntimeClient } from '../agents/runtime/http-client.js'
 
 let warnLog: string[] = []
+test('failure notice count is server-owned and unavailable counts are never zero', async () => {
+  const client = new HttpRuntimeClient({ baseUrl: 'http://runtime.invalid/runtime', token: 'runtime-token',
+    fetchImpl: async (url, init) => {
+      assert.equal(url, 'http://runtime.invalid/runtime/notices/failure-count')
+      assert.deepEqual(JSON.parse(String(init?.body)), { conversationId: 'conversation-a' })
+      return Response.json({ count: 3 })
+    },
+  })
+  assert.equal(await client.incrementFailureNoticeCount('agent-a', 'conversation-a'), 3)
+  await assert.rejects(makeClientThatAlwaysFails().incrementFailureNoticeCount('agent-a', 'conversation-a'))
+  const invalid = new HttpRuntimeClient({ baseUrl: 'http://runtime.invalid', token: 'token',
+    fetchImpl: async () => Response.json({ count: 0 }) })
+  await assert.rejects(invalid.incrementFailureNoticeCount('agent-a', 'conversation-a'), /Invalid runtime failure notice count/)
+})
 const realWarn = console.warn
 
 beforeEach(() => {

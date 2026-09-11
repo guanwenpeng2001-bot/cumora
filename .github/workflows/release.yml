@@ -1,8 +1,8 @@
 name: Release
 
 # Fires when a `v*` tag is pushed (or manually via workflow_dispatch).
-# Hand off to yetone/cumora-releases which has the matrix runners that
-# build + sign + publish the Electron app for every platform.
+# Optional dispatch to this repository. Enable only after installing a
+# repository_dispatch release receiver; this workflow does not build packages.
 #
 # The GKE backend roll-out is deliberately NOT tied to this tag: deploy.yml
 # is `workflow_dispatch` only, so a desktop release never mutates production.
@@ -20,7 +20,10 @@ on:
 
 jobs:
   trigger-release:
+    if: vars.CUMORA_ENABLE_RELEASE_DISPATCH == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Get version
@@ -38,20 +41,19 @@ jobs:
           echo "ref=$REF" >> $GITHUB_OUTPUT
           echo "Triggering release for version: $VERSION (ref: $REF)"
 
-      - name: Trigger release workflow in cumora-releases
+      - name: Trigger release receiver in this repository
         uses: peter-evans/repository-dispatch@v3
         with:
-          # PAT with `repo` + `workflow` scope on yetone/cumora-releases.
-          # Stored as RELEASES_REPO_TOKEN in yetone/cumora secrets.
-          token: ${{ secrets.RELEASES_REPO_TOKEN }}
-          repository: yetone/cumora-releases
+          # Same-repository dispatch can use the workflow token.
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
           event-type: release
           client-payload: '{"ref": "${{ steps.version.outputs.ref }}", "version": "${{ steps.version.outputs.version }}"}'
 
       - name: Output status
         run: |
-          echo "Successfully triggered release workflow in cumora-releases"
+          echo "Successfully dispatched release event to ${{ github.repository }}"
           echo "Version: ${{ steps.version.outputs.version }}"
           echo "Ref: ${{ steps.version.outputs.ref }}"
           echo ""
-          echo "Watch the build at: https://github.com/yetone/cumora-releases/actions"
+          echo "Watch the build at: https://github.com/${{ github.repository }}/actions"

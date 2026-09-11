@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
-import { resolveRoleCall, type RoleCallPlan, type RoleCallCandidate } from './llm-resolver.js'
+import { pool } from './db/pool.js'
+import { resolveRoleCall, type RoleCallPlan, type RoleCallCandidate, type RoleCallAgent } from './llm-resolver.js'
 import { getLlmCandidateClient } from './llm.js'
 import { fallbackReason, isLlmCancellation } from './agents/fallback.js'
 import { capturePricing, measuredUsage, type TokenUsage } from './agents/cost.js'
@@ -33,6 +34,8 @@ export interface LlmExecutionOptions<T> {
   transportRetry?: { maxRetries: number; shouldRetry: (error: unknown) => boolean }
   onRetry?: (reason: 'retry-without-images' | 'retry-provider-connection', candidate: RoleCallCandidate, error: unknown) => Promise<void>
   record?: (record: LlmCallRecord) => Promise<void>
+  /** Transport observation is separate from the single authoritative ledger writer. */
+  onAttempt?: (record: LlmCallRecord) => Promise<void>
   log?: (event: Record<string, unknown>) => void
 }
 
@@ -111,6 +114,7 @@ export async function executeLlmPlan<T>(options: LlmExecutionOptions<T>): Promis
       .catch(error => { console.warn('[llm-execution] recorder failed', error instanceof Error ? error.message : String(error)) })
     const log = options.log ?? ((event: Record<string, unknown>) => { if (failed) console.warn('[llm-execution]', JSON.stringify(event)) })
     log(extras)
+    await options.onAttempt?.(record)
     if (!failed) return value as T
     if (!next) throw error
     if (retryReason) {
@@ -147,8 +151,21 @@ async function textPlan(ctx: LlmCallContext, model?: string, signal?: AbortSigna
     if (selected) selected.models = [model, ...selected.models.slice(1)]
     captured = { ...snapshot, settings: { ...snapshot.settings, [`${role}_model`]: model, llm_config: JSON.stringify(config) } }
   }
+  let agent: RoleCallAgent = { ...ctx.agent, id: ctx.agentId ?? ctx.agent?.id }
+  if (role === 'support' && agent.id && ctx.companyId) {
+    const { rows } = await pool.query<{ model_config: unknown; computer_support_model: string | null }>(
+      `SELECT p.model_config,
+              CASE WHEN p.provider_profile IS NULL AND c.kind <> 'cloud'
+                THEN c.engine_defaults -> p.engine ->> 'fastModel' END AS computer_support_model
+         FROM participants p
+         LEFT JOIN computers c ON c.id = p.computer_id AND c.company_id = p.company_id AND c.revoked_at IS NULL
+        WHERE p.id = $1 AND p.company_id = $2 AND p.kind = 'agent' AND p.departed_at IS NULL`,
+      [agent.id, ctx.companyId],
+    )
+    if (rows[0]) agent = { ...agent, modelConfig: rows[0].model_config, computerSupportModel: rows[0].computer_support_model }
+  }
   return resolveRoleCall(ctx.companyId, ctx.domain ?? (ctx.companyId ? 'managed' : 'server'), role, ctx.purpose,
-    { ...ctx.agent, id: ctx.agentId ?? ctx.agent?.id }, captured, signal)
+    agent, captured, signal)
 }
 
 export function responsesToChat(args: TextArgs): TextArgs {
@@ -219,6 +236,15 @@ export async function executeTrackedText(ctx: LlmCallContext, api: 'responses' |
   const opts = (options ?? {}) as TextOptions
   const signal = opts.signal ?? args.signal as AbortSignal | undefined
   if (signal?.aborted) throw signal.reason ?? new DOMException('Aborted', 'AbortError')
+  if (process.env.CUMORA_RUNTIME_CLIENT === 'http') {
+    const { callRuntimeLlm } = await import('./agents/runtime/llm-http.js')
+    const { signal: _signal, ...body } = args
+    return callRuntimeLlm<TextResponse>('text', {
+      api, purpose: ctx.purpose, args: body, runId: ctx.runId ?? undefined,
+      conversationId: ctx.conversationId ?? undefined,
+      options: { maxRetries: opts.maxRetries, timeout: opts.timeout },
+    }, { signal })
+  }
   const plan = await textPlan(ctx, args.model, signal)
   return executeLlmPlan({ plan, context: ctx, signal, sdkMaxRetries: opts.maxRetries,
     prepare: async (candidate, state) => {

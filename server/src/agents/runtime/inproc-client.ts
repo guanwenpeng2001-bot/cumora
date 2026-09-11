@@ -134,6 +134,38 @@ function toMemoryRow(r: MemoryQueryRow): MemoryRow {
 }
 
 export class InProcRuntimeClient implements AgentRuntimeClient {
+  async validateTurn(agentId: string, generation: string): Promise<boolean> {
+    const persona = await getPersona(agentId)
+    if (!persona?.companyId) return false
+    const { canAcknowledge } = await import('../../turn-safety.js')
+    return canAcknowledge(persona.companyId, generation)
+  }
+
+  async admitTurn(agentId: string) {
+    const persona = await getPersona(agentId)
+    if (!persona?.companyId) return { allowed: false, generation: '0', reason: 'missing_agent' }
+    const { turnAdmission } = await import('../../turn-safety.js')
+    return turnAdmission(persona.companyId, agentId)
+  }
+
+  async confirmStopped(agentId: string, generation: string): Promise<void> {
+    const persona = await getPersona(agentId)
+    if (!persona?.companyId) return
+    const { confirmStopped } = await import('../../turn-safety.js')
+    await confirmStopped(persona.companyId, agentId, generation)
+  }
+
+  async incrementFailureNoticeCount(agentId: string, conversationId: string): Promise<number> {
+    const count = await redis.eval(`
+      local count = redis.call('INCR', KEYS[1])
+      if count == 1 then redis.call('EXPIRE', KEYS[1], 3600) end
+      return count
+    `, 1, `notice-cap:agent_turn_failed:${agentId}:${conversationId}`)
+    if (typeof count !== 'number' || !Number.isSafeInteger(count) || count < 1) {
+      throw new Error('Failure notice counter unavailable')
+    }
+    return count
+  }
   async applyPendingResources(agentId: string, version?: string): Promise<import('./client.js').ResourceApplicationResult> {
     const { applyPendingAgentResources } = await import('../../skill-library.js')
     return applyPendingAgentResources(agentId, version)
@@ -1103,7 +1135,30 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
     conversationId: string
     upToMessageId: string
     consumedMessageIds?: string[]
+    safetyGeneration?: string
   }, dbClient?: PoolClient): Promise<void> {
+    if (!dbClient) {
+      const client = await pool.connect()
+      try {
+        await client.query('BEGIN')
+        await this.markConversationRead(args, client)
+        await client.query('COMMIT')
+      } catch (error) { await client.query('ROLLBACK'); throw error }
+      finally { client.release() }
+      return
+    }
+    // Serialize the receipt commit with emergency stop, including the first
+    // stop when no safety row exists yet. Re-read pause after acquiring lock.
+    const owner = await dbClient.query<{ company_id: string }>(
+      `SELECT c.id AS company_id FROM companies c JOIN participants p ON p.company_id = c.id
+       WHERE p.id = $1 FOR SHARE OF c`, [args.agentId])
+    const companyId = owner.rows[0]?.company_id
+    if (!companyId) throw new Error('agent company not found')
+    const safety = await dbClient.query<{ paused: boolean; generation: string }>(
+      `SELECT paused, generation::text FROM company_turn_safety WHERE company_id = $1`, [companyId])
+    if (safety.rows[0]?.paused || (safety.rows[0]?.generation ?? '0') !== (args.safetyGeneration ?? '0')) {
+      throw new Error('turn stopped; retaining unfinished inputs')
+    }
     // Exact receipts never move a high-water mark across an unconsumed gap.
     await (dbClient ?? pool).query(
       `INSERT INTO agent_message_consumptions (agent_id, message_id)

@@ -335,7 +335,7 @@ async function getLatestDaemonRelease(): Promise<{ version: string; downloadUrl:
   if (!latestRefresh && (latestCache.at === 0 || now - latestCache.at >= LATEST_TTL_MS)) {
     latestRefresh = (async () => {
       try {
-        const res = await fetch('https://api.github.com/repos/guanwenpeng2001-bot/cumora/releases?per_page=30', {
+        const res = await fetch(`https://api.github.com/repos/${encodeURIComponent(process.env.CUMORA_GITHUB_OWNER?.trim() || 'guanwenpeng2001-bot')}/${encodeURIComponent(process.env.CUMORA_GITHUB_REPO?.trim() || 'cumora')}/releases?per_page=30`, {
           headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'cumora-server' },
           signal: AbortSignal.timeout(5000),
         })

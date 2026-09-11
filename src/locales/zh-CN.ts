@@ -601,6 +601,8 @@ export const zhCN: Partial<Record<keyof typeof en, string>> = {
   'agent.engineManagedNote': '该智能体运行在你自己的计算机上——模型参数由其引擎管理,此处不可编辑。',
   'agent.mcEffort': '推理档位',
   'agent.mcFollowGlobal': '跟随全局',
+  'agent.cerebellumModel': '小脑模型',
+  'agent.cerebellumHint': '用于云端收件箱分流、日程分类等辅助任务。留空跟随全局 support；适用时优先继承电脑引擎默认。与本地引擎小模型 fastModel 独立，不改变本地引擎。',
   'agent.mcContextWindow': '上下文窗口',
   'agent.mcContextWindowPh': '跟随模型默认',
   'agent.mcMaxTokens': '输出上限',

@@ -439,7 +439,10 @@ test('persistent Claude startup failure keeps stderr for first send', async () =
   })
 
   assert.ok(session)
-  await delay(50)
+  // Windows resolves claude through a .cmd shim, so the fake's stderr can land
+  // later than a fixed 50ms window. Poll until the diagnostic is captured (or
+  // give up after ~2s) so the assertion is about the contract, not shim speed.
+  for (let i = 0; i < 100 && !logs.some((l) => /subscription expired/i.test(l)); i++) await delay(20)
   const result = await session.send('wake')
 
   assert.equal(result.exitCode, 1)
@@ -906,7 +909,7 @@ test('a stream-json event split across pipe chunks is still parsed', { skip: IS_
   )
   await chmod(fake, 0o755)
 
-  const hops: Array<{ model: string }> = []
+  const hops: Array<{ model: string | null }> = []
   const r = await getAdapter('claude').run({
     home,
     prompt: 'go',

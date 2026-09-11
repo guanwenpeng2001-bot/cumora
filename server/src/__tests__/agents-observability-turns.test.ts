@@ -18,10 +18,10 @@ process.env.OPENAI_API_KEY ??= 'test-key'
 const { getWakeEconomics, getTurnsPerMessage } = await import('../agents/observability.js')
 const { pool } = await import('../db/pool.js')
 
-const realQuery = pool.query.bind(pool)
+const originalQuery = pool.query
 
 afterEach(() => {
-  ;(pool as unknown as { query: typeof realQuery }).query = realQuery
+  ;(pool as unknown as { query: typeof originalQuery }).query = originalQuery
 })
 
 type QueryHandler = (sql: string, params?: unknown[]) => { rows: unknown[] }
@@ -131,16 +131,17 @@ test('sinceHours is clamped to the same window the rest of the panel uses', asyn
   assert.equal(captured[1], 720 * 3_600_000)
 })
 
-test('the aggregate counts zero-turn messages — against a real Postgres', async () => {
+test('the aggregate counts zero-turn messages — against a real Postgres', async (t) => {
   // The other cases here mock pool.query and so only cover the JS mapping. This
   // one executes the aggregate shape itself, because the defect it guards was
   // invisible to a mock: `avg(t.turns)` after a LEFT JOIN skips the NULL rows,
   // so every message no inbox reached vanished from the average and the median
   // while the histogram still counted it.
-  const { pool: realPool } = await import('../db/pool.js')
-  ;(realPool as unknown as { query: typeof realQuery }).query = realQuery
+  const { Pool: RealPool } = await import('pg')
+  const realPool = new RealPool({ connectionString: process.env.DATABASE_URL })
+  t.after(async () => { await realPool.end().catch(() => {}) })
 
-  const { rows } = await realQuery(`
+  const { rows } = await realPool.query(`
     WITH s(mid) AS (VALUES ('a'),('b'),('c'),('d')),
          t(mid, turns) AS (VALUES ('a', 4), ('b', 2))
     SELECT count(*)::int AS messages,

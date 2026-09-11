@@ -843,8 +843,9 @@ export interface EngineWakeProbeResult {
 export interface EngineHopReport {
   /** Model id the engine just hit for this hop (e.g. claude-sonnet-4-6,
    *  gpt-5.5). The model on this hop's own message — NOT the session default,
-   *  since native auto-compaction etc. can switch models mid-turn. */
-  model: string
+   *  since native auto-compaction etc. can switch models mid-turn. Null when
+   *  unavailable; the daemon supplies its resolved engine model for pricing. */
+  model: string | null
   usage: EngineUsage
   /** Wall-clock ms since the engine emitted this hop's first event to the
    *  emission of its terminating event (so cache warming etc. are visible). */
@@ -1227,7 +1228,7 @@ function spawnEngine(
             // same purpose: one row per outbound model call so even the
             // one-shot path (no persistent session) lands in the universal
             // ledger at the right granularity.
-            if (obj.type === 'assistant' && obj.message?.usage && m && onHopUsage) {
+            if (obj.type === 'assistant' && obj.message?.usage && onHopUsage) {
               const startedAt = hopStartedAt
               hopStartedAt = null
               hopIndex += 1
@@ -1652,7 +1653,7 @@ class ClaudeSession implements EngineSession {
       // ledger it (see EngineHopReport). The terminating `type:'result'` event
       // carries the SUM across hops (already used for the turn's final cost), so
       // we deliberately do NOT also emit it as a hop — that'd double-count.
-      if (ev.type === 'assistant' && ev.message?.usage && evModel) {
+      if (ev.type === 'assistant' && ev.message?.usage) {
         const startedAt = this.hopStartedAt
         this.hopStartedAt = null
         this.hopIndex += 1
@@ -1749,7 +1750,13 @@ class ClaudeSession implements EngineSession {
       this.onLog(`[session] engine process died ${this.pending ? 'MID-TURN' : 'while idle'}: ${why} (exit ${code})`)
     }
     if (this.pending) {
-      const detail = failurePreview({ exitCode: code, signalName: null, stderr: this.pending.stderr, stdout: this.pending.stdout })
+      // The engine can die before send() flips `alive` (or between wakes), so
+      // the run-scoped buffer may be empty even though session-level stderr
+      // already holds the reason. Fall back to the session tail or the
+      // diagnostic is lost exactly when it matters.
+      const stderr = this.pending.stderr.length > 0 ? this.pending.stderr : this.stderrTail
+      const stdout = this.pending.stdout.length > 0 ? this.pending.stdout : this.stdoutTail
+      const detail = failurePreview({ exitCode: code, signalName: null, stderr, stdout })
       this.settle({ exitCode: code, error: detail || why, sessionId: this.sid })
     }
   }
@@ -2364,7 +2371,7 @@ class CodexExecTurnTracker {
     this.hopEmitted = true
     try {
       this.onHopUsage({
-        model: this.model ?? 'codex',
+        model: this.model,
         usage,
         latencyMs: this.startedAt == null ? undefined : Date.now() - this.startedAt,
         hopIndex: 1,
@@ -2630,13 +2637,12 @@ class CodexSession implements EngineSession {
       // with that turn's delta — same shape as turnUsage(). Emit even when
       // the operator left the model unpinned (the default): requiring a pin
       // dropped every hop on the BYOA path. actualModel is CLI-reported or
-      // null; the hop's model string falls back to the engine id so the
-      // ledger row still lands.
+      // null; the daemon fills missing models from its resolved engine model.
       const usage = this.turnUsage()
       if (this.onHopUsage && usage) {
         try {
           this.onHopUsage({
-            model: this.actualModel || 'codex',
+            model: this.actualModel,
             usage,
             latencyMs: this.turnStartedAt != null ? Date.now() - this.turnStartedAt : undefined,
             hopIndex: 1,
@@ -3153,7 +3159,7 @@ class GrokSession implements EngineSession {
       if (this.onHopUsage) {
         try {
           this.onHopUsage({
-            model: this.curModel || this.model || 'grok',
+            model: this.curModel || this.model,
             usage: usage ?? {},
             latencyMs: Date.now() - this.pending.startedAt,
             hopIndex: 1,
@@ -3512,7 +3518,7 @@ class ZcodeSession implements EngineSession {
       if (this.onHopUsage) {
         try {
           this.onHopUsage({
-            model: this.model ?? 'zcode',
+            model: this.model,
             usage: usage ?? {},
             latencyMs: Date.now() - startedAt,
             hopIndex: 1,
@@ -3870,7 +3876,7 @@ class CursorTurnTracker {
       }
       // The single turn-level hop — Cursor has no per-message usage, so this
       // is the honest granularity (same contract as Codex's turn-completed).
-      if (ev.is_error !== true && this.usage && this.model && this.onHopUsage) {
+      if (ev.is_error !== true && this.usage && this.onHopUsage) {
         const startedAt = this.startedAt
         try {
           this.onHopUsage({
@@ -4251,7 +4257,7 @@ class OpenCodeTurnTracker {
     if (this.onHopUsage) {
       try {
         this.onHopUsage({
-          model: this.model ?? 'opencode',
+          model: this.model,
           usage: hopUsage,
           latencyMs: this.hopStartedAt == null ? undefined : Date.now() - this.hopStartedAt,
           hopIndex: this.hopIndex,
@@ -4668,7 +4674,7 @@ class PiTurnTracker {
       // Per-hop trajectory — same contract as ClaudeSession.onStdout: one report
       // per model call so the universal ledger sees BYOA hops at the same
       // granularity as cloud hops.
-      if (usage && model && this.onHopUsage) {
+      if (usage && this.onHopUsage) {
         const startedAt = this.hopStartedAt
         this.hopStartedAt = null
         this.hopIndex += 1
@@ -4956,7 +4962,13 @@ class PiSession implements EngineSession {
       this.onLog(`[session] engine process died ${this.pending ? 'MID-TURN' : 'while idle'}: ${why} (exit ${code})`)
     }
     if (this.pending) {
-      const detail = failurePreview({ exitCode: code, signalName: null, stderr: this.pending.stderr, stdout: this.pending.stdout })
+      // The engine can die before send() flips `alive` (or between wakes), so
+      // the run-scoped buffer may be empty even though session-level stderr
+      // already holds the reason. Fall back to the session tail or the
+      // diagnostic is lost exactly when it matters.
+      const stderr = this.pending.stderr.length > 0 ? this.pending.stderr : this.stderrTail
+      const stdout = this.pending.stdout.length > 0 ? this.pending.stdout : this.stdoutTail
+      const detail = failurePreview({ exitCode: code, signalName: null, stderr, stdout })
       this.settle({ exitCode: code, error: detail || why, sessionId: this.sessionId })
     }
   }
@@ -5302,7 +5314,7 @@ class GeminiTurnTracker {
       // spend visible in the same ledger as everything else.
       try {
         this.onHopUsage({
-          model: this.model ?? 'gemini',
+          model: this.model,
           usage,
           latencyMs: this.startedAt == null ? undefined : Date.now() - this.startedAt,
           hopIndex: 1,
@@ -5909,7 +5921,7 @@ class AntigravityTurnTracker {
       this.hopIndex += 1
       try {
         this.onHopUsage({
-          model: this.model ?? 'antigravity',
+          model: this.model,
           usage: this.usage,
           latencyMs: this.startedAt == null ? undefined : Date.now() - this.startedAt,
           hopIndex: this.hopIndex,

@@ -120,10 +120,10 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
   const [model, setModel] = useState(agent?.model ?? '')
   const [fastModel, setFastModel] = useState(agent?.fastModel ?? '')
   // Profiles select local Claude credentials/endpoints, independently of
-  // participants.model_config, which configures managed-agent model behavior.
+  // participants.model_config, which also configures the cloud cerebellum.
   // Advanced model settings (participants.model_config). Empty/'' fields
-  // mean "inherit the global role setting". Managed agents only — BYOA is
-  // engine-managed.
+  // restore inheritance. BYOA exposes the cloud cerebellum override too.
+  const [cerebellumModel, setCerebellumModel] = useState(agent?.modelConfig?.cerebellumModel ?? '')
   const [mcEffort, setMcEffort] = useState(agent?.modelConfig?.effort ?? '')
   const [mcContextWindow, setMcContextWindow] = useState(agent?.modelConfig?.contextWindow != null ? String(agent.modelConfig.contextWindow) : '')
   const [mcMaxTokens, setMcMaxTokens] = useState(agent?.modelConfig?.maxOutputTokens != null ? String(agent.modelConfig.maxOutputTokens) : '')
@@ -269,8 +269,8 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
     })),
   ]
   // Managed primary and fallback pickers share the full global model catalog;
-  // BYOA keeps using the host engine's reported catalog (modelOptions).
-  const catalogState = useModelCatalog(!isByoa && !contextChanged)
+  // Cloud cerebellum also uses this catalog; BYOA main/fast use modelOptions.
+  const catalogState = useModelCatalog(!contextChanged)
   const catalog = catalogState.catalog
   const catalogText = useMemo(
     () => modelSuggestions(catalog, [model, agent?.model ?? ''], mcFallbacks, agent?.modelConfig?.fallbackModels ?? []),
@@ -370,11 +370,18 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
         const inheritChanged = isByoaTarget && inherit !== (savedChoice === INHERIT_ENGINE)
         const engineChanged = isByoaTarget && !inherit && pinned !== ((agent?.engine as EngineId) ?? null)
         const assignmentChanged = Boolean(target && (target !== current || inheritChanged || engineChanged || providerProfile !== (agent?.providerProfile ?? '')))
-        // BYOA agents are engine-managed — never send modelConfig for them.
+        // Cloud cerebellum applies to both hosting modes.
         // Managed: build the object; null clears a previously saved config.
         const modelConfigPayload = ((): AgentModelConfig | null | undefined => {
-          if (isByoaTarget) return undefined
-          const mc: AgentModelConfig = {}
+          const mc: AgentModelConfig = { ...agent?.modelConfig }
+          delete mc.cerebellumModel
+          if (cerebellumModel.trim()) mc.cerebellumModel = cerebellumModel.trim()
+          if (isByoaTarget) return Object.keys(mc).length ? mc : null
+          delete mc.effort
+          delete mc.contextWindow
+          delete mc.maxOutputTokens
+          delete mc.thinking
+          delete mc.fallbackModels
           if (mcEffort && !effortOptions.includes(mcEffort)) throw new Error('effort: ' + effortOptions.join('/'))
           if (mcEffort) mc.effort = mcEffort
           const cw = modelInteger(mcContextWindow, t('agent.mcContextWindow'), 1, 2_000_000)
@@ -618,6 +625,17 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
               />
             </Field>
           )}
+
+          <Field label={t('agent.cerebellumModel')} hint={t('agent.cerebellumHint')}>
+            <Combobox
+              ariaLabel={t('agent.cerebellumModel')}
+              value={cerebellumModel}
+              onValueChange={setCerebellumModel}
+              options={[{ value: '', label: t('agent.followGlobalDefault') }, ...modelComboboxOptions(catalog, [cerebellumModel, agent?.modelConfig?.cerebellumModel ?? ''])]}
+              searchPlaceholder={t('agent.searchModels')}
+            />
+          </Field>
+          {isByoa && <CatalogStatus {...catalogState} />}
 
           <AgentModelFields
             isByoa={isByoa}

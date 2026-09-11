@@ -102,7 +102,7 @@ async function classifyInboxTriageCaptured(args: {
         agentId: args.agentId,
         companyId: args.companyId,
         source: 'cloud',
-        model: getSupportModel(),
+        model: r.model || getSupportModel(),
         actionable: verdict.actionable,
         reason: verdict.reason,
         usage: usageFromOpenAI(r.usage),

@@ -23,9 +23,9 @@ test('registry release refresh never blocks reads and retains stale values on ti
   let now = 1, calls = 0, timeout = 0
   let finish!: (value: unknown) => void
   let fail!: (reason: Error) => void
-  const fetch = () => { calls++; return new Promise((resolve, reject) => { finish = resolve; fail = reject }) }
+  const fetch = (url: string) => { assert.equal(url, 'https://api.github.com/repos/custom-owner/custom-repo/releases?per_page=30'); calls++; return new Promise((resolve, reject) => { finish = resolve; fail = reject }) }
   const js = ts.transpile(block + ';return { getLatestDaemonRelease, pending: () => latestRefresh }', { target: ts.ScriptTarget.ES2022 })
-  const registry = new Function('fetch', 'AbortSignal', 'Date', js)(fetch, { timeout(ms: number) { timeout = ms; return {} } }, { now: () => now })
+  const registry = new Function('fetch', 'AbortSignal', 'Date', 'process', js)(fetch, { timeout(ms: number) { timeout = ms; return {} } }, { now: () => now }, { env: { CUMORA_GITHUB_OWNER: 'custom-owner', CUMORA_GITHUB_REPO: 'custom-repo' } })
   assert.equal(await registry.getLatestDaemonRelease(), null)
   assert.equal(await registry.getLatestDaemonRelease(), null)
   assert.equal(calls, 1)

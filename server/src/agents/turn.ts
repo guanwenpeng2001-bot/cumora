@@ -27,7 +27,6 @@ import { chatResponseStream } from '../novita.js'
 import { fallbackReason } from './fallback.js'
 import type { AgentModelConfig } from './model-config.js'
 import { getBrainModel, getTurnBudgetPolicy, getServerSettingsSnapshot, withServerSettingsSnapshot, type TurnBudgetPolicy } from '../settings.js'
-import { redis } from '../redis.js'
 import { readLocalMessageAttachment } from '../local-attachment-files.js'
 import { messageAttachmentStorageKey } from '../storage-keys.js'
 import { classifyInboxTriage, gateSyntheticWake } from './inbox-triage.js'
@@ -64,7 +63,7 @@ import {
 } from './turn-stream.js'
 import { compactHistory, compactHistoryWithSummary, DEFAULT_COMPACTION_POLICY, type CompactionPolicy, estimateHistoryTokens, estimateTokens, truncateChars, truncateUtf8 } from './turn-compaction.js'
 import { measuredUsage, addUsage, EMPTY_USAGE, type TokenUsage } from './cost.js'
-import { recordLlmCall, type LlmCallContext, type LlmCallRecord } from './llm-ledger.js'
+import type { LlmCallContext, LlmCallRecord } from './llm-ledger.js'
 import { TurnMessageConsumption } from './message-consumption.js'
 import { hasDraftDelivery, resolveDeclaredAutoRelayTarget } from './auto-relay.js'
 import {
@@ -135,6 +134,8 @@ import {
 import { mentionedAgentIds } from './scheduler.js'
 
 export interface AgentTurnOptions {
+  safetyGeneration?: string
+  onTurnAdmitted?: (generation: string) => void
   signal?: AbortSignal
   /** Private Pod drain feedback; deferred messages remain unread. */
   onInboxDeferred?: (deferred: { messageIds: string[]; retryAt: number }) => void
@@ -1169,7 +1170,7 @@ function extractJsonObject(raw: string): Record<string, unknown> | null {
   return null
 }
 
-function parseCompletionVerification(raw: string): CompletionVerification | null {
+export function parseCompletionVerification(raw: string): CompletionVerification | null {
   const parsed = extractJsonObject(raw)
   if (!parsed) return null
   if (typeof parsed.complete !== 'boolean') return null
@@ -1187,7 +1188,7 @@ function verifierSideEffects(effects: CliSideEffect[]): string {
   return JSON.stringify(effects.slice(-20), null, 2)
 }
 
-async function executeAuxiliaryStream<T>(args: {
+export async function executeAuxiliaryStream<T>(args: {
   purpose: 'completion-verify' | 'compaction' | 'steer-summary'
   companyId: string | null
   agentId: string
@@ -1197,7 +1198,19 @@ async function executeAuxiliaryStream<T>(args: {
   signal?: AbortSignal
   extras?: Record<string, unknown>
   parse: (text: string) => T
+  streamEvent?: (event: Record<string, unknown>) => Promise<void>
+  onAttempt?: (record: LlmCallRecord) => Promise<void>
 }): Promise<T> {
+  if (process.env.CUMORA_RUNTIME_CLIENT === 'http') {
+    const { streamRuntimeLlm } = await import('./runtime/llm-http.js')
+    const text = await streamRuntimeLlm<string>('stream', {
+      purpose: args.purpose, input: args.input, instructions: args.instructions, outputTokens: args.outputTokens, extras: args.extras,
+    }, { signal: args.signal, onEvent: async (kind, data) => {
+      if (kind === 'delta') await args.streamEvent?.(data as Record<string, unknown>)
+      if (kind === 'attempt') await args.onAttempt?.(data as LlmCallRecord)
+    } })
+    return args.parse(text)
+  }
   const configuredTimeout = Number(getServerSettingsSnapshot().settings.compaction_stream_timeout_ms)
   const timeoutMs = Number.isSafeInteger(configuredTimeout) && configuredTimeout > 0 && configuredTimeout <= 2_147_483_647
     ? configuredTimeout : 30_000
@@ -1205,7 +1218,7 @@ async function executeAuxiliaryStream<T>(args: {
     'compaction', args.purpose, { id: args.agentId }, undefined, args.signal)
   return executeLlmPlan({
     plan, context: { role: 'compaction', purpose: args.purpose, companyId: args.companyId,
-      agentId: args.agentId, extras: args.extras }, signal: args.signal, sdkMaxRetries: 0,
+      agentId: args.agentId, extras: args.extras }, signal: args.signal, sdkMaxRetries: 0, onAttempt: args.onAttempt,
     prepare: async (candidate, state) => {
       if (!['responses', 'chat'].includes(candidate.protocol)) throw new Error('Non-text auxiliary LLM protocol')
       const client = await getLlmCandidateClient(plan, candidate)
@@ -1236,7 +1249,7 @@ async function executeAuxiliaryStream<T>(args: {
             } as Parameters<typeof client.responses.create>[0], { signal, timeout: timeoutMs, maxRetries: 0 })
           let collected = ''
           let completed = false
-          await consumeResponseStream(stream as AsyncIterable<Record<string, any>>, event => {
+          await consumeResponseStream(stream as AsyncIterable<Record<string, any>>, async event => {
             if (args.signal?.aborted) throw args.signal.reason ?? new Error('auxiliary stream aborted')
             const response = useChat ? event : event.response
             if (typeof response?.model === 'string') state.actualModel = response.model
@@ -1245,6 +1258,7 @@ async function executeAuxiliaryStream<T>(args: {
               state.usage = measuredUsage(response.usage, useChat ? 'chat' : 'responses')
               state.reasoningTokens = response.usage[useChat ? 'completion_tokens_details' : 'output_tokens_details']?.reasoning_tokens
             }
+            await args.streamEvent?.(event)
             if (event.type === 'error' || event.type === 'response.failed' || event.type === 'response.incomplete') {
               const error = response?.error ?? event.error ?? event
               throw Object.assign(new Error(error.message ?? 'Auxiliary response did not complete'),
@@ -1553,7 +1567,28 @@ export async function executeAgentTurnHop(args: {
   retryEvent?: (kind: string, data: Record<string, unknown>) => Promise<void>
   requestEvent?: (data: Record<string, unknown>) => Promise<void>
   record?: (record: LlmCallRecord) => Promise<void>
+  streamEvent?: (event: ResponseStreamEvent) => Promise<void>
+  onAttempt?: (record: LlmCallRecord) => Promise<void>
 }): Promise<{ state: ResponseStreamState; input: ResponseInputItem[] }> {
+  if (process.env.CUMORA_RUNTIME_CLIENT === 'http') {
+    const { streamRuntimeLlm } = await import('./runtime/llm-http.js')
+    const result = await streamRuntimeLlm<{ state: Omit<ResponseStreamState, 'responseTextByPart'> & { responseTextByPart: [string, string][] }; input: ResponseInputItem[] }>('stream', {
+      purpose: 'agent-turn', input: args.input, instructions: args.instructions, tools: args.tools,
+      runId: args.context.runId, conversationId: args.context.conversationId,
+      extras: { hop: args.context.extras?.hop },
+    }, { signal: args.signal, timeoutMs: args.wallTimeoutMs,
+      onEvent: async (kind, data) => {
+        if (kind === 'request') await args.requestEvent?.(data as Record<string, unknown>)
+        if (kind === 'retry') {
+          const retry = data as { kind: string; data: Record<string, unknown> }
+          await args.retryEvent?.(retry.kind, retry.data)
+        }
+        if (kind === 'delta') await args.streamEvent?.(data as ResponseStreamEvent)
+        if (kind === 'attempt') await args.onAttempt?.(data as LlmCallRecord)
+      },
+    })
+    return { ...result, state: { ...result.state, responseTextByPart: new Map(result.state.responseTextByPart) } }
+  }
   const compactionPolicy = args.compactionPolicy ?? DEFAULT_COMPACTION_POLICY
   const controller = new AbortController()
   const signal = args.signal ? AbortSignal.any([args.signal, controller.signal]) : controller.signal
@@ -1567,7 +1602,7 @@ export async function executeAgentTurnHop(args: {
   const instructionTokens = estimateTokens(args.instructions)
   try {
     return await executeLlmPlan({
-      plan: args.plan, context: args.context, signal, sdkMaxRetries: 0, record: args.record,
+      plan: args.plan, context: args.context, signal, sdkMaxRetries: 0, record: args.record, onAttempt: args.onAttempt,
       transportRetry: { maxRetries: 2, shouldRetry: error => {
         if (typeof (error as { status?: unknown } | null)?.status === 'number') return false
         return isModelProviderConnectionError(error) || fallbackReason(error)?.startsWith('transport:') === true
@@ -1623,7 +1658,8 @@ export async function executeAgentTurnHop(args: {
             ? chatResponseStream(client, { ...responsesToChat(body), stream_options: { include_usage: true } }, requestSignal)
             : await client.responses.create(body as Parameters<typeof client.responses.create>[0], { signal: requestSignal, maxRetries: 0 })
           try {
-            await consumeResponseStream(stream as AsyncIterable<ResponseStreamEvent>, event => {
+            await consumeResponseStream(stream as AsyncIterable<ResponseStreamEvent>, async event => {
+              await args.streamEvent?.(event)
               try { applyResponseStreamEvent(state, event, { traceItem: traceResponseOutputItem }) }
               finally {
                 attempt.actualModel = state.actualModel ?? null
@@ -1662,17 +1698,40 @@ export async function executeAgentTurnHop(args: {
 
 export async function runAgentTurn(agentId: string, options: AgentTurnOptions = {}): Promise<void> {
   return withServerSettingsSnapshot(async () => {
+    const admission = await runtime.admitTurn(agentId)
+    if (!admission.allowed) {
+      if (admission.reason === 'emergency_stop') await runtime.confirmStopped(agentId, admission.generation).catch(console.error)
+      return
+    }
+    options.signal?.throwIfAborted()
+    options.onTurnAdmitted?.(admission.generation)
     const policy = getTurnBudgetPolicy()
     const controller = new AbortController()
     const signal = options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal
+    let checkingSafety = false
+    let safetyCancelled = false
+    const safetyTimer = setInterval(() => {
+      if (checkingSafety || signal.aborted) return
+      checkingSafety = true
+      void runtime.validateTurn(agentId, admission.generation).then(valid => {
+        if (!valid) {
+          safetyCancelled = true
+          controller.abort(new DOMException('Emergency stop', 'AbortError'))
+        }
+      }).catch(() => controller.abort(new DOMException('Safety connection lost', 'AbortError')))
+        .finally(() => { checkingSafety = false })
+    }, 2000)
+    safetyTimer.unref()
     const timer = policy.timeoutMs > 0
       ? setTimeout(() => controller.abort(new DOMException('Managed turn deadline exceeded', 'TimeoutError')), policy.timeoutMs)
       : undefined
     timer?.unref()
     try {
-      await runAgentTurnWithBudget(agentId, { ...options, signal }, policy)
+      await runAgentTurnWithBudget(agentId, { ...options, signal, safetyGeneration: admission.generation }, policy)
     } finally {
       if (timer) clearTimeout(timer)
+      clearInterval(safetyTimer)
+      if (safetyCancelled) await runtime.confirmStopped(agentId, admission.generation).catch(console.error)
     }
   })
 }
@@ -1758,11 +1817,11 @@ async function runAgentTurnWithBudget(agentId: string, options: AgentTurnOptions
       options.onInboxDeferred?.({ messageIds: inbox.map(row => row.id), retryAt })
     }
     if (verdict.outcome !== 'execute') {
-      if (verdict.outcome === 'ignore' && verdict.ackAllowed) {
+      if (verdict.outcome === 'ignore' && verdict.ackAllowed && !options.signal?.aborted) {
         const seen = new Map<string, string>()
         for (const row of inbox) seen.set(row.conversation_id, row.id)
         await Promise.all([...seen].map(([conversationId, upToMessageId]) =>
-          runtime.markConversationRead({ agentId, conversationId, upToMessageId,
+          runtime.markConversationRead({ agentId, conversationId, safetyGeneration: options.safetyGeneration, upToMessageId,
             consumedMessageIds: inbox.filter(row => row.conversation_id === conversationId).map(row => row.id) })))
       }
       return
@@ -1999,11 +2058,17 @@ async function runAgentTurnWithBudget(agentId: string, options: AgentTurnOptions
       // agent rather than 200+ per convo. The counter lives in Redis with a
       // 1h TTL — overshoots and observability fall through to the normal
       // event-recording path so we can still see what was failing.
-      const capKey = `notice-cap:agent_turn_failed:${agentId}:${convoId}`
-      const capCount = await redis.incr(capKey).catch(() => 0)
-      // INCR returns the new value; expire only on the first hit of the bucket.
-      if (capCount === 1) {
-        await redis.expire(capKey, 3600).catch(() => undefined)
+      let capCount: number
+      try {
+        capCount = await withNoticeTimeout(runtime.incrementFailureNoticeCount(agentId, convoId), `failureNoticeCount(${convoId})`)
+      } catch (error) {
+        console.error(`[turn] ${agentId} failure notice counter unavailable for ${convoId}:`, errorText(error))
+        await runtime.recordEvent({
+          runId, agentId, companyId: convoCompanyId, kind: 'turn.failure_notice', level: 'error',
+          title: 'Agent failure notice counter unavailable',
+          data: { conversationId: convoId, noticePosted: false, error: errorText(error) }, stage: 'failed',
+        }).catch(() => { /* runtime client logs delivery failures */ })
+        continue
       }
       if (capCount > FAILURE_NOTICE_HOURLY_CAP) {
         await runtime.recordEvent({
@@ -2738,10 +2803,9 @@ Mechanics:
           title: `Model hop ${hop + 1} started`,
           data: { ...data, hop: hop + 1, lastSuccessfulModel }, stage: `model_hop_${hop + 1}`,
         }) },
-        record: async record => {
+        onAttempt: async record => {
           lastAttemptModel = record.model
           if (record.usage) turnUsage = addUsage(turnUsage, record.usage)
-          await recordLlmCall(record)
         },
       })
       streamState = result.state
@@ -2932,6 +2996,9 @@ Mechanics:
     // the steer aborts the *whole* batch, every bash inside gets a
     // SIGTERM.
     const batchAbortController = new AbortController()
+    const abortToolBatch = () => batchAbortController.abort(options.signal?.reason)
+    options.signal?.addEventListener('abort', abortToolBatch, { once: true })
+    if (options.signal?.aborted) abortToolBatch()
     registerActiveToolBatch(
       agentId,
       batchAbortController,
@@ -2994,8 +3061,10 @@ Mechanics:
           } satisfies ToolResult,
         }
       }
-    }))
-    clearActiveToolBatch(agentId)
+    })).finally(() => {
+      options.signal?.removeEventListener('abort', abortToolBatch)
+      clearActiveToolBatch(agentId)
+    })
     const anyAborted = toolResults.some(({ result }) => result.aborted)
     for (const { tc, result } of toolResults) {
       await runtime.recordEvent({
@@ -3556,7 +3625,7 @@ Mechanics:
         || (declaredTurnStatus !== null && isTerminalTurnStatus(declaredTurnStatus.status)))
     let receiptsCommitted = completed
     for (const [conversationId, consumedMessageIds] of consumption.finish(completed)) {
-      await runtime.markConversationRead({ agentId, conversationId,
+      await runtime.markConversationRead({ agentId, conversationId, safetyGeneration: options.safetyGeneration,
         upToMessageId: consumedMessageIds[0], consumedMessageIds,
       }).catch(err => {
         receiptsCommitted = false

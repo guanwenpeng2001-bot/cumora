@@ -1,42 +1,57 @@
 # Release Manual (fork)
 
-How to cut a new desktop release of Cumora.
+## Desktop releases
 
-> **Fork note (guanwenpeng2001-bot/cumora):** this fork does not use
-> `yetone/cumora-releases` or `updates.cumora.ai`. Desktop auto-update reads
-> **this repository's GitHub Releases** (`package.json` → `build.publish`).
-> The agent CLI ships as `agent-cli-v*` tags on this repo's Releases
-> (`.github/workflows/agent-cli-release.yml`). The upstream dispatch workflow
-> described below remains for reference but requires upstream-only secrets and
-> will fail on the fork — build desktop packages locally with
-> `electron-builder --publish` targeting this repo instead.
+Desktop auto-update uses GitHub Releases. `package.json` → `build.extends` loads
+`scripts/electron-publish.cjs`; its default target remains
+`guanwenpeng2001-bot/cumora`. Set `CUMORA_GITHUB_OWNER` and
+`CUMORA_GITHUB_REPO` in the build environment to publish packages and embed the
+update feed for your repository. Set the same variables when building the web
+frontend (Vite injects only these public coordinates) and when starting the API
+server (daemon release lookup reads its process environment). Unset or blank
+values retain the current fork defaults. Changing a feed does not migrate
+already-installed clients: distribute a build with the new configuration.
 
-## TL;DR (upstream reference)
+Build desktop packages locally with `npm run electron:build` (or the platform
+variant); publishing is a separate, explicit operation with electron-builder.
+Signing/notarization credentials are needed for the platforms you distribute.
+The GitHub provider emits the `latest*.yml` feeds used by electron-updater;
+there is no upstream R2 feed or upstream release repository fallback.
 
-```bash
-# 1. Bump the version in package.json
-npm version patch       # → 0.1.0 → 0.1.1   (creates the tag locally)
+`.github/workflows/release.yml` accepts `v*` tags or manual dispatch, but its job
+is disabled unless repository variable `CUMORA_ENABLE_RELEASE_DISPATCH=true`.
+When enabled it sends `repository_dispatch` with event type `release` and
+`ref`/`version` payload to `${{ github.repository }}`, using the workflow token
+with `contents: write`. Install a matching receiver in your repository before
+enabling it. No receiver is included here, so sending the event alone does not
+build, sign, or publish desktop artifacts. Do not enable it merely to obtain a
+green workflow. It never dispatches to `yetone/cumora-releases` and does not
+deploy the backend.
 
-# 2. Push the tag — GitHub Actions does the rest
-git push origin main --tags
-```
+## Fixed agent CLI releases
 
-The push to a `v*` tag fires the desktop release workflow:
+The CLI is a separate artifact, built from `agent-cli/` by
+`.github/workflows/agent-cli-release.yml`. Manually select an existing immutable
+`agent-cli-v<fork-version>` tag; the workflow builds a standalone bundle,
+packs it with checksums, and creates a draft Release in the current repository.
+Publishing the draft and rolling it out to machines are separate operations.
+Update `src/lib/agentCliRelease.ts`'s pinned tag when adopting a new CLI version.
+Changing owner/repo does not create that tag or its assets in the target repo.
 
-- **`.github/workflows/release.yml`** in this repo → dispatches to
-  `yetone/cumora-releases`, which builds + signs + publishes the
-  Electron app for macOS (arm64 + Intel), Windows, and Linux. Final
-  artifacts land at https://github.com/yetone/cumora-releases/releases.
+For a server-specific CLI, set `CUMORA_DEFAULT_SERVER` while running
+`node agent-cli/build.mjs`, or configure that repository variable for the CLI
+release workflow. It is baked into the bundle, not read from the installed
+machine's `CUMORA_DEFAULT_SERVER`. Without a baked default, first pairing must
+supply `--server` or runtime `CUMORA_SERVER_URL`. Saved pairing configuration
+wins over runtime/baked defaults; explicit `--server` wins over saved config.
+Missing server configuration fails before pairing, service installation, or
+network requests. Local help/version/management commands remain available.
 
-It does **not** deploy the API server. Backend production deploys are an
-explicit, separately approved action; a desktop tag must never silently mutate
-the backend.
+## Upstream cloud backend reference
 
-The auto-updater in the desktop app reads from `https://updates.cumora.ai`
-(the R2-backed `generic` feed), with the `cumora-releases` GitHub Release as a
-fallback. Once the release workflow finishes (~15–20 minutes) and the R2 mirror
-step has run, running clients will pick it up on their next periodic update
-check.
+The following backend procedures describe the retained upstream GKE workflows,
+not the self-hosted deployment path in `deploy/README.md`. Their cloud credentials
+and infrastructure are not provisioned by this fork's desktop/CLI release setup.
 
 ## Backend release: build candidate, then ignite production
 
@@ -138,116 +153,3 @@ smoke secrets in both `production` and `production-readback` (or configure the
 latter to inherit repository secrets). Rotate the smoke token like any other
 production credential and never print it in workflow output.
 
-## What the release workflow does
-
-1. Matrix-builds the Electron app on four runners (macOS arm64,
-   macOS Intel, Windows, Linux).
-2. On macOS, imports the Developer ID cert into a temporary keychain,
-   signs the app bundle, and notarises via the Apple credentials in
-   GitHub Secrets.
-3. Uploads platform-specific artifacts (DMG, ZIP, EXE, AppImage, DEB,
-   `latest*.yml` autoupdate feeds, blockmaps).
-4. Merges the per-arch `latest-mac.yml` files so one feed advertises
-   both arm64 and Intel.
-5. Generates a user-friendly changelog via the OpenAI API from the
-   commit list between the previous tag and this one.
-6. Mirrors everything to the `cumora-updates` Cloudflare R2 bucket
-   (only when R2 secrets are configured — optional).
-7. Creates the GitHub Release with the artifacts attached and the
-   generated changelog as the body.
-8. Posts an announcement to the Discord release channel (only when the
-   webhook is configured — optional).
-
-## One-time setup (already done; reference only)
-
-### Required GitHub Secrets
-
-On `yetone/cumora`:
-
-| Name | Purpose |
-|------|---------|
-| `RELEASES_REPO_TOKEN` | Fine-grained PAT scoped to `yetone/cumora-releases`. Needs `Actions: write`. |
-
-On `yetone/cumora-releases`:
-
-| Name | Purpose |
-|------|---------|
-| `CUMORA_REPO_TOKEN`             | Fine-grained PAT scoped to `yetone/cumora`. Needs `Contents: read`. |
-| `MAC_CERTIFICATE_P12`           | Base64-encoded Developer ID Application cert (`.p12`). `base64 -i Certificates.p12 \| pbcopy`. |
-| `MAC_CERTIFICATE_PASSWORD`      | Password protecting the `.p12` above. |
-| `APPLE_ID`                      | Apple Developer account email. |
-| `APPLE_APP_SPECIFIC_PASSWORD`   | App-specific password for notarisation. Generated at appleid.apple.com → Sign-In and Security → App-Specific Passwords. |
-| `APPLE_TEAM_ID`                 | 10-char Team ID from developer.apple.com → Account → Membership. |
-| `OPENAI_API_KEY`                | Used to generate the changelog. |
-| `R2_ACCESS_KEY_ID`              | (optional) R2 mirror for the `cumora-updates` bucket. |
-| `R2_SECRET_ACCESS_KEY`          | (optional) R2 mirror credential. |
-| `CLOUDFLARE_ACCOUNT_ID`         | (optional) R2 endpoint scope. |
-| `DISCORD_RELEASE_WEBHOOK_URL`   | (optional) Discord channel webhook for release announcements. |
-
-If any of the optional secrets are unset, the workflow skips that step
-and still succeeds.
-
-### One-time Cumora-side wiring
-
-- `build.publish` in `package.json` is an **ordered array**: the first entry
-  is the `generic` feed at `https://updates.cumora.ai` (R2-backed) and is what
-  electron-updater actually polls; the `github` entry for
-  `yetone/cumora-releases` is the fallback feed. See `electron/autoUpdater.cjs`.
-- `build.mac.notarize` is `true`; electron-builder picks up `APPLE_TEAM_ID`
-  (alongside `APPLE_ID` and `APPLE_APP_SPECIFIC_PASSWORD`) from the workflow
-  environment.
-- `build/entitlements.mac.plist` declares the hardened-runtime
-  entitlements Electron needs (JIT, network access, dyld vars).
-
-## Releasing the `cumora` CLI to npm
-
-The BYOA daemon users install with `npx cumora@latest` is a **separate**
-artifact from the desktop app: the npm package `cumora`, built from
-`agent-cli/`. It has its own workflow and is not part of a `v*` tag release.
-
-`.github/workflows/publish.yml` publishes it on any push to `main` that
-touches `agent-cli/**` — typically the `chore(agent-cli): release cumora@X`
-version bump in `agent-cli/package.json`. To cut a CLI release:
-
-```bash
-# Bump agent-cli/package.json's own "version", then merge to main.
-# The workflow runs `node build.mjs` and `npm publish --access public`.
-```
-
-Notes:
-
-- It publishes only if that exact version isn't already on the registry, so
-  re-pushing `main` is a no-op rather than a failure.
-- It needs the repo secret `NPM_TOKEN` (an npm **automation** token, which
-  bypasses 2FA for writes). Until that secret exists the workflow no-ops
-  cleanly instead of failing.
-- `agent-cli/package.json`'s version is independent of the root
-  `package.json` version. Keep them in step by convention, not by tooling.
-
-## Manual rebuild of a past release
-
-If a previous release needs a re-roll (signing failed, missing artifact,
-etc.), use the `workflow_dispatch` form on `yetone/cumora-releases`:
-
-1. Go to https://github.com/yetone/cumora-releases/actions/workflows/release.yml
-2. **Run workflow** → enter:
-   - `ref` = the tag from this repo (e.g. `v0.1.0`)
-   - `version` = the bare version (e.g. `0.1.0`)
-3. The workflow re-builds and overwrites the existing release artifacts.
-
-## Common issues
-
-- **macOS notarisation fails.** Most commonly `APPLE_APP_SPECIFIC_PASSWORD`
-  was rotated or the cert is expired. Check
-  `https://appleid.apple.com` and `Keychain Access` on a Mac with the
-  cert installed.
-- **Build runs but no GitHub Release is created.** The publish job
-  requires `permissions: contents: write` which is already set in the
-  workflow. If you forked the repos, make sure that permission is also
-  granted on your fork.
-- **`latest-mac.yml` mentions only one architecture.** One of the two
-  Mac runners failed before producing the yml. Look at the `Upload
-  build artifacts` step on `build-mac-arm64` / `build-mac-x64`.
-- **The desktop app doesn't see the update.** The autoupdater checks 3
-  seconds after launch and then every **30 minutes** (`electron/autoUpdater.cjs`
-  sets that interval explicitly). Force it from the app menu or restart.

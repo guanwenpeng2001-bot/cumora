@@ -400,8 +400,6 @@ test('podManifest: malicious agentId is sanitized AND quoted — cannot escape t
     token: 'jwt-token',
     image: 'quay.io/x/y:z',
     serverUrl: 'http://example/runtime',
-    openaiKey: 'sk-test',
-    openaiBaseUrl: '',
     idleMs: 600_000,
     noWorkMs: 90_000,
   })
@@ -430,8 +428,6 @@ test('podManifest: well-formed inputs produce a parseable manifest with the slug
     token: 'jwt.token.part',
     image: 'quay.io/img:tag',
     serverUrl: 'http://server/runtime',
-    openaiKey: 'sk-abc',
-    openaiBaseUrl: 'https://gateway.example/v1',
     idleMs: 600_000,
     noWorkMs: 90_000,
   })
@@ -472,8 +468,6 @@ test('podManifest: image with embedded quote is escaped (CUMORA_AGENT_COMPUTER_I
     token: 't',
     image: 'evil"\ninjected: yaml',
     serverUrl: 'http://x',
-    openaiKey: 'k',
-    openaiBaseUrl: '',
     idleMs: 1000,
     noWorkMs: 90_000,
   })
@@ -593,7 +587,7 @@ test('planIdlePvcGc: mixed batch picks only the right ones', () => {
 test('podManifest carries the scheduler inbox approval into the cold-start drain', () => {
   const initialTriage = { triageNote: 'scheduler execute', triageBoundary: inboxTriageBoundary([{ id: 'm1' }]) }
   const manifest = podManifest({ agentId: 'iris', token: 'jwt', image: 'image', serverUrl: 'http://server/runtime',
-    openaiKey: 'legacy', openaiBaseUrl: 'https://provider/v1', idleMs: 600000, noWorkMs: 90000, initialTriage })
+    idleMs: 600000, noWorkMs: 90000, initialTriage })
   const lines = manifest.split(String.fromCharCode(10))
   const index = lines.findIndex(line => line.includes('name: CUMORA_AGENT_INITIAL_WAKE'))
   assert.ok(index > 0)

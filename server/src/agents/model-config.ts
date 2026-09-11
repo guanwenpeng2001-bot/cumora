@@ -5,13 +5,13 @@
  * (settings.ts, DB → env) → hardcoded defaults. Every field is optional;
  * absent means "inherit the global brain role's setting".
  *
- * Phase 2 scope: managed agents only. BYOA agents are engine-managed — their
- * model pins flow through the engine assignment path (model/fast_model),
- * and this config is ignored for them by the UI.
+ * Cerebellum overrides also apply to BYOA server-side calls.
  */
 import type { ReasoningEffort } from 'openai/resources/shared.js'
 
 export interface AgentModelConfig {
+  /** Cloud support model; independent of local fastModel. */
+  cerebellumModel?: string
   /** Reasoning effort override for the main turn. */
   effort?: ReasoningEffort
   /** Context window in tokens; undefined = follow the model heuristic. */
@@ -44,9 +44,13 @@ function normalizeAgentModelConfig(raw: unknown, strict: boolean): AgentModelCon
   const b = raw as Record<string, unknown>
   const out: AgentModelConfig = {}
   for (const key of Object.keys(b)) {
-    if (!['effort', 'contextWindow', 'maxOutputTokens', 'thinking', 'fallbackModels'].includes(key)) {
+    if (!['effort', 'contextWindow', 'maxOutputTokens', 'thinking', 'fallbackModels', 'cerebellumModel'].includes(key)) {
       invalid('unknown field')
     }
+  }
+  if (b.cerebellumModel !== undefined) {
+    if (typeof b.cerebellumModel !== 'string') invalid('cerebellumModel must be a string')
+    else if (b.cerebellumModel.trim()) out.cerebellumModel = b.cerebellumModel.trim()
   }
   if (b.effort !== undefined) {
     const effort = typeof b.effort === 'string' ? b.effort.trim().toLowerCase() : ''

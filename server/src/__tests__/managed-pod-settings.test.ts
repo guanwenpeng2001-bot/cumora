@@ -39,6 +39,7 @@ function fixture(bootstrap?: Managed.ManagedPodSettings, extraEnv: Record<string
     ...extraEnv,
   }
   if (bootstrap) {
+    processEnv.CUMORA_RUNTIME_CLIENT = 'http'
     processEnv.CUMORA_AGENT_ID = bootstrap.agentId
     processEnv.CUMORA_MANAGED_POD_BOOTSTRAP = JSON.stringify(bootstrap)
   }
@@ -58,11 +59,13 @@ function fixture(bootstrap?: Managed.ManagedPodSettings, extraEnv: Record<string
   const pool = {
     async query(query: string | { text: string; values: unknown[]; query_timeout: number }) {
       queries.push(query)
+      if (bootstrap) throw new Error('Pod DB access forbidden')
       if (failure) throw new Error('DB failure containing a secret must not be logged')
       if (typeof query === 'string') {
         assert.equal(query, 'SELECT key, value FROM server_settings')
         return { rows }
       }
+      if (query.text.includes('FROM companies c')) return { rows: [owner] }
       assert.match(query.text, /p.id = \$1 AND c.id = \$2/)
       assert.equal(query.query_timeout, 5_000)
       assert.deepEqual(plain(query.values.slice(0, 2)), ['agent-a', 'company-a'])
@@ -80,12 +83,29 @@ function fixture(bootstrap?: Managed.ManagedPodSettings, extraEnv: Record<string
     const exports: Record<string, any> = {}
     modules.set(name, exports)
     runInNewContext(transpile(read(name)), {
-      exports, URL, Date: Clock, setTimeout, clearTimeout, AbortController, AbortSignal, DOMException,
+      exports, URL, structuredClone, Date: Clock, setTimeout, clearTimeout, AbortController, AbortSignal, DOMException,
       setInterval(fn: () => void, ms: number) { intervals.push({ fn, ms }); return { unref() {} } },
       console: { warn: (...args: unknown[]) => messages.push(args.join(' ')), log: (...args: unknown[]) => messages.push(args.join(' ')) },
       process: { env: processEnv, exit(code: number) { throw new Error(`unexpected exit ${code}`) } },
       require(dep: string) {
         if (dep in dependencies) return dependencies[dep]
+        if (dep.endsWith('/llm-http.js')) return { callRuntimeLlm: async (path: string) => {
+          assert.equal(path, 'settings')
+          if (failure) throw new Error('Runtime failure containing a secret must not be logged')
+          let nextRows = rows
+          if (held) { const wait = held; held = undefined; nextRows = ((await wait.promise).rows[0] as { settings: typeof rows }).settings }
+          const server = fixture(undefined)
+          if (bootstrap) {
+            for (const [key, value] of Object.entries(bootstrap.defaults)) {
+              const def = server.settings.SETTING_DEFS.find(d => d.key === key)
+              if (def?.envKeys?.[0]) server.processEnv[def.envKeys[0]] = value
+            }
+          }
+          server.setRows(nextRows)
+          const next = await server.settings.createManagedPodBootstrap('agent-a', 'company-a')
+          return { ...next, source: 'db', policy: { ...next.policy, source: 'db' } }
+        } }
+
         if (dep === 'dotenv/config') return {}
         if (dep === 'node:crypto') return { randomBytes, randomUUID }
         const target = posix.normalize(posix.join(posix.dirname(name), dep)).replace(/\.js$/, '')
@@ -119,33 +139,19 @@ async function bootstrap(extraEnv: Record<string, string> = {}) {
   return { main, config }
 }
 
-test('bootstrap includes every runtime policy, six direct slots and only the owner platform keys', async () => {
+test('v2 bootstrap contains complete policy and no provider or owner credentials', async () => {
   const { main, config } = await bootstrap()
   assert.equal(config.policy.revision, '17')
   assert.equal(config.policy.settings.brain_model, 'db-brain')
   assert.equal(config.defaults.brain_model, 'env-brain')
   assert.equal(config.policy.settings.agent_max_output_tokens, '7123')
   assert.equal(config.policy.settings.brain_fallback_models, 'fallback-a,fallback-b')
-  assert.deepEqual(Object.keys(config.direct), ['text', 'image', 'audio', 'embed', 'novita', 'orcarouter'])
-  assert.equal(config.gateway.keys.kimi, 'owner-kimi')
-  assert.equal(config.direct.text.apiKey, 'direct-text-key')
-  assert.equal(config.direct.image.protocol, 'dashscope-image')
-  assert.equal(config.direct.audio.apiKey, 'direct-image-key')
+  assert.equal(config.version, 2)
+  assert.equal(config.companyId, 'company-a')
+  assert.doesNotMatch(JSON.stringify(config), /direct-text-key|owner-openai|apiKey|baseURL|gateway|"direct"/)
   assert.equal(Object.keys(config.policy.settings).length, main.settings.SETTING_DEFS.filter(def => def.pod).length)
   assert.doesNotMatch(JSON.stringify(config), /never-pod|local_skillhub_path|sub2api_group_config|ADMIN_KEY|RUNTIME_SECRET/)
   assert.doesNotMatch(JSON.stringify(config.policy), /owner-openai|direct-text-key/)
-})
-
-test('bootstrap keeps extra owner platform keys that are not in the historical four', async () => {
-  const main = fixture()
-  main.setOwner({
-    owner_user_id: 'owner-a', authorization_version: '101',
-    sub2api_api_key: JSON.stringify({ openai: 'owner-openai', anthropic: 'owner-anthropic', bogus: 'owner-bogus' }),
-  })
-  const config = await main.settings.createManagedPodBootstrap('agent-a', 'company-a', value => value)
-  assert.equal(config.gateway.keys.openai, 'owner-openai')
-  assert.equal(config.gateway.keys.anthropic, 'owner-anthropic')
-  assert.equal(config.gateway.keys.bogus, 'owner-bogus')
 })
 
 test('first turn uses a complete bootstrap during DB failure and cannot seed or write', async () => {
@@ -156,12 +162,12 @@ test('first turn uses a complete bootstrap during DB failure and cannot seed or 
   assert.equal(pod.settings.getBrainModel(), 'db-brain')
   assert.equal(pod.settings.getSupportModel(), 'db-support')
   assert.equal(pod.settings.getServerSettingsSnapshot().source, 'bootstrap')
-  assert.equal(pod.env.resolveDirectLlmEnv('text').apiKey, 'direct-text-key')
-  assert.equal((await pod.tenant.resolveTenantLlmContext('company-a')).keys.grok, 'owner-grok')
+  assert.throws(() => pod.env.resolveDirectLlmEnv('text'), /unavailable/)
+  await assert.rejects(pod.tenant.resolveTenantLlmContext('company-a'), /server-only/)
   await assert.rejects(pod.settings.seedServerSettingsFromEnv(), /cannot seed/)
   await assert.rejects(pod.settings.writeServerSettings({ brain_model: 'illegal' }), /read-only/)
-  await assert.rejects(pod.tenant.resolveTenantLlmContext('company-b'), /does not authorize/)
-  await assert.rejects(pod.tenant.resolveTenantLlmContext('company-a', 'member'), /does not authorize/)
+  await assert.rejects(pod.tenant.resolveTenantLlmContext('company-b'), /server-only/)
+  await assert.rejects(pod.tenant.resolveTenantLlmContext('company-a', 'member'), /server-only/)
   assert.match(pod.messages.join('\n'), /source=bootstrap revision=17/)
   assert.doesNotMatch(pod.messages.join('\n'), /containing a secret/)
   assert.equal(pod.intervals.length, 1)
@@ -175,16 +181,16 @@ test('bounded first read preserves bootstrap and late success installs policy an
   const held = pod.hold()
   await pod.settings.initializeManagedPodSettings(5)
   assert.equal(pod.settings.getServerSettingsSnapshot().source, 'bootstrap')
-  assert.equal((await pod.tenant.resolveTenantLlmContext('company-a')).ownerId, 'owner-a')
+  assert.equal(pod.managed.getManagedPodSettings()?.companyId, 'company-a')
   held.resolve({ rows: [{ owner_user_id: 'owner-b', authorization_version: '102', sub2api_api_key: 'new-owner-key',
     settings: [{ key: '__settings_revision', value: '18' }, { key: 'brain_model', value: 'new-brain' }] }] })
   await pod.settings.refreshServerSettings()
   assert.equal(pod.settings.getBrainModel(), 'new-brain')
   assert.equal(pod.settings.getSupportModel(), 'env-support')
   assert.equal(pod.settings.getServerSettingsSnapshot().source, 'db')
-  assert.equal((await pod.tenant.resolveTenantLlmContext('company-a')).ownerId, 'owner-b')
-  assert.equal(pod.env.resolveDirectLlmEnv('text').apiKey, 'direct-text-key')
-  assert.ok(Object.isFrozen(pod.managed.getManagedPodSettings()?.gateway.keys))
+  assert.equal(pod.managed.getManagedPodSettings()?.companyId, 'company-a')
+  assert.throws(() => pod.env.resolveDirectLlmEnv('text'), /unavailable/)
+  assert.ok(Object.isFrozen(pod.managed.getManagedPodSettings()?.policy.settings))
 })
 
 test('healthy 30-second refresh converges, reset inherits original env, failure and old revision retain whole snapshot', async () => {
@@ -200,8 +206,7 @@ test('healthy 30-second refresh converges, reset inherits original env, failure 
   assert.equal(pod.settings.getBrainModel(), 'env-brain')
   assert.equal(pod.settings.getSupportModel(), 'updated-support')
   assert.equal(pod.settings.getServerSettingsSnapshot().revision, '18')
-  const context = await pod.tenant.resolveTenantLlmContext('company-a')
-  assert.deepEqual(plain(context.keys), { kimi: 'rotated-kimi' })
+  assert.equal(pod.queries.length, 0)
   const saved = pod.managed.getManagedPodSettings()
   pod.fail()
   await pod.settings.refreshServerSettings(true)
@@ -215,42 +220,7 @@ test('healthy 30-second refresh converges, reset inherits original env, failure 
   pod.setRows([{ key: '__settings_revision', value: '18' }])
   pod.setOwner({ owner_user_id: 'owner-b', authorization_version: '203', sub2api_api_key: '' })
   await pod.settings.refreshServerSettings(true)
-  assert.deepEqual(plain((await pod.tenant.resolveTenantLlmContext('company-a')).keys), {})
-})
-
-test('pure env deployment and all four owner platforms resolve through the unchanged resolver', async () => {
-  const { config } = await bootstrap({ SUB2API_INTERNAL_URL: '', SUB2API_ADMIN_KEY: '' })
-  const directPod = fixture(config)
-  directPod.fail()
-  await directPod.settings.initializeManagedPodSettings()
-  const direct = await directPod.resolver.resolveRoleCall('company-a', 'managed', 'brain', 'turn')
-  assert.equal(direct.candidates[0].route.kind, 'direct')
-  assert.equal(direct.candidates[0].available, true)
-  assert.equal(direct.routable, false)
-  const gateway = fixture((await bootstrap()).config)
-  gateway.fail()
-  await gateway.settings.initializeManagedPodSettings()
-  for (const platform of ['openai', 'kimi', 'deepseek', 'grok']) {
-    const plan = await gateway.resolver.resolveRoleCall('company-a', 'managed', 'brain', 'turn', { model: `${platform}-model` })
-    assert.equal(plan.candidates[0].route.kind, 'gateway')
-    assert.equal(plan.candidates[0].route.platform, platform)
-    assert.equal(plan.candidates[0].available, true)
-    assert.equal(plan.revision, '17')
-    assert.doesNotMatch(JSON.stringify(plan), /owner-kimi|direct-text-key/)
-  }
-  assert.equal(gateway.queries.length, 1, 'business identity reads do not query DB')
-})
-
-test('main-service owner lookup failure is not disguised as direct fallback; incomplete bootstrap fails closed', async () => {
-  const main = fixture()
-  main.fail()
-  await assert.rejects(main.settings.createManagedPodBootstrap('agent-a', 'company-a', value => value), /DB failure/)
-  const { config } = await bootstrap()
-  const incomplete = plain(config)
-  delete (incomplete.policy.settings as Record<string, string>).support_model
-  const pod = fixture(incomplete)
-  await assert.rejects(pod.settings.initializeManagedPodSettings(), /Incomplete/)
-  assert.equal(pod.queries.length, 0)
+  await assert.rejects(pod.tenant.resolveTenantLlmContext('company-a'), /server-only/)
 })
 
 function functionsFrom(file: string, names: string[]): string {
@@ -258,39 +228,6 @@ function functionsFrom(file: string, names: string[]): string {
   return ast.statements.filter(node => ts.isFunctionDeclaration(node) && node.name && names.includes(node.name.text))
     .map(node => node.getText(ast)).join('\n') + '\n' + names.map(name => `exports.${name} = ${name}`).join('\n')
 }
-
-test('unchanged candidate client uses owner platform keys and direct credentials separately', async () => {
-  const pod = fixture((await bootstrap()).config)
-  pod.fail()
-  await pod.settings.initializeManagedPodSettings()
-  const exports: { getLlmCandidateClient?: (plan: unknown, candidate: unknown) => Promise<{ options: { apiKey: string; baseURL: string } }> } = {}
-  runInNewContext(transpile(functionsFrom('llm', ['getLlmCandidateClient'])), {
-    exports, testLlmOverride: null, SDK_MAX_RETRIES: 0, SDK_TIMEOUT_MS: 100,
-    CANDIDATE_CLIENT_TTL_MS: 6 * 60_000, CLIENT_CACHE_MAX: 2048, DIRECT_CLIENT_MAX: 256,
-    candidateClients: new Map(), directCandidateClients: new Map(),
-    capTtlMap(map: Map<unknown, { mintedAt: number }>, max: number, expired: (value: { mintedAt: number }) => boolean) {
-      for (const [key, value] of map) if (expired(value)) map.delete(key)
-      while (map.size >= max) {
-        const first = map.keys().next().value
-        if (first === undefined) break
-        map.delete(first)
-      }
-    },
-    contextForRoleCallPlan: pod.tenant.contextForRoleCallPlan,
-    resolveTenantLlmContext: pod.tenant.resolveTenantLlmContext, resolveDirectLlmEnv: pod.env.resolveDirectLlmEnv,
-    OpenAI: class { constructor(public options: unknown) {} }, withProviderRouting: (client: unknown) => client,
-  })
-  for (const platform of ['openai', 'kimi', 'deepseek', 'grok']) {
-    const plan = await pod.resolver.resolveRoleCall('company-a', 'managed', 'brain', 'turn', { model: `${platform}-model` })
-    const client = await exports.getLlmCandidateClient!(plan, plan.candidates[0])
-    assert.equal(client.options.apiKey, `owner-${platform}`)
-    assert.equal(client.options.baseURL, 'https://gateway.invalid/v1')
-  }
-  const direct = await pod.resolver.resolveRoleCall(null, 'managed', 'brain', 'turn')
-  const client = await exports.getLlmCandidateClient!(direct, direct.candidates[0])
-  assert.equal(client.options.apiKey, 'direct-text-key')
-  assert.equal(client.options.baseURL, 'https://direct.invalid/v1')
-})
 
 test('manifest round-trips bootstrap and never transmits the server signing secret or admin settings', async () => {
   const { main, config } = await bootstrap()
@@ -304,17 +241,15 @@ test('manifest round-trips bootstrap and never transmits the server signing secr
     agentMaxOutputTokens: () => 4000, supportReasoningEffort: () => 'low', supportReasoningHeadroom: () => 0,
   })
   const manifest = exports.podManifest!({ agentId: 'agent-a', token: 'scoped-runtime-token', image: 'test-image',
-    serverUrl: 'https://runtime.invalid', openaiKey: config.direct.text.apiKey, openaiBaseUrl: config.direct.text.baseURL,
+    serverUrl: 'https://runtime.invalid', openaiKey: 'unused-legacy-key', openaiBaseUrl: 'https://unused.invalid',
     bootstrap: config, idleMs: 100, noWorkMs: 100 })
   assert.doesNotMatch(manifest, /never-pod|SUB2API_ADMIN_KEY|local_skillhub_path|sub2api_group_config/)
   const value = manifest.match(/name: CUMORA_MANAGED_POD_BOOTSTRAP\n\s+value: (.+)/)![1]
   assert.deepEqual(JSON.parse(JSON.parse(value)), plain(config))
-  const secret = JSON.parse(manifest.match(/name: AGENT_RUNTIME_SECRET\n\s+value: (.+)/)![1])
-  assert.match(secret, /^[a-f0-9]{64}$/)
-  // Exercise the production image's real env gate with the isolated per-Pod value.
-  const pod = fixture(config, { NODE_ENV: 'production', AGENT_RUNTIME_SECRET: secret, SUB2API_ADMIN_KEY: '' })
+  assert.doesNotMatch(manifest, /AGENT_RUNTIME_SECRET/)
+  const pod = fixture(config, { NODE_ENV: 'production', AGENT_RUNTIME_SECRET: '', SUB2API_ADMIN_KEY: '' })
   assert.equal(pod.env.env.SUB2API_ADMIN_KEY, '')
-  assert.match(manifest, /name: OPENAI_API_KEY\n\s+value: \|-\n\s+direct-text-key/)
+  assert.doesNotMatch(manifest, /OPENAI_API_KEY|DATABASE_URL|REDIS_URL|NOVITA_API_KEY|ORCAROUTER_API_KEY|unused-legacy-key/)
   const source = read('agents/runtime/pod-agent')
   assert.ok(source.indexOf('await initializeManagedPodSettings()') < source.indexOf("await runtime.setStatus(agentId, 'avail')"))
 })
@@ -372,13 +307,8 @@ function fallbackConfig(role: Settings.LlmRole = 'brain', fallbackPolicy: 'disab
 }
 
 async function fallbackFixture(configValue: unknown, base: string, extraEnv: Record<string, string> = {}) {
-  const { config } = await bootstrap(extraEnv)
-  const saved = plain(config)
-  saved.policy = { ...saved.policy, settings: { ...saved.policy.settings, llm_config: JSON.stringify(configValue) } }
-  saved.gateway.baseURL = base + '/gateway/v1'
-  for (const direct of Object.values(saved.direct)) direct.baseURL = base + '/direct/v1'
   const records: any[] = []
-  const pod = fixture(saved, {}, {
+  const pod = fixture(undefined, { ...extraEnv, SUB2API_INTERNAL_URL: base + '/gateway', OPENAI_BASE_URL: base + '/direct/v1', OPENAI_IMAGE_BASE_URL: base + '/direct/v1', OPENAI_AUDIO_BASE_URL: base + '/direct/v1', OPENAI_IMAGE_NATIVE_BASE_URL: base + '/direct/v1', NOVITA_BASE_URL: base + '/direct/v1', ORCAROUTER_BASE_URL: base + '/direct/v1' }, {
     openai: { default: OpenAI },
     './agents/cost.js': {
       captureCallPricing: async () => () => null,
@@ -390,8 +320,8 @@ async function fallbackFixture(configValue: unknown, base: string, extraEnv: Rec
       classifyLlmCallError: (error: unknown) => error ? 'failed' : 'ok',
     },
   })
-  pod.fail()
-  await pod.settings.initializeManagedPodSettings(1)
+  pod.setRows([{ key: '__settings_revision', value: '17' }, { key: 'llm_config', value: JSON.stringify(configValue) }])
+  await pod.settings.loadServerSettings()
   const execution = pod.load('llm-execution')
   const llm = pod.load('llm')
   return { ...pod, execution, llm, records }
@@ -559,18 +489,18 @@ test('T52: fallback schema is strict, embed excluded, configuration crosses Pod 
     { ...fallbackConfig(), roles: [{ role: 'brain', models: ['a'], directTargets: [{ model: 'b', route: 'backup', protocol: 'images' }] }] },
   ]) assert.throws(() => main.settings.parseLlmConfig(JSON.stringify(invalid), true), /invalid llm_config schema/)
   const raw = JSON.stringify(fallbackConfig())
-  const { config } = await bootstrap({ CUMORA_LLM_CONFIG: raw })
+  const { main: service, config } = await bootstrap({ CUMORA_LLM_CONFIG: raw })
   const pod = fixture(config)
   pod.fail()
   await pod.settings.initializeManagedPodSettings(1)
   assert.equal(pod.settings.getServerSettingsSnapshot().settings.llm_config, raw)
-  const plan = await pod.resolver.resolveRoleCall('company-a', 'managed', 'brain', 'isolated')
+  const plan = await service.resolver.resolveRoleCall('company-a', 'managed', 'brain', 'isolated')
   assert.equal(plan.candidates.length, 3)
   assert.equal(plan.candidates[2].route.kind, 'direct')
   assert.ok(Object.isFrozen(plan.candidates))
-  const embed = await pod.resolver.resolveRoleCall('company-a', 'managed', 'embed', 'isolated')
+  const embed = await service.resolver.resolveRoleCall('company-a', 'managed', 'embed', 'isolated')
   assert.equal(embed.candidates.length, 1)
-  const byoa = await pod.resolver.resolveRoleCall('company-a', 'byoa', 'brain', 'isolated')
+  const byoa = await service.resolver.resolveRoleCall('company-a', 'byoa', 'brain', 'isolated')
   assert.equal(byoa.candidates.length, 0)
 })
 
@@ -589,7 +519,7 @@ test('default and explicit ENV provenance survive bootstrap and refresh without 
     assert.equal(serialized.includes(key), false)
   }
   for (const role of ['brain', 'support', 'compaction', 'image', 'audio', 'embed'] as const) {
-    const plan = await pod.resolver.resolveRoleCall('company-a', 'managed', role, 'preview')
+    const plan = await main.resolver.resolveRoleCall('company-a', 'managed', role, 'preview')
     assert.equal(plan.domain, 'managed')
     assert.doesNotMatch(JSON.stringify(plan), /direct-text-key|direct-image-key|direct-embed-key|owner-openai|apiKey|baseURL/)
   }

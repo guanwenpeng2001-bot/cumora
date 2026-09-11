@@ -212,11 +212,16 @@ export interface WorklogEntry {
  *  InProc impl + a stub HTTP impl; later sessions fill the HTTP impl
  *  in as the corresponding `/cli/*` server endpoints land. */
 export interface AgentRuntimeClient {
+  /** Server-owned hourly failure-notice counter; failure must be visible. */
+  incrementFailureNoticeCount(agentId: string, conversationId: string): Promise<number>
   applyPendingResources(agentId: string, version?: string): Promise<ResourceApplicationResult>
 
   // === Read agent state ===
   /** Resolve the agent's persona (name / role / style / model / company).
    *  Returns null when the id isn't a real agent. */
+  validateTurn(agentId: string, generation: string): Promise<boolean>
+  admitTurn(agentId: string): Promise<{ allowed: boolean; generation: string; reason: string | null }>
+  confirmStopped(agentId: string, generation: string): Promise<void>
   loadPersona(agentId: string): Promise<PersonaRow | null>
   /** Resolve a conversation's tenant — used when the inbox is empty
    *  and we need to know which company the run belongs to. */
@@ -407,6 +412,7 @@ export interface AgentRuntimeClient {
     conversationId: string
     upToMessageId: string
     consumedMessageIds?: string[]
+    safetyGeneration?: string
   }): Promise<void>
 }
 

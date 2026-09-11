@@ -19,12 +19,10 @@ services:
     container_name: cumora-postgres
     restart: unless-stopped
     environment:
-      POSTGRES_PASSWORD: cumora
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: cumora
     volumes:
       - cumora-pgdata:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d cumora"]
       interval: 5s
@@ -36,12 +34,13 @@ services:
     image: redis:7
     container_name: cumora-redis
     restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
+    command: ["/bin/sh", "-c", 'exec redis-server --requirepass "$$REDIS_PASSWORD"']
     volumes:
       - cumora-redis-data:/data
-    ports:
-      - "6379:6379"
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", 'REDISCLI_AUTH="$$REDIS_PASSWORD" redis-cli ping | grep -qx PONG']
       interval: 5s
       timeout: 3s
       retries: 12
@@ -56,8 +55,8 @@ services:
     environment:
       # .env carries localhost URLs for host-run dev; inside compose the
       # datastores are reached by service name. `environment` wins over env_file.
-      DATABASE_URL: postgres://postgres:cumora@db:5432/cumora
-      REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/cumora
+      REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}@redis:6379/0
       NODE_ENV: production
     # The schema is owned by the one-shot `migrate` service below. Keeping
     # DDL out of this long-lived container avoids a migration failure turning
@@ -97,7 +96,7 @@ services:
     restart: "no"
     env_file: .env
     environment:
-      DATABASE_URL: postgres://postgres:cumora@db:5432/cumora
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/cumora
       NODE_ENV: production
     command: ["npm", "run", "migrate"]
     depends_on:

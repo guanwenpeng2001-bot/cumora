@@ -139,7 +139,7 @@ for (const scenario of ['matching', 'changed', 'unclassified', 'ignore', 'defer'
     const result = await run({ ...options, onInboxDeferred: (value: any) => deferred.push(value) })
     assert.equal(calls, scenario === 'matching' ? 0 : 1)
     assert.equal(result, scenario === 'ignore' || scenario === 'defer' ? undefined : 'continue to brain')
-    assert.deepEqual(reads, scenario === 'ignore' ? [{ agentId: 'a', conversationId: 'c', upToMessageId: 'two', consumedMessageIds: ['one', 'two'] }] : [])
+    assert.deepEqual(reads, scenario === 'ignore' ? [{ agentId: 'a', conversationId: 'c', upToMessageId: 'two', consumedMessageIds: ['one', 'two'], safetyGeneration: undefined }] : [])
     assert.deepEqual(deferred, scenario === 'defer' ? [{ messageIds: ['one', 'two'], retryAt: 12345 }] : [])
   })
 }
