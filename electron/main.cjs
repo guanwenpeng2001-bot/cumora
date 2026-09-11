@@ -11,6 +11,14 @@ const autoUpdater = require('./autoUpdater.cjs')
 const isDev = !app.isPackaged
 const DEV_URL = process.env.ELECTRON_RENDERER_URL || 'http://localhost:5180'
 
+// A console write into a broken pipe (the app was spawned from a terminal
+// that has since closed, or from a launcher without stdout) emits EPIPE on
+// the stream. Without a listener that becomes an uncaught exception and the
+// whole main process dies — most visibly from electron-updater's logger.
+for (const stream of [process.stdout, process.stderr]) {
+  stream?.on?.('error', () => {})
+}
+
 // ============== `app://` scheme — packaged renderer is served from here ==
 // Production packaging would otherwise load index.html over `file://`,
 // where ANY absolute path (`/logo.png`, `/assets/index-XYZ.js`, the
