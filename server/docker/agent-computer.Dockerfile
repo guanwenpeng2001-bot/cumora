@@ -140,11 +140,14 @@ COPY server/docker/agent-computer-cumora.sh /usr/local/bin/cumora
 # the two common cases; anything richer goes through `opencli browser`
 # directly. Stays in /usr/local/bin so bash finds it via PATH.
 COPY server/docker/agent-computer-cumora-web.sh /usr/local/bin/cumora-web
-RUN chmod +x /usr/local/bin/cumora /usr/local/bin/cumora-web /usr/local/bin/cumora-fuse
-
-# Entrypoint: mount FUSE first, then exec the agent loop.
+# A Windows checkout can hand COPY CRLF text (core.autocrlf + a tree that
+# predates .gitattributes); a CR in the shebang makes every `cumora` call
+# inside the pod fail with "cannot execute". Normalise the scripts in the
+# image so the artifact is correct regardless of how the context was cloned.
 COPY server/docker/agent-computer-entrypoint.sh /usr/local/bin/agent-entrypoint
-RUN chmod +x /usr/local/bin/agent-entrypoint
+RUN sed -i 's/\r$//' /usr/local/bin/cumora /usr/local/bin/cumora-web /usr/local/bin/agent-entrypoint \
+  && chmod +x /usr/local/bin/cumora /usr/local/bin/cumora-web /usr/local/bin/cumora-fuse /usr/local/bin/agent-entrypoint \
+  && ! grep -q "$(printf '\r')" /usr/local/bin/cumora /usr/local/bin/cumora-web /usr/local/bin/agent-entrypoint
 
 # Env contract — orchestrator injects all of these at pod-spawn time:
 #   CUMORA_AGENT_ID            which agent to wake
