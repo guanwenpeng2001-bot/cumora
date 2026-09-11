@@ -26,7 +26,7 @@ function daemonFixture(result: any, options: { payload?: any; backoffUntil?: num
   const source = read('../agents/computer/daemon.ts')
   const ast = ts.createSourceFile('daemon.ts', source, ts.ScriptTarget.Latest, true)
   const cls = ast.statements.find(n => ts.isClassDeclaration(n) && n.name?.text === 'AgentRunner') as ts.ClassDeclaration
-  const methods = cls.members.filter(n => n.name && ['inboxTriage', 'recordTriageUsage'].includes(n.name.getText(ast))).map(n => n.getText(ast)).join('\n')
+  const methods = cls.members.filter(n => n.name && ['inboxTriage', 'recordTriageUsage', 'assertRunning'].includes(n.name.getText(ast))).map(n => n.getText(ast)).join('\n')
   const reports: any[] = [], warnings: string[] = []
   let calls = 0
   const payload = 'payload' in options ? options.payload : { instructions: 'classify', input: 'message', messageIds: ['m1'] }
@@ -47,6 +47,7 @@ function daemonFixture(result: any, options: { payload?: any; backoffUntil?: num
   const runner = new Runner()
   Object.assign(runner, { triageBackoffUntil: options.backoffUntil ?? 0, cfg: { serverUrl: 'fake' }, agent: { id: 'a' }, triageModel: () => 'requested-model',
     triageModelPin: () => 'requested-model', engineEnv: () => ({}),
+    teardown: { signal: new AbortController().signal }, stopped: false,
     adapter: { id: 'codex', classify: async () => { calls++; if (result instanceof Error) throw result; return result } },
   })
   return { reports, warnings, calls: () => calls, run: () => runner.inboxTriage('token', new Map([['c', 'm1']])) }
