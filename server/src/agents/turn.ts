@@ -65,7 +65,8 @@ import {
 import { compactHistory, compactHistoryWithSummary, DEFAULT_COMPACTION_POLICY, type CompactionPolicy, estimateHistoryTokens, estimateTokens, truncateChars, truncateUtf8 } from './turn-compaction.js'
 import { measuredUsage, addUsage, EMPTY_USAGE, type TokenUsage } from './cost.js'
 import { recordLlmCall, type LlmCallContext, type LlmCallRecord } from './llm-ledger.js'
-import { resolveDeclaredAutoRelayTarget } from './auto-relay.js'
+import { TurnMessageConsumption } from './message-consumption.js'
+import { hasDraftDelivery, resolveDeclaredAutoRelayTarget } from './auto-relay.js'
 import {
   canDrainSteer,
   drainSteer,
@@ -142,6 +143,7 @@ export interface AgentTurnOptions {
   /** Short scheduler note rendered only for idle synthetic wakes. */
   idleReason?: string
   /** Server-side support-model triage note for ordinary message wakes. */
+  excludeInboxMessageIds?: string[]
   triageNote?: string
   /** Fingerprint of message IDs classified by the scheduler; only exact matches are reusable. */
   triageBoundary?: string
@@ -168,9 +170,6 @@ export interface AgentTurnOptions {
 //
 // The local read wrappers below exist only as call-site shorthand so
 // the runAgentTurn body reads naturally — they delegate one-to-one.
-async function loadInbox(agentId: string, rc: AgentRuntimeClient = runtime): Promise<InboxRow[]> {
-  return rc.loadInbox(agentId)
-}
 
 async function loadMemory(
   agentId: string,
@@ -1141,7 +1140,9 @@ function shouldVerifyTerminalCompletion(args: {
 }): boolean {
   if (args.inbox.length === 0) return false
   if (!isTerminalTurnStatus(args.status.status)) return false
-  if (args.postedReplyViaTool) return false
+  // Explicit relay is verified against its delivery receipt below. A progress reply
+  // does not prove that another requested action was completed.
+  if (args.status.assistantTextAction === 'reply') return false
   // Non-reply side effects can be complete work (e.g. update a kanban card) or
   // only an acknowledgement (e.g. react with eyes before producing an image).
   // Let a model judge the exact context from the inbox + typed side effects.
@@ -1690,7 +1691,7 @@ async function runAgentTurnWithBudget(agentId: string, options: AgentTurnOptions
   const agentMc: AgentModelConfig | null = persona.modelConfig ?? null
   const turnContextWindow = agentMc?.contextWindow
 
-  const inbox = await loadInbox(agentId)
+  const inbox = await runtime.loadInbox(agentId, { excludeMessageIds: options.excludeInboxMessageIds })
   const wake = classifyWake(options, inbox.length)
   const isIdleWake = wake.idle
   const isBackgroundScanWake = wake.backgroundScan
@@ -1761,7 +1762,8 @@ async function runAgentTurnWithBudget(agentId: string, options: AgentTurnOptions
         const seen = new Map<string, string>()
         for (const row of inbox) seen.set(row.conversation_id, row.id)
         await Promise.all([...seen].map(([conversationId, upToMessageId]) =>
-          runtime.markConversationRead({ agentId, conversationId, upToMessageId })))
+          runtime.markConversationRead({ agentId, conversationId, upToMessageId,
+            consumedMessageIds: inbox.filter(row => row.conversation_id === conversationId).map(row => row.id) })))
       }
       return
     }
@@ -1880,9 +1882,10 @@ async function runAgentTurnWithBudget(agentId: string, options: AgentTurnOptions
   // do not see it unless the agent sends it with `cumora reply` or explicitly
   // declares a relay target through `set_turn_status`.
   let pendingAssistantText = ''
-  // Did the CLI report a visible reply side effect during this turn? Used to
-  // suppress auto-relay so we don't double-post when the model already replied
-  // in hop N and then produced more assistant text in hop N+1.
+  // Track visible activity for diagnostics; only a matching draft receipt
+  // establishes final delivery, and activity alone cannot complete a turn.
+  const consumption = new TurnMessageConsumption()
+  for (const msg of inbox) consumption.inject(msg.id, msg.conversation_id)
   let postedReplyViaTool = false
   let replySideEffectChannelUnreliable = false
   let cliSideEffectsThisTurn: CliSideEffect[] = []
@@ -2475,6 +2478,7 @@ Mechanics:
     const batch = drainSteer(agentId)
     if (!batch || batch.length === 0) return false
 
+    for (const msg of batch) consumption.queue(msg.messageId, msg.conversationId)
     let renderedText: string
     let usedSummary = false
     if (batch.length <= STEER_SUMMARIZE_THRESHOLD) {
@@ -2488,7 +2492,10 @@ Mechanics:
       content: [{ type: 'input_text', text: renderedText }],
     } as unknown as ResponseInputItem)
     nextInput = history
-    for (const s of batch) steeredMessageIds.set(s.messageId, s.conversationId)
+    for (const s of batch) {
+      steeredMessageIds.set(s.messageId, s.conversationId)
+      consumption.inject(s.messageId, s.conversationId)
+    }
     // Record the rendered byte count toward the per-turn byte budget.
     // Use the rendered text length (not raw bodies) — that's what
     // actually lands in the model's context.
@@ -2856,31 +2863,6 @@ Mechanics:
           stage: 'status_required',
         }).catch(() => { /* observability best-effort */ })
         continue
-      }
-      if (postedReplyViaTool) {
-        const inferredStatus: TurnStatusOutput = {
-          status: 'done',
-          reason: 'posted a user-visible reply but omitted turn status',
-          nextStep: '',
-          assistantTextAction: 'none',
-          replyConversationId: null,
-        }
-        declaredTurnStatus = inferredStatus
-        loopExitReason = 'turn_status'
-        finalSummary = `Turn status inferred: done — ${inferredStatus.reason}`
-        await runtime.recordEvent({
-          runId, agentId, companyId: runCompanyId,
-          kind: 'turn.status_inferred',
-          level: 'warn',
-          title: 'Inferred done after user-visible reply despite missing turn status',
-          data: {
-            hop: hop + 1,
-            nudgeCount: statusRequiredNudgeCount,
-            sideEffects: cliSideEffectsThisTurn,
-          },
-          stage: 'turn_status_inferred',
-        }).catch(() => { /* observability best-effort */ })
-        break
       }
       if (
         (isIdleWake || isBackgroundScanWake) &&
@@ -3250,12 +3232,17 @@ Mechanics:
     }).catch(() => { /* observability best-effort */ })
   }
 
+  if (declaredTurnStatus?.assistantTextAction === 'reply' && !pendingAssistantText) {
+    finalStatus = 'failed'
+    finalError = 'Declared assistant-text relay has no draft to deliver'
+  }
+
   // Model-declared assistant-text relay: plain assistant output is treated as
   // an unsent draft. Relay it only when the model explicitly declared a target
   // through set_turn_status and the target validates against this turn's inbox.
   if (
-    pendingAssistantText &&
-    !postedReplyViaTool &&
+    finalStatus === 'completed' && pendingAssistantText &&
+    !hasDraftDelivery(cliSideEffectsThisTurn, declaredTurnStatus?.replyConversationId ?? null, pendingAssistantText) &&
     replySideEffectChannelUnreliable &&
     declaredTurnStatus?.assistantTextAction === 'reply'
   ) {
@@ -3273,7 +3260,7 @@ Mechanics:
       },
       stage: 'auto_relay_suppressed',
     }).catch(() => { /* observability best-effort */ })
-  } else if (pendingAssistantText && !postedReplyViaTool && declaredTurnStatus?.assistantTextAction === 'reply') {
+  } else if (finalStatus === 'completed' && pendingAssistantText && !hasDraftDelivery(cliSideEffectsThisTurn, declaredTurnStatus?.replyConversationId ?? null, pendingAssistantText) && declaredTurnStatus?.assistantTextAction === 'reply') {
     const target = resolveDeclaredAutoRelayTarget(inbox, {
       action: declaredTurnStatus.assistantTextAction,
       conversationId: declaredTurnStatus.replyConversationId,
@@ -3322,7 +3309,8 @@ Mechanics:
         argsJson: JSON.stringify({ command: `cumora reply ${target.conversationId} ${escaped} --continue` }),
         ns: namespace,
       })
-      if (!relay.ok) {
+      const receipt = bashOutputSideEffects(relay.output)
+      if (!relay.ok || !hasDraftDelivery(receipt, target.conversationId, pendingAssistantText)) {
         finalStatus = 'failed'
         finalError = `Auto-relay reply failed: ${relay.error ?? 'unknown error'}`
         await runtime.recordEvent({
@@ -3334,6 +3322,8 @@ Mechanics:
           stage: 'auto_relay_error',
         })
       } else {
+        cliSideEffectsThisTurn.push(...receipt)
+        postedReplyViaTool = true
         toolCallCount += 1
       }
     } else {
@@ -3358,26 +3348,6 @@ Mechanics:
   // above prevents redundant LLM calls when nothing has changed.
 
   if (finalStatus === 'completed') {
-    if (markInitialInboxReadOnCompletion) {
-      const readTargets = new Map<string, string>()
-      for (const msg of inbox) readTargets.set(msg.conversation_id, msg.id)
-      await Promise.all([...readTargets.entries()].map(([conversationId, upToMessageId]) =>
-        runtime.markConversationRead({ agentId, conversationId, upToMessageId }),
-      )).catch((err) => console.warn(`[turn] ${agentId} markInitialInboxRead failed`,
-        err instanceof Error ? err.message : err))
-      await runtime.recordEvent({
-        runId, agentId, companyId: runCompanyId,
-        kind: 'turn.read_advanced_after_verified_completion',
-        level: 'debug',
-        title: 'Advanced inbox read cursor after verified non-reply completion',
-        data: {
-          conversations: [...readTargets.keys()],
-          messageIds: [...readTargets.values()],
-        },
-        stage: 'completed',
-      }).catch(() => { /* observability best-effort */ })
-    }
-    rememberCompletedInbox(agentId, fingerprint)
     finalSummary ||= `Completed with ${toolCallCount} tool call${toolCallCount === 1 ? '' : 's'}`
 
     // Cross-conversation reply audit (observability-only — never blocks).
@@ -3530,6 +3500,8 @@ Mechanics:
           }).catch(() => { /* event log best-effort */ })
         }
       } catch (err) {
+        finalStatus = 'failed'
+        finalError = `Workspace commit failed: ${errorText(err)}`
         console.error(`[turn] ${agentId} fs commit failed`, err)
         await runtime.recordEvent({
           runId, agentId, companyId: runCompanyId,
@@ -3577,44 +3549,21 @@ Mechanics:
         .catch((err) => console.warn(`[turn] ${agentId} unmarkThinking failed`,
           err instanceof Error ? err.message : err))
     }
-    // Steering: advance conversation_reads for every messageId we
-    // consumed via a mid-turn steer drain. Without this, the next
-    // wake's loadInbox would surface those messages again and the
-    // agent would re-process them. Per-conversation: take the
-    // latest message id we drained (markConversationRead picks the
-    // max created_at via GREATEST(...) so out-of-order is fine).
-    if (steeredMessageIds.size > 0) {
-      // Group by conversation so we only do one upsert per convo.
-      const byConvo = new Map<string, string>()
-      for (const [messageId, conversationId] of steeredMessageIds) {
-        byConvo.set(conversationId, messageId) // last one wins; GREATEST handles ordering server-side
-      }
-      // Bounded per-call timeout — without this, the finally block can
-      // hang for `HttpRuntimeClient.timeoutMs * N` (default 30s × N) if
-      // the cumora-server is unreachable. Per-call 5s budget is enough
-      // for a healthy upsert; failures fall through to console.warn
-      // (the message stays in inbox; next wake re-reads it which is
-      // fine — markConversationRead is purely an OPTIMIZATION, not a
-      // correctness requirement).
-      const MARK_READ_TIMEOUT_MS = 5_000
-      const withTimeout = (p: Promise<void>, label: string): Promise<void> => {
-        return Promise.race<void>([
-          p,
-          new Promise<void>((_, rej) =>
-            setTimeout(() => rej(new Error(`${label} timed out after ${MARK_READ_TIMEOUT_MS}ms`)), MARK_READ_TIMEOUT_MS),
-          ),
-        ])
-      }
-      await Promise.all([...byConvo.entries()].map(([conversationId, upToMessageId]) =>
-        withTimeout(
-          runtime.markConversationRead({ agentId, conversationId, upToMessageId }),
-          `markConversationRead(${conversationId})`,
-        ).catch((err) =>
-          console.warn(`[turn] ${agentId} markConversationRead(${conversationId}) failed`,
-            err instanceof Error ? err.message : err),
-        ),
-      ))
+    // Queued and injected are not completion. Failed/cancelled turns retain
+    // every uncompleted message, including holes between out-of-order steers.
+    const completed = finalStatus === 'completed' && !options.signal?.aborted
+      && (markInitialInboxReadOnCompletion || postedReplyViaTool
+        || (declaredTurnStatus !== null && isTerminalTurnStatus(declaredTurnStatus.status)))
+    let receiptsCommitted = completed
+    for (const [conversationId, consumedMessageIds] of consumption.finish(completed)) {
+      await runtime.markConversationRead({ agentId, conversationId,
+        upToMessageId: consumedMessageIds[0], consumedMessageIds,
+      }).catch(err => {
+        receiptsCommitted = false
+        console.warn(`[turn] ${agentId} consumption receipt failed`, err)
+      })
     }
+    if (receiptsCommitted && !options.signal?.aborted) rememberCompletedInbox(agentId, fingerprint)
     // Steering: also discard any items left over in the in-process
     // queue (saturated past MAX_BATCHES_PER_TURN, or arrived after
     // the loop exited but before this finally ran). They're still in

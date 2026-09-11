@@ -29,11 +29,13 @@ function daemonFixture(result: any, options: { payload?: any; backoffUntil?: num
   const methods = cls.members.filter(n => n.name && ['inboxTriage', 'recordTriageUsage', 'assertRunning'].includes(n.name.getText(ast))).map(n => n.getText(ast)).join('\n')
   const reports: any[] = [], warnings: string[] = []
   let calls = 0
+  let timeout: (() => void) | undefined
   const payload = 'payload' in options ? options.payload : { instructions: 'classify', input: 'message', messageIds: ['m1'] }
   const { Runner } = compile(`export class Runner { ${methods} }`, {
     ...triage, randomUUID, AbortController, Date, runtimePolicy: { values: { triageTimeoutMs: 1 } }, TRIAGE_DIR: 'fake-triage', CURRENT_VERSION: 'test-daemon',
+    acquireRunnerSlot: async (semaphore: { acquire: () => Promise<void> }) => semaphore.acquire(),
     triageSem: { acquire: async () => {}, release() {} }, spawnPacer: { gate: async () => {} },
-    setTimeout: options.abort ? (fn: () => void) => { fn(); return 1 } : () => 1, clearTimeout() {},
+    setTimeout: (fn: () => void) => { if (options.abort) timeout = fn; return 1 }, clearTimeout() {},
     mkdir: async () => { if (options.mkdirFails) throw new Error('local directory failure') },
     runtimeGet: async () => payload,
     runtimeBest: async (_url: string, path: string, _token: string, report: any) => {
@@ -49,7 +51,7 @@ function daemonFixture(result: any, options: { payload?: any; backoffUntil?: num
   Object.assign(runner, { triageBackoffUntil: options.backoffUntil ?? 0, cfg: { serverUrl: 'fake' }, agent: { id: 'a' }, triageModel: () => 'requested-model',
     triageModelPin: () => 'requested-model', engineEnv: () => ({}),
     teardown: { signal: new AbortController().signal }, stopped: false, provider: null,
-    adapter: { id: 'codex', classify: async () => { calls++; if (result instanceof Error) throw result; return result } },
+    adapter: { id: 'codex', classify: async () => { calls++; timeout?.(); if (result instanceof Error) throw result; return result } },
   })
   return { reports, warnings, calls: () => calls, run: () => runner.inboxTriage('token', new Map([['c', 'm1']])) }
 }

@@ -9,6 +9,8 @@ import { test, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import ts from 'typescript'
+import { enqueueWakeJob, claimWakeJobs, finishWakeJob, renewWakeJob } from '../agents/wake-queue.js'
+import { wakeQueueFixture } from './wake-queue-fixture.js'
 
 // Run production declarations against in-memory I/O, without importing the
 // server's eagerly connected Redis singleton or touching a database.
@@ -19,10 +21,10 @@ function schedulerFixture(overrides: Record<string, any> = {}) {
     '_shouldRetryEnsurePodFailure', '_shouldRetryWakeFailure', '_wakeRetryDelayMs',
     'triageRetryDelayMs', 'shouldDeliverToMutedAgent', 'escapeRegex', 'wakeRetryId',
     'scheduleWakeRetry', 'postWakeRetryExhaustedNotice', 'pollWakeRetriesOnce',
-    'wakeOne', 'wakeOneCaptured', 'claimAndWake', 'startWakeRetryWorker']
+    'wakeOne', 'wakeOneCaptured', 'claimAndWake', 'persistMessageWake', 'runClaimedWakeJob', 'fanOutWake', 'startWakeRetryWorker']
   const constants = ['lowPriWindowStart', 'lowPriUsed', 'lowPriDroppedInWindow',
     'SAFE_MESSAGE_ENSURE_FAILURE', 'MESSAGE_WAKE_RETRY_MAX_ATTEMPTS', 'WAKE_RETRY_MAX_ATTEMPTS',
-    'WAKE_RETRY_DUE_KEY', 'WAKE_RETRY_JOB_KEY', 'WAKE_RETRY_BATCH_SIZE']
+    'WAKE_RETRY_QUEUE', 'WAKE_EVENT_QUEUE', 'WAKE_RETRY_BATCH_SIZE']
   const selected = ast.statements.filter(n =>
     ts.isFunctionDeclaration(n) && names.includes(n.name?.text ?? '') ||
     ts.isVariableStatement(n) && n.declarationList.declarations.some(d => constants.includes(d.name.getText(ast))),
@@ -31,9 +33,13 @@ function schedulerFixture(overrides: Record<string, any> = {}) {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
   }).outputText
   let now = 1_000_000
-  const jobs = new Map<string, string>(), due = new Map<string, number>()
-  const wakes: any[] = [], notices: any[] = [], scripts: string[] = []
+  const queue = wakeQueueFixture()
+  const jobs = queue.hash('cumora:wake-retry:jobs'), due = queue.sorted('cumora:wake-retry:due')
+  const wakes: any[] = [], notices: any[] = [], scripts = queue.scripts
   const deps = {
+    enqueueWakeJob, claimWakeJobs, finishWakeJob, renewWakeJob,
+    wakeFanoutSem: { run: (task: () => any) => task() },
+    wake: async () => {}, probePodApplication: async () => 'not_applied',
     Date: { now: () => now }, Math: { ...Math, min: Math.min, max: Math.max, round: Math.round, floor: Math.floor, random: () => 0 },
     automationNumber: (key: string) => key === 'triage_backoff_base_ms' ? 30_000 : key === 'triage_backoff_max_ms' ? 60_000 : 20,
     withServerSettingsSnapshot: (fn: () => any) => fn(),
@@ -44,34 +50,12 @@ function schedulerFixture(overrides: Record<string, any> = {}) {
     ensurePod: async () => ({ ok: true, created: true }),
     notifyAlert: async () => {},
     inprocClient: { loadInbox: async () => [{ id: 'unread' }], postSystemNotice: async (notice: any) => { notices.push(notice); return { posted: true } } },
-    redis: { eval: async (script: string, _count: number, _jobs: string, _due: string, ...args: any[]) => {
-      scripts.push(script)
-      if (script.includes('ZRANGEBYSCORE')) {
-        assert.match(script, /HGET/)
-        assert.match(script, /HDEL/)
-        assert.match(script, /ZREM/)
-        const claimed: string[] = []
-        for (const [id, score] of [...due].sort((a, b) => a[1] - b[1])) {
-          if (score > args[0] || claimed.length >= args[1]) continue
-          const raw = jobs.get(id)
-          due.delete(id); jobs.delete(id)
-          if (raw) claimed.push(raw)
-        }
-        return claimed
-      }
-      assert.match(script, /math.min/)
-      assert.match(script, /math.max/)
-      const [id, raw, at] = args
-      const incoming = JSON.parse(raw), previous = jobs.get(id)
-      if (previous) incoming.attempt = Math.max(JSON.parse(previous).attempt, incoming.attempt)
-      jobs.set(id, JSON.stringify(incoming)); due.set(id, Math.min(due.get(id) ?? at, at))
-      return 1
-    } },
+    redis: queue.store,
     ...overrides,
   }
   const api: Record<string, any> = {}
   new Function('exports', ...Object.keys(deps), output)(api, ...Object.values(deps))
-  return { api, jobs, due, wakes, notices, scripts, advance: (ms: number) => { now += ms } }
+  return { api, queue, jobs, due, wakes, notices, scripts, advance: (ms: number) => { now += ms } }
 }
 const { api: { _consumeLowPriorityWakeBudget, _resetLowPriorityWakeBudgetForTests,
   _shouldRetryEnsurePodFailure, _shouldRetryWakeFailure, _wakeRetryDelayMs, shouldDeliverToMutedAgent } } = schedulerFixture()
@@ -184,7 +168,7 @@ test('retry identity survives host-to-triage transition; earlier deadline and la
   await enqueue(f, 1, 'triage', { triageBoundary: 'new-boundary' })
   assert.equal(f.jobs.size, 1)
   const job = JSON.parse([...f.jobs.values()][0])
-  assert.equal(job.id, 'agent:message.new:convo')
+  assert.equal(job.id, 'agent:message.new:convo:-')
   assert.equal(job.options.triageBoundary, 'new-boundary')
   assert.equal(job.attempt, 4)
   assert.ok([...f.due.values()][0] < firstDue)
@@ -236,7 +220,7 @@ test('resting triage exhaustion retains a low-frequency inbox probe and heals wi
   assert.equal(classifications, 1)
   assert.equal(spawns, 1, 'resting Pod is started after classifier recovery')
   assert.equal(f.wakes.length, 0, 'cold-start drain needs no replay')
-  assert.equal(f.jobs.size, 0)
+  assert.equal(f.jobs.size, 1, 'apply is not yet delivery')
 })
 
 test('recovery probe stops for an externally drained inbox', async () => {
@@ -268,73 +252,49 @@ for (const code of ['capacity_denied', 'pod_apply_failed', 'watchdog_timeout']) 
       ensurePod: async (_id: string, options: any) => {
         const triage = options && typeof options.then === 'function' ? await options : options
         assert.equal(triage.triageNote, 'single triage')
-        return { ok: false, created: false, code, reason: 'temporary failure' }
+        return { ok: false, created: false, code, reason: 'temporary failure', applyState: code === 'capacity_denied' ? 'not_applied' : 'unknown' }
       } })
     await f.api.wakeOne('agent', 'message.new', 'convo', null, { placementTriage: true })
     assert.equal(triages, 1, 'preserve fix-lm single triage with forwarded boundary')
-    assert.equal(f.jobs.size, code === 'capacity_denied' ? 1 : 0)
+    assert.equal(f.jobs.size, 1, 'ambiguous failures retain a probe; pre-apply failures retry')
   })
 }
 
-test('message claim renews across a long fan-out and cannot renew another owner', async () => {
-  let now = 0, sequence = 0, fanouts = 0
-  let claim: { owner: string; until: number } | null = null
-  const timers: Array<{ fn: () => void; cleared: boolean; unref: () => void }> = []
-  let release!: () => void
-  const blocked = new Promise<void>(resolve => { release = resolve })
-  const f = schedulerFixture({ randomUUID: () => String(++sequence), wake: async () => { fanouts++; await blocked },
-    setInterval: (fn: () => void) => { const t = { fn, cleared: false, unref() {} }; timers.push(t); return t },
-    clearInterval: (t: typeof timers[number]) => { t.cleared = true },
-    redis: {
-      set: async (_key: string, owner: string, _ex: string, seconds: number) => {
-        if (claim && claim.until > now) return null
-        claim = { owner, until: now + seconds * 1000 }; return 'OK'
-      },
-      eval: async (script: string, _n: number, _key: string, owner: string) => {
-        assert.match(script, /GET/); assert.match(script, /EXPIRE/)
-        if (!claim || claim.owner !== owner) return 0
-        claim.until = now + 300_000; return 1
-      },
-    },
-  })
-  const first = f.api.claimAndWake({ message: { id: 'm' } })
-  await new Promise(resolve => setImmediate(resolve))
-  for (let i = 0; i < 20; i++) { now += 30_000; timers[0].fn() }
-  await f.api.claimAndWake({ message: { id: 'm' } })
-  assert.equal(fanouts, 1, '600s fan-out still has one owner')
-  claim = { owner: 'new-owner', until: now + 1 }
-  timers[0].fn()
-  assert.equal(claim.until, now + 1)
-  release(); await first
-  assert.equal(timers[0].cleared, true)
+test('initial events persist before fan-out and survive worker failure', async () => {
+  let attempts = 0
+  const f = schedulerFixture({ wake: async () => { if (++attempts === 1) throw Error('recipient lookup offline') } })
+  const event = { type: 'message.new', message: { id: 'm' } }
+  await f.api.claimAndWake(event)
+  await f.api.claimAndWake(event)
+  const events = f.queue.hash('cumora:wake-event:jobs')
+  assert.equal(events.size, 1)
+  assert.equal(attempts, 0, 'publishing only persists; completion requires fan-out')
+  await f.api.pollWakeRetriesOnce()
+  assert.equal(events.size, 1)
+  f.advance(300_000)
+  await f.api.pollWakeRetriesOnce()
+  assert.equal(attempts, 2)
+  assert.equal(events.size, 0)
 })
 
-test('message.new cold start overlaps inbox triage with ensurePod', async () => {
-  let triageStarted = false, ensureStarted = false
-  let releaseTriage!: () => void, releaseEnsure!: () => void
-  const triageGate = new Promise<void>(resolve => { releaseTriage = resolve })
-  const ensureGate = new Promise<void>(resolve => { releaseEnsure = resolve })
+test('online managed wake never calls ensurePod or podHealth', async () => {
+  let delivered = false
   const f = schedulerFixture({
-    deliverWake: async () => 0,
-    triageWakeRecipient: async () => {
-      triageStarted = true
-      await triageGate
-      return { triageNote: 'n', triageBoundary: 'b' }
-    },
-    ensurePod: async () => {
-      ensureStarted = true
-      await ensureGate
-      return { ok: true, created: true }
-    },
+    ensurePod: () => { assert.fail('Kubernetes must not enter an online delivery') },
+    deliverWake: async () => { delivered = true; return 1 },
   })
-  const pending = f.api.wakeOne('agent', 'message.new', 'convo', null, { placementTriage: true })
-  await new Promise(resolve => setImmediate(resolve))
-  assert.equal(triageStarted, true)
-  assert.equal(ensureStarted, true)
-  releaseTriage()
-  releaseEnsure()
-  await pending
-  assert.equal(f.wakes.length, 0)
+  assert.equal(await f.api.wakeOne('agent', 'message.new', 'convo', null, { placementTriage: true }), true)
+  assert.equal(delivered, true)
+})
+
+test('cold wake tries delivery before starting Pod and keeps reconciliation until subscribed', async () => {
+  const order: string[] = []
+  const f = schedulerFixture({ deliverWake: async () => { order.push('deliver'); return 0 },
+    ensurePod: async () => { order.push('ensure'); return { ok: true, created: true, applyState: 'applied' } },
+  })
+  await f.api.wakeOne('agent', 'message.new', 'convo', null, { placementTriage: true })
+  assert.deepEqual(order, ['deliver', 'ensure'])
+  assert.equal(JSON.parse([...f.jobs.values()][0]).options.applyState, 'applied')
 })
 
 test('a thrown host lookup is queued before runtime selection', async () => {
@@ -370,4 +330,33 @@ test('continued triage outage re-enters bounded retries after a recovery probe, 
   for (let i = 0; i < 5; i++) { f.advance(60_000); await f.api.pollWakeRetriesOnce() }
   assert.equal(JSON.parse([...f.jobs.values()][0]).options.recoveryProbe, true)
   assert.equal(f.wakes.length, 0, 'outage never bypasses the triage gate')
+})
+
+for (const observed of ['unknown', 'applied', 'not_applied', 'recoverable']) test(`unknown apply probes ${observed} before deciding to create`, async () => {
+  let probes = 0, applies = 0
+  const f = schedulerFixture({ deliverWake: async () => 0,
+    probePodApplication: async () => { probes++; return observed },
+    ensurePod: async () => { applies++; return { ok: true, created: true, applyState: 'applied' } },
+  })
+  await f.api.wakeOne('agent', 'message.new', 'convo', null, { placementTriage: true, applyState: 'unknown' })
+  assert.equal(probes, 1)
+  assert.equal(applies, observed === 'not_applied' || observed === 'recoverable' ? 1 : 0)
+  assert.equal(f.jobs.size, 1)
+})
+
+test('pre-apply bootstrap failure retries without relying on the capacity code', async () => {
+  const f = schedulerFixture({ deliverWake: async () => 0,
+    ensurePod: async () => ({ ok: false, created: false, code: 'pod_apply_failed', reason: 'bootstrap offline', applyState: 'not_applied' }),
+  })
+  await f.api.wakeOne('agent', 'message.new', 'convo', null, { placementTriage: true })
+  assert.equal(JSON.parse([...f.jobs.values()][0]).options.applyState, 'not_applied')
+})
+
+test('fan-out durably preserves each recipient and message identity', async () => {
+  const f = schedulerFixture()
+  await f.api.fanOutWake(['a', 'b'], 'c', null, null, 'm1')
+  await f.api.fanOutWake(['a', 'b'], 'c', null, null, 'm1')
+  await f.api.fanOutWake(['a'], 'c', null, null, 'm2')
+  assert.equal(f.jobs.size, 3)
+  assert.equal(f.wakes.length, 0)
 })

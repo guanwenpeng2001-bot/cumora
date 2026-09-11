@@ -154,7 +154,9 @@ function drainFixture() {
   const deps = {
     Date: { now: () => now }, mergeWakeTurnOptions, parseWakeData, decidePodExit,
     process: { env: {} },
-    runtime: { loadInbox: async () => inbox },
+    runtime: { loadInbox: async (_id: string, options: { excludeMessageIds?: string[]; onlyMessageIds?: string[] } = {}) =>
+      inbox.filter(row => !options.excludeMessageIds?.includes(row.id)
+        && (!options.onlyMessageIds || options.onlyMessageIds.includes(row.id))) },
     runAgentTurn: async (_id: string, options: any) => { calls.push(options); await run(options) },
     setTimeout: (fn: () => void, ms: number) => timer(fn, ms, false),
     setInterval: (fn: () => void, ms: number) => timer(fn, ms, true),
@@ -256,7 +258,8 @@ for (const source of ['wake', 'probe']) {
       await flushDrain()
     }
     assert.equal(f.calls.length, 2)
-    assert.equal(f.pod.state.inboxDeferred, null)
-    assert.ok(f.timers[0].cleared)
+    assert.deepEqual(f.pod.state.inboxDeferred.messageIds, ['old'], 'new human work cannot acknowledge old deferred work')
+    assert.deepEqual(f.calls[1].excludeInboxMessageIds, ['old'])
+    assert.ok(f.timers[0].cleared, 'old deadline is rearmed after the fresh turn')
   })
 }

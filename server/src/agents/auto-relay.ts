@@ -10,6 +10,20 @@
  * runtime client.
  */
 
+import { createHash } from 'node:crypto'
+import type { CliSideEffect } from './cli-result.js'
+
+export function replyDraftId(body: string): string {
+  return createHash('sha256').update(body).digest('hex')
+}
+
+export function hasDraftDelivery(effects: readonly CliSideEffect[], conversationId: string | null, body: string): boolean {
+  const draftId = replyDraftId(body)
+  return effects.some(effect => effect.event === 'message.posted' && effect.command === 'reply'
+    && effect.visibleToUser !== false && Boolean(effect.messageId)
+    && effect.conversationId === conversationId && effect.draftId === draftId)
+}
+
 export interface AutoRelayInboxRow {
   conversation_id: string
   conversation_kind: string | null

@@ -149,7 +149,7 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
     return companyIdForConversation(conversationId)
   }
 
-  async loadInbox(agentId: string): Promise<InboxRow[]> {
+  async loadInbox(agentId: string, options: { excludeMessageIds?: string[]; onlyMessageIds?: string[] } = {}): Promise<InboxRow[]> {
     // Resolve membership through the normalized participant-led index, then
     // pull each conversation's unread tail with the message index. This avoids
     // both the old JSONB seq-scan and its dedicated enable_seqscan=off session.
@@ -216,6 +216,10 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
               AND (co.current_member OR mm.delivery_recipient_id = $1)
               AND (mm.author_id <> $1 OR mm.delivery_recipient_id = $1)
               AND ROW(mm.created_at, mm.id) > ROW(co.lr_at, co.lr_id)
+              AND NOT (mm.id = ANY($2::text[]))
+              AND ($3::text[] IS NULL OR mm.id = ANY($3::text[]))
+              AND NOT EXISTS (SELECT 1 FROM agent_message_consumptions consumed
+                WHERE consumed.agent_id = $1 AND consumed.message_id = mm.id)
               AND (
                 mm.delivery_recipient_id = $1
                 OR NOT co.muted
@@ -231,15 +235,16 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
                      AND quoted.author_id = $1
                 )
               )
-            ORDER BY mm.created_at ASC, mm.id ASC
+            ORDER BY EXISTS (SELECT 1 FROM participants human WHERE human.id = mm.author_id AND human.kind = 'human') DESC, mm.created_at ASC, mm.id ASC
             LIMIT 200
          ) m ON true
          LEFT JOIN participants p ON p.id = m.author_id AND p.company_id = co.company_id
-        ORDER BY m.created_at ASC, m.id ASC
+        ORDER BY (p.kind = 'human') DESC NULLS LAST, m.created_at ASC, m.id ASC
         LIMIT 200`,
-      [agentId],
+      [agentId, options.excludeMessageIds ?? [], options.onlyMessageIds ?? null],
     )
-    await refreshAttachmentUrls(rows)
+    const work = rows.some(row => row.author_kind === 'human') ? rows.filter(row => row.author_kind === 'human') : rows
+    await refreshAttachmentUrls(work)
     // NOTE: This used to call recordSeen() here to advance the freshness-
     // preflight boundary, but that fired for EVERY caller of loadInbox —
     // including `maybeSteer`'s "probe to decide whether to steer" path
@@ -252,7 +257,7 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
     // nothing > 2 and let the duplicate post). Advance is now done by
     // the SERVER endpoint handler that actually shows to brain, see
     // runtime/server.ts /inbox (handler chooses advance vs probe).
-    return rows
+    return work
   }
 
   /**
@@ -1097,53 +1102,24 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
     companyId?: string | null
     conversationId: string
     upToMessageId: string
+    consumedMessageIds?: string[]
   }, dbClient?: PoolClient): Promise<void> {
-    // Monotonic advance via ROW comparison: only update the cursor
-    // when the incoming (created_at, message_id) pair lexicographically
-    // exceeds the existing pair. This makes the operation idempotent,
-    // out-of-order safe, AND collision-safe — two messages with the
-    // same created_at are distinguishable by id.
-    try {
-      await (dbClient ?? pool).query(
-        `WITH msg AS (
-           SELECT m.created_at, m.id AS message_id
-             FROM messages m
-             JOIN conversations c
-               ON c.id = m.conversation_id AND c.company_id = m.company_id
-             JOIN participants p
-               ON p.id = $2 AND p.company_id = c.company_id
-              AND p.kind = 'agent' AND p.departed_at IS NULL
-            WHERE m.id = $1 AND m.conversation_id = $3
-              AND ($4::text IS NULL OR c.company_id = $4)
-              AND (
-                EXISTS (
-                  SELECT 1 FROM conversation_members cm
-                   WHERE cm.conversation_id = c.id
-                     AND cm.company_id = c.company_id
-                     AND cm.participant_id = $2
-                )
-                OR (m.kind = 'system' AND m.delivery_recipient_id = $2)
-              )
-         )
-         INSERT INTO conversation_reads (user_id, conversation_id, last_read_at, last_read_message_id)
-         SELECT $2, $3, msg.created_at, msg.message_id FROM msg
-         ON CONFLICT (user_id, conversation_id)
-         DO UPDATE SET
-           last_read_at = CASE
-             WHEN ROW(EXCLUDED.last_read_at, EXCLUDED.last_read_message_id)
-                > ROW(conversation_reads.last_read_at, conversation_reads.last_read_message_id)
-             THEN EXCLUDED.last_read_at ELSE conversation_reads.last_read_at END,
-           last_read_message_id = CASE
-             WHEN ROW(EXCLUDED.last_read_at, EXCLUDED.last_read_message_id)
-                > ROW(conversation_reads.last_read_at, conversation_reads.last_read_message_id)
-             THEN EXCLUDED.last_read_message_id ELSE conversation_reads.last_read_message_id END`,
-        [args.upToMessageId, args.agentId, args.conversationId, args.companyId ?? null],
-      )
-    } catch (err) {
-      if (dbClient) throw err
-      console.warn(`[runtime] markConversationRead(${args.agentId}, ${args.conversationId}, ${args.upToMessageId}) failed — dropping`,
-        err instanceof Error ? err.message : err)
-    }
+    // Exact receipts never move a high-water mark across an unconsumed gap.
+    await (dbClient ?? pool).query(
+      `INSERT INTO agent_message_consumptions (agent_id, message_id)
+       SELECT $1, m.id FROM messages m
+       JOIN conversations c ON c.id = m.conversation_id AND c.company_id = m.company_id
+       JOIN participants p ON p.id = $1 AND p.company_id = c.company_id
+         AND p.kind = 'agent' AND p.departed_at IS NULL
+       WHERE m.conversation_id = $2 AND m.id = ANY($3::text[])
+         AND ($4::text IS NULL OR c.company_id = $4)
+         AND (EXISTS (SELECT 1 FROM conversation_members cm
+           WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id
+             AND cm.participant_id = $1)
+           OR (m.kind = 'system' AND m.delivery_recipient_id = $1))
+       ON CONFLICT DO NOTHING`,
+      [args.agentId, args.conversationId, args.consumedMessageIds ?? [args.upToMessageId], args.companyId ?? null],
+    )
   }
 }
 

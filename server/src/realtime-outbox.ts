@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import type { PoolClient, QueryResult, QueryResultRow } from 'pg'
 import { pool } from './db/pool.js'
 import { stripLoneSurrogates } from './agents/text-safety.js'
-import { publish, type BroadcastEvent } from './redis.js'
+import { publish, type BroadcastEvent, type MessageNewEvent } from './redis.js'
 
 /**
  * Transactional realtime outbox.
@@ -124,8 +124,8 @@ async function claimBatch(limit: number): Promise<PendingBroadcast[]> {
           AND discarded_at IS NULL
           AND available_at <= NOW()
           AND (locked_until IS NULL OR locked_until < NOW())
-          AND attempts < $3
-          AND created_at > NOW() - ($4 * INTERVAL '1 hour')
+          AND (payload->>'type' = 'message.new' OR (attempts < $3
+            AND created_at > NOW() - ($4 * INTERVAL '1 hour')))
         ORDER BY created_at, id
         LIMIT $1
         FOR UPDATE SKIP LOCKED
@@ -150,6 +150,7 @@ async function discardExpired(): Promise<number> {
             last_error = COALESCE(last_error, 'delivery budget exhausted')
       WHERE published_at IS NULL
         AND discarded_at IS NULL
+        AND payload->>'type' IS DISTINCT FROM 'message.new'
         AND (attempts >= $1 OR created_at <= NOW() - ($2 * INTERVAL '1 hour'))`,
     [MAX_ATTEMPTS, MAX_AGE_HOURS],
   )
@@ -209,6 +210,7 @@ async function markFailed(row: PendingBroadcast, error: unknown): Promise<void> 
  */
 export async function drainRealtimeOutbox(options: {
   publishFn?: (channel: string, event: BroadcastEvent) => Promise<void>
+  persistWakeFn?: (event: MessageNewEvent) => Promise<void>
   batchSize?: number
 } = {}): Promise<OutboxDrainResult> {
   const publishFn = options.publishFn ?? publish
@@ -222,6 +224,10 @@ export async function drainRealtimeOutbox(options: {
   // connection spike. Promise.all is safe at this batch size (32).
   await Promise.all(rows.map(async (row) => {
     try {
+      if (row.payload.type === 'message.new') {
+        const persistWake = options.persistWakeFn ?? (await import('./agents/scheduler.js')).persistMessageWake
+        await persistWake(row.payload)
+      }
       await publishFn(row.channel, row.payload)
       await markPublished(row.id)
       published += 1

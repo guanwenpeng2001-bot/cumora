@@ -134,8 +134,11 @@ export class HttpRuntimeClient implements AgentRuntimeClient {
   }
 
 
-  async loadInbox(_agentId: string): Promise<InboxRow[]> {
-    const out = await this.call<{ rows: InboxRow[] }>('GET', '/inbox')
+  async loadInbox(_agentId: string, options: { excludeMessageIds?: string[]; onlyMessageIds?: string[] } = {}): Promise<InboxRow[]> {
+    const query = new URLSearchParams()
+    for (const id of options.excludeMessageIds ?? []) query.append('exclude', id)
+    for (const id of options.onlyMessageIds ?? []) query.append('only', id)
+    const out = await this.call<{ rows: InboxRow[] }>('GET', `/inbox?${query}`)
     return out.rows
   }
 
@@ -478,15 +481,18 @@ export class HttpRuntimeClient implements AgentRuntimeClient {
     agentId: string
     conversationId: string
     upToMessageId: string
+    consumedMessageIds?: string[]
   }): Promise<void> {
     try {
       await this.call<{ ok: true }>('POST', `/conversation/mark-read`, {
         conversationId: args.conversationId,
         upToMessageId: args.upToMessageId,
+        consumedMessageIds: args.consumedMessageIds,
       })
     } catch (err) {
-      console.warn(`[runtime] markConversationRead failed — dropping`,
+      console.warn(`[runtime] markConversationRead failed — retaining unread messages`,
         err instanceof Error ? err.message : err)
+      throw err
     }
   }
 }

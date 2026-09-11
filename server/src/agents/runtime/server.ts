@@ -220,7 +220,17 @@ runtimeRouter.post('/conversation/company-id', withAgent(async (_c, req, res) =>
 }))
 
 runtimeRouter.get('/inbox', withAgent(async (c, req, res) => {
-  const rows = await inprocClient.loadInbox(c.sub)
+  const excluded = [req.query.exclude ?? []].flat()
+  if (excluded.length > 1000 || excluded.some(id => typeof id !== 'string')) {
+    res.status(400).json({ error: 'invalid inbox exclusions' }); return
+  }
+  const only = req.query.only === undefined ? undefined : [req.query.only].flat()
+  if (only && (only.length > 1000 || only.some(id => typeof id !== 'string'))) {
+    res.status(400).json({ error: 'invalid inbox selectors' }); return
+  }
+  const rows = await inprocClient.loadInbox(c.sub, {
+    excludeMessageIds: excluded as string[], onlyMessageIds: only as string[] | undefined,
+  })
   // Advance the freshness-preflight "seen" boundary per-convo to the max
   // seq we just surfaced — the caller will SHOW these rows to the agent
   // (default path: daemon's snapshotUnread → brief → big brain). For
@@ -895,15 +905,19 @@ runtimeRouter.get('/worklog/peek', withAgent(async (c, req, res) => {
   res.json({ entries: gate.result ?? [] })
 }))
 
-// ─── steering dedup: advance per-agent conversation_reads cursor ─────
+// ─── completed-message receipts (initial inbox and steer inputs) ─────
 //
 // At turn end the pod tells us which messages it already consumed via
 // a mid-turn steer drain, so the next wake's loadInbox doesn't surface
 // them again. agentId from JWT (c.sub).
 runtimeRouter.post('/conversation/mark-read', withAgent(async (c, req, res) => {
-  const body = req.body as { conversationId?: string; upToMessageId?: string } | undefined
+  const body = req.body as { conversationId?: string; upToMessageId?: string; consumedMessageIds?: string[] } | undefined
   if (!body?.conversationId || !body.upToMessageId) {
     res.status(400).json({ error: 'conversationId and upToMessageId required' }); return
+  }
+  if (body.consumedMessageIds !== undefined && (!Array.isArray(body.consumedMessageIds)
+    || body.consumedMessageIds.length > 1000 || body.consumedMessageIds.some(id => typeof id !== 'string'))) {
+    res.status(400).json({ error: 'invalid consumedMessageIds' }); return
   }
   const gate = await withRuntimeMessageReadAuthorization({
     agentId: c.sub,
@@ -915,6 +929,7 @@ runtimeRouter.post('/conversation/mark-read', withAgent(async (c, req, res) => {
       companyId: c.companyId,
       conversationId: body.conversationId as string,
       upToMessageId: body.upToMessageId as string,
+      consumedMessageIds: body.consumedMessageIds,
     }, client),
   })
   if (!gate.authorized) { res.status(403).json({ error: 'message is not readable in that conversation' }); return }

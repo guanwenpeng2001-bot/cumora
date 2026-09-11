@@ -9,6 +9,7 @@
  * for structured output if the agent wants to parse fields.
  */
 
+import { replyDraftId } from './auto-relay.js'
 import { pool } from '../db/pool.js'
 import type { PoolClient } from 'pg'
 import { storage, freshenAttachmentUrl, type StoredAttachment } from '../storage.js'
@@ -1070,6 +1071,8 @@ async function loadInbox(agentId: string): Promise<InboxItem[]> {
                 WHERE member.conversation_id = c.id
                   AND member.participant_id = $1
              ) OR m.delivery_recipient_id = $1)
+        AND NOT EXISTS (SELECT 1 FROM agent_message_consumptions consumed
+          WHERE consumed.agent_id = $1 AND consumed.message_id = m.id)
         AND (m.author_id <> $1 OR m.delivery_recipient_id = $1)
         AND m.created_at > COALESCE(
           (SELECT last_read_at FROM conversation_reads
@@ -2345,12 +2348,7 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
       [messageId, convoId, me, finalBody, sequence, attachment ? JSON.stringify(attachment) : null, resolvedQuotedId, companyId],
     )
     await txClient.query(`UPDATE conversations SET updated_at = NOW() WHERE id = $1`, [convoId])
-    await txClient.query(
-      `INSERT INTO conversation_reads (user_id, conversation_id, last_read_at)
-       VALUES ($1, $2, NOW())
-       ON CONFLICT (user_id, conversation_id) DO UPDATE SET last_read_at = NOW()`,
-      [me, convoId],
-    )
+    // Sending is not consumption. The turn commits exact input receipts after completion.
     await enqueueBroadcast(txClient, CH_MESSAGE_NEW, {
       type: 'message.new',
       conversationId: convoId,
@@ -2427,6 +2425,7 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
     medium: 'chat',
     conversationId: convoId,
     messageId,
+    draftId: replyDraftId(finalBody),
     sequence,
     authorId: me,
     companyId,

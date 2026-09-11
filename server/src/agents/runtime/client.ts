@@ -222,7 +222,7 @@ export interface AgentRuntimeClient {
    *  and we need to know which company the run belongs to. */
   getConversationCompanyId(conversationId: string): Promise<string | null>
   /** Unread messages across all of the agent's conversations. */
-  loadInbox(agentId: string): Promise<InboxRow[]>
+  loadInbox(agentId: string, options?: { excludeMessageIds?: string[]; onlyMessageIds?: string[] }): Promise<InboxRow[]>
   /** Hybrid memory retrieval: pinned + semantic + recent, filtered to
    *  global + the current project(s). Pass conversationIds (preferred)
    *  or projectIds; empty/omitted scope = GLOBAL only (no-project wake). */
@@ -399,17 +399,14 @@ export interface AgentRuntimeClient {
    *  the racy window between turn-end and the next message arriving. */
   clearBusyHeartbeat(agentId: string): Promise<void>
 
-  /** Advance the per-agent conversation_reads cursor to (at least) the
-   *  given message's created_at. Used at turn end to mark messages
-   *  the agent already consumed via a steer drain mid-turn — without
-   *  this, the next wake's loadInbox would surface those messages
-   *  again and the agent would re-process them. Idempotent: if the
-   *  cursor is already past, this is a no-op. */
+  /** Persist exact completed-message receipts. Legacy callers without a set
+   * confirm only upToMessageId; no implicit prefix may cross an unread gap. */
   markConversationRead(args: {
     agentId: string
     companyId?: string | null
     conversationId: string
     upToMessageId: string
+    consumedMessageIds?: string[]
   }): Promise<void>
 }
 

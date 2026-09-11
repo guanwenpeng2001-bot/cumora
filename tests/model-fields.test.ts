@@ -527,3 +527,27 @@ test('computers refresh coalesces in-flight and keeps byId when unchanged', asyn
   assert.equal(calls, 2)
   assert.equal(useComputers.getState().byId, byId)
 })
+
+test('staged agent save preserves provider id through a failed host assignment retry', async () => {
+  const { AgentEditorSave } = await import('../src/components/agentEditorSave')
+  let profiles = 0, attempts = 0
+  const seen: unknown[][] = []
+  const save = new AgentEditorSave({
+    agentId: 'a', profile: { name: 'Agent', systemPrompt: 'Prompt' },
+    create: { requestId: 'create-profile', name: 'Agent', systemPrompt: 'Prompt', providerProfile: 'work' },
+    assignment: { computerId: 'local', engine: 'claude', inherit: false, model: 'work/pin', fastModel: null, providerProfile: 'work' },
+    skills: null, mcp: null, expectedEngine: 'claude', engineError: 'wrong engine',
+  })
+  const client = {
+    updateAgent: async () => { profiles++ },
+    assignAgentComputer: async (...args: unknown[]) => {
+      seen.push(args)
+      if (++attempts === 1) throw new Error('offline')
+      return { ok: true, kind: 'local', engine: 'claude' }
+    },
+  }
+  await assert.rejects(save.run(client as any, () => true, () => {}), /offline/)
+  assert.equal(await save.run(client as any, () => true, () => {}), true)
+  assert.equal(profiles, 1)
+  assert.deepEqual(seen, Array(2).fill(['a', 'local', 'claude', false, 'work/pin', null, 'work']))
+})

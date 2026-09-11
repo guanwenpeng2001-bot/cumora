@@ -84,9 +84,14 @@ async function admitInboxDrain(agentId: string): Promise<boolean> {
   const deferred = state.inboxDeferred
   if (!deferred) return true
   if (Date.now() < deferred.retryAt) {
-    const inbox = await runtime.loadInbox(agentId)
-    const ids = new Set(deferred.messageIds)
-    if (inbox.some(row => ids.has(row.id)) && inbox.every(row => ids.has(row.id))) return false
+    const waiting = await runtime.loadInbox(agentId, { onlyMessageIds: deferred.messageIds })
+    if (waiting.length > 0) {
+      // Probe outside the deferred work page, before LIMIT is applied.
+      const fresh = await runtime.loadInbox(agentId, { excludeMessageIds: deferred.messageIds })
+      if (fresh.length === 0) return false
+      mergeTurnOptions({ excludeInboxMessageIds: deferred.messageIds })
+      return true
+    }
   }
   state.inboxDeferred = null
   if (inboxRetryTimer) clearTimeout(inboxRetryTimer)

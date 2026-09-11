@@ -820,14 +820,15 @@ export type PodApplyState = 'not_applied' | 'applied' | 'unknown'
 export type EnsurePodResult = EnsurePodOutcome & { applyState: PodApplyState }
 
 /** An ambiguous apply must be reconciled before any new creation attempt. */
-export async function probePodApplication(agentId: string): Promise<PodApplyState> {
+export async function probePodApplication(agentId: string): Promise<PodApplyState | 'recoverable'> {
   const result = await kubectlWithRetry(['get', 'pod', podName(agentId), '--ignore-not-found=true', '-o', 'json'])
   if (result.code !== 0) return 'unknown'
   if (!result.out.trim()) return 'not_applied'
   try {
-    const pod = JSON.parse(result.out) as { status?: { phase?: string } }
-    if (pod.status?.phase === 'Failed' || pod.status?.phase === 'Succeeded') return 'not_applied'
-    return 'applied'
+    JSON.parse(result.out) // Reject malformed health responses before reconciliation.
+    const health = parsePodHealth(result.out)
+    if (health.phase === 'Failed' || health.phase === 'Succeeded' || stuckPendingReason(health)) return 'recoverable'
+    return health.phase === 'Running' || health.phase === 'Pending' ? 'applied' : 'unknown'
   } catch { return 'unknown' }
 }
 
@@ -988,13 +989,13 @@ async function ensurePodImpl(agentId: string, signal: AbortSignal, initialTriage
     return null
   }
   const h = await podHealth(agentId)
-  if (h.phase === 'Running') {
+  if (h.phase === 'Running' && !stuckPendingReason(h)) {
     progress.value = 'applied'
     const denied = await recheckPlacement()
     if (denied) return denied
     return { created: false, ok: true, reason: 'already running' }
   }
-  if (h.phase === 'Pending') {
+  if (h.phase === 'Pending' || h.phase === 'Running') {
     const stuck = stuckPendingReason(h)
     if (!stuck) {
       progress.value = 'applied'
