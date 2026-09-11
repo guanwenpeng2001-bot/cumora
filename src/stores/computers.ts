@@ -30,6 +30,7 @@ function fromApi(c: ApiComputer): Computer {
     latestDaemonVersion: c.latest_daemon_version ?? null,
     latestDaemonDownloadUrl: c.latest_daemon_download_url ?? null,
     daemonOutdated: c.daemon_outdated ?? false,
+    engineDefaults: c.engine_defaults,
     runtimePolicy: c.runtimePolicy,
   }
 }

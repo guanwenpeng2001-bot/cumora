@@ -100,7 +100,7 @@ test('T5 isolated PostgreSQL: tenant binding, rollback, delivery and summaries',
 
   await t.test('device delivery SQL filters resource and computer ownership and revoked devices', async () => {
     await db.query("ALTER TABLE participants ADD name text, ADD role text, ADD system_prompt text, ADD model text, ADD fast_model text")
-    await db.query("ALTER TABLE computers ADD company_id text, ADD revoked_at timestamptz, ADD available_engines jsonb DEFAULT '[]', ADD detected_engines jsonb DEFAULT '[]'")
+    await db.query("ALTER TABLE computers ADD company_id text, ADD revoked_at timestamptz, ADD available_engines jsonb DEFAULT '[]', ADD detected_engines jsonb DEFAULT '[]', ADD engine_defaults jsonb DEFAULT '{}'")
     await db.query("UPDATE computers SET company_id = 'c1'")
     const source = readFileSync(new URL('../agents/computer/registry.ts', import.meta.url), 'utf8')
     const start = source.indexOf('`SELECT p.id, p.name', source.indexOf('export async function listAgentsForComputer')) + 1

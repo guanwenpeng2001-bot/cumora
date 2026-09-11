@@ -109,7 +109,16 @@ test('runtime callId index is registered after the immutable version 13 prefix',
   assert.equal(SCHEMA_MIGRATIONS[13].checksum, runtimeCallIdIndexChecksum())
   assert.equal(SCHEMA_MIGRATIONS[13].name, '0014_runtime_call_id_index')
   const prior = current().slice(0, 13)
-  assert.deepEqual(validateMigrationHistory(prior, { allowPending: true }).pending, [SCHEMA_MIGRATIONS[13]])
-  // The added index changes performance only; schema 13 remains readable.
-  assert.equal(validateMigrationHistory(prior).currentVersion, 13)
+  assert.deepEqual(
+    validateMigrationHistory(prior, { allowPending: true }).pending,
+    [SCHEMA_MIGRATIONS[13], SCHEMA_MIGRATIONS[14]],
+  )
+})
+
+test('the engine defaults migration matches its immutable manifest checksum', async () => {
+  const { engineDefaultsChecksum } = await import('../db/migrations/0015-engine-defaults.js')
+  assert.equal(engineDefaultsChecksum(), SCHEMA_MIGRATIONS[14].checksum)
+  assert.equal(SCHEMA_MIGRATIONS[14].name, '0015_engine_defaults')
+  const prior = current().slice(0, 14)
+  assert.deepEqual(validateMigrationHistory(prior, { allowPending: true }).pending, [SCHEMA_MIGRATIONS[14]])
 })

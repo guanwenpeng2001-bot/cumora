@@ -222,11 +222,16 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
   const modelCatalog = selectedComputer?.detectedEngines
     ?.find((engine) => engine.id === selectedEngineId)
     ?.modelCatalog
+  // Per-computer engine model defaults (configured on the Computer card).
+  // When the local CLI catalog can't name a default (e.g. custom endpoints),
+  // these Cumora-side settings show as the hint for "follow engine default".
+  const engineDefaultModel = selectedComputer?.engineDefaults?.[selectedEngineId]?.model ?? undefined
+  const engineDefaultFastModel = selectedComputer?.engineDefaults?.[selectedEngineId]?.fastModel ?? undefined
   const modelOptions: Array<ComboboxOption<string>> = [
     {
       value: '',
       label: t('agent.followEngineDefault'),
-      hint: modelCatalog?.defaultModel ?? undefined,
+      hint: engineDefaultModel ?? modelCatalog?.defaultModel ?? undefined,
     },
     ...(modelCatalog?.models ?? []).map((option) => ({
       value: option.id,
@@ -241,7 +246,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
     {
       value: '',
       label: t('agent.followSmallBrainDefault'),
-      hint: modelCatalog?.defaultFastModel ?? undefined,
+      hint: engineDefaultFastModel ?? modelCatalog?.defaultFastModel ?? undefined,
     },
     ...(modelCatalog?.models ?? []).map((option) => ({
       value: option.id,

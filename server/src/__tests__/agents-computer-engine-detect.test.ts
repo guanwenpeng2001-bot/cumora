@@ -11,6 +11,7 @@ process.env.CUMORA_DEFAULT_CLAUDE_MODEL = 'claude-opus-4-7'
 process.env.CUMORA_DEFAULT_GEMINI_MODEL = 'gemini-2.5-pro'
 process.env.CUMORA_DEFAULT_QWEN_MODEL = 'qwen3-coder-plus'
 process.env.CUMORA_DEFAULT_ANTIGRAVITY_MODEL = 'Gemini 3.5 Flash (High)'
+process.env.CUMORA_DEFAULT_KIMI_MODEL = 'kimi-k2'
 process.env.OPENAI_API_KEY ??= 'test-key'
 
 const registry = await import('../agents/computer/registry.js')
@@ -72,6 +73,7 @@ test('listAgentsForComputer keeps an explicit model and pins CUMORA_DEFAULT_* wh
         { id: 'aster', name: 'Aster', role: 'reviewer', systemPrompt: null, engine: 'antigravity', model: null, fastModel: null },
         { id: 'atlas', name: 'Atlas', role: 'analyst', systemPrompt: null, engine: 'gemini', model: null, fastModel: null },
         { id: 'orion', name: 'Orion', role: 'coder', systemPrompt: null, engine: 'qwen', model: null, fastModel: null },
+        { id: 'kimi-agent', name: 'Kimi', role: 'coder', systemPrompt: null, engine: 'kimi', model: null, fastModel: null },
       ] }
     }
     return { rows: [] }
@@ -87,6 +89,8 @@ test('listAgentsForComputer keeps an explicit model and pins CUMORA_DEFAULT_* wh
   assert.equal(agents[3]?.engine, 'gemini')
   assert.equal(agents[4]?.model, 'qwen3-coder-plus')
   assert.equal(agents[4]?.engine, 'qwen')
+  assert.equal(agents[5]?.model, 'kimi-k2')
+  assert.equal(agents[5]?.engine, 'kimi')
 })
 
 test('listAgentsForComputer prefers a reported local default without overriding an explicit pin', async () => {
@@ -129,6 +133,34 @@ test('listAgentsForComputer prefers a reported local default without overriding 
   assert.equal(agents[2]?.model, null, 'custom provider with unnamed default must not inherit the deploy pin')
   assert.equal(agents[2]?.fastModel, 'provider/haiku')
   assert.equal('detectedEngines' in (agents[1] ?? {}), false)
+})
+
+test('listAgentsForComputer prefers computer engine_defaults over deploy pins, including kimi', async () => {
+  installPoolMock(({ sql }) => {
+    if (/FROM participants/.test(sql)) {
+      return { rows: [
+        {
+          id: 'kimi-agent', name: 'Kimi', role: null, systemPrompt: null, engine: 'kimi', model: null, fastModel: null,
+          engineDefaults: { kimi: { model: 'kimi-computer-default', fastModel: 'kimi-fast' } },
+        },
+        {
+          id: 'claude-agent', name: 'Claude', role: null, systemPrompt: null, engine: 'claude', model: null, fastModel: null,
+          engineDefaults: { claude: { model: 'computer-sonnet' } },
+        },
+        {
+          id: 'pinned', name: 'Pinned', role: null, systemPrompt: null, engine: 'kimi', model: 'agent-pin', fastModel: null,
+          engineDefaults: { kimi: { model: 'should-not-win', fastModel: 'kimi-fast' } },
+        },
+      ] }
+    }
+    return { rows: [] }
+  })
+  const agents = await registry.listAgentsForComputer('comp-1')
+  assert.equal(agents[0]?.model, 'kimi-computer-default')
+  assert.equal(agents[0]?.fastModel, 'kimi-fast')
+  assert.equal(agents[1]?.model, 'computer-sonnet')
+  assert.equal(agents[2]?.model, 'agent-pin')
+  assert.equal(agents[2]?.fastModel, 'kimi-fast')
 })
 
 test('reportDetectedEngines keeps the previous default first when it is still installed', async () => {

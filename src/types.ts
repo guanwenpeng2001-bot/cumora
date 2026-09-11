@@ -43,6 +43,15 @@ export interface DetectedEngine {
   modelCatalog?: EngineModelCatalog
 }
 
+/** Per-engine default model settings. Stored on the Computer and inherited
+ *  by agents when their own model/fastModel is not set. */
+export interface EngineDefaults {
+  model?: string | null
+  fastModel?: string | null
+}
+
+export type EngineDefaultsMap = Partial<Record<EngineId, EngineDefaults>>
+
 export interface Computer {
   id: string
   name: string
@@ -68,6 +77,9 @@ export interface Computer {
   latestDaemonDownloadUrl?: string | null
   /** True when the daemon is behind the latest version → show the upgrade banner. */
   daemonOutdated?: boolean
+  /** Per-engine default model settings. Agents inherit these when their own
+   *  model/fastModel is not set. */
+  engineDefaults?: EngineDefaultsMap
   /** BYOA runtime-policy application state, when the daemon reports it. */
   runtimePolicy?: {
     desired: string
