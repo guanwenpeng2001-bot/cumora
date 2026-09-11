@@ -69,3 +69,18 @@ test('resolveDeclaredAutoRelayTarget: duplicate inbox rows collapse by lookup, n
   assert.ok(out)
   assert.equal(out!.conversationId, 'c-dm')
 })
+
+test('the declared relay carries the anti-monologue bypass, last', async () => {
+  // parseArgs treats `--continue <token>` as a value flag, so the bypass must
+  // come AFTER the body. The defect was in what turn.ts's relay sends, not in
+  // cmdReply — pin the command shape so a tidy-up cannot drop the flag or
+  // move it in front of the draft.
+  const { readFile } = await import('node:fs/promises')
+  const source = await readFile(new URL('../agents/turn.ts', import.meta.url), 'utf8')
+  const relay = source.slice(source.indexOf('Auto-relayed assistant text as reply'))
+  const block = relay.slice(0, relay.indexOf('if (!relay.ok)'))
+  assert.match(
+    block, /command: `cumora reply \$\{target\.conversationId\} \$\{escaped\} --continue`/,
+    'the declared relay must bypass the anti-monologue gate with --continue last',
+  )
+})

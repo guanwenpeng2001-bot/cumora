@@ -57,6 +57,19 @@ test('parseArgs: interleaved positionals and flags', () => {
   assert.deepEqual(r.flags, { quote: 'm-abc' })
 })
 
+test('parseArgs: --continue last is boolean; before the body it consumes the body', () => {
+  // Declared relay must put `--continue` LAST. parseArgs treats
+  // `--continue <token>` as a VALUE flag, so flag-before-body eats the
+  // draft and posts an empty message (or no body at all).
+  const last = parseArgs(['reply', 'convo-1', 'the actual answer', '--continue'])
+  assert.deepEqual(last.positional, ['reply', 'convo-1', 'the actual answer'])
+  assert.equal(last.flags.continue, true)
+
+  const first = parseArgs(['reply', 'convo-1', '--continue', 'the actual answer'])
+  assert.deepEqual(first.positional, ['reply', 'convo-1'])
+  assert.equal(first.flags.continue, 'the actual answer')
+})
+
 test('parseArgs: last write wins for repeated flag', () => {
   const r = parseArgs(['--as', 'A', '--as', 'B', 'kanban'])
   assert.equal(r.flags.as, 'B', 'last value of a repeated flag wins')

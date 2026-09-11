@@ -80,7 +80,10 @@ services:
       interval: 10s
       timeout: 5s
       retries: 12
-      start_period: 30s
+      # Match the k8s startupProbe budget (~300s). Schema verification retries
+      # with exponential backoff plus bounded connection timeouts can exceed
+      # the previous 30s grace window even though migrate already finished.
+      start_period: 300s
 
   # Run schema migrations exactly once before the API starts. Compose waits
   # for this service to exit successfully through server.depends_on.

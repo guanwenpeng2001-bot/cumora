@@ -232,12 +232,14 @@ its RBAC subject, all namespaced resources, the runtime URL and agent namespace.
 The application Pods only read `schema_migrations` and refuse to start outside
 their supported version range. They never execute DDL during startup.
 
-The checked-in manifest points `livenessProbe` directly at `/api/livez`,
-which is a pure process liveness endpoint and does not touch the database.
-`readinessProbe` remains DB-backed so traffic is removed while the database is
-unavailable without restarting healthy application processes.
-Readiness should stay on `/api/health` — that one *should* pull a pod out of
-rotation when its dependencies are gone.
+The checked-in manifest gives the server a startup grace window for the
+schema gate: `/api/livez` is checked every 5 seconds with a 60-failure budget
+(about 5 minutes). Once startup succeeds, liveness continues to use the
+DB-free `/api/livez` process check while readiness uses `/api/health` to keep a
+pod out of rotation when its dependencies are unavailable. The production
+Deploy workflow reapplies the same probe contract during its Pod-template
+patch, so a manual `kubectl apply` does not require a follow-up imperative
+probe patch.
 
 ## 7. Verify end-to-end
 
