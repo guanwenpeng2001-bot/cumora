@@ -22,6 +22,7 @@ interface SaveSnapshot {
     inherit: boolean
     model: string | null
     fastModel: string | null
+    providerProfile?: string | null
   }
   skills: string[] | null
   mcp: string[] | null
@@ -69,7 +70,7 @@ export class AgentEditorSave {
             let engine = this.createdEngine
             if (snapshot.assignment) {
               const a = snapshot.assignment
-              const out = await client.assignAgentComputer(this.agentId!, a.computerId, a.engine, a.inherit, a.model, a.fastModel)
+              const out = await client.assignAgentComputer(this.agentId!, a.computerId, a.engine, a.inherit, a.model, a.fastModel, a.providerProfile)
               engine = out.engine
             }
             if (snapshot.expectedEngine && engine !== snapshot.expectedEngine) throw new Error(snapshot.engineError)

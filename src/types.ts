@@ -27,6 +27,7 @@ export interface EngineModelCatalog {
 }
 
 export interface DetectedEngine {
+  providerProfiles?: Array<{ id: string; label: string; model: string; fastModel: string }>
   id: EngineId
   bin: string
   path: string | null
@@ -123,6 +124,8 @@ export interface Participant {
   /** Advanced per-agent model settings (managed agents only; BYOA is
    *  engine-managed). Mirrors server/src/agents/model-config.ts. */
   modelConfig?: AgentModelConfig | null
+  /** Local Claude credential/endpoint profile id; independent of modelConfig. */
+  providerProfile?: string | null
   /** small-brain (fast/auxiliary) model override */
   fastModel?: string | null
   /** id of the Computer this agent runs on (null/undefined = Cumora Cloud) */

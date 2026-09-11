@@ -26,9 +26,13 @@ export class EngineSessionStore {
     sessionsDir: string,
     private readonly agentId: string,
     engine: EngineId,
+    /** Opaque extra dimension of session identity (currently the provider
+     * profile fingerprint). A different value is a different endpoint or
+     * account, so its pointer must never be offered to the other one. */
+    scope?: string,
   ) {
     this.engine = engine
-    this.sessionFile = join(sessionsDir, agentId, `${engine}.session`)
+    this.sessionFile = join(sessionsDir, agentId, `${engine}${scope ? `.${scope}` : ''}.session`)
     this.legacyFile = join(sessionsDir, `${agentId}.session`)
   }
 

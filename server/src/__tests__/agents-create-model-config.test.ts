@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
 import ts from 'typescript'
 import * as modelConfig from '../agents/model-config.js'
+import { isProviderProfileId } from '../agents/computer/provider-profiles.js'
 import type * as Creation from '../agents/create.js'
 
 const source = ts.transpileModule(readFileSync(new URL('../agents/create.ts', import.meta.url), 'utf8'), {
@@ -13,7 +14,7 @@ const input: Creation.CreateAgentRecordInput = {
   companyId: 'company-test', tier: 'pro', maxActiveAgents: 10,
   requestId: 'request-model-001', name: 'Test Agent', systemPrompt: 'Only a test agent',
 }
-function fixture() {
+function fixture(allowProvider = false) {
   const records: any[] = [], statements: string[] = [], inserts: unknown[][] = []
   let connections = 0, releases = 0
   const client = {
@@ -37,7 +38,11 @@ function fixture() {
     if (name === './model-config.js') return modelConfig
     if (name === './computer/registry.js') return {
       cloudComputerId: () => 'cloud-test',
-      resolveComputerAssignment: () => { throw new Error('Unexpected placement lookup') },
+      resolveComputerAssignment: (args: any) => {
+        if (!allowProvider) throw new Error('Unexpected placement lookup')
+        return args.engine === 'claude' && ['work', 'personal'].includes(args.providerProfile)
+          ? { kind: 'local', engine: 'claude', inherit: false } : null
+      },
     }
     throw new Error('Unexpected dependency: ' + name)
   })
@@ -111,20 +116,21 @@ test('legacy creation hash accepts matching config but rejects changed config', 
   assert.equal(f.inserts.length, 1)
 })
 
-function routeFixture() {
-  const f = fixture()
+function routeFixture(allowProvider = false) {
+  const f = fixture(allowProvider)
   const router = readFileSync(new URL('../api/router.ts', import.meta.url), 'utf8')
   const begin = router.indexOf('function readAgentBody(')
   const end = router.indexOf("api.put('/agents/:id'", begin)
   assert.ok(begin >= 0 && end > begin)
-  const output = ts.transpileModule(router.slice(begin, end), {
+  const providerReader = router.slice(router.indexOf('function readProviderProfile('), router.indexOf('// Assign an agent to a computer'))
+  const output = ts.transpileModule(providerReader + router.slice(begin, end), {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
   }).outputText
   let handler: any, portraits = 0
   class HttpError extends Error { constructor(readonly status: number, message: string) { super(message) } }
   const bindings = {
     api: { post(path: string, fn: any) { assert.equal(path, '/agents'); handler = fn } },
-    ...modelConfig, ...f, HttpError,
+    ...modelConfig, ...f, HttpError, isProviderProfileId,
     requireCompanyRole: async () => ({ userId: 'user-test', companyId: input.companyId }),
     companyPlanTier: async () => 'pro', TIER_LIMITS: { pro: { agentsPerCompany: 10 } },
     pool: { query: async (sql: string) => { assert.match(sql, /INSERT INTO agent_workspace/); return { rows: [] } } },
@@ -182,4 +188,31 @@ test('POST /agents blank models and empty config preserve inherited defaults', a
   assert.equal(f.inserts[0][8], null)
   assert.equal(f.inserts[0][9], null)
   assert.equal(f.inserts[0][16], null)
+})
+
+
+test('profile selection persists beside model_config and remains part of creation retry identity', async () => {
+  const f = routeFixture(true)
+  const body = { ...input, computerId: 'local-test', engine: 'claude', inherit: false,
+    providerProfile: 'work', model: 'work/pin', fastModel: 'work/fast', modelConfig: { effort: 'high' } }
+  assert.equal((await f.request(body)).status, 201)
+  assert.equal(f.inserts[0][17], 'work')
+  assert.deepEqual(JSON.parse(f.inserts[0][16] as string), { effort: 'high' })
+  assert.equal(f.inserts[0][8], 'work/pin')
+  assert.equal((await f.request(body)).status, 200)
+  assert.equal((await f.request({ ...body, providerProfile: 'personal' })).status, 409)
+  assert.equal(f.inserts.length, 1)
+})
+
+test('API rejects invalid profile ids without echoing credentials or inserting an agent', async () => {
+  const f = routeFixture(true)
+  for (const providerProfile of [{ apiKey: 'fixture-secret' }, '../fixture-secret', '', 123]) {
+    const response = await f.request({ ...input, providerProfile })
+    assert.equal(response.status, 400)
+    assert.doesNotMatch(JSON.stringify(response), /fixture-secret|apiKey/)
+  }
+  assert.equal(f.connections(), 0)
+  assert.equal(f.inserts.length, 0)
+  assert.equal((await f.request({ ...input, providerProfile: 'work' })).status, 400)
+  assert.equal(f.inserts.length, 0)
 })

@@ -3,7 +3,7 @@
  *
  * Run: node --import tsx --test server/src/__tests__/agents-computer-engine-detect.test.ts
  */
-import { after, afterEach, test } from 'node:test'
+import { after, afterEach, beforeEach, test, type TestContext } from 'node:test'
 import assert from 'node:assert/strict'
 
 process.env.CUMORA_RUNTIME_CLIENT = 'http'
@@ -16,6 +16,8 @@ process.env.OPENAI_API_KEY ??= 'test-key'
 
 const registry = await import('../agents/computer/registry.js')
 const { pool } = await import('../db/pool.js')
+const { redis } = await import('../redis.js')
+beforeEach((t) => { (t as TestContext).mock.method(redis, 'publish', async () => 0) })
 
 const originalQuery = pool.query.bind(pool)
 
@@ -277,7 +279,7 @@ test('assignAgentToComputer persists model pins in the host assignment update', 
   assert.match(update?.sql ?? '', /model = \$4/)
   assert.match(update?.sql ?? '', /fast_model = \$5/)
   assert.deepEqual(update?.params, [
-    'comp-1', 'codex', false, 'gpt-5.6-sol', null, 'bram', 'co-1',
+    'comp-1', 'codex', false, 'gpt-5.6-sol', null, null, 'bram', 'co-1',
   ])
 })
 

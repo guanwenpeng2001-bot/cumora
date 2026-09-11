@@ -39,6 +39,7 @@ import {
 } from '../memory-scope.js'
 import { canonicalAgentResources, type RuntimeTriageReport, type ResourceApplicationResult } from '../runtime/client.js'
 import { parseSseStream, wakeStreamWasStable } from '../runtime/sse-parse.js'
+import { type ProviderProfile, providerProfileEnv, providerProfileFingerprint, providerProfileMetadata, readProviderProfiles, redactProviderSecret } from './provider-profiles.js'
 import { parseComputerControlEvent } from './control-event.js'
 import {
   mergeWakeBackgroundBriefs,
@@ -413,6 +414,7 @@ interface DaemonConfig {
 }
 
 interface AgentInfo {
+  providerProfile?: string | null
   resourceVersion?: string
   id: string
   name: string
@@ -557,7 +559,7 @@ interface RuntimeTriagePayload {
 // ─── arg parsing ────────────────────────────────────────────────────────
 
 function parseArgs(argv: string[]): {
-  pair?: string; server?: string; engine?: string
+  pair?: string; server?: string; engine?: string; provider?: string
   installService?: boolean; uninstallService?: boolean; restart?: boolean; stop?: boolean
   status?: boolean; logs?: boolean; version?: boolean; doctor?: boolean; help?: boolean
 } {
@@ -566,6 +568,8 @@ function parseArgs(argv: string[]): {
     if (argv[i] === '--help' || argv[i] === '-h' || argv[i] === 'help') out.help = true
     else if (argv[i] === '--pair') out.pair = argv[++i]
     else if (argv[i].startsWith('--pair=')) out.pair = argv[i].slice('--pair='.length)
+    else if (argv[i] === '--provider') out.provider = argv[++i] || ''
+    else if (argv[i].startsWith('--provider=')) out.provider = argv[i].slice('--provider='.length)
     else if (argv[i] === '--server') out.server = argv[++i]
     else if (argv[i].startsWith('--server=')) out.server = argv[i].slice('--server='.length)
     else if (argv[i] === '--engine') out.engine = argv[++i]
@@ -879,6 +883,7 @@ function helpText(): string {
     '',
     'Diagnostics:',
     '  --doctor             check engines, PATH, login/quota',
+    '  --provider <id>      with --doctor: check one local Claude provider profile',
     '  --version, -v        print the daemon version',
     '  --help, -h           show this help',
     '',
@@ -1646,7 +1651,7 @@ export function resolveTriageModel(
   return resolveEngineFastModel(configured, engineOverride)?.trim() || computerDefault?.trim() || undefined
 }
 
-class AgentRunner {
+export class AgentRunner {
   /** Aborted once in stop(). Handed to every one-shot `adapter.run(...)` so the
    *  engine child dies with its runner, the way the persistent session already
    *  does. Without it those children were orphaned: they keep the `cumora` IPC
@@ -1711,6 +1716,9 @@ class AgentRunner {
    * Runner replacement aborts/stops it and awaits this barrier before the next
    * runner rewrites persona or standing-prompt files. */
   private activeEngineRun: Promise<EngineRunResult> | null = null
+  private activeTriage: Promise<unknown> | null = null
+  /** Drain resource application and turn cleanup before a profile replacement. */
+  private activeTurn: Promise<void> | null = null
   /** When the last engine turn (chat OR agenda) finished — the "quiet" anchor for
    *  agenda wakes, and the throttle for how often we check the board. */
   private lastTurnEndedAt = 0
@@ -1745,7 +1753,10 @@ class AgentRunner {
     private readonly cfg: DaemonConfig,
     private agent: AgentInfo,
     engine: EngineId,
+    private readonly provider?: ProviderProfile,
   ) {
+    if (provider && (engine !== 'claude' || allowUnsandboxedByoa())) throw new Error('provider profiles require secure Claude BYOA')
+    if (agent.providerProfile && provider?.id !== agent.providerProfile) throw new Error('provider profile unavailable')
     this.engine = engine
     this.home = join(AGENTS_ROOT, agent.id)
     this.binDir = join(this.home, 'bin')
@@ -1756,7 +1767,10 @@ class AgentRunner {
     // granted only the two leaf request/response directories; Claude reaches
     // them through the fixed MCP bridge, not a model-controlled shell.
     this.ipcDir = join(CONFIG_DIR, '.runtime-cli-ipc', this.agent.id)
-    this.sessionStore = new EngineSessionStore(SESSIONS_DIR, agent.id, engine)
+    // The profile is a third dimension of session identity alongside agent and
+    // engine: a different endpoint/account owns a different transcript, so its
+    // session id must never be offered to another profile's provider.
+    this.sessionStore = new EngineSessionStore(SESSIONS_DIR, agent.id, engine, providerProfileFingerprint(provider) || undefined)
     this.adapter = getAdapter(engine)
   }
 
@@ -2010,16 +2024,24 @@ class AgentRunner {
     await Promise.allSettled([
       session?.stop({ force: options.forceEngine }) ?? Promise.resolve(),
       this.activeEngineRun ?? Promise.resolve(),
+      this.activeTriage ?? Promise.resolve(),
+      this.activeTurn ?? Promise.resolve(),
     ])
     await this.sessionStore.flush()
   }
 
-  executionConfigMatches(agent: AgentInfo, engine: EngineId): boolean {
-    return this.adapter.id === engine && this.agent.model === agent.model && this.agent.fastModel === agent.fastModel
+  providerMatches(agent: AgentInfo, provider?: ProviderProfile): boolean {
+    return (this.agent.providerProfile ?? null) === (agent.providerProfile ?? null)
+      && providerProfileFingerprint(this.provider) === providerProfileFingerprint(provider)
   }
 
-  configMatches(agent: AgentInfo, engine: EngineId): boolean {
-    return this.executionConfigMatches(agent, engine)
+  executionConfigMatches(agent: AgentInfo, engine: EngineId, provider?: ProviderProfile): boolean {
+    return this.providerMatches(agent, provider)
+      && this.adapter.id === engine && this.agent.model === agent.model && this.agent.fastModel === agent.fastModel
+  }
+
+  configMatches(agent: AgentInfo, engine: EngineId, provider?: ProviderProfile): boolean {
+    return this.executionConfigMatches(agent, engine, provider)
       && canonicalAgentResources(this.agent) === canonicalAgentResources(agent)
       && this.agent.resourceVersion === agent.resourceVersion
   }
@@ -2056,6 +2078,7 @@ class AgentRunner {
   }
 
   private async applyPendingResources(): Promise<boolean> {
+    if (this.stopped) return false
     const pending = this.pendingResources
     if (!pending) { await this.reportResources(); return true }
     try {
@@ -2083,7 +2106,7 @@ class AgentRunner {
     if (this.token && Date.now() < this.tokenExpiresAt - TOKEN_REFRESH_SKEW_MS) return this.token
     const minted = await api<{ token: string; expiresInSeconds: number }>(
       this.cfg.serverUrl, `/api/agents/${this.agent.id}/runtime-token`,
-      { method: 'POST', headers: { Authorization: `Bearer ${this.cfg.deviceToken}` }, body: '{}', signal },
+      { method: 'POST', headers: { Authorization: `Bearer ${this.cfg.deviceToken}` }, body: JSON.stringify({ providerProfile: this.agent.providerProfile ?? null }), signal },
     )
     this.token = minted.token
     this.tokenExpiresAt = Date.now() + minted.expiresInSeconds * 1000
@@ -2139,11 +2162,13 @@ class AgentRunner {
    *  or bearer token crosses the model-process boundary. */
   /** Big-brain model for the local engine, after the CUMORA_ENGINE_MODEL escape. */
   private engineModel(): string | null {
+    if (this.provider) return this.agent.model || this.provider.model
     return resolveEngineModel(this.agent.model, process.env.CUMORA_ENGINE_MODEL)
   }
 
   /** Small/fast-brain model for the local engine, after the same escape. */
   private engineFastModel(): string | null {
+    if (this.provider) return this.agent.fastModel || this.provider.fastModel
     return resolveEngineFastModel(this.agent.fastModel, process.env.CUMORA_ENGINE_MODEL)
   }
 
@@ -2152,11 +2177,12 @@ class AgentRunner {
    * already accepts a model, while preserving CUMORA_TRIAGE_MODEL as a fallback
    * for old deployments and engines left on their default. */
   private triageModelPin(): string | undefined {
+    if (this.provider) return this.agent.fastModel || this.provider.fastModel
     return resolveTriageModel(this.agent.fastModel, process.env.CUMORA_TRIAGE_MODEL, process.env.CUMORA_ENGINE_MODEL)
   }
 
   private engineEnv(): NodeJS.ProcessEnv {
-    return {
+    const env = {
       ...process.env,
       PATH: engineProcessPath(this.binDir),
       CUMORA_AGENT_IPC_DIR: this.ipcDir,
@@ -2164,6 +2190,7 @@ class AgentRunner {
       CUMORA_AGENT_ID: this.agent.id,
       CUMORA_MCP_CONNECTORS_JSON: JSON.stringify(this.agent.mcpConnectors ?? []),
     }
+    return this.provider ? providerProfileEnv(env, this.provider) : env
   }
 
   /** The long-lived engine process for this agent (persistent stream-json),
@@ -2173,6 +2200,7 @@ class AgentRunner {
    *  prior process has died it respawns, resuming this.sessionId so context
    *  carries across the restart. */
   private ensureEngineSession(resumeSessionId = this.resumeSessionId()): EngineSession | null {
+    if (this.stopped) return null
     if (!this.adapter.startSession) return null
     if (this.persistentUnusable) return null
     if (this.engineSession?.alive) return this.engineSession
@@ -2207,7 +2235,7 @@ class AgentRunner {
   }
 
   private visibleEngineError(exitCode: number, detail?: string): string {
-    const raw = conciseError(detail || `process exited with code ${exitCode}`)
+    const raw = conciseError(redactProviderSecret(detail || `process exited with code ${exitCode}`, this.provider))
     const redacted = raw
       .split(this.home).join('<agent home>')
       .split(homedir()).join('~')
@@ -2315,14 +2343,17 @@ class AgentRunner {
     await spawnPacer.gate()
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), runtimePolicy.values.triageTimeoutMs)
+    const onStop = () => controller.abort(this.teardown.signal.reason)
+    this.teardown.signal.addEventListener('abort', onStop, { once: true })
     const callId = randomUUID()
     const startedAt = Date.now()
     let attempted = false
     let res: { text: string; error?: string; usage?: EngineUsage; model?: string | null }
     try {
       await mkdir(TRIAGE_DIR, { recursive: true })
+      this.teardown.signal.throwIfAborted()
       attempted = true
-      res = await this.adapter.classify({
+      const pending = this.adapter.classify({
         cwd: TRIAGE_DIR,
         prompt: `${payload.instructions}\n\n${payload.input}`,
         env: this.engineEnv(),
@@ -2331,13 +2362,19 @@ class AgentRunner {
         model: this.triageModelPin(),
         signal: controller.signal,
       })
+      this.activeTriage = pending
+      res = await pending
     } catch (err) {
       res = { text: '', error: err instanceof Error ? err.message : String(err) }
     } finally {
       clearTimeout(timer)
       triageSem.release()
+      this.activeTriage = null
+      this.teardown.signal.removeEventListener('abort', onStop)
     }
 
+    res.text = redactProviderSecret(res.text, this.provider)
+    if (res.error) res.error = redactProviderSecret(res.error, this.provider)
     let verdict: RuntimeInboxTriageResponse
     if (res.error || !res.text.trim() || controller.signal.aborted) {
       const errText = res.error ?? 'no output'
@@ -2493,6 +2530,7 @@ class AgentRunner {
    *  hook chatter (started/response × N hooks) and rate-limit keepalives. We
    *  keep the signal — assistant text, tool calls/results, init, errors. */
   private logEngineLine(line: string): void {
+    line = redactProviderSecret(line, this.provider)
     if (line.includes('"hook_started"') || line.includes('"hook_response"') || line.includes('"rate_limit_event"')) return
     console.log(`[${this.agent.id}/${this.adapter.id}] ${line.slice(0, 500)}`)
   }
@@ -2700,6 +2738,7 @@ class AgentRunner {
         this.memoryDigest(),
         runtimeGet<{ roster: string }>(this.cfg.serverUrl, '/roster', token).then((r) => r?.roster ?? '').catch(() => ''),
       ])
+      this.teardown.signal.throwIfAborted()
       const result = await this.runWithSessionRecovery(this.agendaDelta(ag.brief, memoryDigest, roster))
       exitCode = result.exitCode
       turnUsage = result.usage
@@ -2764,10 +2803,11 @@ class AgentRunner {
    *  Node ≥15 crashes the whole daemon). runTurn already catches internally;
    *  this is the belt-and-suspenders second layer. */
   private kickTurn(reason: string): void {
-    void this.runTurn(reason).catch((err) => {
+    const turn = this.runTurn(reason).catch((err) => {
       console.error(`[computer] ${this.agent.id} runTurn rejected (swallowed):`,
-        err instanceof Error ? err.message : err)
-    })
+        redactProviderSecret(err instanceof Error ? err.message : String(err), this.provider))
+    }).finally(() => { if (this.activeTurn === turn) this.activeTurn = null })
+    if (!this.activeTurn) this.activeTurn = turn
   }
 
   /** Debounced entry to a turn (debounce + coalesce).
@@ -2937,6 +2977,7 @@ class AgentRunner {
         // triage decision.
         const triage = activeBackgroundBrief ? null : triageDisposition(await this.inboxTriage(token, seen).catch((err) =>
           deferTriage('fail-closed', err instanceof Error ? err.message : String(err), 'payload-unavailable')))
+        if (this.stopped) break
         const triageMs = Date.now() - turnStart // ensureToken + snapshot + triage
         if (triage?.outcome === 'defer') {
           // A probe of an existing cooldown must not extend it indefinitely.
@@ -3057,6 +3098,7 @@ class AgentRunner {
             runtimeGet<{ roster: string }>(this.cfg.serverUrl, '/roster', token)
               .then((r) => r?.roster ?? '').catch(() => ''),
           ])
+          this.teardown.signal.throwIfAborted()
           const delta = turnBackgroundBrief
             ? this.manualBriefDelta(turnBackgroundBrief, memoryDigest, digest, roster)
             : this.chatDelta(memoryDigest, triageNote, digest, roster)
@@ -3072,7 +3114,7 @@ class AgentRunner {
             await this.resetEngineSession(this.resetReason(engineError))
           }
         } catch (err) {
-          console.error(`[computer] ${this.agent.id} engine spawn failed:`, err instanceof Error ? err.message : err)
+          console.error(`[computer] ${this.agent.id} engine spawn failed:`, redactProviderSecret(err instanceof Error ? err.message : String(err), this.provider))
           exitCode = 1
           engineError = this.visibleEngineError(exitCode, err instanceof Error ? (err.stack || err.message) : String(err))
         } finally {
@@ -3177,7 +3219,7 @@ class AgentRunner {
       // and end this turn; the next wake or INBOX_POLL_MS drain retries with a
       // fresh token. (ensureToken is in this try, so its throws land here.)
       console.error(`[computer] ${this.agent.id} turn aborted (will retry on next wake/poll):`,
-        err instanceof Error ? err.message : err)
+        redactProviderSecret(err instanceof Error ? err.message : String(err), this.provider))
     } finally {
       try { await this.applyPendingResources() }
       finally { this.busy = false }
@@ -3346,7 +3388,7 @@ async function doRun(serverOverride?: string): Promise<void> {
   const syncOnce = async (): Promise<void> => {
     let agents: AgentInfo[]
     try {
-      agents = await api<AgentInfo[]>(cfg.serverUrl, '/api/computers/me/agents', {
+      agents = await api<AgentInfo[]>(cfg.serverUrl, '/api/computers/me/agents?providerProfiles=1', {
         headers: { Authorization: `Bearer ${cfg.deviceToken}` },
       })
     } catch (err) {
@@ -3354,8 +3396,15 @@ async function doRun(serverOverride?: string): Promise<void> {
       return
     }
     const available = engineInventory.current
+    let profiles: ProviderProfile[] = []
+    try { profiles = readProviderProfiles(join(CONFIG_DIR, 'providers.json')) }
+    catch (err) { console.warn('[computer]', (err as Error).message) }
     for (const agent of agents) {
-      const engine = resolveAvailableEngine(agent.engine, available)
+      const provider = profiles.find((p) => p.id === agent.providerProfile)
+      // A bound profile never falls back to another engine or the host account.
+      const engine = agent.providerProfile
+        ? (provider && !allowUnsandboxedByoa() && agent.engine === 'claude' && available.includes('claude') ? 'claude' : null)
+        : resolveAvailableEngine(agent.engine, available)
       if (!engine) {
         const reason = blockedEngines.find(({ id }) => id === agent.engine)?.reason
           ?? (agent.engine && runnableEngineIds([agent.engine]).length === 0
@@ -3371,18 +3420,20 @@ async function doRun(serverOverride?: string): Promise<void> {
       }
       const existing = runners.get(agent.id)
       if (existing) {
-        if (existing.executionConfigMatches(agent, engine)) {
+        if (existing.executionConfigMatches(agent, engine, provider)) {
           await existing.queueResources(agent)
           continue
         }
-        if (existing.isBusy) continue
+        // Credential changes abort and drain the old runner even during a turn.
+        // Ordinary model changes retain the fork's finish-current-turn policy.
+        if (existing.isBusy && existing.providerMatches(agent, provider)) continue
         // Engine/model/persona was edited in Cumora — restart the runner so the
         // change takes effect on the next wake without a daemon restart.
         console.log(`[computer] agent ${agent.name} (${agent.id}) config changed → restarting on ${engine}`)
         runners.delete(agent.id)
         await existing.stop({ forceEngine: true })
       }
-      const runner = new AgentRunner(cfg, agent, engine)
+      const runner = new AgentRunner(cfg, agent, engine, provider)
       runners.set(agent.id, runner)
       console.log(`[computer] hosting agent ${agent.name} (${agent.id}) on ${engine}`)
       await runner.start()
@@ -3466,11 +3517,16 @@ async function doRun(serverOverride?: string): Promise<void> {
       // when the card's version line goes stale. The blocked reasons are part
       // of the fingerprint: fixing the cause (upgrading the CLI, installing
       // bwrap) has to clear the card, not wait for an unrelated change.
-      const fingerprint = JSON.stringify(snapshot)
+      let profiles: ProviderProfile[] = []
+      try { profiles = readProviderProfiles(join(CONFIG_DIR, 'providers.json')) }
+      catch (err) { console.warn('[computer]', (err as Error).message) }
+      const advertisedSnapshot = snapshot.map((entry) => entry.id === 'claude'
+        ? { ...entry, providerProfiles: allowUnsandboxedByoa() ? [] : profiles.map(providerProfileMetadata) } : entry)
+      const fingerprint = JSON.stringify(advertisedSnapshot)
       await reportEngineSnapshot(fingerprint, forceReport, () => api(cfg.serverUrl, '/api/computers/me/engines', {
         method: 'POST',
         headers: { Authorization: `Bearer ${cfg.deviceToken}` },
-        body: JSON.stringify({ engines: next, detected: snapshot, blocked: blockedIds }),
+        body: JSON.stringify({ engines: next, detected: advertisedSnapshot, blocked: blockedIds }),
       })).catch((err) => {
         console.warn('[computer] engine snapshot report failed', err instanceof Error ? err.message : err)
       })
@@ -3972,7 +4028,7 @@ export async function restartService(hooks: RestartServiceHooks = {}): Promise<v
  *  match incidentally elsewhere in the command line. */
 export const ONE_SHOT_FLAGS = [
   'stop', 'status', 'restart', 'logs', 'version', 'install-service',
-  'uninstall-service', 'pair', 'doctor', 'help',
+  'uninstall-service', 'pair', 'doctor', 'provider', 'help',
 ] as const
 const ONE_SHOT_FLAG_RE = new RegExp(`--(?:${ONE_SHOT_FLAGS.join('|')})\\b`)
 
@@ -4280,11 +4336,23 @@ async function tailLogs(): Promise<void> {
  *  brain (the triage cerebellum) reachable + authed? Each tier gets a trivial
  *  one-shot probe over the SAME spawn path real wakes use, so green here means
  *  real wakes will work. Pure local: no cloud, no DB, no pairing required. */
-async function runDoctor(): Promise<void> {
+async function runDoctor(providerId?: string): Promise<void> {
+  const provider = providerId !== undefined
+    ? readProviderProfiles(join(CONFIG_DIR, 'providers.json')).find((p) => p.id === providerId) : undefined
+  if (providerId !== undefined && !provider) throw new Error('provider profile not found in providers.json')
   console.log(`cumora ${CURRENT_VERSION} · engine doctor`)
   console.log('probing local engines (big brain = main reasoning, small brain = triage cerebellum)…\n')
 
-  const results = await runEngineDoctor({ onLog: (l) => console.error(`  · ${l}`) })
+  const results = await runEngineDoctor({
+    env: provider ? providerProfileEnv(process.env, provider) : undefined,
+    engines: provider ? ['claude'] : undefined,
+    onLog: (l) => console.error(`  · ${redactProviderSecret(l, provider)}`),
+  })
+  for (const result of results) {
+    for (const health of [result.big, result.small, result.wake]) {
+      if (health) health.detail = redactProviderSecret(health.detail, provider)
+    }
+  }
   console.log('')
 
   let anyUsable = false
@@ -4335,10 +4403,11 @@ async function runDoctor(): Promise<void> {
 
 export async function runComputerDaemon(argv: string[]): Promise<void> {
   const args = parseArgs(argv)
+  if (args.provider !== undefined && !args.doctor) throw new Error('--provider requires --doctor')
   const serverUrl = (args.server || DEFAULT_SERVER).replace(/\/+$/, '')
   if (args.help) { console.log(helpText()); return }
   if (args.version) { console.log(CURRENT_VERSION); return }
-  if (args.doctor) { await runDoctor(); return }
+  if (args.doctor) { await runDoctor(args.provider); return }
   if (args.restart) { await restartService(); return }
   if (args.stop) { await stopService(); return }
   if (args.status) { await printStatus(); return }

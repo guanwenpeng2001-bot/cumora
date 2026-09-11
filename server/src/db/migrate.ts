@@ -62,6 +62,7 @@ import { SUB2API_SYNC_SQL, sub2apiSyncChecksum } from './migrations/0012-sub2api
 import { USAGE_ROLLUP_V2_SQL, usageRollupV2Checksum } from './migrations/0013-usage-rollup-v2.js'
 import { RUNTIME_CALL_ID_INDEX_SQL, runtimeCallIdIndexChecksum } from './migrations/0014-runtime-call-id-index.js'
 import { ENGINE_DEFAULTS_SQL, engineDefaultsChecksum } from './migrations/0015-engine-defaults.js'
+import { AGENT_PROVIDER_PROFILE_SQL, agentProviderProfileChecksum } from './migrations/0016-agent-provider-profile.js'
 
 /** Frozen data backfill embedded in migration 0001. Exported so its behavior
  * can be exercised against PostgreSQL without replaying the whole migration. */
@@ -2682,6 +2683,12 @@ const VERSIONED_MIGRATIONS: readonly VersionedMigration[] = [
     sourceChecksum: engineDefaultsChecksum(),
     transactional: true,
     up: async (client) => { await client.query(ENGINE_DEFAULTS_SQL) },
+  },
+  {
+    ...SCHEMA_MIGRATIONS[15],
+    sourceChecksum: agentProviderProfileChecksum(),
+    transactional: true,
+    up: async (client) => { await client.query(AGENT_PROVIDER_PROFILE_SQL) },
   },
 ]
 

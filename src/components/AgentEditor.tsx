@@ -39,6 +39,7 @@ function newCreateRequestId(): string {
  *  the computer default means the user pinned it. */
 function initialEngineChoice(agent: Participant | null, computer: { kind: string; availableEngines: EngineId[] } | undefined): string {
   if (!agent || !computer || computer.kind === 'cloud') return INHERIT_ENGINE
+  if (agent.providerProfile) return 'claude'
   const advertised = computer.availableEngines
   const engine = agent.engine
   if (!engine || engine === 'managed' || !advertised.includes(engine)) return INHERIT_ENGINE
@@ -115,8 +116,11 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
   const [systemPrompt, setSystemPrompt] = useState(agent?.systemPrompt ?? '')
   const [bio, setBio] = useState(agent?.bio ?? '')
   const [avatarBg, setAvatarBg] = useState(agent?.avatarBg ?? PALETTE[0])
+  const [providerProfile, setProviderProfile] = useState(agent?.providerProfile ?? '')
   const [model, setModel] = useState(agent?.model ?? '')
   const [fastModel, setFastModel] = useState(agent?.fastModel ?? '')
+  // Profiles select local Claude credentials/endpoints, independently of
+  // participants.model_config, which configures managed-agent model behavior.
   // Advanced model settings (participants.model_config). Empty/'' fields
   // mean "inherit the global role setting". Managed agents only — BYOA is
   // engine-managed.
@@ -219,14 +223,21 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
       : (selectedComputer?.availableEngines[0] ?? 'claude')
   ) as EngineId
   const selectedComputerOffline = isByoa && selectedComputer.status !== 'online'
-  const modelCatalog = selectedComputer?.detectedEngines
-    ?.find((engine) => engine.id === selectedEngineId)
-    ?.modelCatalog
+  const detectedEngine = selectedComputer?.detectedEngines?.find((engine) => engine.id === selectedEngineId)
+  const profiles = detectedEngine?.providerProfiles ?? []
+  const selectedProfile = profiles.find((p) => p.id === providerProfile)
+  const modelCatalog = providerProfile ? {
+    models: [], defaultModel: selectedProfile?.model, defaultFastModel: selectedProfile?.fastModel,
+    supportsCustom: true, fastModelScope: 'agent',
+  } : detectedEngine?.modelCatalog
   // Per-computer engine model defaults (configured on the Computer card).
   // When the local CLI catalog can't name a default (e.g. custom endpoints),
   // these Cumora-side settings show as the hint for "follow engine default".
-  const engineDefaultModel = selectedComputer?.engineDefaults?.[selectedEngineId]?.model ?? undefined
-  const engineDefaultFastModel = selectedComputer?.engineDefaults?.[selectedEngineId]?.fastModel ?? undefined
+  // A profile's endpoint owns its own namespace, so the engine-wide default
+  // must not be offered there — the server does not apply it either.
+  const engineDefaults = providerProfile ? undefined : selectedComputer?.engineDefaults?.[selectedEngineId]
+  const engineDefaultModel = engineDefaults?.model ?? undefined
+  const engineDefaultFastModel = engineDefaults?.fastModel ?? undefined
   const modelOptions: Array<ComboboxOption<string>> = [
     {
       value: '',
@@ -324,6 +335,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
     if (id === computerId) return
     engineTouched.current = true
     setComputerId(id)
+    setProviderProfile('')
     setEngineChoice(INHERIT_ENGINE)
     clearModelPins()
   }
@@ -352,12 +364,12 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
         const current = agent?.computerId ?? cloud?.id
         const targetComputer = target ? computersById[target] : undefined
         const isByoaTarget = !!targetComputer && targetComputer.kind !== 'cloud'
-        const inherit = engineChoice === INHERIT_ENGINE
-        const pinned = inherit ? undefined : (engineChoice as EngineId)
+        const inherit = !providerProfile && engineChoice === INHERIT_ENGINE
+        const pinned = providerProfile ? 'claude' : inherit ? undefined : (engineChoice as EngineId)
         const savedChoice = initialEngineChoice(agent, targetComputer)
         const inheritChanged = isByoaTarget && inherit !== (savedChoice === INHERIT_ENGINE)
         const engineChanged = isByoaTarget && !inherit && pinned !== ((agent?.engine as EngineId) ?? null)
-        const assignmentChanged = Boolean(target && (target !== current || inheritChanged || engineChanged))
+        const assignmentChanged = Boolean(target && (target !== current || inheritChanged || engineChanged || providerProfile !== (agent?.providerProfile ?? '')))
         // BYOA agents are engine-managed — never send modelConfig for them.
         // Managed: build the object; null clears a previously saved config.
         const modelConfigPayload = ((): AgentModelConfig | null | undefined => {
@@ -392,11 +404,13 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
             ...payload,
             requestId: createRequestId.current,
             computerId: target || null,
+            providerProfile: providerProfile || null,
             engine: isByoaTarget ? pinned : undefined,
             inherit: isByoaTarget ? inherit : false,
           },
           assignment: editing && target && assignmentChanged ? {
             computerId: target,
+            providerProfile: providerProfile || null,
             engine: isByoaTarget ? pinned : undefined,
             inherit: isByoaTarget ? inherit : false,
             model: model.trim() || null,
@@ -538,6 +552,26 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
               placeholder={t('agent.bioPh')}
             />
           </Field>
+
+          {isByoa && selectedEngineId === 'claude' && (profiles.length > 0 || providerProfile) && (
+            <Field label={t('agent.providerLabel')} hint={t('agent.providerHint')}>
+              <Select
+                ariaLabel={t('agent.providerLabel')}
+                value={providerProfile}
+                onValueChange={(value) => {
+                  setProviderProfile(value)
+                  if (value) { engineTouched.current = true; setEngineChoice('claude') }
+                  clearModelPins()
+                }}
+                options={[
+                  { value: '', label: t('agent.providerDefault') },
+                  ...profiles.map((p) => ({ value: p.id, label: p.label })),
+                  ...(providerProfile && !selectedProfile
+                    ? [{ value: providerProfile, label: t('agent.providerMissing', { id: providerProfile }), disabled: true }] : []),
+                ]}
+              />
+            </Field>
+          )}
 
           <Field
             label={isByoa ? t('agent.modelLabelByoa') : t('agent.modelLabel')}
@@ -693,6 +727,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
                     if (value === engineChoice) return
                     engineTouched.current = true
                     setEngineChoice(value)
+                    setProviderProfile('')
                     clearModelPins()
                   }}
                   options={(() => {
