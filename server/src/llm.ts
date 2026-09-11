@@ -336,7 +336,10 @@ function dashscopeImageClient(apiKey: string, base: string, progress?: (stage: '
     return Object.assign(new Error(message), { status })
   }
 
-  // qwen-image* models live on the synchronous multimodal-generation API;
+  // qwen-image*, z-image* and the wan2.x-image series live on the synchronous
+  // multimodal-generation API (measured against the live endpoint: the async
+  // text2image task API answers them with 'url error'). Classic wanx*/wan*
+  // text2image models stay on the async task API.
   // wan*/wanx* live on the async text2image task API.
   async function generateSync(model: string, prompt: string, size?: string, n?: number) {
     const resp = await fetch(`${base}/services/aigc/multimodal-generation/generation`, {
@@ -410,7 +413,8 @@ function dashscopeImageClient(apiKey: string, base: string, progress?: (stage: '
   }
 
   async function generate(args: { model: string; prompt: string; size?: string; n?: number }) {
-    return args.model.startsWith('qwen-image')
+    const syncFamily = args.model.startsWith('qwen-image') || args.model.startsWith('z-image') || /^wan[0-9]\.[0-9]-image/.test(args.model)
+    return syncFamily
       ? generateSync(args.model, args.prompt, args.size, args.n)
       : generateAsync(args.model, args.prompt, args.size, args.n)
   }
