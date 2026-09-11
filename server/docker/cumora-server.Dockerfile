@@ -64,6 +64,8 @@ COPY package.json package-lock.json ./
 RUN npm ci --no-audit --no-fund --prefer-offline --ignore-scripts
 COPY src ./src
 COPY public ./public
+# Contracts shared with the server live outside src/; the SPA build needs them.
+COPY shared ./shared
 COPY index.html ./
 COPY vite.config.ts ./
 COPY tsconfig.json ./

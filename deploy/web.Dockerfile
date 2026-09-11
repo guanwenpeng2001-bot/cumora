@@ -12,6 +12,9 @@ COPY package.json package-lock.json ./
 RUN npm ci --no-audit --no-fund --prefer-offline --ignore-scripts
 COPY src ./src
 COPY public ./public
+# Shared contracts live outside src/ (server and SPA both import them); without
+# this COPY the SPA build fails on `../../shared/*` resolution.
+COPY shared ./shared
 COPY index.html vite.config.ts tsconfig.json tsconfig.node.json postcss.config.js tailwind.config.ts ./
 # VITE_CUMORA_API_BASE is intentionally NOT set: the SPA is served same-origin
 # with the API behind nginx, so src/api/client.ts falls back to relative URLs.
