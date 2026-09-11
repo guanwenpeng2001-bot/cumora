@@ -10,10 +10,10 @@
 | 基础 | redis | cumora-redis | 6379 | redis:7;外部卷 `cumora-redis-data` |
 | 基础 | migrate | cumora-migrate | — | server 镜像;一次性执行 `npm run migrate` |
 | 基础 | server | cumora-server | 5181 | API、调度器、orchestrator;等待 migrate 成功退出 |
-| 基础 | web | cumora-web | 8080 | nginx SPA;反代 `/api`、`/ws`、`/uploads` |
+| 基础 | web | cumora-web | 8080 | nginx SPA;反代 `/api`、`/runtime`（含 SSE）、`/ws`、`/uploads` |
 | 可选网关 | sub2api | cumora-sub2api | 8082 | 本地 fork `../sub2api` 构建;保留原镜像标签与数据卷 |
 
-基础层为五个服务定义(含一次性 migrate),叠加后为六个;正常长期运行的原五容器身份不变。项目名仍为 `cumora`,默认网络仍为 `cumora_default`,网关命名卷仍为 `cumora_sub2api-data`。如果既有部署通过 `-p` 或 `COMPOSE_PROJECT_NAME` 指定过项目名,所有后续命令必须继续使用同一值,以保留原网络及网关卷前缀。不要添加新的网络/卷名称或更换项目名。
+基础层为五个服务定义(含一次性 migrate),叠加后为六个;正常长期运行的原五容器身份不变。项目名仍为 `cumora`,默认网络仍为 `cumora_default`,网关命名卷仍为 `cumora_sub2api-data`。如果既有部署通过 `-p` 或 `COMPOSE_PROJECT_NAME` 指定过项目名,所有后续命令必须继续使用同一值,以保留原网络及网关卷前缀。不要重命名已有网络/卷或更换项目名。本地附件另使用固定名称卷 `cumora-uploads`。
 
 sub2api 继续复用 db 内独立的 `sub2api` 数据库及 Redis 逻辑库 1。基础 Compose 不负责创建该数据库;新环境需在另行授权的初始化步骤中准备,现有环境不重建、不修改数据。`server → migrate(service_completed_successfully) → db(service_healthy)` 的迁移门槛保持不变;server 还等待 Redis 健康。网关仅依赖 db/redis 健康,server/web 不依赖网关健康或启动成功。
 
@@ -101,3 +101,34 @@ scheduler 的优先级为 sub2api DB 设置 → env → 当前值。环境变量
 ## 浏览器与 OAuth
 
 Web 发布端口为 8080,API 为 5181;外部实际域名由部署填写。若通过容器 Web 登录,把浏览器入口加入 `CUMORA_AUTH_RETURN_ALLOWLIST`,并将认证完成地址指向该 Web 入口。独立前端需要相应 CORS 配置;Pod 内部地址和浏览器 OAuth 地址不能混用。宿主机已有进程占用端口时先安排独立运维窗口,不要在配置解析任务中停止它们。
+
+
+## 本地 uploads 持久化与旧容器升级迁出
+
+四个核心 R2 变量未全部配置时，server 使用本地存储。本地存储必须持久化；基础 Compose 将命名卷 `cumora-uploads` 挂到 `/app/server/uploads`，与镜像 WORKDIR 和 storage.ts 一致。附件、头像及其子目录都在此处，数据库与 Redis 卷不能保护这些文件。其他部署（包括 Kubernetes）必须提供存储目录的持久挂载或完整对象存储配置；多副本本地存储需要共享持久存储。生产启动会提示持久化要求，但提示不能检测底层卷是否真正耐久。
+
+**已有容器必须先迁出文件，再应用新增卷。** 新空卷会遮住旧容器可写层的 uploads；不要先重建 server，也不要依赖 Docker 自动复制旧容器数据。以下为后续维护窗口的操作顺序，本次源码修改不执行这些动作：
+
+1. 保留旧 server 容器和准确镜像 digest，备份数据库及现有 uploads。暂停上传、头像生成和存储 GC 等写入，完成最终一致性复制。
+2. 将旧容器的整个 `/app/server/uploads/.` 复制到独立备份目录（例如 `docker cp cumora-server:/app/server/uploads/. <backup-directory>`）。保留目录结构和文件名，核对文件数量、大小及校验和；空目录或复制失败必须先查清，不能继续重建。
+3. 创建或确认固定名称的 `cumora-uploads` 卷。若卷已存在，先备份并检查内容，禁止盲目覆盖。通过单独的临时工具容器，将备份目录只读挂载并复制到该卷根目录，保留权限，确认 server 运行用户可读写。不要嵌套成 `uploads/uploads`。
+4. 在应用新挂载之前，从卷读回核对同一组校验和。保留卷外备份；随后才在维护窗口按原 Compose 文件组合更新 server。不要执行 `down -v`（上传卷为 Compose 管理卷，可能被删除），也不要删除旧容器直到恢复验收完成。
+5. 验证历史附件和头像 URL、新上传和下载，再安排一次受控 server 重建，确认新旧文件仍可读。保留备份直到升级验收及回退窗口结束。卷提供持久化，不替代备份。
+
+同源网页生成的 BYOA 配对命令使用当前 HTTP(S) 页面 origin。使用 localhost、127.* 或 ::1 打开的页面会提示：另一台机器的 loopback 指向它自己，应先使用远程机器可达的域名或局域网地址打开网页，再生成命令。显式 server 配置和开发 API target 优先于页面 origin。nginx 的 `/runtime/` 同时转发普通请求及 wake-stream，关闭响应缓冲并配置 3600 秒读写超时。
+
+## 发布前的 schema 回退预检
+
+候选迁移先于 Deployment 更新，故 `kubectl rollout undo` **只恢复镜像/模板，不恢复数据库**。旧 Pod 迁移后仍在运行也不能证明旧镜像能重新启动。保留 schema gate、不可变迁移历史及 checksum；不要删除 gate 或为通过预检而扩大版本范围。
+
+迁移前，从准确回滚镜像所对应的制品/源码取得 `server/src/db/migrations/manifest.ts`，记录镜像 digest，并运行离线预检：
+
+```bash
+node scripts/rollback-precheck.mjs <rollback-image-manifest.ts>
+```
+
+预检读取本仓库候选 manifest 的目标 schema 与回滚 manifest 的支持范围，不连接数据库、不运行迁移。缺少证据或范围不兼容时打印警告并以 1 退出；范围兼容只代表静态必要条件通过，仍会提醒核验 ledger/checksum 和业务兼容性。这是维护人员的发布前检查，尚未自动接入部署 workflow。
+
+发布验收还必须在隔离环境验证“准确回滚镜像 × 候选迁移后的数据库”，包括旧镜像重新启动的 schema gate 和关键读写。审计中的旧范围 13–14 无法接受 schema 15；当前版本可能继续增长，须每次重新读取制品，不能复用该数字或仅比较镜像标签。
+
+若无通过验证的回滚制品，发布方案应明确采用向前修复，不得承诺 undo 能恢复服务。可选长期策略为经过验证的扩展/收缩迁移兼容窗口，或构建兼容新 schema 的专用回滚制品；扩大支持范围、数据降级/恢复和自动发布失败分支属于需用户决定的 schema 政策，本次不改变。数据库备份恢复涉及停写及备份之后的数据损失，不能当作镜像回退自动执行。

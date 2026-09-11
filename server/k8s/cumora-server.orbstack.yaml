@@ -48,6 +48,10 @@ rules:
 - apiGroups: [""]
   resources: ["pods/log"]
   verbs: ["get", "list"]
+# Chrome-profile PVC lifecycle: apply/read plus off-board and idle cleanup.
+- apiGroups: [""]
+  resources: ["persistentvolumeclaims"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 ---
 # Nodes are cluster-scoped, so the FUSE admission probe needs a narrow
 # ClusterRole in addition to the namespaced Pod Role above.

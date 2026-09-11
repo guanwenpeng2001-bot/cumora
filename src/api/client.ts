@@ -77,7 +77,15 @@ export function resolveAssetUrl(url: string | null | undefined): string {
  * In Vite dev the browser uses a relative proxy, so SERVER_ORIGIN is empty;
  * the daemon still needs the API target rather than the renderer origin. */
 export function getPairingServerOrigin(): string {
-  return SERVER_ORIGIN || DEV_API_TARGET || ''
+  return SERVER_ORIGIN || DEV_API_TARGET || (typeof location !== 'undefined' && /^https?:$/.test(location.protocol) ? location.origin : '')
+}
+
+/** Loopback addresses reach only the machine running the pairing command. */
+export function isPairingServerLoopback(origin = getPairingServerOrigin()): boolean {
+  try {
+    const host = new URL(origin).hostname.toLowerCase()
+    return host === 'localhost' || host.endsWith('.localhost') || host === '[::1]' || /^127\./.test(host)
+  } catch { return false }
 }
 
 /** Persist a new server origin override and clear the existing session.

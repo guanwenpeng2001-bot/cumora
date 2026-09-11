@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { type ApiProject, type ApiQuotaSnapshot, type ApiQuotaWindow, api, getPairingServerOrigin, getServerOrigin } from '@/api/client'
+import { type ApiProject, type ApiQuotaSnapshot, type ApiQuotaWindow, api, getPairingServerOrigin, getServerOrigin, isPairingServerLoopback } from '@/api/client'
 import { AppearancePicker, ChatLayoutPicker } from '@/components/AppearancePicker'
 import { Avatar } from '@/components/Avatar'
 import { Checkbox } from '@/components/Checkbox'
@@ -1323,6 +1323,7 @@ function ComputersTab() {
                       <div className="text-[12px] text-ink-400">{t('me.computersGenerating')}</div>
                     ) : (
                       <>
+                        {isPairingServerLoopback(origin) && <p role="status" className="mb-2 text-[12px] text-amber-700">{t('me.pairingLoopbackWarning')}</p>}
                         <pre className="bg-ink-900 text-cloud rounded-[10px] p-3 text-[12px] overflow-x-auto whitespace-pre-wrap break-all font-mono select-all">{repairCmd}</pre>
                         <button type="button" onClick={(e) => { e.stopPropagation(); void navigator.clipboard?.writeText(repairCmd); setRepairCopied(true) }}
                           className="mt-2 inline-flex items-center justify-center min-w-[120px] text-[12px] font-semibold px-3 py-1.5 rounded-[9px] text-white transition-colors duration-200"
@@ -1370,6 +1371,7 @@ function ComputersTab() {
                 {t('me.keepInBackground')} <span className="text-ink-400">— {t('me.keepInBackgroundDetail')}</span>
               </span>
             </label>
+            {isPairingServerLoopback(origin) && <p role="status" className="mb-2 text-[12px] text-amber-700">{t('me.pairingLoopbackWarning')}</p>}
             <pre className="bg-ink-900 text-cloud rounded-[10px] p-3 text-[12px] overflow-x-auto whitespace-pre-wrap break-all font-mono select-all">{pairCommand}</pre>
             <div className="flex gap-2 mt-3">
               <button type="button" onClick={copyCommand} aria-live="polite"

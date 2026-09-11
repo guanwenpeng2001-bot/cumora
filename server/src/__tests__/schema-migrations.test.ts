@@ -111,7 +111,7 @@ test('runtime callId index is registered after the immutable version 13 prefix',
   const prior = current().slice(0, 13)
   assert.deepEqual(
     validateMigrationHistory(prior, { allowPending: true }).pending,
-    [SCHEMA_MIGRATIONS[13], SCHEMA_MIGRATIONS[14], SCHEMA_MIGRATIONS[15]],
+    SCHEMA_MIGRATIONS.slice(13),
   )
 })
 
@@ -120,7 +120,7 @@ test('the engine defaults migration matches its immutable manifest checksum', as
   assert.equal(engineDefaultsChecksum(), SCHEMA_MIGRATIONS[14].checksum)
   assert.equal(SCHEMA_MIGRATIONS[14].name, '0015_engine_defaults')
   const prior = current().slice(0, 14)
-  assert.deepEqual(validateMigrationHistory(prior, { allowPending: true }).pending, [SCHEMA_MIGRATIONS[14], SCHEMA_MIGRATIONS[15]])
+  assert.deepEqual(validateMigrationHistory(prior, { allowPending: true }).pending, SCHEMA_MIGRATIONS.slice(14))
 })
 
 
@@ -129,9 +129,9 @@ test('provider profiles append version 16 without changing the fork migration pr
   assert.equal(SCHEMA_MIGRATIONS[15].name, '0016_agent_provider_profile')
   assert.equal(SCHEMA_MIGRATIONS[15].checksum, agentProviderProfileChecksum())
   assert.equal(agentProviderProfileChecksum(), '8816423a0ad867d4781c6a9e323e6e34ecadca0ecaf82bd0b9541f164a199fa0')
-  assert.equal(MAX_SUPPORTED_SCHEMA_VERSION, 16)
+  assert.ok(MAX_SUPPORTED_SCHEMA_VERSION >= 16)
   const prior = current().slice(0, 15)
-  assert.deepEqual(validateMigrationHistory(prior, { allowPending: true }).pending, [SCHEMA_MIGRATIONS[15]])
+  assert.deepEqual(validateMigrationHistory(prior, { allowPending: true }).pending, SCHEMA_MIGRATIONS.slice(15))
   assert.throws(() => validateMigrationHistory(prior), (error) => error instanceof MigrationHistoryError && error.code === 'schema_behind')
   assert.match(AGENT_PROVIDER_PROFILE_SQL, /NEW\.provider_profile IS DISTINCT FROM OLD\.provider_profile/)
   assert.match(AGENT_PROVIDER_PROFILE_SQL, /BEFORE UPDATE OF company_id, computer_id, kind, departed_at, provider_profile/)

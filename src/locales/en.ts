@@ -1447,6 +1447,7 @@ export const en = {
   'me.runOnHost': 'On the host machine, run the first line to install the fixed fork CLI, then the second line after installation succeeds:',
   'me.engineRequired': 'Kimi Code (<span class="font-mono not-italic">kimi</span>) and other unsandboxed engines require explicit <span class="font-mono not-italic">CUMORA_BYOA_ALLOW_UNSANDBOXED=1</span> opt-in, granting access to host files, environment, and network. Pairing commands include this opt-in when such an engine is selected. Supported alternatives include <span class="font-mono not-italic">claude</span>, <span class="font-mono not-italic">codex</span>, <span class="font-mono not-italic">grok</span>, <span class="font-mono not-italic">cursor-agent</span>, or <span class="font-mono not-italic">opencode</span>. Install and sign in to the selected CLI. The computer names itself after that machine and appears here once paired. This token stays valid.',
   'me.keepInBackground': 'Keep it running in the background',
+  'me.pairingLoopbackWarning': 'This server address points to localhost. To pair another machine, open Cumora using a domain or LAN address reachable from that machine, then generate a new pairing command.',
   'me.keepInBackgroundDetail': 'auto-start when you sign in and auto-restart on crash. Fork CLI updates require installing a fixed Release. Otherwise this terminal has to stay open.',
   'me.done': 'Done',
   'me.addComputer': '+ Add a computer',

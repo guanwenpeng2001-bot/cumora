@@ -300,7 +300,10 @@ function buildStorage(): Storage {
       urlTtl: env.R2_URL_TTL_SECONDS,
     })
   }
-  console.log('[storage] local mode · server/uploads/ (set R2_* env to use R2)')
+  console.log(`[storage] local mode · ${UPLOAD_DIR} (set R2_* env to use R2)`)
+  if (process.env.NODE_ENV === 'production') {
+    console.warn(`[storage] Local uploads must be persisted at ${UPLOAD_DIR}; back up and migrate existing files before container recreation. See deploy/README.md.`)
+  }
   return new LocalStorage()
 }
 

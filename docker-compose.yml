@@ -63,6 +63,8 @@ services:
     # DDL out of this long-lived container avoids a migration failure turning
     # into a server CrashLoopBackOff.
     volumes:
+      # Must match storage.ts UPLOAD_DIR under image WORKDIR /app.
+      - cumora-uploads:/app/server/uploads
       # Container-reachable kubeconfig copy (see header). Read-only mount;
       # kubectl in the container runs as root and auto-detects this path.
       - ${KUBECONFIG_DOCKER:-${USERPROFILE:-${HOME}}/.kube/config-docker}:/root/.kube/config:ro
@@ -116,6 +118,8 @@ services:
 
 
 volumes:
+  cumora-uploads:
+    name: cumora-uploads
   # Pre-existing data — external so `compose down` never touches them.
   cumora-pgdata:
     external: true

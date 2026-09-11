@@ -799,7 +799,7 @@ export function stuckPendingReason(h: PodHealth): string | null {
  *  couldn't get a Pod into a runnable state" (apply failed, persona
  *  missing, etc.). Callers that just want to log real failures should
  *  check `!ok` rather than string-matching `reason`. */
-export type EnsurePodResult =
+type EnsurePodOutcome =
   | { created: true;  ok: true;  reason: string }
   | { created: false; ok: true;  reason: string }
   | {
@@ -815,6 +815,21 @@ export type EnsurePodResult =
         | 'placement_denied'
         | 'pod_apply_failed'
     }
+
+export type PodApplyState = 'not_applied' | 'applied' | 'unknown'
+export type EnsurePodResult = EnsurePodOutcome & { applyState: PodApplyState }
+
+/** An ambiguous apply must be reconciled before any new creation attempt. */
+export async function probePodApplication(agentId: string): Promise<PodApplyState> {
+  const result = await kubectlWithRetry(['get', 'pod', podName(agentId), '--ignore-not-found=true', '-o', 'json'])
+  if (result.code !== 0) return 'unknown'
+  if (!result.out.trim()) return 'not_applied'
+  try {
+    const pod = JSON.parse(result.out) as { status?: { phase?: string } }
+    if (pod.status?.phase === 'Failed' || pod.status?.phase === 'Succeeded') return 'not_applied'
+    return 'applied'
+  } catch { return 'unknown' }
+}
 
 export type ManagedPodPlacementVerification =
   | { ok: true; companyId: string; computerId: string | null; runtimeAssignmentId: string }
@@ -887,10 +902,11 @@ export async function ensurePod(agentId: string, initialTriage?: InitialInboxTri
   const existing = inFlight.get(agentId)
   if (existing) return existing
   const p = (async (): Promise<EnsurePodResult> => {
+    const progress: { value: PodApplyState } = { value: 'not_applied' }
     let watchdogFired = false
     const controller = new AbortController()
     let watchdogTimer: NodeJS.Timeout | null = null
-    const watchdog = new Promise<EnsurePodResult>((resolve) => {
+    const watchdog = new Promise<EnsurePodOutcome>((resolve) => {
       watchdogTimer = setTimeout(() => {
         watchdogFired = true
         // Cancel kubectl mutations and mark the generation obsolete. The
@@ -907,7 +923,7 @@ export async function ensurePod(agentId: string, initialTriage?: InitialInboxTri
       watchdogTimer.unref?.()
     })
     try {
-      const result = await Promise.race([ensurePodImpl(agentId, controller.signal, initialTriage), watchdog])
+      const result = await Promise.race([ensurePodImpl(agentId, controller.signal, initialTriage, progress), watchdog])
       if (watchdogFired) {
         // Alert because this means something hung BELOW the per-call
         // timeouts — a real bug we want to know about, not just a
@@ -918,10 +934,10 @@ export async function ensurePod(agentId: string, initialTriage?: InitialInboxTri
           extras: { agentId },
         })
       }
-      return result
+      return { ...result, applyState: progress.value }
     } catch {
       console.warn(`[orchestrator] ${agentId} Pod preparation failed; check Pod URL/bootstrap configuration`)
-      return { created: false, ok: false, code: 'pod_apply_failed', reason: 'Pod preparation failed; check Pod URL/bootstrap configuration, including SUB2API_PUBLIC_URL for Compose and CUMORA_POD_HOST_REWRITE for local Kubernetes' }
+      return { created: false, ok: false, applyState: progress.value, code: 'pod_apply_failed', reason: 'Pod preparation failed; check Pod URL/bootstrap configuration, including SUB2API_PUBLIC_URL for Compose and CUMORA_POD_HOST_REWRITE for local Kubernetes' }
     } finally {
       if (watchdogTimer) clearTimeout(watchdogTimer)
       inFlight.delete(agentId)
@@ -931,12 +947,12 @@ export async function ensurePod(agentId: string, initialTriage?: InitialInboxTri
   return p
 }
 
-async function ensurePodImpl(agentId: string, signal: AbortSignal, initialTriage?: InitialInboxTriageArg): Promise<EnsurePodResult> {
+async function ensurePodImpl(agentId: string, signal: AbortSignal, initialTriage: InitialInboxTriageArg | undefined, progress: { value: PodApplyState }): Promise<EnsurePodOutcome> {
   const startedAt = Date.now()
   // This is the final authorization boundary for managed execution. Scheduler
   // lookups are advisory only: assignment/tier can change between a wake and
   // this call, and other callers may invoke ensurePod directly.
-  const cleanupDenied = async (denied: EnsurePodResult): Promise<EnsurePodResult> => {
+  const cleanupDenied = async (denied: EnsurePodOutcome): Promise<EnsurePodOutcome> => {
     // A lookup failure is not evidence of revoked placement; never delete for it.
     if (denied.ok || denied.code !== 'placement_denied' || signal.aborted) return denied
     const reap = await kubectlWithRetry(
@@ -954,7 +970,7 @@ async function ensurePodImpl(agentId: string, signal: AbortSignal, initialTriage
   if (!initialPlacement.ok) {
     return cleanupDenied({ created: false, ...initialPlacement })
   }
-  const recheckPlacement = async (): Promise<EnsurePodResult | null> => {
+  const recheckPlacement = async (): Promise<EnsurePodOutcome | null> => {
     const current = await verifyManagedPodPlacement(agentId)
     if (!current.ok) return cleanupDenied({ created: false, ...current })
     if (
@@ -973,6 +989,7 @@ async function ensurePodImpl(agentId: string, signal: AbortSignal, initialTriage
   }
   const h = await podHealth(agentId)
   if (h.phase === 'Running') {
+    progress.value = 'applied'
     const denied = await recheckPlacement()
     if (denied) return denied
     return { created: false, ok: true, reason: 'already running' }
@@ -980,6 +997,7 @@ async function ensurePodImpl(agentId: string, signal: AbortSignal, initialTriage
   if (h.phase === 'Pending') {
     const stuck = stuckPendingReason(h)
     if (!stuck) {
+      progress.value = 'applied'
       const denied = await recheckPlacement()
       if (denied) return denied
       return { created: false, ok: true, reason: 'already pending' }
@@ -1094,9 +1112,8 @@ async function ensurePodImpl(agentId: string, signal: AbortSignal, initialTriage
   // apply is idempotent — if the PVC already exists this is a no-op.
   // The PVC outlives the pod, so an idle-exit / restart / re-spawn
   // all attach to the same volume and Chromium's cookies + login
-  // state survive. Failure here is non-fatal: the pod can still run
-  // (Chromium would just have an empty profile) so we log and
-  // continue rather than block the agent from spawning.
+  // state survive. Preparation must fail when PVC apply fails: the Pod
+  // would reference a missing volume. emptyDir requires explicit opt-out.
   //
   // Skipped entirely when CUMORA_CHROME_PROFILE_PVC=false — used by
   // clusters that don't have a default StorageClass set up yet. The
@@ -1105,7 +1122,9 @@ async function ensurePodImpl(agentId: string, signal: AbortSignal, initialTriage
     const pvcManifest = chromeProfilePvcManifest({ agentId })
     const pvcApply = await kubectlWithRetry(['apply', '-f', '-'], { stdin: pvcManifest, timeoutMs: 20_000, signal })
     if (pvcApply.code !== 0) {
-      console.warn(`[orchestrator] chrome PVC apply failed for ${agentId}: ${(pvcApply.err || pvcApply.out).trim()}`)
+      const reason = `Pod preparation failed: chrome-profile PVC apply failed: ${(pvcApply.err || pvcApply.out).trim()}`
+      console.warn(`[orchestrator] ${agentId} ${reason}`)
+      return { created: false, ok: false, code: 'pod_apply_failed', reason }
     }
   }
 
@@ -1159,6 +1178,7 @@ async function ensurePodImpl(agentId: string, signal: AbortSignal, initialTriage
         },
       }
     }
+    progress.value = 'unknown'
     return {
       podApply: await kubectlWithRetry(['apply', '-f', '-'], { stdin: manifest, timeoutMs: 45_000, signal }),
       denied: null,
@@ -1187,6 +1207,7 @@ async function ensurePodImpl(agentId: string, signal: AbortSignal, initialTriage
       reason: `pod apply failed: ${errText}`,
     }
   }
+  progress.value = 'applied'
   bumpFuseUtilUsedOnSpawn()
   console.log(`[orchestrator] ${agentId} pod spun up in ${Date.now() - startedAt}ms`)
   return { created: true, ok: true, reason: 'spun up' }

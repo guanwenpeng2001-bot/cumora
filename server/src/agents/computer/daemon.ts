@@ -676,8 +676,16 @@ async function runtimeGet<T>(
       headers: { Authorization: `Bearer ${token}` },
       signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
     })
-    return res.ok ? await res.json().catch(() => null) as T | null : null
-  } catch { return null }
+    if (!res.ok) return null
+    try {
+      return await res.json() as T
+    } catch {
+      throw new SyntaxError('Runtime GET returned invalid JSON; check the server origin and /runtime/ reverse proxy (an SPA HTML response is not a runtime response)')
+    }
+  } catch (error) {
+    if (error instanceof SyntaxError) throw error
+    return null
+  }
 }
 
 /** Which conversation should show "<agent> is typing…" for this turn.
