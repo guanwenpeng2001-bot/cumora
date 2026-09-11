@@ -318,21 +318,18 @@ test('[integration] steer (verbatim path): mid-turn message lands in next hop in
   assert.equal(stData.usedSummary, false, 'a 1-message batch is rendered verbatim, not summarized')
   assert.deepEqual(stData.messageIds, [steeredMessageId])
 
-  // ── assertion 3: conversation_reads cursor advanced past the steered message ──
-  const { rows: readRows } = await pool.query<{ last_read_at: Date }>(
-    `SELECT last_read_at FROM conversation_reads
-       WHERE user_id = $1 AND conversation_id = $2`,
-    [agentId, conversationId],
-  )
-  assert.equal(readRows.length, 1, 'conversation_reads row should exist for the agent')
+  // ── assertion 3: consumption receipt exists for the steered message ──
   const { rows: msgRows } = await pool.query<{ created_at: Date }>(
     `SELECT created_at FROM messages WHERE id = $1`, [steeredMessageId],
   )
   assert.ok(msgRows[0])
-  assert.ok(
-    readRows[0].last_read_at.getTime() >= msgRows[0].created_at.getTime(),
-    'last_read_at must be at or past the steered message\'s created_at',
+  // New consumption-receipt design (deep-3): the read cursor no longer
+  // advances; completed inputs get durable receipts instead.
+  const { rows: consumed } = await pool.query<{ message_id: string }>(
+    `SELECT message_id FROM agent_message_consumptions WHERE agent_id = $1 AND message_id = $2`,
+    [agentId, steeredMessageId],
   )
+  assert.equal(consumed.length, 1, 'steered message must have a consumption receipt after the turn')
 })
 
 // ── Fix #1/#1b: end-to-end wire — deliverSteer → SSE delivery ─────────
