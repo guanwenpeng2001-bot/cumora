@@ -41,6 +41,8 @@ export interface ModelPrice {
   version?: string
   matchedModel?: string
   match?: 'exact' | 'route' | 'alias' | 'fallback'
+  unit?: 'second' | 'image'
+  usdPerUnit?: number
   unpriced?: string
 }
 
@@ -52,6 +54,7 @@ const FALLBACK_PRICE: ModelPrice = { inPer1M: 0, cachedInPer1M: 0, cacheWritePer
 export function validModelPrice(value: unknown): value is ModelPrice {
   if (!value || typeof value !== 'object') return false
   const p = value as ModelPrice
+  if (p.unit !== undefined && (!['second', 'image'].includes(p.unit) || typeof p.usdPerUnit !== 'number' || !Number.isFinite(p.usdPerUnit) || p.usdPerUnit < 0)) return false
   return [p.inPer1M, p.cachedInPer1M, p.cacheWritePer1M, p.outPer1M]
     .every(n => typeof n === 'number' && Number.isFinite(n) && n >= 0)
 }

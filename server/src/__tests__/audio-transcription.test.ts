@@ -37,7 +37,7 @@ function fixture(statuses: (number | Error)[] = [], gateway = false, content: un
     const status = statuses[requests.length - 1]
     if (status instanceof Error) throw status
     if (status) throw Object.assign(new Error('SECRET_AUDIO_AND_TRANSCRIPT'), { status })
-    return { model: 'actual-asr', choices: [{ message: { content } }], usage: { prompt_tokens: 12, completion_tokens: 8, secret: 'SECRET_AUDIO_AND_TRANSCRIPT' } }
+    return { model: 'actual-asr', choices: [{ message: { content } }], usage: { prompt_tokens: 12, completion_tokens: 8, seconds: 12.5, secret: 'SECRET_AUDIO_AND_TRANSCRIPT' } }
   } })
   const execution = compile(read('../llm-execution.ts'), {
     './db/pool.js': { pool: { query: async () => { throw new Error('Unexpected audio test DB access') } } },
@@ -85,6 +85,7 @@ for (const gateway of [false, true]) {
     assert.equal(f.records[0].companyId, 'company-a'); assert.equal(f.records[0].purpose, 'audio-transcription')
     assert.equal(f.records[0].extras.role, 'audio'); assert.equal(f.records[0].model, 'actual-asr')
     assert.equal(f.records[0].usage.inputTokens, 12)
+    assert.deepEqual(f.records[0].units, { unit: 'second', quantity: 12.5 })
     assert.doesNotMatch(JSON.stringify(f.records), /你好|SECRET_AUDIO_AND_TRANSCRIPT|data:audio/)
   })
 }
@@ -97,6 +98,8 @@ for (const status of [401, 403, 402, 429, 500, 503]) {
     assert.equal(f.records[0].extras.httpStatus, status); assert.equal(f.records[1].status, 'ok')
     assert.equal(f.records[0].extras.logicalCallId, f.records[1].extras.logicalCallId)
     assert.equal(f.records[0].usage, null)
+    assert.equal(f.records[0].units, undefined)
+    assert.deepEqual(f.records[1].units, { unit: 'second', quantity: 12.5 })
     assert.doesNotMatch(JSON.stringify([f.records, f.logs]), /SECRET_AUDIO_AND_TRANSCRIPT|你好|data:audio/)
   })
 }

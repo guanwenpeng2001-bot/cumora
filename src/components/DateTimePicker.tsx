@@ -126,12 +126,12 @@ export function DateTimePicker({
       if (wrapRef.current?.contains(target) || popRef.current?.contains(target)) return
       setOpen(false)
     }
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false) }
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') { e.preventDefault(); e.stopImmediatePropagation(); setOpen(false); wrapRef.current?.querySelector<HTMLButtonElement>('button')?.focus() } }
     window.addEventListener('mousedown', onDown)
-    window.addEventListener('keydown', onKey)
+    window.addEventListener('keydown', onKey, true)
     return () => {
       window.removeEventListener('mousedown', onDown)
-      window.removeEventListener('keydown', onKey)
+      window.removeEventListener('keydown', onKey, true)
     }
   }, [open])
 
@@ -319,7 +319,7 @@ export function DateTimePicker({
             )}
           </div>
         </div>,
-        document.body,
+        wrapRef.current?.closest('[role="dialog"]') ?? document.body,
       )
     : null
 

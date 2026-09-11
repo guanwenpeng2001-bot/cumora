@@ -1,3 +1,4 @@
+import { Dialog } from './Dialog'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { type ApiWorkspaceMember, api, resolveAssetUrl, ws } from '@/api/client'
 import { useT } from '@/lib/i18n'
@@ -98,7 +99,7 @@ export function WorkspaceSettingsModal({ company, companyCount, onInvite, onClos
   }
 
   return (
-    <div className="fixed inset-0 z-[120] grid place-items-center p-4" role="dialog" aria-modal="true" aria-label={t('workspace.settingsTitle')}>
+    <Dialog onClose={() => { if (!deleting) onClose() }} className="fixed inset-0 z-[120] grid place-items-center p-4" role="dialog" aria-modal="true" aria-label={t('workspace.settingsTitle')}>
       <button
         type="button"
         className="absolute inset-0 bg-ink-900/35"
@@ -212,6 +213,6 @@ export function WorkspaceSettingsModal({ company, companyCount, onInvite, onClos
           </section>
         )}
       </div>
-    </div>
+    </Dialog>
   )
 }

@@ -35,7 +35,8 @@ const TAB_LABEL_KEY: Record<LibTab, MessageKey> = {
 export function MobileLibrary() {
   // i18n: prefer the translated key, fall back to the inline English.
   const tLabel = useTLabel()
-  const [tab, setTab] = useState<LibTab>('documents')
+  const tab = useApp(s => s.librarySection)
+  const setTab = useApp(s => s.setLibrarySection)
   const create = useDocuments((s) => s.create)
   const createBoard = useBoards((s) => s.createBoard)
   const openDocumentPeek = useApp((s) => s.openDocumentPeek)

@@ -53,7 +53,7 @@ function daemonFixture(result: any, options: { payload?: any; backoffUntil?: num
     teardown: { signal: new AbortController().signal }, stopped: false, provider: null,
     adapter: { id: 'codex', classify: async () => { calls++; timeout?.(); if (result instanceof Error) throw result; return result } },
   })
-  return { reports, warnings, calls: () => calls, run: () => runner.inboxTriage('token', new Map([['c', 'm1']])) }
+  return { reports, warnings, calls: () => calls, run: () => runner.inboxTriage('token', new Map([['c', ['m1']]])) }
 }
 const valid = { text: '{"actionable":false,"reason":"already answered"}' }
 for (const [name, result, status, category] of [

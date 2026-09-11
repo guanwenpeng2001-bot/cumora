@@ -1,3 +1,4 @@
+import { listPagination, pageResult, PaginationError } from './list-pagination.js'
 import { parseBudgetRule } from '../turn-safety-policy.js'
 import { safetySnapshot, saveBudget, removeBudget, emergencyStop, resumeTurns } from '../turn-safety.js'
 import { resolveRoleCall } from '../llm-resolver.js'
@@ -516,8 +517,9 @@ function safe(handler: (req: Request & AuthedRequest, res: Response) => Promise<
     try {
       await handler(req, res)
     } catch (e) {
-      if (e instanceof HttpError) {
-        res.status(e.status).json({ error: e.message })
+      if (e instanceof HttpError || e instanceof PaginationError) {
+        const invitationFailure = req.route?.path === '/invitations/:token/accept' && e.status < 500
+        res.status(e.status).json({ error: e.message, ...(invitationFailure ? { code: e.status === 401 ? 'INVITATION_AUTH_REQUIRED' : 'INVITATION_LIMIT_REACHED', retryable: false } : {}) })
         return
       }
       console.error('[api] unhandled', e)
@@ -530,7 +532,7 @@ function safe(handler: (req: Request & AuthedRequest, res: Response) => Promise<
  *  async route's rejection bubbles here in Express 5. HttpError → its status
  *  code; anything else → 500 with a generic message (real cause logged). */
 function errorHandler(err: unknown, _req: Request, res: Response, _next: NextFunction): void {
-  if (err instanceof HttpError) {
+  if (err instanceof HttpError || err instanceof PaginationError) {
     res.status(err.status).json({ error: err.message })
     return
   }
@@ -1863,9 +1865,6 @@ async function loadInvitation(args: {
     company: { id: r.company_id, name: r.company_name, slug: r.company_slug },
     multiUse: r.max_uses > 1,
   }
-  if (r.revoked_at) return { status: 'revoked', invitation: baseInvite }
-  if (new Date(r.expires_at).getTime() < Date.now()) return { status: 'expired', invitation: baseInvite }
-  if (r.use_count >= r.max_uses) return { status: 'consumed', invitation: baseInvite }
   if (args.viewerUserId) {
     const { rows: mem } = await pool.query(
       `SELECT 1 FROM company_members WHERE company_id = $1 AND user_id = $2 LIMIT 1`,
@@ -1873,6 +1872,9 @@ async function loadInvitation(args: {
     )
     if (mem[0]) return { status: 'already_member', invitation: baseInvite }
   }
+  if (r.revoked_at) return { status: 'revoked', invitation: baseInvite }
+  if (new Date(r.expires_at).getTime() < Date.now()) return { status: 'expired', invitation: baseInvite }
+  if (r.use_count >= r.max_uses) return { status: 'consumed', invitation: baseInvite }
   if (r.email && args.viewerEmailLower && r.email.toLowerCase() !== args.viewerEmailLower) {
     return { status: 'wrong_email', invitation: baseInvite }
   }
@@ -2315,6 +2317,7 @@ function buildInviteUrl(token: string): string {
 api.get('/companies/:id/invitations', safe(async (req, res) => {
   const companyId = String(req.params.id)
   await requireCompanyAdmin(req, companyId)
+  const page = listPagination(req.query, 200)
   const { rows } = await pool.query<{
     token_hash: string; email: string | null; role: string; note: string | null
     max_uses: number; use_count: number; created_at: string; expires_at: string
@@ -2329,12 +2332,13 @@ api.get('/companies/:id/invitations', safe(async (req, res) => {
        FROM company_invitations i
        LEFT JOIN users u ON u.id = i.invited_by
       WHERE i.company_id = $1
-      ORDER BY i.created_at DESC
-      LIMIT 200`,
-    [companyId],
+      ORDER BY i.created_at DESC, i.token_hash DESC
+      LIMIT $2 OFFSET $3`,
+    [companyId, page.limit + 1, page.offset],
   )
   const now = Date.now()
-  res.json(rows.map((r) => {
+  const result = pageResult(res, rows, page)
+  const invitations = result.items.map((r) => {
     const expired = new Date(r.expires_at).getTime() < now
     const consumed = r.use_count >= r.max_uses
     const status = r.revoked_at ? 'revoked'
@@ -2360,7 +2364,10 @@ api.get('/companies/:id/invitations', safe(async (req, res) => {
       inviterName: r.inviter_name,
       status,
     }
-  }))
+  })
+  res.json(req.query.paginated === '1'
+    ? { invitations, hasMore: result.hasMore, nextCursor: result.nextCursor }
+    : invitations)
 }))
 
 /** Create a new invitation. Body: { email?, role?, note?, multiUse? }.
@@ -2520,7 +2527,7 @@ api.delete('/companies/:id/invitations/:inviteId', safe(async (req, res) => {
  *  so the UI can show the right CTA. */
 api.get('/invitations/:token', safe(async (req, res) => {
   const token = String(req.params.token)
-  if (!token || token.length < 8) { res.status(400).json({ error: 'bad token' }); return }
+  if (!token || token.length < 8) { res.status(400).json({ error: 'bad token', code: 'INVITATION_INVALID', retryable: false }); return }
   let viewerEmail: string | null = null
   if (req.authUserId) {
     const { rows } = await pool.query<{ email: string }>(
@@ -2549,12 +2556,12 @@ api.get('/invitations/:token', safe(async (req, res) => {
 api.post('/invitations/:token/accept', safe(async (req, res) => {
   const me = requireAuth(req)
   const token = String(req.params.token)
-  if (!token || token.length < 8) { res.status(400).json({ error: 'bad token' }); return }
+  if (!token || token.length < 8) { res.status(400).json({ error: 'bad token', code: 'INVITATION_INVALID', retryable: false }); return }
   const tokenHash = hashInviteToken(token)
   const { rows: userRow } = await pool.query<{ email: string; display_name: string; avatar_url: string | null }>(
     `SELECT email, display_name, avatar_url FROM users WHERE id = $1`, [me],
   )
-  if (!userRow[0]) { res.status(401).json({ error: 'session points to missing user' }); return }
+  if (!userRow[0]) { res.status(401).json({ error: 'session points to missing user', code: 'INVITATION_AUTH_REQUIRED', retryable: false }); return }
   const viewerEmail = userRow[0].email.toLowerCase()
   const displayName = userRow[0].display_name
   // Reuse the user's OAuth-mirrored avatar (stamped on users.avatar_url at
@@ -2577,28 +2584,9 @@ api.post('/invitations/:token/accept', safe(async (req, res) => {
     )
     if (rows.length === 0) {
       await client.query('ROLLBACK')
-      res.status(404).json({ error: 'invitation not found' }); return
+      res.status(404).json({ error: 'invitation not found', code: 'INVITATION_NOT_FOUND', retryable: false }); return
     }
     const inv = rows[0]
-    if (inv.revoked_at) {
-      await client.query('ROLLBACK')
-      res.status(410).json({ error: 'invitation revoked' }); return
-    }
-    if (new Date(inv.expires_at).getTime() < Date.now()) {
-      await client.query('ROLLBACK')
-      res.status(410).json({ error: 'invitation expired' }); return
-    }
-    if (inv.use_count >= inv.max_uses) {
-      await client.query('ROLLBACK')
-      res.status(410).json({ error: 'invitation already used' }); return
-    }
-    if (inv.email && inv.email.toLowerCase() !== viewerEmail) {
-      await client.query('ROLLBACK')
-      res.status(403).json({
-        error: `this invitation is reserved for ${inv.email} — sign in with that email to accept`,
-      }); return
-    }
-
     // Idempotent membership upsert — if already a member, decline to
     // double-bump usage but still return success so the client can route
     // them into the workspace.
@@ -2626,6 +2614,26 @@ api.post('/invitations/:token/accept', safe(async (req, res) => {
         },
       })
       return
+    }
+
+    if (inv.revoked_at) {
+      await client.query('ROLLBACK')
+      res.status(410).json({ error: 'invitation revoked', code: 'INVITATION_REVOKED', retryable: false }); return
+    }
+    if (new Date(inv.expires_at).getTime() < Date.now()) {
+      await client.query('ROLLBACK')
+      res.status(410).json({ error: 'invitation expired', code: 'INVITATION_EXPIRED', retryable: false }); return
+    }
+    if (inv.use_count >= inv.max_uses) {
+      await client.query('ROLLBACK')
+      res.status(410).json({ error: 'invitation already used', code: 'INVITATION_CONSUMED', retryable: false }); return
+    }
+    if (inv.email && inv.email.toLowerCase() !== viewerEmail) {
+      await client.query('ROLLBACK')
+      res.status(403).json({
+        code: 'INVITATION_WRONG_EMAIL', retryable: false,
+        error: `this invitation is reserved for ${inv.email} — sign in with that email to accept`,
+      }); return
     }
 
     await assertUserCompanyLimit(me, client)
@@ -3694,20 +3702,13 @@ api.post('/agents/:id/rehire', async (req, res) => {
   res.json({ ok: true })
 })
 
-/**
- * Ceiling on one sidebar page.
- *
- * The route has no cursor, so this is a backstop rather than pagination: it
- * bounds the pathological workspace the performance review described (10,000
- * conversations returned in one response) without changing the contract for
- * the real ones, which are nowhere near it. If a workspace ever trips the log
- * line below, that is the signal that real cursor paging has become worth its
- * cost across the ~80 call sites that read this list.
- */
+/** Bounded pages; legacy array clients receive pagination headers, while
+ * ?paginated=1 returns { conversations, hasMore, nextCursor }. */
 const CONVERSATION_LIST_LIMIT = 500
 
 api.get('/conversations', async (req, res) => {
   const { userId: me, companyId: tenant } = await requireCompany(req)
+  const page = listPagination(req.query, CONVERSATION_LIST_LIMIT)
   const { rows } = await pool.query(
     `SELECT
         c.id, c.kind,
@@ -3790,14 +3791,15 @@ api.get('/conversations', async (req, res) => {
              AND cm.company_id = c.company_id
              AND cm.participant_id = $1
         )
-      ORDER BY c.pinned DESC, c.updated_at DESC
-      LIMIT ${CONVERSATION_LIST_LIMIT}`,
-    [me, tenant],
+      ORDER BY c.pinned DESC, c.updated_at DESC, c.id DESC
+      LIMIT $3 OFFSET $4`,
+    [me, tenant, page.limit + 1, page.offset],
   )
-  if (rows.length === CONVERSATION_LIST_LIMIT) {
-    console.warn(`[conversations] ${tenant} hit the ${CONVERSATION_LIST_LIMIT}-row sidebar ceiling; older rows are being withheld`)
-  }
-  res.json(rows)
+  const result = pageResult(res, rows, page)
+  res.json(req.query.paginated === '1'
+    ? { conversations: result.items, hasMore: result.hasMore, nextCursor: result.nextCursor }
+    : result.items)
+
 })
 
 /**
@@ -4198,17 +4200,35 @@ api.post('/conversations/:id/typing', async (req, res) => {
 
 api.post('/conversations/:id/read', async (req, res) => {
   const { id } = req.params
-  // Membership-gated: only members can record a read receipt on a convo.
-  // Without this, a tenant peer could write conversation_reads rows pointing
-  // at conversations they're not in (low impact, but the same audit-trail
-  // concern as marking phantom reads).
-  const { userId: me } = await requireConversationMember(req, id)
-  await pool.query(
-    `INSERT INTO conversation_reads (user_id, conversation_id, last_read_at)
-     VALUES ($1, $2, NOW())
-     ON CONFLICT (user_id, conversation_id) DO UPDATE SET last_read_at = NOW()`,
-    [me, id],
+  const { userId: me, companyId } = await requireConversationMember(req, id)
+  const { messageId, sequence } = req.body ?? {}
+  if (typeof messageId !== 'string' || !messageId.trim() ||
+      !Number.isSafeInteger(sequence) || sequence < 1) {
+    res.status(400).json({ error: 'messageId and a positive integer sequence are required' })
+    return
+  }
+  // Resolve the client-visible boundary in this conversation and tenant. Older
+  // requests cannot regress the cursor; arrivals after this boundary stay unread.
+  const { rows } = await pool.query<{ valid: boolean }>(
+    `WITH boundary AS (
+       SELECT created_at, id FROM messages
+        WHERE id = $3 AND sequence = $4 AND conversation_id = $2 AND company_id = $5
+     ), receipt AS (
+       INSERT INTO conversation_reads (user_id, conversation_id, last_read_at, last_read_message_id)
+       SELECT $1, $2, created_at, id FROM boundary
+       ON CONFLICT (user_id, conversation_id) DO UPDATE
+         SET last_read_at = EXCLUDED.last_read_at,
+             last_read_message_id = EXCLUDED.last_read_message_id
+         WHERE ROW(conversation_reads.last_read_at, COALESCE(conversation_reads.last_read_message_id, ''))
+             < ROW(EXCLUDED.last_read_at, EXCLUDED.last_read_message_id)
+       RETURNING user_id
+     ) SELECT EXISTS (SELECT 1 FROM boundary) AS valid`,
+    [me, id, messageId, sequence, companyId],
   )
+  if (!rows[0]?.valid) {
+    res.status(400).json({ error: 'message boundary does not match this conversation' })
+    return
+  }
   res.json({ ok: true })
 })
 
@@ -4511,6 +4531,10 @@ api.post('/conversations/:id/messages', async (req, res) => {
   // thread (or an agent calling `cumora reply` from its CLI) would just
   // write a kind='text' row that the external recipient never sees.
   if (convo.kind === 'email') {
+    if (rawAttachment != null || (req.body?.attachments != null && (!Array.isArray(req.body.attachments) || req.body.attachments.length > 0))) {
+      res.status(400).json({ error: 'email chat replies do not support attachments; use /email/reply/:messageId', code: 'EMAIL_ATTACHMENTS_UNSUPPORTED', retryable: false })
+      return
+    }
     if (!body) {
       res.status(400).json({ error: 'email replies require a body (attachments-only sends not supported here yet)' })
       return
@@ -4518,12 +4542,15 @@ api.post('/conversations/:id/messages', async (req, res) => {
     try {
       const { replyInEmailConversation } = await import('../email.js')
       const result = await replyInEmailConversation({
-        conversationId: id, companyId: tenant, authorId: me, body,
+        conversationId: id, companyId: tenant, authorId: me, body, clientId,
         // Human user — leave autoSubmitted false. Agent path uses cmdReply
         // in the CLI which sets it true.
       })
-      res.status(result.transportStatus === 'sent' ? 202 : 502).json({
+      res.status(result.transportStatus === 'failed' ? 502 : 202).json({
+        clientId,
+        persisted: true,
         id: result.messageId,
+        conversationId: id,
         sequence: result.sequence,
         transportStatus: result.transportStatus,
         mock: result.mock,
@@ -4805,6 +4832,15 @@ api.post('/polls/:messageId/close', async (req, res) => {
  * so the user can see + retry from the thread instead of losing the
  * draft on the wire. */
 
+/** Same actor/conversation clientId contract as chat messages. */
+function emailClientId(raw: unknown): string | null {
+  if (raw == null) return null
+  if (typeof raw !== 'string' || raw.length === 0 || raw.length > 80) {
+    throw new HttpError(400, 'invalid clientId')
+  }
+  return raw
+}
+
 /** Validate + resolve attachment metadata for outbound email. Caller has
  *  already uploaded the bytes (via the standard /uploads path) and hands
  *  us each entry's storage key + filename + mime + size. We:
@@ -4826,11 +4862,13 @@ async function resolveHttpAttachments(raw: unknown[]): Promise<Array<{
   }> = []
   let totalBytes = 0
   for (const entry of raw) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return new Error('each attachment must be an object')
     const a = entry as Record<string, unknown>
     const key = typeof a.key === 'string' ? a.key : ''
     const filename = typeof a.filename === 'string' ? a.filename.slice(0, 200) : ''
     const mimeType = typeof a.mimeType === 'string' ? a.mimeType.slice(0, 120) : 'application/octet-stream'
-    const sizeBytes = Math.max(0, Number(a.sizeBytes ?? 0))
+    const sizeBytes = Number(a.sizeBytes ?? 0)
+    if (!Number.isFinite(sizeBytes) || sizeBytes < 0) return new Error('invalid attachment size')
     if (!key || !filename) return new Error('each attachment needs key + filename')
     totalBytes += sizeBytes
     if (totalBytes > MAX_ATTACH_TOTAL) return new Error(`attachments exceed ${MAX_ATTACH_TOTAL} bytes total`)
@@ -4890,6 +4928,11 @@ async function resolveHttpRecipient(raw: string, ctx: EmailRecipientResolveCtx):
 api.post('/email/send', async (req, res) => {
   try {
     const { userId: me, companyId: tenant } = await requireCompany(req)
+    const clientId = emailClientId(req.body?.clientId)
+    if (req.body?.attachment != null || (req.body?.attachments != null && !Array.isArray(req.body.attachments))) {
+      res.status(400).json({ error: 'use an attachments array with key and filename for each attachment', code: 'EMAIL_ATTACHMENTS_INVALID', retryable: false })
+      return
+    }
     const toRaw = Array.isArray(req.body?.to) ? req.body.to as unknown[] : []
     const ccRaw = Array.isArray(req.body?.cc) ? req.body.cc as unknown[] : []
     const attachRaw = Array.isArray(req.body?.attachments) ? req.body.attachments as unknown[] : []
@@ -4953,6 +4996,7 @@ api.post('/email/send', async (req, res) => {
 
     const messageId = mintMessageId()
     const conv = await findOrCreateEmailConversation({
+      creationKey: clientId ? JSON.stringify([me, clientId]) : null,
       companyId: tenant, inReplyTo: null, references: [],
       subject, memberIds: [...memberIds],
     })
@@ -4961,6 +5005,7 @@ api.post('/email/send', async (req, res) => {
     // persistEmailMessage pins the active participant and conversation
     // membership, so a concurrent removal wins before any provider call.
     const persisted = await persistEmailMessage({
+      clientId,
       conversationId: conv.conversationId,
       companyId: tenant,
       authorId: me,
@@ -4979,6 +5024,14 @@ api.post('/email/send', async (req, res) => {
         storageKey: a.storageKey,
       })),
     })
+    if (persisted.duplicate) {
+      const { readPersistedEmailResult } = await import('../email.js')
+      const result = await readPersistedEmailResult(persisted.messageId)
+      res.status(result.transportStatus === 'failed' ? 502 : 200).json({
+        ...result, conversationId: conv.conversationId, clientId, persisted: true,
+      })
+      return
+    }
     const sendRes = await sendViaProvider({
       from: fromLine,
       to: toResolved.map((r) => formatAddress(r.addr, r.name)),
@@ -5007,6 +5060,7 @@ api.post('/email/send', async (req, res) => {
     })
     res.status(sendRes.ok ? 200 : 502).json({
       messageId: persisted.messageId,
+      sequence: persisted.sequence, clientId, persisted: true,
       conversationId: conv.conversationId,
       transportStatus: sendRes.ok ? 'sent' : 'failed',
       mock: sendRes.mock,
@@ -5067,6 +5121,11 @@ api.get('/email/:messageId/html', async (req, res) => {
 api.post('/email/reply/:messageId', async (req, res) => {
   try {
     const { userId: me, companyId: tenant } = await requireCompany(req)
+    const clientId = emailClientId(req.body?.clientId)
+    if (req.body?.attachment != null || (req.body?.attachments != null && !Array.isArray(req.body.attachments))) {
+      res.status(400).json({ error: 'use an attachments array with key and filename for each attachment', code: 'EMAIL_ATTACHMENTS_INVALID', retryable: false })
+      return
+    }
     const { messageId: replyTarget } = req.params
     const body = String(req.body?.body ?? '').trim().slice(0, 50_000)
     const ccRaw = Array.isArray(req.body?.cc) ? req.body.cc as unknown[] : []
@@ -5162,6 +5221,7 @@ api.post('/email/reply/:messageId', async (req, res) => {
     // A participant removed while this request is in flight cannot reach the
     // external mail provider with stale conversation access.
     const persisted = await persistEmailMessage({
+      clientId,
       conversationId: o.conversation_id,
       companyId: tenant,
       authorId: me,
@@ -5178,6 +5238,14 @@ api.post('/email/reply/:messageId', async (req, res) => {
         storageKey: a.storageKey,
       })),
     })
+    if (persisted.duplicate) {
+      const { readPersistedEmailResult } = await import('../email.js')
+      const result = await readPersistedEmailResult(persisted.messageId)
+      res.status(result.transportStatus === 'failed' ? 502 : 200).json({
+        ...result, conversationId: o.conversation_id, clientId, persisted: true,
+      })
+      return
+    }
     const sendRes = await sendViaProvider({
       from: fromLine, to: replyTo,
       cc: ccCombined.length ? ccCombined : undefined,
@@ -5212,6 +5280,7 @@ api.post('/email/reply/:messageId', async (req, res) => {
     )
     res.status(sendRes.ok ? 200 : 502).json({
       messageId: persisted.messageId,
+      sequence: persisted.sequence, clientId, persisted: true,
       conversationId: o.conversation_id,
       transportStatus: sendRes.ok ? 'sent' : 'failed',
       mock: sendRes.mock,
@@ -6978,11 +7047,16 @@ async function enqueueCalendarChange(db: PoolClient, args: {
 
 api.get('/calendar/events', async (req, res) => {
   const { userId: me, companyId } = await requireCompany(req)
-  // Optional range window — keeps the list bounded for the agenda / month
-  // view. Without a window we return everything in the company, capped at
-  // 1000 rows. The list page will paginate when that becomes a real cap.
-  const from = typeof req.query.from === 'string' ? new Date(req.query.from) : null
-  const to = typeof req.query.to === 'string' ? new Date(req.query.to) : null
+  const page = listPagination(req.query, 1000)
+  // Default agenda window: 30 days back through 365 days ahead. Echo the
+  // resolved range so subsequent pages can reuse the exact same window.
+  const now = Date.now()
+  const from = new Date(typeof req.query.from === 'string' ? req.query.from : now - 30 * 86400000)
+  const to = new Date(typeof req.query.to === 'string' ? req.query.to : now + 365 * 86400000)
+  if (!Number.isFinite(from.getTime()) || !Number.isFinite(to.getTime()) || from > to) {
+    res.status(400).json({ error: 'invalid calendar range' })
+    return
+  }
   // Privacy filter: `is_private` rows are only visible to their creator
   // or assignee. The clause uses $2 for the caller id; range filters
   // bind after.
@@ -7000,9 +7074,11 @@ api.get('/calendar/events', async (req, res) => {
     params.push(to)
     sql += ` AND start_at <= $${params.length}`
   }
-  sql += ` ORDER BY start_at ASC LIMIT 1000`
+  params.push(page.limit + 1, page.offset)
+  sql += ` ORDER BY start_at ASC, id ASC LIMIT $${params.length - 1} OFFSET $${params.length}`
   const { rows } = await pool.query(sql, params)
-  res.json({ events: rows.map(rowToCalendarEvent) })
+  const result = pageResult(res, rows, page)
+  res.json({ events: result.items.map(rowToCalendarEvent), hasMore: result.hasMore, nextCursor: result.nextCursor, from: from.toISOString(), to: to.toISOString() })
 })
 
 api.post('/calendar/events', async (req, res) => {
@@ -7376,15 +7452,19 @@ async function enqueueDocumentChanged(
 
 api.get('/documents', safe(async (req, res) => {
   const { companyId } = await requireCompany(req)
+  const page = listPagination(req.query, 200)
   const { rows } = await pool.query<DocumentRow>(
     `SELECT id, company_id, title, created_by, conversation_id, created_at, updated_at
        FROM documents
       WHERE company_id = $1
-      ORDER BY updated_at DESC
-      LIMIT 200`,
-    [companyId],
+      ORDER BY updated_at DESC, id DESC
+      LIMIT $2 OFFSET $3`,
+    [companyId, page.limit + 1, page.offset],
   )
-  res.json({ documents: rows.map(toDocPayload) })
+  const result = pageResult(res, rows, page)
+  // Absence from an incomplete page is not deletion; /documents/:id remains
+  // the authority for a selected document outside the currently loaded page.
+  res.json({ documents: result.items.map(toDocPayload), hasMore: result.hasMore, nextCursor: result.nextCursor })
 }))
 
 api.post('/documents', safe(async (req, res) => {

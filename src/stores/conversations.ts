@@ -25,7 +25,7 @@ interface ConversationsState {
   applyIncomingMessage: (
     conversationId: string,
     message: ApiMessage,
-    opts: { read: boolean },
+    opts: { read: boolean; deliveryId?: string },
   ) => boolean
   /** Clear a row's badge without waiting for the server round trip. */
   markLocallyRead: (conversationId: string) => void
@@ -156,6 +156,7 @@ function fromApi(c: ApiConversation): Conversation {
     mutedUntil: c.mutedUntil,
     unread: c.unreadCount > 0 ? c.unreadCount : undefined,
     lastMessageId: last?.id ?? null,
+    lastSequence: last?.sequence ?? useMessages.getState().byConvo[c.id]?.find(m => m.id === last?.id)?.sequence,
     lastAt: timeFromIso(last?.createdAt ?? c.updatedAt),
     lastAtIso: last?.createdAt ?? c.updatedAt,
     preview: previewOf(last),
@@ -197,28 +198,54 @@ export function isMuted(c: Pick<Conversation, 'muted' | 'mutedUntil'>): boolean 
   return new Date(c.mutedUntil).getTime() > Date.now()
 }
 
+let eventEpoch = -1
+let revision = 0
+let reloadGeneration = 0
+const seenMessages = new Set<string>()
+const seenDeliveries = new Set<string>()
+let reconcileTimer: ReturnType<typeof setTimeout> | undefined
+function reconcileUnread() {
+  if (reconcileTimer !== undefined) return
+  reconcileTimer = setTimeout(() => {
+    reconcileTimer = undefined
+    void useConversations.getState().reload()
+  }, 150)
+}
+
+function mergeSnapshot(list: ApiConversation[], current: Conversation[]): Conversation[] {
+  return list.map(fromApi).map(row => {
+    const previous = current.find(c => c.id === row.id)
+    if (previous?.lastSequence !== undefined && ((row.lastSequence === undefined && previous.lastAtIso >= row.lastAtIso)
+      || (row.lastSequence !== undefined && previous.lastSequence > row.lastSequence))) {
+      return { ...row, lastSequence: previous.lastSequence, lastMessageId: previous.lastMessageId,
+        lastAt: previous.lastAt, lastAtIso: previous.lastAtIso, preview: previous.preview }
+    }
+    return row
+  }).sort(bySidebarOrder)
+}
+
 export const useConversations = create<ConversationsState>((set, get) => ({
   list: [],
   loaded: false,
   async load() {
+    ++reloadGeneration
+    ++revision
+    seenMessages.clear()
+    seenDeliveries.clear()
     // Clear stale data immediately so a workspace switch never shows the
     // previous tenant's conversations during the loading window.
     set({ list: [], loaded: false })
-    try {
-      await commitIfContextCurrent(() => api.getConversations(), (list) => {
-        const conversations = list.map(fromApi)
-        set({ list: conversations, loaded: true })
-        refreshActiveMessagesIfSidebarMoved(conversations)
-      })
-    } catch (err) {
-      console.warn('[conversations] load failed', err)
-    }
+    await get().reload()
   },
   async reload() {
+    const generation = ++reloadGeneration
+    const startRevision = revision
     try {
       await commitIfContextCurrent(() => api.getConversations(), (list) => {
-        const conversations = list.map(fromApi)
-        set({ list: conversations })
+        if (generation !== reloadGeneration) return
+        if (startRevision !== revision) { reconcileUnread(); return }
+        const conversations = mergeSnapshot(list, get().list)
+        set({ list: conversations, loaded: true })
         refreshActiveMessagesIfSidebarMoved(conversations)
       })
     } catch (err) {
@@ -231,24 +258,37 @@ export const useConversations = create<ConversationsState>((set, get) => ({
     // added to. There is no row to patch, so fall back to a fetch.
     if (!existing) { void get().reload(); return false }
 
+    const epoch = useAuth.getState().contextEpoch
+    if (eventEpoch !== epoch) {
+      eventEpoch = epoch
+      seenMessages.clear()
+      seenDeliveries.clear()
+    }
+    const key = `${conversationId}:${message.id}`
+    if (seenMessages.has(key) || (opts.deliveryId && seenDeliveries.has(opts.deliveryId))) return true
+    seenMessages.add(key)
+    if (opts.deliveryId) seenDeliveries.add(opts.deliveryId)
+    if (seenMessages.size > 4096) seenMessages.delete(seenMessages.values().next().value!)
+    if (seenDeliveries.size > 4096) seenDeliveries.delete(seenDeliveries.values().next().value!)
+    ++revision
+    const sequence = message.sequence
+    const newer = Number.isSafeInteger(sequence) && (existing.lastSequence === undefined
+      ? !existing.lastMessageId || (message.createdAt ?? message.at ?? '') > existing.lastAtIso
+      : sequence > existing.lastSequence)
+    // A replay may already be included in the fetched unread count. Reconcile
+    // all ambiguous arrivals; only advance the preview with a newer sequence.
+    reconcileUnread()
+    if (!newer || existing.lastMessageId === message.id) return true
     const last = lastMessageFromWs(message)
-    // The server counts unread as `author_id <> me AND created_at > last_read`.
-    // Mirror the author half here: a message this user sent from the CLI or
-    // another device echoes back over WS, and counting it would show a badge
-    // that the next reconcile silently takes away again.
     const mine = message.authorId === useAuth.getState().user?.id
-    const unread = opts.read
-      ? undefined                                    // the user is looking at it
-      : mine
-        ? existing.unread                            // own message: no change
-        : (existing.unread ?? 0) + 1
     const next: Conversation = {
       ...existing,
       lastMessageId: last.id,
+      lastSequence: sequence,
       lastAt: timeFromIso(last.createdAt),
       lastAtIso: last.createdAt,
       preview: previewOf(last),
-      unread,
+      unread: mine ? existing.unread : (existing.unread ?? 0) + 1,
     }
     const list = get().list.map((c) => (c.id === conversationId ? next : c)).sort(bySidebarOrder)
     set({ list })
@@ -282,18 +322,7 @@ export function bootConversations() {
       return
     }
     if (e.type === 'message.new') {
-      // Patch the one row this message touched. The event carries the whole
-      // message, so a refetch would only re-derive what we already have —
-      // for every conversation in the workspace, on every online client.
-      const active = useApp.getState().selectedConversationId
-      const isActive = e.conversationId === active
-      useConversations.getState().applyIncomingMessage(e.conversationId, e.message, { read: isActive })
-      // Still tell the server the user has seen it, so the badge stays gone
-      // across reloads and other devices. Local state is already correct, so
-      // this no longer needs to be awaited before repainting.
-      if (isActive) {
-        void api.markRead(e.conversationId).catch(() => { /* retried on next view */ })
-      }
+      useConversations.getState().applyIncomingMessage(e.conversationId, e.message, { read: false, deliveryId: e.deliveryId })
       return
     }
     if (e.type === 'group.pulled') {

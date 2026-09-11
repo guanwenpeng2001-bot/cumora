@@ -6,8 +6,8 @@
  * last subscriber detaches we keep the room around for a short grace
  * window so a refresh / quick re-open doesn't pay the cold-load cost.
  *
- * Persistence is append-only: every Y.Doc 'update' event is written to
- * `document_updates`. A periodic compaction merges the log into a single
+ * Persistence is append-only: edits are written to `document_updates`
+ * with a transactional outbox event before being applied to live rooms. A periodic compaction merges the log into a single
  * `document_snapshots` row; the next cold load reads the snapshot + any
  * tail updates. The room manager subscribes to a Redis channel so two
  * different server instances can fan an update out to each other and
@@ -17,6 +17,7 @@
 import * as Y from 'yjs'
 import type { PoolClient } from 'pg'
 import { pool } from '../db/pool.js'
+import { enqueueBroadcast, withOutboxTransaction } from '../realtime-outbox.js'
 import { compactDocument, readDocumentState } from './persistence.js'
 import {
   redis, sub, publish,
@@ -53,8 +54,7 @@ interface Room {
   compacting: boolean
   /** Set during cold-load to coalesce concurrent waiters. */
   loaded: Promise<void>
-  /** Marked true after the doc is hydrated from DB; flips OFF doc.on('update')
-   *  persistence to skip writing replays back into the log. */
+  /** Set once durable state has loaded and the room can accept bus updates. */
   hydrated: boolean
 }
 
@@ -70,18 +70,55 @@ const evictions = new Map<string, NodeJS.Timeout>()
  *  echo-suppressed when they originated here. */
 const INSTANCE_ORIGIN = `instance:${env.INSTANCE_ID}`
 
-async function persistUpdate(documentId: string, authorId: string, bytes: Uint8Array): Promise<void> {
-  await pool.query(
-    `INSERT INTO document_updates (document_id, author_id, update_bytes)
-     VALUES ($1, $2, $3)`,
-    [documentId, authorId, Buffer.from(bytes)],
-  )
-  // Bump the parent doc's updated_at so the listing API sorts the
-  // freshly-edited doc to the top without a separate write.
-  await pool.query(
-    `UPDATE documents SET updated_at = NOW() WHERE id = $1`,
-    [documentId],
-  ).catch(() => { /* swallow — list ordering is best-effort */ })
+/** Build edits against durable state under the document row lock. The live
+ * room is changed only after commit (or via the durable outbox for a caller's
+ * transaction), so failed edits cannot become dependencies of later edits. */
+async function editDocument<T>(
+  documentId: string, companyId: string, originId: string, authorId: string,
+  edit: (doc: Y.Doc) => T | Promise<T>, dbClient?: PoolClient, incomingUpdate?: Uint8Array,
+): Promise<T> {
+  let committedUpdate: Uint8Array | undefined
+  const run = async (client: PoolClient): Promise<T> => {
+    const parent = await client.query(
+      'SELECT id FROM documents WHERE id = $1 AND company_id = $2 FOR UPDATE',
+      [documentId, companyId],
+    )
+    if (!parent.rowCount) throw new Error(`document ${documentId} not found`)
+    const draft = new Y.Doc()
+    try {
+      await hydrateDoc(documentId, draft, client)
+      const updates: Uint8Array[] = incomingUpdate ? [incomingUpdate] : []
+      draft.on('update', (update: Uint8Array) => updates.push(update))
+      const result = await edit(draft)
+      if (updates.length) {
+        const update = Y.mergeUpdates(updates)
+        await client.query(
+          'INSERT INTO document_updates (document_id, author_id, update_bytes) VALUES ($1, $2, $3)',
+          [documentId, authorId, Buffer.from(update)],
+        )
+        await client.query('UPDATE documents SET updated_at = NOW() WHERE id = $1', [documentId])
+        await enqueueBroadcast(client, CH_DOC_UPDATE, {
+          type: 'doc.update', companyId, documentId,
+          updateB64: Buffer.from(update).toString('base64'), originId, authorId,
+        })
+        committedUpdate = update
+      }
+      return result
+    } finally {
+      draft.destroy()
+    }
+  }
+  if (dbClient) return run(dbClient)
+  const result = await withOutboxTransaction(run)
+  if (committedUpdate) applyRemoteUpdate(documentId, originId, committedUpdate)
+  return result
+}
+
+async function prepareDocument(documentId: string, companyId: string, dbClient?: PoolClient): Promise<void> {
+  await editDocument(documentId, companyId, 'system:doc-image-refresh', 'system', async (doc) => {
+    normalizeMarkdownImageParagraphs(doc, pmFragment(doc), { originId: 'system:doc-image-normalize', authorId: 'system' })
+    await refreshDocumentImageUrls(doc, pmFragment(doc), { originId: 'system:doc-image-refresh', authorId: 'system' })
+  }, dbClient)
 }
 
 async function maybeCompact(room: Room): Promise<void> {
@@ -110,7 +147,6 @@ function roomKey(documentId: string): string {
 async function getOrCreateRoom(
   documentId: string,
   companyId: string,
-  dbClient?: PoolClient,
 ): Promise<Room> {
   // Clear any pending eviction — we're reusing the warm room.
   const pending = evictions.get(documentId)
@@ -137,7 +173,7 @@ async function getOrCreateRoom(
   rooms.set(key, room)
 
   room.loaded = (async () => {
-    await hydrateDoc(documentId, doc, dbClient)
+    await hydrateDoc(documentId, doc)
     room.hydrated = true
     doc.on('update', (update: Uint8Array, origin: unknown) => {
       // Hydration replays are tagged 'hydrate' to skip persistence + fan-out.
@@ -148,40 +184,13 @@ async function getOrCreateRoom(
         if (isRemote) return (origin as { remote: string }).remote
         return INSTANCE_ORIGIN
       })()
-      const authorId = (() => {
-        if (typeof origin === 'object' && origin !== null && 'authorId' in origin) {
-          return String((origin as { authorId: string }).authorId)
-        }
-        return originId
-      })()
-
       // Local subscribers get the binary update directly.
       for (const s of room.subs) {
         if (s.originId === originId) continue
         try { s.onUpdate(update, originId) } catch (e) { console.warn('[docs] sub error', e) }
       }
 
-      // Persist + fan-out unless this update arrived FROM another instance
-      // (it's already persisted there + already on the bus).
-      if (!isRemote) {
-        void persistUpdate(documentId, authorId, update).then(() => {
-          room.updatesSinceSnapshot += 1
-          void maybeCompact(room).catch((e) => console.warn('[docs] compact failed', e))
-        }).catch((e) => {
-          console.warn('[docs] persistUpdate failed', e)
-        })
-        void publish(CH_DOC_UPDATE, {
-          type: 'doc.update',
-          companyId: room.companyId,
-          documentId,
-          updateB64: Buffer.from(update).toString('base64'),
-          originId,
-          authorId,
-        }).catch(() => { /* swallow */ })
-      }
     })
-    normalizeMarkdownImageParagraphs(doc, pmFragment(doc), { originId: 'system:doc-image-normalize', authorId: 'system' })
-    await refreshDocumentImageUrls(doc, pmFragment(doc), { originId: 'system:doc-image-refresh', authorId: 'system' })
   })().catch((error) => {
     // Never cache a rejected hydration promise. A transient DB timeout or a
     // corrupt row must fail the current waiters, but a later request should be
@@ -202,8 +211,8 @@ export async function subscribe(
   companyId: string,
   sub: DocSubscriber,
 ): Promise<{ initialState: Uint8Array }> {
+  await prepareDocument(documentId, companyId)
   const room = await getOrCreateRoom(documentId, companyId)
-  await refreshDocumentImageUrls(room.doc, pmFragment(room.doc), { originId: 'system:doc-image-refresh', authorId: 'system' })
   room.subs.add(sub)
   return { initialState: Y.encodeStateAsUpdate(room.doc) }
 }
@@ -225,8 +234,7 @@ export function unsubscribe(documentId: string, sub: DocSubscriber): void {
   }
 }
 
-/** Apply a Yjs update produced by a local subscriber. The room's
- *  doc.on('update') hook is responsible for persistence + fan-out. */
+/** Persist a local update and its outbox event before changing the room. */
 export async function applyLocalUpdate(
   documentId: string,
   companyId: string,
@@ -235,19 +243,28 @@ export async function applyLocalUpdate(
   update: Uint8Array,
   dbClient?: PoolClient,
 ): Promise<void> {
-  const room = await getOrCreateRoom(documentId, companyId, dbClient)
-  // origin carries everything the persistence hook needs to route the
-  // event correctly. Plain object so the `remote` discriminator is absent
-  // (i.e. it's a LOCAL update — must persist + fan-out).
-  Y.applyUpdate(room.doc, update, { originId, authorId } as never)
+  await editDocument(documentId, companyId, originId, authorId, (doc) => {
+    Y.applyUpdate(doc, update)
+  }, dbClient, update)
 }
 
 /** Apply a Yjs update that came FROM another server instance via Redis.
  *  Tagged with `remote` so the persistence hook skips re-writing it. */
 function applyRemoteUpdate(documentId: string, originId: string, update: Uint8Array): void {
   const room = rooms.get(roomKey(documentId))
-  if (!room || !room.hydrated) return  // nobody's listening locally
+  if (!room || !room.hydrated) {
+    // Agent-only documents need compaction too, even without a live room.
+    void pool.query(
+      'SELECT 1 FROM document_updates WHERE document_id = $1 OFFSET $2 LIMIT 1',
+      [documentId, COMPACT_AFTER_UPDATES - 1],
+    ).then(async (rows) => {
+      if (rows.rowCount) await compactDocument(pool, documentId)
+    }).catch((error) => console.warn('[docs] compact failed', error))
+    return
+  }
   Y.applyUpdate(room.doc, update, { remote: originId } as never)
+  room.updatesSinceSnapshot += 1
+  void maybeCompact(room).catch((error) => console.warn('[docs] compact failed', error))
 }
 
 /** Awareness is ephemeral — no DB, just fan-out. */
@@ -520,23 +537,12 @@ export function extractStorageKeysFromDoc(doc: Y.Doc): string[] {
   return Array.from(keys)
 }
 
-/** Collect storage keys for a document. Reuses an active in-memory room if present,
- *  otherwise hydrates a temporary in-memory Y.Doc without adding to the room map,
- *  registering listeners, or refreshing presigned URLs. */
+/** Read storage references from durable state; the live room may still be
+ *  waiting for committed edits on the outbox. Never refresh URLs here. */
 export async function collectDocumentStorageKeys(
   documentId: string,
   dbClient?: PoolClient,
 ): Promise<string[]> {
-  const existing = rooms.get(roomKey(documentId))
-  if (existing) {
-    try {
-      await existing.loaded
-      return extractStorageKeysFromDoc(existing.doc)
-    } catch {
-      // Fall through to cold hydration if existing room threw
-    }
-  }
-
   const doc = new Y.Doc()
   try {
     await hydrateDoc(documentId, doc, dbClient)
@@ -674,9 +680,11 @@ export async function readDocumentText(
   companyId: string,
   dbClient?: PoolClient,
 ): Promise<string> {
-  const room = await getOrCreateRoom(documentId, companyId, dbClient)
-  await refreshDocumentImageUrls(room.doc, pmFragment(room.doc), { originId: 'system:doc-image-refresh', authorId: 'system' })
-  return fragmentToPlainText(pmFragment(room.doc))
+  return editDocument(documentId, companyId, 'system:doc-image-refresh', 'system', async (doc) => {
+    normalizeMarkdownImageParagraphs(doc, pmFragment(doc), { originId: 'system:doc-image-normalize', authorId: 'system' })
+    await refreshDocumentImageUrls(doc, pmFragment(doc), { originId: 'system:doc-image-refresh', authorId: 'system' })
+    return fragmentToPlainText(pmFragment(doc))
+  }, dbClient)
 }
 
 /** Append agent-authored prose to the document as native ProseMirror nodes.
@@ -786,117 +794,118 @@ export async function applyAgentEdit(
   blocksReplaced: number
   deletedStorageKeys: string[]
 }> {
-  const room = await getOrCreateRoom(documentId, companyId, dbClient)
-  const fragment = pmFragment(room.doc)
-  let replaced = 0
-  let imagePlaced: 'absolute' | 'anchor' | 'anchor-missed' | null = null
-  let imagesDeleted = 0
-  let blocksReplaced = 0
-  const deletedStorageKeys: string[] = []
-  const origin = { originId: `agent:${agentId}`, authorId: agentId } as never
-  room.doc.transact(() => {
-    for (const op of ops) {
-      if (op.kind === 'append') {
-        insertAgentMarkdown(fragment, op.text)
-      } else if (op.kind === 'insertParagraph') {
-        if (op.at === 'end') {
+  return editDocument(documentId, companyId, `agent:${agentId}`, agentId, (doc) => {
+    const fragment = pmFragment(doc)
+    let replaced = 0
+    let imagePlaced: 'absolute' | 'anchor' | 'anchor-missed' | null = null
+    let imagesDeleted = 0
+    let blocksReplaced = 0
+    const deletedStorageKeys: string[] = []
+    const origin = { originId: `agent:${agentId}`, authorId: agentId } as never
+    doc.transact(() => {
+      for (const op of ops) {
+        if (op.kind === 'append') {
           insertAgentMarkdown(fragment, op.text)
-        } else {
-          insertAgentMarkdown(fragment, op.text, 0)
-        }
-      } else if (op.kind === 'replaceBlock') {
-        // Structural swap: replace ONE whole block (the first containing
-        // anchorText) with freshly-parsed markdown blocks. This is what
-        // `replace` can't do — that op only edits text inside a block, so
-        // e.g. a flattened markdown table stuck in a paragraph could never
-        // be turned back into a real table without this. Anchor miss is a
-        // no-op (mirrors the image-replace rule: never fall back to append).
-        const hit = findFirstBlockContaining(fragment, op.anchorText)
-        if (hit) {
-          fragment.delete(hit.index, 1)
-          insertAgentMarkdown(fragment, op.text, hit.index)
-          blocksReplaced++
-        }
-      } else if (op.kind === 'image') {
-        // Direct image-block insert — bypasses the markdown parser
-        // entirely so agents get a deterministic insert regardless of
-        // how their model formatter wrapped the URL. Same Y.XmlElement
-        // shape the markdown image branch emits, so the human's editor
-        // doesn't care which path produced it.
-        const yImage = imageElementFromNode({
-          type: 'image',
-          attrs: { src: op.src, alt: op.alt, title: null },
-        })
-        if (!yImage) continue
-        const p = op.placement
-        if (isAnchoredImagePlacement(p)) {
-          const hit = findFirstBlockContaining(fragment, p.anchorText)
-          if (!hit) {
-            // Anchor not found — DO NOT fall back to end. Falling back
-            // would mean every `--replace` miss silently re-appends a
-            // duplicate image, which is how the doc collected the mess
-            // it has now. Skip the op and let the CLI return an error
-            // so the agent retries with a different snippet or fixes
-            // the doc by hand.
-            imagePlaced = 'anchor-missed'
-          } else if (p.mode === 'replace') {
-            fragment.delete(hit.index, 1)
-            fragment.insert(hit.index, [yImage])
-            imagePlaced = 'anchor'
-          } else if (p.mode === 'after') {
-            fragment.insert(hit.index + 1, [yImage])
-            imagePlaced = 'anchor'
-          } else /* before */ {
-            fragment.insert(hit.index, [yImage])
-            imagePlaced = 'anchor'
+        } else if (op.kind === 'insertParagraph') {
+          if (op.at === 'end') {
+            insertAgentMarkdown(fragment, op.text)
+          } else {
+            insertAgentMarkdown(fragment, op.text, 0)
           }
-        } else {
-          // Absolute placement (start / end).
-          if (p.mode === 'start') fragment.insert(0, [yImage])
-          else fragment.push([yImage])
-          imagePlaced = 'absolute'
-        }
-      } else if (op.kind === 'imageDelete') {
-        // Walk every image node in the fragment and delete those whose
-        // src / alt matches the supplied criterion. Iterate from end →
-        // start to keep indices stable as we splice. Collected via
-        // collectImageBlocks above (which recurses through container
-        // blocks like blockquote / list) so we can also reach nested
-        // illustrations.
-        const all = collectImageBlocks(fragment)
-        const matches = all.filter(({ element }) => {
-          const src = xmlAttrString(element, 'src')
-          const alt = xmlAttrString(element, 'alt')
-          if (op.match.by === 'src') return src === op.match.src
-          if (op.match.by === 'src-contains') return src.includes(op.match.substring)
-          /* by alt */ return alt === op.match.alt
-        })
-        // Sort descending by index so we can delete in place without
-        // shifting earlier indices. Group by container (rare for nested
-        // images but possible).
-        matches.sort((a, b) => b.index - a.index)
-        for (const m of matches) {
-          const key = imageStorageKey(m.element)
-          if (key) deletedStorageKeys.push(key)
-          m.container.delete(m.index, 1)
-          imagesDeleted++
-        }
-      } else if (op.kind === 'replace') {
-        for (const t of iterXmlText(fragment)) {
-          const s = t.toString()
-          const idx = s.indexOf(op.find)
-          if (idx >= 0) {
-            t.delete(idx, op.find.length)
-            if (op.replace.length > 0) t.insert(idx, op.replace)
-            replaced++
-            break
+        } else if (op.kind === 'replaceBlock') {
+          // Structural swap: replace ONE whole block (the first containing
+          // anchorText) with freshly-parsed markdown blocks. This is what
+          // `replace` can't do — that op only edits text inside a block, so
+          // e.g. a flattened markdown table stuck in a paragraph could never
+          // be turned back into a real table without this. Anchor miss is a
+          // no-op (mirrors the image-replace rule: never fall back to append).
+          const hit = findFirstBlockContaining(fragment, op.anchorText)
+          if (hit) {
+            fragment.delete(hit.index, 1)
+            insertAgentMarkdown(fragment, op.text, hit.index)
+            blocksReplaced++
+          }
+        } else if (op.kind === 'image') {
+          // Direct image-block insert — bypasses the markdown parser
+          // entirely so agents get a deterministic insert regardless of
+          // how their model formatter wrapped the URL. Same Y.XmlElement
+          // shape the markdown image branch emits, so the human's editor
+          // doesn't care which path produced it.
+          const yImage = imageElementFromNode({
+            type: 'image',
+            attrs: { src: op.src, alt: op.alt, title: null },
+          })
+          if (!yImage) continue
+          const p = op.placement
+          if (isAnchoredImagePlacement(p)) {
+            const hit = findFirstBlockContaining(fragment, p.anchorText)
+            if (!hit) {
+              // Anchor not found — DO NOT fall back to end. Falling back
+              // would mean every `--replace` miss silently re-appends a
+              // duplicate image, which is how the doc collected the mess
+              // it has now. Skip the op and let the CLI return an error
+              // so the agent retries with a different snippet or fixes
+              // the doc by hand.
+              imagePlaced = 'anchor-missed'
+            } else if (p.mode === 'replace') {
+              fragment.delete(hit.index, 1)
+              fragment.insert(hit.index, [yImage])
+              imagePlaced = 'anchor'
+            } else if (p.mode === 'after') {
+              fragment.insert(hit.index + 1, [yImage])
+              imagePlaced = 'anchor'
+            } else /* before */ {
+              fragment.insert(hit.index, [yImage])
+              imagePlaced = 'anchor'
+            }
+          } else {
+            // Absolute placement (start / end).
+            if (p.mode === 'start') fragment.insert(0, [yImage])
+            else fragment.push([yImage])
+            imagePlaced = 'absolute'
+          }
+        } else if (op.kind === 'imageDelete') {
+          // Walk every image node in the fragment and delete those whose
+          // src / alt matches the supplied criterion. Iterate from end →
+          // start to keep indices stable as we splice. Collected via
+          // collectImageBlocks above (which recurses through container
+          // blocks like blockquote / list) so we can also reach nested
+          // illustrations.
+          const all = collectImageBlocks(fragment)
+          const matches = all.filter(({ element }) => {
+            const src = xmlAttrString(element, 'src')
+            const alt = xmlAttrString(element, 'alt')
+            if (op.match.by === 'src') return src === op.match.src
+            if (op.match.by === 'src-contains') return src.includes(op.match.substring)
+            /* by alt */ return alt === op.match.alt
+          })
+          // Sort descending by index so we can delete in place without
+          // shifting earlier indices. Group by container (rare for nested
+          // images but possible).
+          matches.sort((a, b) => b.index - a.index)
+          for (const m of matches) {
+            const key = imageStorageKey(m.element)
+            if (key) deletedStorageKeys.push(key)
+            m.container.delete(m.index, 1)
+            imagesDeleted++
+          }
+        } else if (op.kind === 'replace') {
+          for (const t of iterXmlText(fragment)) {
+            const s = t.toString()
+            const idx = s.indexOf(op.find)
+            if (idx >= 0) {
+              t.delete(idx, op.find.length)
+              if (op.replace.length > 0) t.insert(idx, op.replace)
+              replaced++
+              break
+            }
           }
         }
       }
-    }
-    normalizeMarkdownImageParagraphChildren(fragment)
-  }, origin)
-  return { replaced, imagePlaced, imagesDeleted, blocksReplaced, deletedStorageKeys }
+      normalizeMarkdownImageParagraphChildren(fragment)
+    }, origin)
+    return { replaced, imagePlaced, imagesDeleted, blocksReplaced, deletedStorageKeys }
+  }, dbClient)
 }
 
 /** Cross-instance bus bootstrap. Idempotent — safe to call from index.ts

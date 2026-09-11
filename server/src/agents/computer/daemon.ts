@@ -530,28 +530,12 @@ interface RuntimeInboxResponse {
 // in EVERY chat turn's prompt (see chatDelta), so it stays small.
 const DIGEST_MAX_MESSAGE_LINES = 40
 
-/** Render the pre-loaded unread digest for the wake prompt within
- *  DIGEST_MAX_MESSAGE_LINES.
- *
- *  The budget is spent PER CONVERSATION rather than as one global "newest N
- *  lines" tail, because `ackSeen` marks the WHOLE snapshot read: anything the
- *  digest leaves out is marked read having never been shown, and since
- *  mark-read pins each conversation's cursor at its NEWEST message it can never
- *  resurface in a later wake. A global tail let a burst in one busy room evict —
- *  and then ack away — every message of a quieter conversation, including a
- *  human DM the agent could not even name afterwards. The cloud path avoids this
- *  by giving every conversation with unread its own window (see loadContext).
- *
- *  Whatever the budget still cannot fit is announced IN PLACE with its exact
- *  count and the command that reads it, so the engine can recover the rest
- *  instead of never learning it existed. Conversations keep first-seen order and
- *  their messages stay chronological; when everything fits, every unread line is
- *  shown, exactly as before.
- *
- *  Exported for tests — pure, no server and no engine. */
+/** Render a per-conversation digest. Report the displayed suffix separately so
+ * clipped inputs remain unread after a successful engine turn. */
 export function renderInboxDigest(
   byConvo: Map<string, { head: string; msgs: string[] }>,
   budget = DIGEST_MAX_MESSAGE_LINES,
+  onShown?: (conversationId: string, start: number) => void,
 ): string {
   if (byConvo.size === 0) return ''
   // Water-fill quietest-first: each conversation takes at most an even share of
@@ -571,12 +555,13 @@ export function renderInboxDigest(
   for (const [id, convo] of byConvo) {
     const shown = keep.get(id) ?? 0
     lines.push(convo.head)
-    // Never drop unread in SILENCE — this turn is about to mark it read.
+    // Announce omitted input; it receives no completion receipt.
     if (convo.msgs.length > shown) {
       lines.push(`  … ${convo.msgs.length - shown} older unread message(s) not shown — \`cumora messages ${id} --tail ${convo.msgs.length}\` to read them`)
     }
     // slice(length - shown), NOT slice(-shown): slice(-0) is slice(0) and would
     // print everything for a conversation budgeted to zero.
+    onShown?.(id, convo.msgs.length - shown)
     lines.push(...convo.msgs.slice(convo.msgs.length - shown))
   }
   return lines.join('\n')
@@ -718,7 +703,7 @@ async function runtimeGet<T>(
  *  and the "no indicator at all" case is the one users read as a hang. */
 export function typingConversation(
   wakeConvo: string | null,
-  seen: Map<string, string>,
+  seen: ReadonlyMap<string, unknown>,
 ): string | null {
   if (wakeConvo) return wakeConvo
   return seen.size === 1 ? [...seen.keys()][0] : null
@@ -2408,11 +2393,11 @@ export class AgentRunner {
    *  engine's cheap fast model (Claude Haiku), NOT a cloud call. The server only
    *  builds the prompt (it has the DB for inbox+context); inference is 100%
    *  local: no network model hop, no sub2api quota (429/503), no big brain. */
-  private async inboxTriage(token: string, seen: Map<string, string>): Promise<RuntimeInboxTriageResponse> {
+  private async inboxTriage(token: string, seen: Map<string, string[]>): Promise<RuntimeInboxTriageResponse> {
     const payload = await runtimeGet<RuntimeTriagePayload>(this.cfg.serverUrl, '/inbox-triage/payload', token)
     if (!payload) return deferTriage('fail-closed', 'triage payload unavailable', 'payload-unavailable')
-    if (payload.messageIds !== undefined && (!Array.isArray(payload.messageIds) ||
-        [...seen.values()].some((id) => !payload.messageIds!.includes(id)))) {
+    if (!Array.isArray(payload.messageIds) ||
+        [...seen.values()].flat().some((id) => !payload.messageIds!.includes(id))) {
       return deferTriage('fail-closed', 'triage snapshot no longer covers the unread boundary', 'invalid-result')
     }
     if (payload.verdict) return triageDisposition(payload.verdict)
@@ -2529,16 +2514,6 @@ export class AgentRunner {
     console.warn(`[computer] ${this.agent.id} triage report failed (callId=${report.callId})`)
   }
 
-  /** Snapshot the unread inbox: the {conversationId → latest unread message id}
-   *  cursor map (for `ackSeen`), AND a human-readable digest of the unread
-   *  messages to PRE-LOAD into the wake prompt. Pre-loading is what the cloud
-   *  agent already does (it builds the turn input from the inbox), so the BYOA
-   *  engine can read the room and reply WITHOUT first spending `cumora inbox` +
-   *  `cumora messages` round-trips — each of those is an extra opus hop, and
-   *  cutting them is most of the per-turn latency.
-   *  Captured BEFORE the engine runs so `ackSeen` advances exactly what THIS
-   *  turn saw; messages that land mid-turn keep a higher id, stay unread, and
-   *  drive the coalesced rerun. */
   /** Parse a system row's wire payload as a due calendar alarm (the JSON the
    *  server's calendar dispatcher writes). Wire-format read, not content
    *  classification. Null = not a calendar dispatch. */
@@ -2554,25 +2529,26 @@ export class AgentRunner {
     } catch { return null }
   }
 
-  private async snapshotUnread(token: string): Promise<{ seen: Map<string, string>; digest: string; hasReal: boolean; projectIds: string[] }> {
+  private async snapshotUnread(token: string): Promise<{ seen: Map<string, string[]>; displayed: Map<string, string[]>; digest: string; hasReal: boolean; projectIds: string[] }> {
     const inbox = await runtimeGet<RuntimeInboxResponse>(this.cfg.serverUrl, '/inbox', token)
-    const seen = new Map<string, string>()
+    const seen = new Map<string, string[]>()
     // Unread grouped BY CONVERSATION (first-seen order), each with the header
     // (title + topic) the cloud agent's context also carries — so a BYOA agent
     // always sees what the group is FOR (its topic), not just the messages.
-    // Grouped rather than one flat line list because the digest has a LINE
-    // BUDGET, and spending it per conversation is what stops a busy room from
-    // evicting — and `ackSeen` then burying — a quiet one. See renderInboxDigest.
+    // Share the digest budget across conversations; preserve omitted IDs only
+    // in the full snapshot, not in the successful engine consumption set.
     const byConvo = new Map<string, { head: string; msgs: string[] }>()
     // `hasReal` = is ANY unread a genuine human/agent message (not a system
     // relay/status/membership notice)? The cost gate in runTurn uses this to
     // refuse to spend ANY model on a system-only (or empty) inbox.
     let hasReal = false
-    // rows are ordered created_at ASC, so the last row per conversation is its
-    // newest unread message — exactly the cursor we want to advance to.
+    // Retain every input ID, including messages the digest budget will omit.
     for (const row of inbox?.rows ?? []) {
       if (typeof row.conversation_id !== 'string' || !row.conversation_id) continue
-      if (typeof row.id === 'string' && row.id) seen.set(row.conversation_id, row.id)
+      if (typeof row.id !== 'string' || !row.id) continue
+      const ids = seen.get(row.conversation_id) ?? []
+      ids.push(row.id)
+      seen.set(row.conversation_id, ids)
       // A due CALENDAR dispatch is a SELF-SCHEDULED ALARM, not system noise —
       // it must count as real or a BYOA agent's own alarm can never wake its
       // engine (the cloud path special-cases these system rows the same way).
@@ -2605,19 +2581,20 @@ export class AgentRunner {
     const projectIds = uniqueProjectIds(
       (inbox?.rows ?? []).map((r) => (typeof r.project_id === 'string' ? r.project_id : null)),
     )
-    return { seen, digest: renderInboxDigest(byConvo), hasReal, projectIds }
+    const displayed = new Map<string, string[]>()
+    const digest = renderInboxDigest(byConvo, DIGEST_MAX_MESSAGE_LINES, (id, start) => {
+      const ids = seen.get(id)!.slice(start)
+      if (ids.length) displayed.set(id, ids)
+    })
+    return { seen, displayed, digest, hasReal, projectIds }
   }
 
-  /** Advance this agent's read cursor over the conversations it just saw, so a
-   *  wake that ends WITHOUT a reply (small-brain said "skip", or the engine
-   *  read the room and chose silence) does not re-trigger on the same messages
-   *  every INBOX_POLL_MS. markConversationRead is monotonic, so this never
-   *  regresses a cursor the engine already advanced further via `cumora reply`. */
-  private async ackSeen(token: string, seen: Map<string, string>): Promise<void> {
+  /** Commit exact receipts for classified or successfully displayed input. */
+  private async ackSeen(token: string, seen: Map<string, string[]>): Promise<void> {
     if (this.turnCancelled || this.teardown.signal.aborted) return
     if (seen.size === 0) return
-    await Promise.all([...seen].map(([conversationId, upToMessageId]) =>
-      runtimeBest(this.cfg.serverUrl, '/conversation/mark-read', token, { conversationId, upToMessageId }, this.safetyGeneration),
+    await Promise.all([...seen].map(([conversationId, consumedMessageIds]) =>
+      runtimeBest(this.cfg.serverUrl, '/conversation/mark-read', token, { conversationId, upToMessageId: consumedMessageIds.at(-1), consumedMessageIds }, this.safetyGeneration),
     ))
   }
 
@@ -3064,9 +3041,9 @@ export class AgentRunner {
         this.pendingBackgroundBrief = null
         // Snapshot what's unread BEFORE triaging, so triage provably sees a
         // superset of what we may ack — a real task that lands during/after
-        // triage keeps a higher id, stays out of `seen`, and so survives to
+        // triage stays out of `seen`, and so survives to
         // drive the coalesced rerun rather than being silently acked away.
-        const { seen, digest, hasReal, projectIds } = await this.snapshotUnread(token)
+        const { seen, displayed, digest, hasReal, projectIds } = await this.snapshotUnread(token)
         // Which conversation should show "<agent> is typing…"? Prefer the one the
         // wake named, but fall back to the unread we just snapshotted, because a
         // wake often carries no conversation at all:
@@ -3318,12 +3295,9 @@ export class AgentRunner {
           )
         }
         activeBackgroundBrief = null
-        // Clean turn → ack everything this turn saw. If the engine replied it
-        // already advanced these cursors (monotonic ack is a no-op then); if it
-        // read the room and chose silence, this is what stops the same inbox
-        // from re-waking the big brain on the next drain. On engine FAILURE we
-        // skip the ack so the unread survives for a retry / next wake.
-        if (!engineError) await this.ackSeen(token, seen)
+        // A clean turn consumes only the displayed digest, even when it stays silent.
+        // Clipped input and failed turns remain eligible for a later wake.
+        if (!engineError) await this.ackSeen(token, displayed)
         await runtimeBest(this.cfg.serverUrl, '/status', token, { status: 'avail' })
         // A chat turn resets the "quiet" anchor: an agent that just acted in chat
         // isn't immediately pulled into an agenda turn (mirrors the cloud idle

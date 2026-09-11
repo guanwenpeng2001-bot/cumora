@@ -11,6 +11,14 @@
  * to hardcode — a translation pass shouldn't quietly reword the product.
  */
 export const en = {
+  "auth.retrySession": "Unable to check your session. Your sign-in and drafts have been kept. Try again when the connection recovers.",
+  'mclist.openUnread': 'Open unread conversation',
+  'me.usage.truncated': 'Only the accessible portion of these logs is shown. Narrow the time range to see other entries.',
+  "auth.retry": "Retry",
+  "onboard.contactAdmin": "Contact a workspace owner or administrator to connect a computer. You can switch workspaces from the title bar.",
+  "onboard.continueDesktop": "Continue on a desktop computer: open the address below, sign in to the same workspace, and connect your computer there.",
+  "onboard.copyFailed": "Could not copy. Select and copy the command manually.",
+
   // ─── shared ───────────────────────────────────────────────────────
   'common.close': 'close',
   'common.use': 'Use',
@@ -210,6 +218,8 @@ export const en = {
 
   'me.tab.computers': 'Computers',
   'me.tab.projects': 'Projects',
+  'me.autonomyPending': 'Not effective (planned): autonomy thresholds are not connected to action decisions or approvals. Use the enforced emergency stop and budget admission controls above.',
+  'me.trustPending': 'Not effective (planned): the server does not consume this preference; it cannot restrict permissions.',
   'me.tab.trust': 'Trust & autonomy',
   'me.tab.preferences': 'Preferences',
   'me.daemonNeedsUpdate': 'A daemon needs updating',

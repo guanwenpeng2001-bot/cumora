@@ -105,6 +105,7 @@ export interface LlmCallRecord extends LlmCallContext {
   model: string
   /** null/undefined → call ran but provider gave no usage (recorded as zeros,
    *  measured=false). The cost will be 0 in that case — we never guess. */
+  units?: { unit: 'second' | 'image'; quantity: number } | null
   usage?: TokenUsage | null
   reasoningTokens?: number
   latencyMs: number
@@ -132,18 +133,22 @@ function llmCallValues(rec: LlmCallRecord): unknown[] {
   const validUsage = rec.usage
     && [rec.usage.inputTokens, rec.usage.cachedInputTokens, rec.usage.cacheCreationTokens, rec.usage.outputTokens]
       .every(n => typeof n === 'number' && Number.isSafeInteger(n) && n >= 0)
+  const units = rec.units
+  const validUnits = Boolean(units && typeof units.quantity === 'number' && Number.isFinite(units.quantity)
+    && units.quantity >= 0 && (units.unit === 'second' || (units.unit === 'image' && Number.isSafeInteger(units.quantity))))
+  const media = rec.purpose === 'avatar-image' || rec.purpose === 'agent-image' || rec.purpose === 'audio-transcription'
+  const unitMode = media || price.unit !== undefined
   const unpriced = rec.extras?.unpriced || price.unpriced
     || (price.match === 'fallback' ? 'no-price' : null)
-    || (rec.purpose === 'avatar-image' || rec.purpose === 'agent-image' ? 'image-pricing-unavailable' : null)
-    || (rec.purpose === 'audio-transcription' ? 'duration-pricing-unavailable' : null)
-    || (!validUsage ? 'usage-unavailable' : null)
+    || (unitMode ? !validUnits ? 'unit-quantity-unavailable'
+      : !price.unit || price.unit !== units?.unit || (media && units?.unit !== (rec.purpose === 'audio-transcription' ? 'second' : 'image')) ? 'unit-price-unavailable' : null
+      : !validUsage ? 'usage-unavailable' : null)
     || (!validModelPrice(price) ? 'invalid-price' : null)
   const usage = validUsage ? rec.usage! : EMPTY_USAGE
-  const cost = effectiveCostUsd(rec.model, usage, price)
+  const cost = unitMode ? { usd: validUnits ? units!.quantity * (price.usdPerUnit ?? NaN) : 0, estimated: true }
+    : effectiveCostUsd(rec.model, usage, price)
   const reason = unpriced || (!Number.isFinite(cost.usd) ? 'invalid-cost' : null)
-  // `measured` tracks usage measurement only; pricing validity is expressed
-  // via cost_estimated/extras.unpriced, never by flipping measured.
-  const measured = Boolean(validUsage)
+  const measured = Boolean(validUsage) || validUnits
   return [
     `llm-${randomUUID()}`,
     rec.companyId, rec.agentId ?? null, rec.runId ?? null, rec.conversationId ?? null,
@@ -153,7 +158,7 @@ function llmCallValues(rec: LlmCallRecord): unknown[] {
     measured && !reason ? cost.usd : 0, reason ? true : cost.estimated, measured,
     rec.latencyMs, rec.status,
     rec.error ? rec.error.slice(0, 500) : null,
-    JSON.stringify({ ...rec.extras, pricing: price, unpriced: reason || undefined, usage: validUsage ? rec.usage : null, measurement: measured ? 'measured' : 'unknown' }),
+    JSON.stringify({ ...rec.extras, pricing: price, units: validUnits ? units : null, unpriced: reason || undefined, usage: validUsage ? rec.usage : null, measurement: measured ? 'measured' : 'unknown' }),
     rec.daemonVersion ?? null,
   ]
 }
@@ -319,10 +324,7 @@ export async function getTrackedLlmClient(ctx: LlmCallContext): Promise<OpenAI> 
     return executeTrackedText(ctx, api, args, opts)
   }
 
-  // Images don't surface token usage; we still record latency/status + tag
-  // `extras.n` / `extras.size` so per-image spend is countable (cost is
-  // resolved by image-model rate in cost.ts, currently 0 since we haven't
-  // seeded image prices — a known gap, flagged via cost_estimated=true).
+  // Returned image count is measurement; requested n alone never proves delivery.
   const wrapImagesGenerate = (
     boundGenerate: (args: AnyArgs, opts?: unknown) => Promise<AnyResponse>,
   ) =>
@@ -335,6 +337,7 @@ export async function getTrackedLlmClient(ctx: LlmCallContext): Promise<OpenAI> 
         void recordLlmCall({
           ...ctx, model, pricing, usage: null,
           latencyMs: Date.now() - t0, status: 'ok',
+          units: Array.isArray(r.data) ? { unit: 'image', quantity: r.data.filter((item: { b64_json?: unknown; url?: unknown } | null) => item?.b64_json || item?.url).length } : null,
           extras: { ...(ctx.extras ?? {}), n: args.n ?? 1, size: args.size },
         })
         return r

@@ -272,3 +272,128 @@ test('[integration] non-email conversation POST still writes a kind=text row (re
   )
   assert.equal(rows[0].kind, 'text', 'group convo POSTs must remain kind=text — only email convos auto-promote')
 })
+
+for (const failed of [false, true]) {
+  test(`[integration] clientId collapses concurrent email replies and replays persisted ${failed ? 'failures' : 'successes'}`, async () => {
+    const { conversationId, companyId } = await seedEmailConvoWithInbound()
+    process.env.EMAIL_MOCK_FAIL_RATE = failed ? '1' : '0'
+    const post = () => fetch(`${baseUrl}/api/conversations/${conversationId}/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-company-id': companyId },
+      body: JSON.stringify({ body: 'one logical email', clientId: 'same-email' }),
+    })
+    try {
+      const responses = await Promise.all([post(), post(), post()])
+      const results = await Promise.all(responses.map((r) => r.json())) as Array<{ id: string; clientId: string; persisted: boolean }>
+      assert.equal(new Set(results.map((r) => r.id)).size, 1)
+      assert.ok(results.every((r) => r.clientId === 'same-email' && r.persisted))
+      process.env.EMAIL_MOCK_FAIL_RATE = failed ? '0' : '1'
+      const replay = await post()
+      assert.equal(replay.status, failed ? 502 : 202, 'replay must not invoke provider after mock outcome changes')
+      assert.equal((await replay.json() as { id: string }).id, results[0].id)
+      const rows = await pool.query(`SELECT m.client_id, em.transport_status FROM messages m
+        JOIN email_messages em ON em.message_id = m.id WHERE m.conversation_id = $1 AND em.direction = 'out'`, [conversationId])
+      assert.equal(rows.rowCount, 1)
+      assert.equal(rows.rows[0].client_id, 'same-email')
+      assert.equal(rows.rows[0].transport_status, failed ? 'failed' : 'sent')
+    } finally { process.env.EMAIL_MOCK_FAIL_RATE = '0' }
+  })
+}
+
+test('[integration] chat email attachments are rejected before persistence', async () => {
+  const { conversationId, companyId } = await seedEmailConvoWithInbound()
+  for (const extra of [{ attachment: { name: 'file.pdf', url: 'https://example.com/file.pdf' } }, { attachments: [{ filename: 'file.pdf' }] }]) {
+    const response = await fetch(`${baseUrl}/api/conversations/${conversationId}/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-company-id': companyId },
+      body: JSON.stringify({ body: 'see attachment', ...extra }),
+    })
+    assert.equal(response.status, 400)
+  }
+  const count = await pool.query(`SELECT 1 FROM email_messages WHERE conversation_id = $1 AND direction = 'out'`, [conversationId])
+  assert.equal(count.rowCount, 0)
+})
+
+for (const route of ['send', 'reply']) {
+  test(`[integration] /email/${route} clientId retries preserve a single failed message`, async () => {
+    const { conversationId, companyId } = await seedEmailConvoWithInbound()
+    const parent = await pool.query(`SELECT message_id FROM email_messages WHERE conversation_id = $1`, [conversationId])
+    const path = route === 'send' ? '/email/send' : `/email/reply/${parent.rows[0].message_id}`
+    const post = () => fetch(`${baseUrl}/api${path}`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-company-id': companyId },
+      body: JSON.stringify({ to: ['alice@example.com'], subject: 'once', body: 'once', clientId: `key-${route}` }),
+    })
+    process.env.EMAIL_MOCK_FAIL_RATE = '1'
+    try {
+      const first = await post()
+      assert.equal(first.status, 502)
+      const original = await first.json() as { messageId: string; conversationId: string; sequence: number }
+      assert.ok(original.messageId && original.conversationId && original.sequence)
+      process.env.EMAIL_MOCK_FAIL_RATE = '0'
+      const repeated = await Promise.all([post(), post()])
+      for (const response of repeated) {
+        assert.equal(response.status, 502)
+        const payload = await response.json() as { messageId: string; conversationId: string }
+        assert.equal(payload.messageId, original.messageId)
+        assert.equal(payload.conversationId, original.conversationId)
+      }
+      const count = await pool.query(`SELECT 1 FROM messages WHERE author_id = $1 AND client_id = $2`, [ME_USER_ID, `key-${route}`])
+      assert.equal(count.rowCount, 1)
+    } finally { process.env.EMAIL_MOCK_FAIL_RATE = '0' }
+  })
+}
+
+for (const route of ['send', 'reply']) {
+  test(`[integration] concurrent /email/${route} calls invoke provider exactly once`, async () => {
+    const { conversationId, companyId } = await seedEmailConvoWithInbound()
+    const parent = await pool.query(`SELECT message_id FROM email_messages WHERE conversation_id = $1`, [conversationId])
+    const path = route === 'send' ? '/email/send' : `/email/reply/${parent.rows[0].message_id}`
+    const originalFetch = globalThis.fetch
+    const savedKey = process.env.RESEND_API_KEY
+    let providerCalls = 0
+    process.env.RESEND_API_KEY = 'test-intercepted-only'
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).startsWith('https://api.resend.com/')) {
+        providerCalls++
+        await new Promise((resolve) => setTimeout(resolve, 100))
+        return new Response(JSON.stringify({ id: 'test-provider-id' }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      return originalFetch(input, init)
+    }) as typeof fetch
+    const post = () => fetch(`${baseUrl}/api${path}`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-company-id': companyId },
+      body: JSON.stringify({ to: ['alice@example.com'], subject: 'concurrent', body: 'one provider call', clientId: 'concurrent-new' }),
+    })
+    try {
+      const responses = await Promise.all([post(), post(), post()])
+      const results = await Promise.all(responses.map(async (response) => {
+        assert.equal(response.status, 200)
+        return await response.json() as { messageId: string; conversationId: string }
+      }))
+      assert.equal(new Set(results.map((result) => result.messageId)).size, 1)
+      assert.equal(new Set(results.map((result) => result.conversationId)).size, 1)
+      assert.equal(providerCalls, 1)
+      const replay = await post()
+      assert.equal(replay.status, 200)
+      assert.equal(providerCalls, 1)
+    } finally {
+      globalThis.fetch = originalFetch
+      if (savedKey === undefined) delete process.env.RESEND_API_KEY
+      else process.env.RESEND_API_KEY = savedKey
+    }
+  })
+}
+
+test('[integration] explicit email endpoints reject malformed attachment shapes without sending', async () => {
+  const { conversationId, companyId } = await seedEmailConvoWithInbound()
+  const parent = await pool.query(`SELECT message_id FROM email_messages WHERE conversation_id = $1`, [conversationId])
+  for (const path of ['/email/send', `/email/reply/${parent.rows[0].message_id}`]) {
+    for (const extra of [{ attachment: { name: 'ignored.pdf' } }, { attachments: {} }, { attachments: [null] }]) {
+      const response = await fetch(`${baseUrl}/api${path}`, {
+        method: 'POST', headers: { 'content-type': 'application/json', 'x-company-id': companyId },
+        body: JSON.stringify({ to: ['alice@example.com'], subject: 'attachment', body: 'see file', ...extra }),
+      })
+      assert.equal(response.status, 400)
+    }
+  }
+  const result = await pool.query(`SELECT 1 FROM email_messages WHERE company_id = $1 AND direction = 'out'`, [companyId])
+  assert.equal(result.rowCount, 0)
+})

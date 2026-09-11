@@ -30,16 +30,27 @@ const XAI = 'https://docs.x.ai/developers/pricing'
 
 // One reference menu for both cold-start lookup and the existing DB seed path.
 // USD, standard online API rates; no batch, subscription or reseller discounts.
-// The fixed token schema cannot select context/time tiers or meter seconds/images.
-// Record those restrictions and native-unit media prices in the existing note.
+// Context/time tiers remain documented in notes. Native units are snapshotted
+// with the price and ledger extras without changing historical token columns.
 function tokenSeed(model: string, input: number, cached: number, write: number, output: number,
   sourceUrl: string, note = '标准在线 API；缓存写入未单列时按普通输入估算'): PricingSeed {
   return { model, inPer1M: input, cachedInPer1M: cached, cacheWritePer1M: write, outPer1M: output,
     sourceUrl, pricedAt: CHECKED_AT, note, verified: false }
 }
+// Structured USD reference rates transcribed from the existing y9 official seed notes.
+const MEDIA_USD: Record<string, number> = {
+  'qwen3-asr-flash': 0.000032, 'qwen3-asr-flash-filetrans': 0.000032,
+  'qwen3-asr-flash-realtime': 0.000047, 'fun-asr': 0.000032,
+  'fun-asr-mtl': 0.000032, 'fun-asr-realtime': 0.000047, 'whisper-1': 0.0001,
+  'qwen-image-max': 0.071677, 'qwen-image-2.0-pro': 0.071676,
+  'qwen-image-2.0': 0.028671, 'qwen-image-plus': 0.028671, 'qwen-image': 0.035,
+  'wan2.7-image-pro': 0.068761, 'wan2.7-image': 0.027504, 'wan2.6-image': 0.028671,
+}
 function mediaSeed(model: string, unit: 'second' | 'image' | 'modality-token', note: string, sourceUrl = ALIBABA): PricingSeed {
-  return { ...tokenSeed(model, 0, 0, 0, 0, sourceUrl, `[unit:${unit}] ${note}；现有台账未支持此计量，非免费`),
-    unpriced: unit === 'second' ? 'duration-pricing-unavailable' : 'image-pricing-unavailable' }
+  const usdPerUnit = MEDIA_USD[model]
+  return { ...tokenSeed(model, 0, 0, 0, 0, sourceUrl, `[unit:${unit}] ${note}；按备注北京参考档估算，非免费`),
+    ...(unit !== 'modality-token' && usdPerUnit !== undefined ? { unit, usdPerUnit }
+      : { unpriced: 'media-tier-pricing-unavailable' }) }
 }
 const DEEPSEEK_NOTE = '峰时参考：周一至周五 UTC 01–04/06–10；谷时输入/缓存/输出减半；缓存写入按普通输入估算'
 const GOOGLE_NOTE = '标准文本价；2026-12-31 前促销，2027-01-01 起输入/缓存/输出翻倍；缓存存储 $0.50/M token/小时另计，写入按输入估算'
@@ -186,6 +197,12 @@ function dbRowPrice(r: DbRow): Readonly<ModelPrice> {
       ? seedPriceFor(r.model.trim().toLowerCase())?.unpriced : undefined,
     sourceUrl: r.source_url, pricedAt: r.priced_at ? new Date(r.priced_at).toISOString().slice(0, 10) : null,
   }
+  // Only untouched legacy media placeholders inherit unit rates.
+  if (p.source === 'legacy' && [p.inPer1M, p.cachedInPer1M, p.cacheWritePer1M, p.outPer1M].every(n => n === 0)) {
+    const seed = seedPriceFor(r.model.trim().toLowerCase())
+    if (seed?.unit) Object.assign(p, { unit: seed.unit, usdPerUnit: seed.usdPerUnit,
+      sourceUrl: seed.sourceUrl, pricedAt: seed.pricedAt, note: seed.note, unpriced: undefined })
+  }
   if (!validModelPrice(p)) throw new Error(`Invalid model price: ${r.model}`)
   const version = priceVersion({ ...p, version: new Date(r.updated_at).toISOString() })
   return Object.freeze({ ...p, version })
@@ -234,7 +251,7 @@ export async function modelPricingTable(): Promise<ModelPricingRow[]> {
     const price = dbRowPrice(r)
     return {
       ...price, model: r.model,
-      note: price.source === 'legacy' ? `${price.pricedAt === CHECKED_AT ? '官方刊例参考，按备注档位估算' : '兼容估算，非当前官方报价'}；${publicNote(r.note) ?? ''}` : publicNote(r.note),
+      note: price.source === 'legacy' ? `${price.pricedAt === CHECKED_AT ? '官方刊例参考，按备注档位估算' : '兼容估算，非当前官方报价'}；${price.note ?? ''}` : price.note ?? null,
       sourceUrl: price.sourceUrl ?? null, pricedAt: price.pricedAt ?? null,
       updatedAt: new Date(r.updated_at).toISOString(),
     }

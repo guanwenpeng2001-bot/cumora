@@ -1,3 +1,4 @@
+import { MessageReadBoundary } from '@/components/MessageReadBoundary'
 import { useVoiceInput } from '@/lib/useVoiceInput'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso'
@@ -621,12 +622,12 @@ export function MobileChat() {
             const createdAt = m.at ? new Date(m.at).getTime() : 0
             const animate = createdAt > convoOpenedAtRef.current
             return (
-              <MessageRowMobileShell
+              <MessageReadBoundary message={m}><MessageRowMobileShell
                 msg={m}
                 author={author}
                 animate={animate}
                 onLongPress={(coords) => setTapback({ msg: m, coords })}
-              />
+              /></MessageReadBoundary>
             )
           }}
           computeItemKey={(_index, m) => m.clientId ?? m.id}

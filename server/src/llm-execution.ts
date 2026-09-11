@@ -8,6 +8,7 @@ import { recordLlmCall, classifyLlmCallError, type LlmCallContext, type LlmCallR
 import { getServerSettingsSnapshot, parseLlmConfig } from './settings.js'
 
 export interface LlmAttemptState {
+  units?: LlmCallRecord['units']
   usage: TokenUsage | null
   rawUsage: unknown
   usageProtocol?: 'responses' | 'chat'
@@ -104,7 +105,7 @@ export async function executeLlmPlan<T>(options: LlmExecutionOptions<T>): Promis
       sdkMaxRetries: options.sdkMaxRetries ?? null, sdkRetryPolicy: options.sdkMaxRetries === undefined ? 'client-default' : 'request-override', sdkRetriesIndividuallyObservable: false,
     }
     const record: LlmCallRecord = {
-      ...context, model: state.actualModel ?? candidate.model, usage: state.usage,
+      ...context, model: state.actualModel ?? candidate.model, usage: state.usage, units: state.units,
       pricing: pricing(state.actualModel ?? candidate.model, candidate.route.id),
       reasoningTokens: state.reasoningTokens, latencyMs: Date.now() - start, status,
       error: failed ? (error instanceof Error ? error.message : String(error)) : null, extras,

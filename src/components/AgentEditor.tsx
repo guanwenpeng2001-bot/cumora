@@ -1,3 +1,4 @@
+import { Dialog } from './Dialog'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { type AgentInput, api, getPairingServerOrigin, http, resolveAssetUrl } from '@/api/client'
 import { Checkbox } from '@/components/Checkbox'
@@ -354,7 +355,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
   }, [onClose, onSaved, savedAgentId])
 
   const submit = async () => {
-    if (!canWrite || savedAgentId || submitting.current || generatingAvatar || !name.trim() || !systemPrompt.trim() || !isCurrent()) return
+    if (!canWrite || savedAgentId || submitting.current || generatingAvatar || !name.trim() || systemPrompt.trim().length < 10 || !isCurrent()) return
     submitting.current = true
     setErr(null)
     setBusy(true)
@@ -409,8 +410,9 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
           profile: profilePayload,
           create: {
             ...payload,
+            name, systemPrompt,
             requestId: createRequestId.current,
-            computerId: target || null,
+            computerId: target || undefined,
             providerProfile: providerProfile || null,
             engine: isByoaTarget ? pinned : undefined,
             inherit: isByoaTarget ? inherit : false,
@@ -482,7 +484,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
   }
 
   return (
-    <div
+    <Dialog onClose={onClose}
       className="fixed inset-0 z-50 grid place-items-center p-6"
       style={{ background: 'rgba(15, 30, 50, 0.55)', backdropFilter: 'blur(6px)' }}
       onClick={close}
@@ -879,7 +881,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
                 <button
                   type="button"
                   onClick={generateAvatar}
-                  disabled={!editing || generatingAvatar || !name.trim() || !systemPrompt.trim()}
+                  disabled={!editing || generatingAvatar || !name.trim() || systemPrompt.trim().length < 10}
                   className="self-start inline-flex items-center gap-1.5 px-3.5 py-2 rounded-[10px] text-[12.5px] font-semibold transition disabled:opacity-50 disabled:cursor-not-allowed"
                   style={{
                     // Hardcoded purple — this button intentionally keeps the
@@ -956,7 +958,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
           {canWrite && !savedAgentId && <button
             type="button"
             onClick={submit}
-            disabled={busy || generatingAvatar || contextChanged || !name.trim() || !systemPrompt.trim()}
+            disabled={busy || generatingAvatar || contextChanged || !name.trim() || systemPrompt.trim().length < 10}
             className="px-5 py-2 rounded-[9px] text-[12.5px] font-semibold text-white transition disabled:opacity-50"
             style={{
               background: 'var(--skype)',
@@ -1005,7 +1007,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
           animation: ae-dot 1.4s steps(4, end) infinite;
         }
       `}</style>
-    </div>
+    </Dialog>
   )
 }
 

@@ -284,10 +284,10 @@ function convoSwipeActions(c: Conversation): SwipeAction[] {
   const actions: SwipeAction[] = []
   if (c.unread !== undefined && c.unread > 0) {
     actions.push({
-      label: t('mclist.swipeRead'),
+      label: t('mclist.openUnread'),
       background: 'var(--skype)',
       onClick: async () => {
-        try { await api.markRead(c.id); await reload() }
+        try { useApp.getState().setView('conversations'); useApp.getState().selectConversation(c.id) }
         catch (err) { console.warn('markRead failed', err) }
       },
     })
@@ -384,11 +384,11 @@ function convoMenuItems(
   )
   if (c.unread !== undefined && c.unread > 0) {
     items.push({
-      label: t('mclist.menuMarkRead'),
+      label: t('mclist.openUnread'),
       onClick: async () => {
         try {
-          await api.markRead(c.id)
-          await reload()
+          useApp.getState().setView('conversations')
+          useApp.getState().selectConversation(c.id)
         } catch (err) { console.warn('markRead failed', err) }
       },
     })

@@ -17,6 +17,14 @@
 import type { en } from './en'
 
 export const zhCN: Partial<Record<keyof typeof en, string>> = {
+  "auth.retrySession": "暂时无法验证会话。登录信息与草稿已保留，请在网络恢复后重试。",
+  'mclist.openUnread': '打开未读会话',
+  'me.usage.truncated': '当前仅显示可访问范围内的日志。请缩小时间范围以查看其他记录。',
+  "auth.retry": "重试",
+  "onboard.contactAdmin": "请联系工作区所有者或管理员连接计算机。你也可以通过顶部标题栏切换工作区。",
+  "onboard.continueDesktop": "请在电脑上继续：打开下方地址，登录同一工作区，然后在电脑上完成连接。",
+  "onboard.copyFailed": "复制失败，请手动选中并复制命令。",
+
   // ─── 通用 ─────────────────────────────────────────────────────────
   'common.close': '关闭',
   'common.use': '使用',
@@ -215,6 +223,8 @@ export const zhCN: Partial<Record<keyof typeof en, string>> = {
 
   'me.tab.computers': '计算机',
   'me.tab.projects': '项目',
+  'me.autonomyPending': '未生效（规划中）：自主权阈值尚未接入行动决策与审批，当前不能限制拉群、工具调用或私聊。请使用上方已生效的急停和预算准入控制。',
+  'me.trustPending': '未生效（规划中）：服务端尚未消费此偏好，当前不能作为权限限制。',
   'me.tab.trust': '信任与自主权',
   'me.tab.preferences': '偏好设置',
   'me.daemonNeedsUpdate': '有守护进程需要更新',

@@ -34,10 +34,18 @@ interface Props {
   /** Internal: marks a panel as a child so it skips outside-click handling
    *  (its parent owns dismissal of the whole stack). */
   _isChild?: boolean
+  _onBack?: () => void
+  _focusOnOpen?: boolean
 }
 
-export function ContextMenu({ x, y, items, onClose, _isChild }: Props) {
+export function ContextMenu({ x, y, items, onClose, _isChild, _onBack, _focusOnOpen = !_isChild }: Props) {
   const ref = useRef<HTMLDivElement>(null)
+  const opener = useRef(document.activeElement as HTMLElement | null)
+  const [keyboardSubmenu, setKeyboardSubmenu] = useState(false)
+  useEffect(() => {
+    if (_focusOnOpen) ref.current?.querySelector<HTMLButtonElement>('[role="menuitem"]:not(:disabled)')?.focus()
+  }, [_focusOnOpen])
+  useEffect(() => () => { if (!_isChild && opener.current?.isConnected) opener.current.focus() }, [_isChild])
   // Which row's submenu is currently rendered. Stays sticky as the user
   // moves across no-submenu siblings — only resets when they enter ANOTHER
   // submenu opener.
@@ -95,6 +103,19 @@ export function ContextMenu({ x, y, items, onClose, _isChild }: Props) {
           top: y,
           boxShadow: '0 10px 30px -8px rgba(10, 30, 60, 0.20), 0 4px 10px -4px rgba(10, 30, 60, 0.12), 0 0 0 1px rgba(0, 80, 140, 0.08)',
         }}
+        onKeyDown={(event) => {
+          const nodes = [...(ref.current?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]:not(:disabled)') ?? [])]
+          const index = nodes.indexOf(document.activeElement as HTMLButtonElement)
+          let target: HTMLButtonElement | undefined
+          if (event.key === 'ArrowDown') target = nodes[(index + 1) % nodes.length]
+          if (event.key === 'ArrowUp') target = nodes[(index - 1 + nodes.length) % nodes.length]
+          if (event.key === 'Home') target = nodes[0]
+          if (event.key === 'End') target = nodes.at(-1)
+          if (target) { event.preventDefault(); target.focus() }
+          if (event.key === 'ArrowLeft' && _isChild) { event.preventDefault(); _onBack?.() }
+          if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); if (_isChild) _onBack?.(); else onClose() }
+          if (event.key === 'Tab') { event.preventDefault(); onClose() }
+        }}
         onContextMenu={(e) => e.preventDefault()}
       >
         {items.map((it, i) => {
@@ -105,8 +126,20 @@ export function ContextMenu({ x, y, items, onClose, _isChild }: Props) {
               key={i}
               role="menuitem"
               disabled={it.disabled}
+              aria-haspopup={hasSubmenu ? 'menu' : undefined}
+              aria-expanded={hasSubmenu ? openSubmenuIdx === i : undefined}
+              onKeyDown={(event) => {
+                if (hasSubmenu && ['ArrowRight', 'Enter', ' '].includes(event.key)) {
+                  event.preventDefault()
+                  const r = event.currentTarget.getBoundingClientRect()
+                  setKeyboardSubmenu(true)
+                  setOpenSubmenuIdx(i)
+                  setSubmenuAnchor({ top: r.top, right: r.right, left: r.left })
+                }
+              }}
               onMouseEnter={(e) => {
-                if (hasSubmenu) {
+                if (hasSubmenu && !it.disabled) {
+                  setKeyboardSubmenu(false)
                   const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
                   setOpenSubmenuIdx(i)
                   setSubmenuAnchor({ top: r.top, right: r.right, left: r.left })
@@ -114,11 +147,17 @@ export function ContextMenu({ x, y, items, onClose, _isChild }: Props) {
                 // Sibling rows without their own submenu KEEP the current
                 // child open so the user can travel right to it.
               }}
-              onClick={() => {
+              onClick={(e) => {
                 if (it.disabled) return
                 // Submenu-only rows don't have their own action; the user
                 // needs to pick a leaf. Don't dismiss the menu here.
-                if (hasSubmenu) return
+                if (hasSubmenu) {
+                  const r = e.currentTarget.getBoundingClientRect()
+                  setKeyboardSubmenu(true)
+                  setOpenSubmenuIdx(i)
+                  setSubmenuAnchor({ top: r.top, right: r.right, left: r.left })
+                  return
+                }
                 it.onSelect?.()
                 onClose()
               }}
@@ -145,6 +184,12 @@ export function ContextMenu({ x, y, items, onClose, _isChild }: Props) {
       </div>
       {submenuOpen && openItem?.submenu && submenuAnchor && (
         <SubmenuFly
+          key={openSubmenuIdx}
+          focusOnOpen={keyboardSubmenu}
+          onBack={() => {
+            ref.current?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')[openSubmenuIdx ?? 0]?.focus()
+            setOpenSubmenuIdx(null)
+          }}
           anchor={submenuAnchor}
           items={openItem.submenu}
           onClose={onClose}
@@ -158,9 +203,13 @@ export function ContextMenu({ x, y, items, onClose, _isChild }: Props) {
  *  prefers the right edge but flips to the left if there's no room. */
 function SubmenuFly({
   anchor,
+  focusOnOpen,
+  onBack,
   items,
   onClose,
 }: {
+  focusOnOpen: boolean
+  onBack: () => void
   anchor: { top: number; right: number; left: number }
   items: ContextMenuItem[]
   onClose: () => void
@@ -178,6 +227,8 @@ function SubmenuFly({
       items={items}
       onClose={onClose}
       _isChild
+      _onBack={onBack}
+      _focusOnOpen={focusOnOpen}
     />
   )
 }

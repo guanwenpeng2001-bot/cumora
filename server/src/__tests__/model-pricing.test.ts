@@ -459,3 +459,50 @@ test('native media prices survive seeding as notes, never as invented token rate
   seeds[0].inPer1M = 999
   assert.equal(f.pricing.seedPriceFor('gpt-6-astra').inPer1M, 10)
 })
+
+
+test('media unit quantities price frozen official rates and preserve source per hop', async () => {
+  const f = fixture()
+  await f.pricing.seedModelPricing()
+  for (const [model, purpose, unit, quantity, rate] of [
+    ['qwen3-asr-flash', 'audio-transcription', 'second', 12.5, 0.000032],
+    ['whisper-1', 'audio-transcription', 'second', 60, 0.0001],
+    ['qwen-image-max', 'agent-image', 'image', 3, 0.071677],
+  ] as const) {
+    await f.recorder.recordLlmCall({ companyId: 'a', model, purpose, units: { unit, quantity }, status: 'ok', latencyMs: 1 })
+    const row = f.ledger.at(-1), extras = JSON.parse(row[19])
+    assert.equal(row[13], quantity * rate)
+    assert.equal(row[14], true)
+    assert.equal(row[15], true)
+    assert.deepEqual(extras.units, { unit, quantity })
+    assert.equal(extras.pricing.usdPerUnit, rate)
+    assert.ok(extras.pricing.sourceUrl.startsWith('https://'))
+    assert.equal(extras.pricing.pricedAt, '2026-09-11')
+    assert.equal(extras.unpriced, undefined)
+  }
+})
+
+test('media never substitutes requested counts, tokens, latency or invalid units for measurement', async () => {
+  const f = fixture()
+  for (const units of [undefined, { unit: 'image', quantity: -1 }, { unit: 'image', quantity: 1.5 },
+    { unit: 'image', quantity: Infinity }, { unit: 'second', quantity: 3 }]) {
+    await f.recorder.recordLlmCall({ companyId: 'a', model: 'qwen-image-max', purpose: 'agent-image',
+      units, usage, extras: { n: 2 }, status: 'failed', latencyMs: 1000 })
+    assert.equal(f.ledger.at(-1)[13], 0)
+    assert.ok(JSON.parse(f.ledger.at(-1)[19]).unpriced)
+  }
+  for (const model of ['gpt-image-2', 'z-image-turbo', 'unknown-image']) {
+    await f.recorder.recordLlmCall({ companyId: 'a', model, purpose: 'agent-image',
+      units: { unit: 'image', quantity: 1 }, status: 'ok', latencyMs: 1 })
+    assert.equal(f.ledger.at(-1)[13], 0)
+    assert.ok(JSON.parse(f.ledger.at(-1)[19]).unpriced)
+  }
+  const pricing = f.cost.priceFor('qwen-image-max')
+  await f.pricing.upsertModelPricing(priceInput('qwen-image-max', 99))
+  await f.recorder.recordLlmCall({ companyId: 'a', model: 'qwen-image-max', pricing, purpose: 'agent-image',
+    units: { unit: 'image', quantity: 2 }, status: 'failed', latencyMs: 1 })
+  assert.equal(f.ledger.at(-1)[13], 2 * 0.071677, 'completed generation remains billable after delivery failure')
+  await f.recorder.recordLlmCall({ companyId: 'a', model: 'qwen-image-max', purpose: 'agent-image',
+    units: { unit: 'image', quantity: 2 }, status: 'ok', latencyMs: 1 })
+  assert.ok(JSON.parse(f.ledger.at(-1)[19]).unpriced, 'admin token override is never reinterpreted as a unit price')
+})

@@ -1,3 +1,4 @@
+import { Dialog } from './Dialog'
 /**
  * Modal for inviting humans to a company workspace.
  *
@@ -107,7 +108,7 @@ export function InvitePeopleModal({ companyId, companyName, actorRole, onClose }
   const historicalInvitations = useMemo(() => list.filter((i) => i.status !== 'active'), [list])
 
   return (
-    <div
+    <Dialog onClose={onClose}
       className="fixed inset-0 z-50 grid place-items-center p-6"
       style={{ background: 'rgba(15, 30, 50, 0.55)', backdropFilter: 'blur(6px)' }}
       onClick={onClose}
@@ -333,7 +334,7 @@ export function InvitePeopleModal({ companyId, companyName, actorRole, onClose }
           box-shadow: 0 0 0 3px var(--sky-50);
         }
       `}</style>
-    </div>
+    </Dialog>
   )
 }
 

@@ -1,3 +1,4 @@
+import { Dialog } from './Dialog'
 /**
  * Modal for creating + editing a calendar event. Drives the AI-native
  * "schedule a task for an agent" flow: title + start time + assignee +
@@ -219,7 +220,7 @@ export function EventEditor({ event, prefill, onClose }: Props) {
   const canDelete = event && event.createdBy === meId
 
   return (
-    <div
+    <Dialog onClose={onClose}
       className="fixed inset-0 z-50 grid place-items-center p-6"
       style={{ background: 'rgba(15, 30, 50, 0.55)', backdropFilter: 'blur(6px)' }}
       onClick={onClose}
@@ -604,7 +605,7 @@ export function EventEditor({ event, prefill, onClose }: Props) {
           box-shadow: 0 0 0 3px var(--sky-50);
         }
       `}</style>
-    </div>
+    </Dialog>
   )
 }
 

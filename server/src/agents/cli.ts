@@ -2247,8 +2247,9 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
   const finalBody = consumedAsTextContent ? '' : body
 
   // Atomically claim next sequence + check verbatim-dup + INSERT, all in
-  // ONE transaction. The conversation_counters UPSERT takes a row-level
-  // lock (ON CONFLICT DO UPDATE), and that lock stays held until COMMIT —
+  // ONE transaction. Lock the conversation exclusively BEFORE its counter,
+  // matching the HTTP send path and avoiding shared-lock upgrade deadlocks.
+  // Both locks stay held until COMMIT —
   // serializing every concurrent cumora-reply to the same convo through
   // this critical section. While we hold the lock, we re-check the last
   // peer message body against our draft (committed visibility — we'll
@@ -2272,7 +2273,7 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
       ? await txClient.query(
         `SELECT c.id FROM conversations c
           WHERE c.id = $1 AND c.company_id = $2
-          FOR SHARE OF c`,
+          FOR UPDATE OF c`,
         [convoId, companyId],
       )
       : null
@@ -3616,13 +3617,8 @@ async function cmdEmailReply(parsed: ParsedArgs, me: string, companyId: string):
     console.warn(`[email] post-send UPDATE failed for ${persisted.messageId}; retry worker will reconcile`, error)
   })
 
-  // Auto-ack — replying definitionally means I read the original.
-  await pool.query(
-    `INSERT INTO conversation_reads (user_id, conversation_id, last_read_at)
-     VALUES ($1, $2, NOW())
-     ON CONFLICT (user_id, conversation_id) DO UPDATE SET last_read_at = NOW()`,
-    [me, o.conversation_id],
-  )
+  // Sending (including a failed delivery) cannot acknowledge unseen input.
+  // The completed turn commits exact consumption receipts, as for chat replies.
 
   if (!sendRes.ok) return err(`email persisted as failed: ${sendRes.error} · ${persisted.messageId}`, 1)
   const mockTag = sendRes.mock ? ' (mock)' : ''

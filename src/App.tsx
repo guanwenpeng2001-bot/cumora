@@ -1,4 +1,6 @@
-import { useEffect, useRef, useState } from 'react'
+import { useDocuments } from '@/stores/documents'
+import { useBoards } from '@/stores/boards'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { useIsMobile } from '@/lib/utils'
 import { useApp } from '@/stores/app'
 import { useAuth } from '@/stores/auth'
@@ -9,7 +11,6 @@ import { bootWhispers, useWhispers } from '@/stores/whispers'
 import { bootComputers, useComputers } from '@/stores/computers'
 import { Onboarding } from '@/desktop/Onboarding'
 import { usePrefs } from '@/stores/preferences'
-import { api } from '@/api/client'
 import { DesktopApp } from '@/desktop/DesktopApp'
 import { MobileApp } from '@/mobile/MobileApp'
 import { AuthGate } from '@/components/AuthGate'
@@ -43,6 +44,27 @@ function isAdminContext(): boolean {
 
 function AuthedApp() {
   const isMobile = useIsMobile()
+  useLayoutEffect(() => {
+    const app = useApp.getState()
+    if (isMobile) {
+      if (app.view === 'documents') {
+        const id = useDocuments.getState().selectedId
+        if (id) app.openDocumentPeek(id)
+      } else if (app.view === 'boards') {
+        const id = useBoards.getState().selectedId
+        if (id) app.openBoardPeek(id)
+      }
+    } else if (app.view === 'library') {
+      if (app.librarySection === 'documents' && app.openDocumentId) {
+        useDocuments.getState().select(app.openDocumentId)
+        app.closeDocumentPeek()
+      } else if (app.librarySection === 'boards' && app.openBoardId) {
+        useBoards.getState().selectBoard(app.openBoardId)
+        app.closeBoardPeek()
+      }
+    }
+    app.mapLayout(isMobile)
+  }, [isMobile])
   const convoId = useApp((s) => s.selectedConversationId)
   const view = useApp((s) => s.view)
   // Free tier is BYOA-only: gate the app behind pairing a computer until one
@@ -135,11 +157,6 @@ function AuthedApp() {
   useEffect(() => {
     if (!convoId || !selectedConvoExists) return
     void useMessages.getState().loadConversation(convoId)
-    // Clear the badge locally, then persist. The server response tells us
-    // nothing the client doesn't already know, so refetching the whole list
-    // to learn that one count went to zero is pure waste.
-    useConversations.getState().markLocallyRead(convoId)
-    void api.markRead(convoId).catch(() => { /* swallow */ })
   }, [convoId, selectedConvoExists])
 
   // Lazy-refresh whisper list when entering whispers view
@@ -195,6 +212,7 @@ export function App() {
   // the simplest way to reload all data without stale rows leaking across.
   const userId = useAuth((s) => s.user?.id ?? null)
   const companyId = useAuth((s) => s.activeCompanyId)
+  const contextEpoch = useAuth((s) => s.contextEpoch)
 
   // Invite-link handling — runs BEFORE the rest of the shell so the
   // accept page is the user's first impression when they open a link. The
@@ -268,7 +286,7 @@ export function App() {
         <WorkspaceSessionBridge />
         {userId && !companyId
           ? <NoWorkspaceScreen />
-          : <AuthedApp key={`${userId ?? 'anon'}::${companyId ?? 'none'}`} />}
+          : <AuthedApp key={`${contextEpoch}::${userId ?? 'anon'}::${companyId ?? 'none'}`} />}
       </ErrorBoundary>
     </AuthGate>
   )

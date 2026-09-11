@@ -14,7 +14,7 @@
  * agent wakes) runs identically — useful for local dev where you don't
  * want to burn Resend quota.
  */
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import type { PoolClient } from 'pg'
 import { pool } from './db/pool.js'
 import { env } from './env.js'
@@ -588,6 +588,7 @@ export async function findUserInCompanyByAuthEmail(
  *  surfaces it as a 4xx / CLI error.
  */
 export async function persistEmailMessage(args: {
+  clientId?: string | null
   conversationId: string
   companyId: string
   /** Participant id authoring this message — agent for outbound, agent or
@@ -628,7 +629,7 @@ export async function persistEmailMessage(args: {
     storageKey: string | null
     truncated?: boolean
   }>
-}): Promise<{ messageId: string; sequence: number }> {
+}): Promise<{ messageId: string; sequence: number; duplicate?: boolean }> {
   // Need this lazily to avoid a circular import (redis pulls in env, etc).
   const { CH_MESSAGE_NEW, publish } = await import('./redis.js')
   const messageId = `m-${randomUUID()}`
@@ -672,6 +673,20 @@ export async function persistEmailMessage(args: {
       if (!membership.rowCount) throw new Error('email conversation not found or no longer authorized')
     }
 
+    // The conversation lock serializes lookup + insert across server replicas.
+    // A replay never publishes another wake or reaches the mail provider.
+    if (args.clientId) {
+      const existing = await client.query<{ id: string; sequence: number }>(
+        `SELECT id, sequence FROM messages
+          WHERE conversation_id = $1 AND author_id = $2 AND client_id = $3`,
+        [args.conversationId, args.authorId, args.clientId],
+      )
+      if (existing.rows[0]) {
+        await client.query('COMMIT')
+        return { messageId: existing.rows[0].id, sequence: existing.rows[0].sequence, duplicate: true }
+      }
+    }
+
     const seqResult = await client.query<{ seq: number }>(
       `INSERT INTO conversation_counters (conversation_id, next_sequence)
        VALUES ($1, 2)
@@ -681,9 +696,9 @@ export async function persistEmailMessage(args: {
     )
     sequence = seqResult.rows[0]?.seq ?? 1
     await client.query(
-      `INSERT INTO messages (id, conversation_id, author_id, kind, body, sequence, company_id)
-       VALUES ($1, $2, $3, 'email', $4, $5, $6)`,
-      [messageId, args.conversationId, args.authorId, args.body, sequence, args.companyId],
+      `INSERT INTO messages (id, conversation_id, author_id, kind, body, sequence, company_id, client_id)
+       VALUES ($1, $2, $3, 'email', $4, $5, $6, $7)`,
+      [messageId, args.conversationId, args.authorId, args.body, sequence, args.companyId, args.clientId ?? null],
     )
     const initialRetryAt = args.direction === 'out'
       ? (args.transportStatus === 'failed'
@@ -781,6 +796,7 @@ export async function persistEmailMessage(args: {
       conversationId: args.conversationId,
       authorId: args.authorId,
       kind: 'email',
+      clientId: args.clientId ?? undefined,
       body: args.body,
       sequence,
       at: new Date().toISOString(),
@@ -825,6 +841,7 @@ export async function persistEmailMessage(args: {
  *  memberships; including the internal sender still makes their own outbox
  *  messages appear in their inbox (matching Gmail's behavior). */
 export async function findOrCreateEmailConversation(args: {
+  creationKey?: string | null
   companyId: string
   inReplyTo: string | null
   references: string[]
@@ -888,10 +905,13 @@ export async function findOrCreateEmailConversation(args: {
     }
 
     const cleanSubject = args.subject.replace(/^\s*((re|fwd|fw)\s*:\s*)+/i, '').trim() || '(no subject)'
-    const id = `email-${randomUUID().slice(0, 12)}`
+    const id = args.creationKey
+      ? `email-${createHash('sha256').update(JSON.stringify([args.companyId, args.creationKey])).digest('hex')}`
+      : `email-${randomUUID().slice(0, 12)}`
     await client.query(
       `INSERT INTO conversations (id, kind, title, members, company_id, topic)
-       VALUES ($1, 'email', $2, $3::jsonb, $4, $5)`,
+       VALUES ($1, 'email', $2, $3::jsonb, $4, $5)
+       ON CONFLICT (id) DO NOTHING`,
       [id, cleanSubject.slice(0, 200), JSON.stringify(concreteMembers), args.companyId, cleanSubject.slice(0, 200)],
     )
     await client.query('COMMIT')
@@ -937,6 +957,7 @@ export async function recordExternalContact(args: {
  *  uses the caller's cumora-domain address — lazy-minted if it wasn't
  *  there yet, matching the resolver used by /participants. */
 export async function replyInEmailConversation(args: {
+  clientId?: string | null
   conversationId: string
   companyId: string
   authorId: string
@@ -1042,6 +1063,7 @@ export async function replyInEmailConversation(args: {
   // Resend dedupes server-side via that header — no duplicate hits
   // the user's inbox.
   const persisted = await persistEmailMessage({
+    clientId: args.clientId,
     conversationId: args.conversationId,
     companyId: args.companyId,
     authorId: args.authorId,
@@ -1058,6 +1080,8 @@ export async function replyInEmailConversation(args: {
     body: args.body,
     autoSubmitted: Boolean(args.autoSubmitted),
   })
+
+  if (persisted.duplicate) return readPersistedEmailResult(persisted.messageId)
 
   const sendRes = await sendViaProvider({
     from: fromLine,
@@ -1107,4 +1131,19 @@ export async function replyInEmailConversation(args: {
     mock: sendRes.mock,
     error: sendRes.error,
   }
+}
+
+/** Durable replay result. Failed/sending rows belong to the retry worker;
+ * an HTTP replay must never start a second provider attempt. */
+export async function readPersistedEmailResult(messageId: string): Promise<{
+  messageId: string; sequence: number; transportStatus: string; error: string | null; mock: boolean;
+}> {
+  const { rows } = await pool.query<{
+    sequence: number; transport_status: string; transport_error: string | null;
+  }>(`SELECT m.sequence, em.transport_status, em.transport_error
+        FROM messages m JOIN email_messages em ON em.message_id = m.id WHERE m.id = $1`, [messageId])
+  const row = rows[0]
+  if (!row) throw new Error('persisted email missing')
+  return { messageId, sequence: row.sequence, transportStatus: row.transport_status,
+    error: row.transport_error, mock: !process.env.RESEND_API_KEY }
 }

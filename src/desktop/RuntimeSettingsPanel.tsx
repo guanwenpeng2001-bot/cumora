@@ -158,6 +158,7 @@ function RuntimeSettingsContent() {
   const [snapshot, setSnapshot] = useState<ApiModelSettings | null>(null)
   const [error, setError] = useState('')
   const [opened, setOpened] = useState<Record<string, boolean>>({})
+  const [visited, setVisited] = useState<Record<string, boolean>>({})
   useEffect(() => {
     if (!isAdmin) return
     const controller = new AbortController()
@@ -192,10 +193,11 @@ function RuntimeSettingsContent() {
       {snapshot.diagnostics?.map(d => <p key={d} role="alert" className="text-[12px] text-coral-deep">{d}</p>)}
       {domains.map(([domain, label]) => <details key={domain} className="space-y-3" onToggle={(e) => {
         const open = (e.currentTarget as HTMLDetailsElement).open
+        if (open) setVisited(s => s[domain] ? s : { ...s, [domain]: true })
         setOpened(s => (s[domain] === open ? s : { ...s, [domain]: open }))
       }}>
         <summary className="font-semibold cursor-pointer">{translate(zh ? 'zh-CN' : 'en', label)}</summary>
-        {opened[domain] && <SettingFields snapshot={snapshot} definitions={definitionsByDomain[domain] ?? []} onSaved={onSaved} />}
+        {(opened[domain] || visited[domain]) && <SettingFields snapshot={snapshot} definitions={definitionsByDomain[domain] ?? []} onSaved={onSaved} />}
       </details>)}
     </>}
     <ByoaPolicyStatus />

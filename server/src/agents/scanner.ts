@@ -169,13 +169,28 @@ async function agentHasUnreadInbox(agentId: string): Promise<boolean> {
        SELECT 1
          FROM messages m
          JOIN conversations c ON c.id = m.conversation_id
-        WHERE EXISTS (
+         JOIN participants agent ON agent.id = $1 AND agent.company_id = c.company_id
+           AND agent.kind = 'agent' AND agent.departed_at IS NULL
+        WHERE (m.delivery_recipient_id = $1 OR EXISTS (
                 SELECT 1 FROM conversation_members cm
                  WHERE cm.conversation_id = c.id
                    AND cm.company_id = c.company_id
                    AND cm.participant_id = $1
-              )
-          AND m.author_id <> $1
+              ))
+          AND (m.author_id <> $1 OR m.delivery_recipient_id = $1)
+          AND (
+            m.delivery_recipient_id = $1 OR c.kind = 'direct'
+            OR NOT EXISTS (SELECT 1 FROM conversation_mutes mu
+              WHERE mu.user_id = $1 AND mu.conversation_id = c.id
+                AND (mu.muted_until IS NULL OR mu.muted_until > NOW()))
+            OR EXISTS (SELECT 1 FROM regexp_matches(m.body, '@([[:alnum:]_-]+)', 'g') mention
+              WHERE LOWER(mention[1]) = LOWER($1))
+            OR EXISTS (SELECT 1 FROM messages quoted
+              WHERE quoted.id = m.quoted_message_id AND quoted.conversation_id = m.conversation_id
+                AND quoted.author_id = $1)
+          )
+          AND NOT EXISTS (SELECT 1 FROM agent_message_consumptions consumed
+            WHERE consumed.agent_id = $1 AND consumed.message_id = m.id)
           AND ROW(m.created_at, m.id) > (
             SELECT
               COALESCE(cr.last_read_at, '1970-01-01T00:00:00Z'::timestamptz),

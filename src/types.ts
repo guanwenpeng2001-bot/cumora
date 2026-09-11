@@ -169,6 +169,7 @@ export interface Conversation {
   /** Latest persisted message id from the conversation list payload. Used to
    *  detect when the sidebar preview has advanced past the open transcript. */
   lastMessageId?: string | null
+  lastSequence?: number
   lastAt: string
   /** Raw ISO timestamp the row was last touched (last message time, or
    *  the conversation's own updatedAt when there are no messages yet).
@@ -274,6 +275,7 @@ export interface QuotedSummary {
 }
 
 export interface Message {
+  sequence?: number
   id: string
   conversationId: string
   authorId: string

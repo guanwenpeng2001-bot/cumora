@@ -5,7 +5,6 @@
  */
 import { create } from 'zustand'
 import type { ServerCapabilities } from '@/api/client'
-import { commitIfEpochCurrent } from './contextEpoch'
 
 export interface AuthCompany {
   id: string
@@ -60,7 +59,10 @@ function resetWorkspaceStores(): void {
     import('./boards').then(({ useBoards }) => useBoards.getState().reset()),
     import('./calendar').then(({ useCalendar }) => useCalendar.getState().reset()),
     import('./shipping').then(({ useShipping }) => useShipping.getState().reset()),
-    import('./app').then(({ useApp }) => useApp.getState().selectConversation(null)),
+    import('./app').then(({ useApp }) => {
+      useApp.getState().selectConversation(null)
+      useApp.setState({ calendarEditing: null, openDocumentId: null, openBoardId: null, openBoardCardId: null, openCalendarEventId: null })
+    }),
   ])
 }
 
@@ -91,7 +93,7 @@ export const useAuth = create<AuthState>((set) => ({
       : (activeCompanyId && memberIds.has(activeCompanyId) ? activeCompanyId : (companies[0]?.id ?? null))
     if (resolved) localStorage.setItem(COMPANY_KEY, resolved)
     else localStorage.removeItem(COMPANY_KEY)
-    const previous = useAuth.getState().activeCompanyId
+    const previous = useAuth.getState()
     set((s) => ({
       user,
       companies,
@@ -100,7 +102,10 @@ export const useAuth = create<AuthState>((set) => ({
         ? s.contextEpoch + 1
         : s.contextEpoch,
     }))
-    if (previous !== resolved) resetWorkspaceStores()
+    if (previous.contextEpoch !== useAuth.getState().contextEpoch) {
+      resetWorkspaceStores()
+      void import('@/api/client').then(({ ws }) => ws.reconnect())
+    }
   },
   setServerCapabilities(caps) {
     set({ serverCapabilities: caps })
@@ -220,10 +225,26 @@ export function getActiveCompanyId(): string | null {
 export async function commitIfContextCurrent<T>(
   request: () => Promise<T>,
   commit: (value: T) => void,
+  reject?: (error: unknown) => void,
+  settled?: () => void,
 ): Promise<boolean> {
-  return commitIfEpochCurrent(
-    () => useAuth.getState().contextEpoch,
-    request,
-    commit,
-  )
+  const context = useAuth.getState()
+  const current = () => {
+    const now = useAuth.getState()
+    return now.contextEpoch === context.contextEpoch && now.token === context.token
+      && now.activeCompanyId === context.activeCompanyId
+  }
+  try {
+    const value = await request()
+    if (!current()) return false
+    commit(value)
+    return true
+  } catch (error) {
+    if (!current()) return false
+    if (!reject) throw error
+    reject(error)
+    return true
+  } finally {
+    if (current()) settled?.()
+  }
 }

@@ -1,11 +1,22 @@
 import { create } from 'zustand'
-import type { ViewKey } from '@/types'
+import type { CalendarEvent, ViewKey } from '@/types'
 import { applyDraftUpdate, type ComposerDraft } from './composerDrafts'
 import { loadComposerDrafts, saveComposerDrafts } from './composerDraftsStorage'
 
 export type { ComposerDraft }
 
+export type CalendarEditing = { mode: 'edit'; event: CalendarEvent }
+  | { mode: 'new'; prefill?: { startAt: Date; endAt?: Date | null; allDay?: boolean } } | null
+
 interface AppState {
+  calendarEditing: CalendarEditing
+  setCalendarEditing: (editing: CalendarEditing) => void
+  calendarCursor: Date
+  setCalendarCursor: (cursor: Date | ((current: Date) => Date)) => void
+
+  librarySection: 'documents' | 'boards' | 'calendar'
+  setLibrarySection: (section: 'documents' | 'boards' | 'calendar') => void
+  mapLayout: (mobile: boolean) => void
   view: ViewKey['view']
   setView: (v: ViewKey['view']) => void
 
@@ -106,8 +117,23 @@ interface AppState {
 }
 
 export const useApp = create<AppState>((set) => ({
+  calendarEditing: null,
+  setCalendarEditing: (calendarEditing) => set({ calendarEditing }),
+  calendarCursor: new Date(),
+  setCalendarCursor: (calendarCursor) => set(s => ({ calendarCursor: typeof calendarCursor === 'function' ? calendarCursor(s.calendarCursor) : calendarCursor })),
+  librarySection: 'documents',
+  setLibrarySection: (librarySection) => set({ librarySection }),
+  mapLayout: (mobile) => set(s => {
+    if (mobile && ['documents', 'boards', 'calendar'].includes(s.view)) {
+      return { view: 'library', librarySection: s.view as AppState['librarySection'] }
+    }
+    if (!mobile && s.view === 'library') return { view: s.librarySection }
+    return s
+  }),
   view: 'conversations',
-  setView: (v) => set({ view: v }),
+  setView: (v) => set(s => ({ view: v,
+    librarySection: ['documents', 'boards', 'calendar'].includes(v) ? v as AppState['librarySection'] : s.librarySection,
+  })),
 
   // Starts unselected — the real conversations list arrives async from the
   // server. Seeding with a mock id here used to fire a 404 messages fetch

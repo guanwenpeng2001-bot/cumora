@@ -352,3 +352,59 @@ test('metadata preserves disjoint gaps and legacy evidence even when the worker 
   assert.equal(meta.rollupCoverageFrom, '2026-09-01T00:00:00.000Z')
   assert.equal(meta.retainedRollupFrom, '2026-09-03T00:00:00.000Z')
 })
+
+
+test('trend uses UTC labels, elapsed-time spacing, and inclusive local calendar dates', async () => {
+  const source = readFileSync(new URL('../../../src/desktop/UsageDashboard.tsx', import.meta.url), 'utf8')
+  const ast = ts.createSourceFile('chart.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
+  const names = ['localDateToIso', 'rangeOf', 'fmtTime', 'downsampleTrend', 'TrendChart', 'UnitCostDetails', 'fmtUsd']
+  const functions = ast.statements.filter((n): n is ts.FunctionDeclaration => ts.isFunctionDeclaration(n) && names.includes(n.name?.text ?? ''))
+  const js = ts.transpileModule(functions.map(n => n.getText(ast)).join('\n') + '\nexports.chart = TrendChart; exports.range = rangeOf; exports.time = fmtTime; exports.usd = fmtUsd;', {
+    fileName: 'chart.tsx', compilerOptions: { jsx: ts.JsxEmit.ReactJSX, module: ts.ModuleKind.CommonJS },
+  }).outputText
+  const jsx = await import('react/jsx-runtime')
+  const { renderToStaticMarkup } = await import('react-dom/server')
+  const exports: Record<string, any> = {}
+  new Function('exports', 'require', js)(exports, () => jsx)
+  assert.equal(exports.usd(0.000032), '$0.0000320')
+  const old = process.env.TZ
+  try {
+    process.env.TZ = 'Asia/Shanghai'
+    assert.equal(exports.time('2026-09-11T23:00:00Z', 'hour'), '9/11 23:00')
+    const range = exports.range('custom', '2026-09-11', '2026-09-11')
+    assert.equal(range.from, '2026-09-10T16:00:00.000Z')
+    assert.equal(range.to, '2026-09-11T16:00:00.000Z')
+    assert.throws(() => exports.range('custom', '2026-02-30', '2026-03-01'), /Invalid calendar date/)
+    process.env.TZ = 'America/New_York'
+    const dst = exports.range('custom', '2026-03-08', '2026-03-08')
+    assert.equal(Date.parse(dst.to) - Date.parse(dst.from), 23 * 3600000)
+  } finally { if (old === undefined) delete process.env.TZ; else process.env.TZ = old }
+  const points = [0, 1, 4].map(hour => ({ bucket: `2026-09-11T0${hour}:00:00Z`, costUsd: 0.1, inputTokens: 10, outputTokens: 5, cacheReadTokens: 0 }))
+  const html = renderToStaticMarkup(exports.chart({ points, granularity: 'hour', t: (s: string) => s }))
+  assert.match(html, /M8\.0,10\.0 L184\.0,10\.0 L712\.0,10\.0/)
+  assert.ok(html.includes('0–0.1'))
+  const unitHtml = renderToStaticMarkup(exports.UnitCostDetails({ row: { units: { unit: 'second', quantity: 12.5 },
+    unitPricing: { usdPerUnit: 0.000032, sourceUrl: 'https://example.com/pricing', pricedAt: '2026-09-11' } } }))
+  assert.match(unitHtml, /12.5 second/)
+  assert.match(unitHtml, /0.000032\/second/)
+  assert.match(unitHtml, /https:\/\/example.com\/pricing/)
+})
+
+
+test('usage logs expose frozen unit pricing without treating unit-only calls as measured tokens', async () => {
+  const units = { unit: 'image', quantity: 2 }
+  const price = { unit: 'image', usdPerUnit: 0.071677, sourceUrl: 'https://example.com/pricing', pricedAt: '2026-09-11' }
+  const usage = loadUsage(async (sql: string) => {
+    if (sql.includes('COUNT(*)')) return { rows: [{ total: '1' }] }
+    assert.match(sql, /AS token_measured/)
+    return { rows: [{ id: 'media-hop', created_at: new Date('2026-09-11T00:00:00Z'), model: 'qwen-image-max',
+      purpose: 'agent-image', source: 'cloud', measured: true, token_measured: false, unpriced: false,
+      units, unit_pricing: price, cost_usd: String(2 * 0.071677), cost_estimated: true, status: 'ok' }] }
+  })
+  const result = await usage.usageLogs('a', { from: new Date('2026-09-11T00:00:00Z'), to: new Date('2026-09-12T00:00:00Z') }, { page: 1, pageSize: 50 })
+  assert.deepEqual(result.items[0].units, units)
+  assert.deepEqual(result.items[0].unitPricing, price)
+  assert.equal(result.items[0].tokenMeasured, false)
+  assert.equal(result.items[0].measured, true)
+  assert.equal(result.items[0].costUsd, 2 * 0.071677)
+})

@@ -22,6 +22,8 @@ type RangePreset = 'today' | 'week' | 'custom'
 
 function localDateToIso(value: string, endExclusive = false): string {
   const [year, month, day] = value.split('-').map(Number)
+  const start = new Date(year, month - 1, day)
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value) || start.getFullYear() !== year || start.getMonth() !== month - 1 || start.getDate() !== day) throw new Error('Invalid calendar date')
   const date = endExclusive
     ? new Date(year, month - 1, day + 1)
     : new Date(year, month - 1, day)
@@ -53,6 +55,7 @@ function fmtTokens(n: number | null | undefined): string {
 }
 function fmtUsd(n: number | null | undefined): string {
   if (n == null || !Number.isFinite(n)) return '—'
+  if (n > 0 && n < 0.0001) return `$${n.toPrecision(3)}`
   return n >= 1 ? `$${n.toFixed(2)}` : `$${n.toFixed(4)}`
 }
 function fmtPct(n: number): string {
@@ -61,8 +64,8 @@ function fmtPct(n: number): string {
 function fmtTime(iso: string, granularity: 'hour' | 'day'): string {
   const d = new Date(iso)
   return granularity === 'hour'
-    ? `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:00`
-    : `${d.getMonth() + 1}/${d.getDate()}`
+    ? `${d.getUTCMonth() + 1}/${d.getUTCDate()} ${String(d.getUTCHours()).padStart(2, '0')}:00`
+    : `${d.getUTCMonth() + 1}/${d.getUTCDate()}`
 }
 
 /** Keep at most `maxPoints` samples, always including the first and last. */
@@ -101,7 +104,9 @@ function TrendChart({ points, granularity, t }: {
   ]
   const n = sampled.length
   if (n === 0) return null
-  const x = (i: number) => PAD.l + (i / Math.max(1, n - 1)) * (W - PAD.l - PAD.r)
+  const firstTime = Date.parse(sampled[0]!.bucket)
+  const timeSpan = Math.max(1, Date.parse(sampled[n - 1]!.bucket) - firstTime)
+  const x = (i: number) => PAD.l + ((Date.parse(sampled[i]!.bucket) - firstTime) / timeSpan) * (W - PAD.l - PAD.r)
   const lines = series.map((s) => {
     const max = Math.max(...sampled.map((p) => p[s.key]), 1e-9)
     const y = (v: number) => PAD.t + (1 - v / max) * (H - PAD.t - PAD.b)
@@ -124,12 +129,30 @@ function TrendChart({ points, granularity, t }: {
         {lines.map((l) => (
           <span key={l.key} className="inline-flex items-center gap-1.5 text-[10.5px] text-ink-500">
             <span className="w-2.5 h-[2px] rounded" style={{ background: l.color }} />
-            {l.label}
+            {l.label} · 0–{l.max}
           </span>
         ))}
       </div>
     </div>
   )
+}
+
+function tokensMeasured(row: ApiUsageLogRow & { tokenMeasured?: boolean }): boolean {
+  return (row.tokenMeasured ?? row.measured) === true
+}
+
+export function UnitCostDetails({ row }: { row: ApiUsageLogRow & {
+  units?: { unit: 'second' | 'image'; quantity: number } | null
+  unitPricing?: { usdPerUnit?: number; sourceUrl?: string | null; pricedAt?: string | null; note?: string | null } | null
+} }) {
+  if (!row.units) return null
+  const price = row.unitPricing
+  const url = price?.sourceUrl && /^https?:\/\//.test(price.sourceUrl) ? price.sourceUrl : null
+  return <div className="text-[10px] whitespace-normal">
+    {row.units.quantity} {row.units.unit} · {price?.usdPerUnit === undefined ? '—' : `$${price.usdPerUnit}/${row.units.unit}`}
+    {url && <a className="block underline" href={url} target="_blank" rel="noreferrer">{price?.pricedAt ?? 'Source'}</a>}
+    {price?.note && <div>{price.note}</div>}
+  </div>
 }
 
 function UsageMetadata({ metadata }: { metadata?: ApiUsageMetadata }) {
@@ -376,6 +399,9 @@ function UsageDashboardContent() {
         {status(trendQuery, trend.length === 0)}
         {trendQuery.data && <UsageMetadata metadata={trendQuery.data.metadata} />}
         <div className="text-[11px] text-ink-500">{translate(locale, 'settings.trendAndGroupAmountsShowKnownReferenceCostsMissing')}</div>
+        <div className="text-[11px] text-ink-500">{locale === 'zh-CN'
+          ? '日期筛选：本地时区，含起始日和结束日；查询区间左闭右开。趋势轴与分桶：UTC，按实际时间间隔排列；首尾桶仅计所选区间。各曲线独立纵轴归一化，图例列出上限。'
+          : 'Date filter: local time, both selected dates included; query interval [from, to). Trend axis and buckets: UTC, spaced by elapsed time; edge buckets include only the selected interval. Each series has its own normalized scale; maxima appear in the legend.'}</div>
         <TrendChart points={trend} granularity={granularity} t={t} />
       </div>
 
@@ -499,10 +525,11 @@ function UsageDashboardContent() {
                   {r.actualModel || unknown}
                   <LogAttemptDetails r={r} locale={locale} t={t} unknown={unknown} />
                 </td>
-                <td className={td}>{r.measured === true ? fmtTokens(r.inputTokens) : unknown}</td>
-                <td className={td}>{r.measured === true ? fmtTokens(r.outputTokens) : unknown}</td>
+                <td className={td}>{tokensMeasured(r) ? fmtTokens(r.inputTokens) : unknown}</td>
+                <td className={td}>{tokensMeasured(r) ? fmtTokens(r.outputTokens) : unknown}</td>
                 <td className={td}>{r.unpriced === true ? translate(locale, 'settings.unpriced') : r.measured !== true || r.unpriced !== false ? unknown : fmtUsd(r.costUsd)}
                   {r.costEstimated && <div>{t('me.usage.estimated')}</div>}
+                  <UnitCostDetails row={r} />
                 </td>
                 <td className={td}>
                   <span className={cn('text-[10.5px] font-semibold px-1.5 py-0.5 rounded', r.status === 'ok' ? 'text-skype-deep bg-sky2-50' : 'text-coral-deep bg-coral-soft')}>
@@ -515,12 +542,13 @@ function UsageDashboardContent() {
             )}
           />
         </div>
+        {logs?.truncated && <p role="status" className="mt-3 text-[12px] text-ink-500">{t('me.usage.truncated')}</p>}
         {logs && logs.total > logs.pageSize && (
           <div className="flex items-center gap-3 mt-3 justify-end">
             <button type="button" disabled={page <= 1} onClick={() => setPage(page - 1)}
               className="h-6 px-2.5 rounded-[6px] text-[11px] font-semibold text-ink-500 hover:bg-sky2-50 disabled:opacity-40">←</button>
-            <span className="text-[11px] text-ink-400 tabular-nums">{page} / {Math.ceil(logs.total / logs.pageSize)}</span>
-            <button type="button" disabled={page >= Math.ceil(logs.total / logs.pageSize)} onClick={() => setPage(page + 1)}
+            <span className="text-[11px] text-ink-400 tabular-nums">{page} / {(logs.maxPage ?? Math.max(1, Math.ceil(logs.total / logs.pageSize)))}</span>
+            <button type="button" disabled={page >= (logs.maxPage ?? Math.max(1, Math.ceil(logs.total / logs.pageSize)))} onClick={() => setPage(page + 1)}
               className="h-6 px-2.5 rounded-[6px] text-[11px] font-semibold text-ink-500 hover:bg-sky2-50 disabled:opacity-40">→</button>
           </div>
         )}

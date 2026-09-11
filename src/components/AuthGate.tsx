@@ -11,9 +11,10 @@
  *      the app loads, otherwise we fall through to AuthScreen.
  */
 import { useEffect, useState, type ReactNode } from 'react'
-import { api } from '@/api/client'
+import { api, ApiError } from '@/api/client'
 import { useAuth } from '@/stores/auth'
 import { isElectron } from '@/lib/runtime'
+import { useT } from '@/lib/i18n'
 import { AuthScreen } from './AuthScreen'
 import { WindowDragStrip } from './WindowDragStrip'
 
@@ -44,6 +45,10 @@ function consumeOAuthFragment(): CarriedSession | null {
 
 
 export function AuthGate({ children, unauthFallback }: AuthGateProps) {
+  const t = useT()
+  const [probeError, setProbeError] = useState(false)
+  const [attempt, setAttempt] = useState(0)
+  const epoch = useAuth((s) => s.contextEpoch)
   const token = useAuth((s) => s.token)
   const ready = useAuth((s) => s.ready)
   const setSession = useAuth((s) => s.setSession)
@@ -68,21 +73,24 @@ export function AuthGate({ children, unauthFallback }: AuthGateProps) {
 
   useEffect(() => {
     let cancelled = false
+    setProbeError(false)
+    const current = () => !cancelled && useAuth.getState().token === token && useAuth.getState().contextEpoch === epoch
     if (!token) { markReady(); return }
     void (async () => {
       try {
         const r = await api.authMe()
-        if (cancelled) return
+        if (!current()) return
         setMe(r.user, r.companies, r.activeCompanyId)
         setServerCapabilities(r.serverCapabilities)
         markReady()
-      } catch {
-        // Token's bad / expired — clear and route to login.
-        if (!cancelled) clear()
+      } catch (error) {
+        if (!current()) return
+        if (error instanceof ApiError && error.status === 401) clear()
+        else setProbeError(true)
       }
     })()
     return () => { cancelled = true }
-  }, [token, setMe, setServerCapabilities, clear, markReady])
+  }, [token, epoch, attempt, setMe, setServerCapabilities, clear, markReady])
 
   // Electron-only: listen for OAuth tokens forwarded by the main
   // process. The user clicked "Continue with Google" → we opened the
@@ -113,6 +121,14 @@ export function AuthGate({ children, unauthFallback }: AuthGateProps) {
     window.addEventListener('cumora:oauth-token', handler)
     return () => window.removeEventListener('cumora:oauth-token', handler)
   }, [setSession])
+
+  if (token && probeError) {
+    return <div className="fixed inset-0 grid place-content-center gap-4 bg-paper text-ink-700 p-6" role="alert">
+      <WindowDragStrip />
+      <p>{t('auth.retrySession')}</p>
+      <button type="button" className="action-button rounded-lg px-4 py-2" onClick={() => setAttempt(n => n + 1)}>{t('auth.retry')}</button>
+    </div>
+  }
 
   if (!ready) {
     // Brief loading flash while we probe — keeps the app from flashing

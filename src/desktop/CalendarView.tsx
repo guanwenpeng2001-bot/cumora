@@ -1,3 +1,4 @@
+import { useApp } from '@/stores/app'
 /**
  * Calendar — macOS-Calendar-style scheduling surface. Three view modes
  * (Day / Week / Month) share one toolbar; each one supports:
@@ -36,10 +37,6 @@ interface AgendaItem {
 }
 
 type ViewMode = 'day' | 'week' | 'month'
-type EditingState =
-  | { mode: 'edit'; event: CalendarEvent }
-  | { mode: 'new'; prefill?: EventEditorPrefill }
-  | null
 
 const DAY_MS = 86_400_000
 const WEEK_KEYS = [
@@ -597,8 +594,10 @@ function TimeGrid({ cursor, events, onEdit, onNew, dayCount }: GridProps & { day
 export function CalendarView() {
   const t = useT()
   const [mode, setMode] = useState<ViewMode>('week')
-  const [cursor, setCursor] = useState<Date>(() => new Date())
-  const [editing, setEditing] = useState<EditingState>(null)
+  const cursor = useApp(s => s.calendarCursor)
+  const setCursor = useApp(s => s.setCalendarCursor)
+  const editing = useApp(s => s.calendarEditing)
+  const setEditing = useApp(s => s.setCalendarEditing)
 
   const events = useCalendar((s) => s.events)
   const loaded = useCalendar((s) => s.loaded)

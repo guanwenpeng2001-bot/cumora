@@ -3,6 +3,9 @@
 @tailwind utilities;
 
 :root {
+  --action-bg: #0078C8;
+  --action-fg: #ffffff;
+  --text-muted: #5B7186;
   color-scheme: light;
   /* RGB channels are the source of truth so Tailwind opacity modifiers
    * (`bg-paper/60`) keep working. `--name` is the hex-equivalent used by
@@ -1028,4 +1031,21 @@ input:focus, textarea:focus, button:focus { outline: none; }
   .reaction-burst {
     display: none;
   }
+}
+
+/* Readable actions are independent of decorative brand blues. */
+html.dark {
+  --action-bg: #61AFEF;
+  --action-fg: #21252B;
+  --text-muted: #ABB2BF;
+}
+.action-button, .bg-skype.text-white {
+  background-color: var(--action-bg);
+  color: var(--action-fg);
+}
+.action-button:hover, button.bg-skype.text-white:hover {
+  filter: brightness(0.94);
+}
+.text-ink-300, .placeholder\:text-ink-300::placeholder {
+  color: var(--text-muted);
 }

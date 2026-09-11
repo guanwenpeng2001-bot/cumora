@@ -1,3 +1,5 @@
+import { useAuth } from '@/stores/auth'
+import { useIsMobile } from '@/lib/utils'
 import { isWindows } from '@/lib/runtime'
 import { agentCliCommand } from '@/lib/agentCliRelease'
 import { useEffect, useState } from 'react'
@@ -16,6 +18,9 @@ import { RUNNABLE_ENGINES, engineLabel, type RunnableEngineId } from '@/lib/engi
  */
 export function Onboarding() {
   const t = useT()
+  const mobile = useIsMobile()
+  const role = useAuth(s => s.companies.find(c => c.id === s.activeCompanyId)?.role)
+  const canPair = role === 'owner' || role === 'admin'
   const [busy, setBusy] = useState(false)
   const [code, setCode] = useState<string | null>(null)
   const [err, setErr] = useState<string | null>(null)
@@ -50,6 +55,7 @@ export function Onboarding() {
   const cmd = code ? optIn + agentCliCommand(` --pair ${code}${origin ? ` --server ${origin}` : ''}${engineFlag}${serviceFlag}`) : ''
 
   async function getCode() {
+    if (!canPair || mobile) return
     setErr(null); setBusy(true)
     try { setCode((await api.requestPairingCode()).code) }
     catch (e) { setErr(e instanceof Error ? e.message : String(e)) }
@@ -75,7 +81,10 @@ export function Onboarding() {
           <p className="text-[14.5px] text-ink-600 leading-relaxed mb-6 max-w-[560px]" dangerouslySetInnerHTML={{ __html: t('onboard.body') }} />
 
           <div className="bg-cloud rounded-[16px] p-5" style={{ border: '1px solid var(--ink-100)' }}>
-            {!code ? (
+            {!canPair ? <p role="status">{t('onboard.contactAdmin')}</p> : mobile ? <div>
+              <p>{t('onboard.continueDesktop')}</p>
+              <p className="mt-3 select-all break-all text-ink-700">{getPairingServerOrigin() || location.origin}</p>
+            </div> : !code ? (
               <>
                 {/* biome-ignore lint/security/noDangerouslySetInnerHtml: static copy from the locale bundle, not user input */}
                 <div className="text-[13px] text-ink-600 mb-4" dangerouslySetInnerHTML={{ __html: t('onboard.cmdIntro') }} />
@@ -118,7 +127,10 @@ export function Onboarding() {
                 </label>
                 <pre className="bg-ink-900 text-cloud rounded-[10px] p-3 text-[12px] overflow-x-auto whitespace-pre-wrap break-all font-mono select-all">{cmd}</pre>
                 <div className="flex items-center gap-3 mt-3">
-                  <button type="button" onClick={() => { void navigator.clipboard?.writeText(cmd); setCopied(true) }}
+                  <button type="button" onClick={async () => {
+                      try { await navigator.clipboard.writeText(cmd); setCopied(true); setErr(null) }
+                      catch { setErr(t('onboard.copyFailed')) }
+                    }}
                     className="inline-flex items-center justify-center min-w-[120px] text-[12px] font-semibold px-3 py-1.5 rounded-[9px] text-white transition-colors duration-200"
                     style={{ background: copied ? '#3BB273' : 'var(--skype)' }}>
                     {copied ? t('onboard.copied') : t('onboard.copy')}
@@ -132,6 +144,7 @@ export function Onboarding() {
             )}
           </div>
 
+          {err && code && <p role="alert" className="text-coral-deep mt-3">{err}</p>}
           <p className="text-[12px] text-ink-400 mt-4">
             {t('onboard.cloudCta')} <span className="text-skype-deep">{t('onboard.upgradePro')}</span> {t('onboard.cloudRun')}
           </p>

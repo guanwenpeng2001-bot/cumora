@@ -208,12 +208,7 @@ export async function startPrivateChat(args: {
       [messageId, conversationId, instigatorId, opening, sequence, companyId],
     )
     await client.query(`UPDATE conversations SET updated_at = NOW() WHERE id = $1`, [conversationId])
-    await client.query(
-      `INSERT INTO conversation_reads (user_id, conversation_id, last_read_at)
-       VALUES ($1, $2, NOW())
-       ON CONFLICT (user_id, conversation_id) DO UPDATE SET last_read_at = NOW()`,
-      [instigatorId, conversationId],
-    )
+    // Sending does not consume input; completed turns commit exact receipts.
     await enqueueBroadcast(client, CH_MESSAGE_NEW, {
       type: 'message.new',
       conversationId,

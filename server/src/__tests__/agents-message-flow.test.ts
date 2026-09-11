@@ -112,6 +112,26 @@ test('reply transaction does not acknowledge a new message that arrived during i
   assert.ok(statements.every(sql => !/conversation_reads|agent_message_consumptions/.test(sql)))
 })
 
+for (const delivered of [true, false]) test(`email reply ${delivered ? 'success' : 'failure'} leaves consumption to turn completion`, async () => {
+  const source = read('../agents/cli.ts')
+  const start = source.indexOf('  const finalStatus = sendRes.ok', source.indexOf('async function cmdEmailReply'))
+  const end = source.indexOf('\nasync function cmdAvatar', start)
+  assert.ok(start > 0 && end > start)
+  const statements: string[] = []
+  const run = compile(`return async function() { ${source.slice(start, end)}`, {
+    sendRes: { ok: delivered, error: delivered ? null : 'delivery failed', mock: true },
+    pool: { query: async (sql: string) => { statements.push(sql) } },
+    persisted: { messageId: 'sent' }, companyId: 'company', messageId: 'smtp-id',
+    me: 'agent', o: { conversation_id: 'thread' }, replyTo: 'consumed-old',
+    subject: 'Re: topic', toAddrs: ['test@example.test'], ccCombined: [],
+    ok: (text: string) => ({ ok: true, text }), err: (text: string) => ({ ok: false, text }),
+  })
+  assert.equal((await run()).ok, delivered)
+  assert.equal(statements.length, 1)
+  assert.match(statements[0], /UPDATE email_messages/)
+  assert.ok(statements.every(sql => !/conversation_reads|agent_message_consumptions/.test(sql)))
+})
+
 test('worker death retains a leased payload and expired owners cannot ack or renew its reclaim', async () => {
   const f = wakeQueueFixture(), queue = 'q'
   await enqueueWakeJob(f.store, queue, 'm', { body: 'durable' }, 0)

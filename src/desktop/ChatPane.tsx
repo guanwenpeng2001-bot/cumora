@@ -1,3 +1,4 @@
+import { MessageReadBoundary } from '@/components/MessageReadBoundary'
 import { useVoiceInput } from '@/lib/useVoiceInput'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso'
@@ -2130,7 +2131,7 @@ export function ChatPane() {
                     isCurrent && 'ring-2 ring-gold shadow-[0_0_24px_-4px_rgba(244,183,64,0.55)]',
                   )}
                 >
-                  <MessageRow msg={m} author={author} delay={delay} animate={firstAnimation} />
+                  <MessageReadBoundary message={m}><MessageRow msg={m} author={author} delay={delay} animate={firstAnimation} /></MessageReadBoundary>
                 </div>
               )
             }}

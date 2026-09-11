@@ -440,14 +440,14 @@ function TrustTab() {
   const t = useT()
   const byId = useParticipants((s) => s.byId)
   const autonomy = usePrefs((s) => s.autonomy)
-  const setAutonomy = usePrefs((s) => s.setAutonomy)
   const agents = Object.values(byId).filter((p) => p.kind === 'agent')
 
   return (
     <div className="space-y-6">
+      <TurnSafetyPanel budgets />
       <Section title={t('me.sectionPerAgent')}>
         <div className="text-[13px] text-ink-500 leading-[1.55] mb-4 max-w-2xl font-display italic">
-          {t('me.perAgentIntro')}
+          {t('me.autonomyPending')}
         </div>
         <div className="space-y-2">
           {agents.map((a) => {
@@ -467,8 +467,7 @@ function TrustTab() {
                     <span>{t('me.autonomyThreshold')}</span>
                     <span className="font-mono text-[11px] font-semibold text-ink-700">{trust.toFixed(2)}</span>
                   </div>
-                  <input type="range" min={0} max={1} step={0.01} value={trust}
-                    onChange={(e) => setAutonomy(a.id, parseFloat(e.target.value))}
+                  <input type="range" disabled aria-label={t('me.autonomyPending')} min={0} max={1} step={0.01} value={trust}
                     className="w-full accent-whisper" />
                 </div>
               </div>
@@ -673,10 +672,10 @@ function PreferencesTab() {
             {g.items.map((it, i) => {
               const on = get(it.key, it.default)
               return (
-                <div key={i} className="flex items-center gap-4 p-4 cursor-pointer" onClick={() => setPref(it.key, !on)}>
+                <div key={i} className="flex items-center gap-4 p-4 cursor-pointer" onClick={() => !it.key.startsWith('priv.') && setPref(it.key, !on)} aria-disabled={it.key.startsWith('priv.')}>
                   <div className="flex-1 min-w-0">
                     <div className="font-semibold text-[13px] text-ink-900">{t(it.lbl)}</div>
-                    <div className="font-display italic font-normal text-[11.5px] text-ink-500 mt-0.5">{t(it.sub)}</div>
+                    <div className="font-display italic font-normal text-[11.5px] text-ink-500 mt-0.5">{it.key.startsWith('priv.') ? t('me.trustPending') : t(it.sub)}</div>
                   </div>
                   <span className={cn('w-9 h-5 rounded-full relative shrink-0 transition-colors', on ? 'bg-skype' : 'bg-ink-200')}>
                     <span className={cn('absolute w-4 h-4 bg-white rounded-full top-0.5 transition-all', on ? 'left-[18px]' : 'left-0.5')}
@@ -886,7 +885,7 @@ function ComputersTab() {
         },
       }
       await api.updateEngineDefaults(computerId, defaults)
-      await useComputers.getState().refresh()
+      await useComputers.getState().refresh(true)
       // A late response must not close a different editing session.
       setEditingModel((current) => current === savedEditor ? null : current)
     } catch (e) {
@@ -962,7 +961,7 @@ function ComputersTab() {
     if (!confirm(t('me.removeConfirm', { label }))) return
     try {
       await api.deleteComputer(id)
-      await useComputers.getState().refresh()
+      await useComputers.getState().refresh(true)
     } catch (e) { alert(e instanceof Error ? e.message : String(e)) }
   }
 

@@ -1,3 +1,4 @@
+import { Dialog } from './Dialog'
 /**
  * Modal for creating a new group conversation. User picks a title and a set of
  * teammates (active agents + other humans). Yetone is auto-included.
@@ -98,7 +99,7 @@ export function GroupCreator({ onClose, initialPicked }: Props) {
   const canSubmit = picked.size > 0 && !busy
 
   return (
-    <div
+    <Dialog onClose={onClose}
       className="fixed inset-0 z-50 grid place-items-center p-6"
       style={{ background: 'rgba(15, 30, 50, 0.55)', backdropFilter: 'blur(6px)' }}
       onClick={onClose}
@@ -246,6 +247,6 @@ export function GroupCreator({ onClose, initialPicked }: Props) {
           >{busy ? t('group.creatingBtn') : (picked.size > 0 ? t('group.createBtnWithCount', { n: picked.size + 1 }) : t('group.createBtn'))}</button>
         </div>
       </div>
-    </div>
+    </Dialog>
   )
 }

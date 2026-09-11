@@ -126,9 +126,11 @@ export function setDevModeEnabled(enabled: boolean): void {
 }
 
 export class ApiError extends Error {
-  constructor(message: string, readonly status: number) {
+  readonly code?: string
+  constructor(message: string, readonly status: number, readonly payload?: Record<string, unknown>) {
     super(message)
     this.name = 'ApiError'
+    this.code = typeof payload?.error === 'string' ? payload.error : undefined
   }
 }
 
@@ -146,12 +148,14 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
     signal?.throwIfAborted()
     if (!res.ok) {
       let detail: string | null = null
+      let payload: Record<string, unknown> | undefined
       try {
         const text = await res.text()
         if (text) {
           try {
             const j = JSON.parse(text) as { error?: string; message?: string }
-            detail = j.error ?? j.message ?? text.slice(0, 200)
+            if (j && typeof j === 'object' && !Array.isArray(j)) payload = j
+            detail = typeof j?.error === 'string' ? j.error : typeof j?.message === 'string' ? j.message : text.slice(0, 200)
           } catch { detail = text.slice(0, 200) }
         }
       } catch (error) {
@@ -165,7 +169,7 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
         && useAuth.getState().token === token) {
         useAuth.getState().clear()
       }
-      throw new ApiError(detail ? `${detail} (${res.status})` : `${res.status} ${res.statusText}`, res.status)
+      throw new ApiError(detail ? `${detail} (${res.status})` : `${res.status} ${res.statusText}`, res.status, payload)
     }
     const value = await res.json() as T
     signal?.throwIfAborted()
@@ -204,6 +208,7 @@ export interface ApiConversation {
   updatedAt: string
   unreadCount: number
   lastMessage: {
+    sequence?: number
     id: string
     authorId: string
     kind: string
@@ -432,7 +437,7 @@ export interface ApiUsageLogRow {
   route?: string | null
   platform?: string | null
   requestedModel?: string
-  actualModel?: string
+  actualModel?: string | null
   failureReason?: string | null
   failureStage?: string | null
   httpStatus?: number | null
@@ -440,6 +445,9 @@ export interface ApiUsageLogRow {
   attempt?: number | null
 }
 export interface ApiUsageLogPage {
+  accessibleTotal?: number
+  maxPage?: number
+  truncated?: boolean
   items: ApiUsageLogRow[]
   total: number
   page: number
@@ -531,7 +539,7 @@ export interface ApiParticipant {
   avatarBg: string
   avatarUrl?: string | null
   status: Status
-  statusUpdatedAt?: string
+  statusUpdatedAt?: string | null
   bio: string | null
   tools: string[] | null
   systemPrompt?: string | null
@@ -637,11 +645,13 @@ export interface AgentInput {
 }
 
 export interface AgentCreateInput extends AgentInput {
+  name: string
+  systemPrompt: string
   providerProfile?: string | null
   /** Stable for the lifetime of one create form so ambiguous retries replay. */
   requestId: string
   /** Initial host placement is committed atomically with the Agent row. */
-  computerId?: string | null
+  computerId?: string
   engine?: EngineId
   inherit?: boolean
 }
@@ -1080,7 +1090,7 @@ export interface ShippingRelease {
 
 export interface ShippingFriction {
   id: string
-  featureId: string | null
+  featureId?: string | null
   title: string
   description: string
   source: string
@@ -1357,7 +1367,7 @@ export const api = {
   generateAgentAvatar: (id: string) =>
     http<{ url: string }>(`/agents/${encodeURIComponent(id)}/avatar/generate`, { method: 'POST' }),
   getConversations: () => http<ApiConversation[]>('/conversations'),
-  createGroup: (input: { title: string; members: string[]; subtitle?: string; projectId?: string | null }) =>
+  createGroup: (input: { title: string; members: string[]; topic?: string; projectId?: string | null }) =>
     http<{ id: string; members: string[]; projectId: string | null }>('/conversations', {
       method: 'POST',
       body: JSON.stringify(input),
@@ -1689,10 +1699,10 @@ export const api = {
     http<ApiBindingWriteResult>(`/agents/${encodeURIComponent(agentId)}/skills`, { signal, method: 'PUT', body: JSON.stringify({ skillIds }) }),
   getUsageLogs: (from: string, to: string, page: number, pageSize: number, source?: string, signal?: AbortSignal) =>
     http<ApiUsageLogPage>(`/usage/logs?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&page=${page}&pageSize=${pageSize}${source ? `&source=${encodeURIComponent(source)}` : ''}`, { signal }),
-  markRead: (conversationId: string) =>
+  markRead: (conversationId: string, boundary: { messageId: string; sequence: number }) =>
     http<{ ok: boolean }>(`/conversations/${encodeURIComponent(conversationId)}/read`, {
       method: 'POST',
-      body: JSON.stringify({}),
+      body: JSON.stringify(boundary),
     }),
   /** Broadcast a typing indicator into a conversation. Callers should
    *  throttle to roughly one POST every few seconds while typing
@@ -1869,7 +1879,7 @@ export const api = {
   listDocuments: () =>
     http<{ documents: ApiDocument[] }>('/documents'),
   createDocument: (input: { title?: string; conversationId?: string | null; requestId?: string } = {}) =>
-    http<ApiDocument>('/documents', { method: 'POST', body: JSON.stringify(input) }),
+    http<ApiDocument & { replayed?: boolean }>('/documents', { method: 'POST', body: JSON.stringify(input) }),
   getDocument: (id: string) =>
     http<ApiDocument>(`/documents/${encodeURIComponent(id)}`),
   renameDocument: (id: string, title: string) =>
@@ -1915,7 +1925,7 @@ export interface CalendarEventInput {
 
 /* ============== WebSocket bridge ============== */
 
-export type WsEvent =
+export type WsEvent = { deliveryId?: string } & (
   | { type: 'hello'; instanceId: string; ts: number }
   | { type: 'message.new'; conversationId: string; message: ApiMessage }
   | { type: 'message.delta'; conversationId: string; messageId: string; authorId: string; delta: string; sequence: number; done: boolean }
@@ -1984,10 +1994,15 @@ export type WsEvent =
       userId?: string
       role?: 'admin' | 'member'
     }
+)
 
 type Listener = (e: WsEvent) => void
 
-class WsClient {
+export class WsClient {
+  private generation = 0
+  private identity: { token: string; epoch: number } | null = null
+  private retryTimer: ReturnType<typeof setTimeout> | null = null
+  private ticketAbort: AbortController | null = null
   private ws: WebSocket | null = null
   private listeners = new Set<Listener>()
   private reconnectDelay = 500
@@ -2004,46 +2019,70 @@ class WsClient {
    *  memo clears once it settles, so a later connect still gets a fresh socket. */
   private connecting: Promise<void> | null = null
 
+  private identityCurrent(): boolean {
+    return !!this.identity && this.identity.token === getAuthToken()
+      && this.identity.epoch === useAuth.getState().contextEpoch
+  }
+
   connect(): Promise<void> {
+    if (this.identity && !this.identityCurrent()) this.close()
+    if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) return Promise.resolve()
     const existing = this.connecting
     if (existing) return existing
-    const p = this.connectImpl().finally(() => { this.connecting = null })
+    this.intentionalClose = false
+    const generation = ++this.generation
+    const p = this.connectImpl(generation).finally(() => { if (this.connecting === p) this.connecting = null })
     this.connecting = p
     return p
   }
 
-  private async connectImpl() {
+  private async connectImpl(generation: number) {
     if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) return
     const token = getAuthToken()
     if (!token) return  // not signed in → don't even try
     // Fetch a SHORT-LIVED one-shot ticket so we never put the actual
     // session token on the WS URL (which would land in proxy access logs
     // / referrer headers). The ticket is consumed atomically server-side.
+    const epoch = useAuth.getState().contextEpoch
+    this.identity = { token, epoch }
+    const current = () => generation === this.generation && !this.intentionalClose
+      && token === getAuthToken() && epoch === useAuth.getState().contextEpoch
+    const controller = new AbortController()
+    this.ticketAbort = controller
     let ticket: string
     try {
       const r = await fetch(`${API}/auth/ws-ticket`, {
+        signal: controller.signal,
         method: 'POST',
         headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
       })
       if (!r.ok) {
         // Schedule a retry — auth might be in flight, server bouncing, etc.
-        this.scheduleReconnect()
+        this.scheduleReconnect(generation, token, epoch)
         return
       }
       const j = await r.json() as { ticket: string }
       ticket = j.ticket
     } catch {
-      this.scheduleReconnect()
+      this.scheduleReconnect(generation, token, epoch)
       return
     }
+    if (!current()) return
     const url = `${wsOrigin()}/ws?t=${encodeURIComponent(ticket)}`
     const sock = new WebSocket(url)
     this.ws = sock
-    sock.onopen = () => { this.reconnectDelay = 500 }
+    sock.onopen = () => {
+      if (!current() || this.ws !== sock) { sock.close(); return }
+      this.reconnectDelay = 500
+    }
     sock.onmessage = (ev) => {
+      if (!current() || this.ws !== sock) return
       try {
         const data = JSON.parse(ev.data) as WsEvent
-        this.listeners.forEach((l) => { l(data) })
+        for (const listener of this.listeners) {
+          if (!current() || this.ws !== sock) return
+          listener(data)
+        }
       } catch { /* ignore */ }
     }
     sock.onclose = () => {
@@ -2053,17 +2092,23 @@ class WsClient {
       // LIVE socket (`isOpen()`/`send()` start reporting closed while typing
       // frames are silently dropped) and schedule a second one on top of it,
       // putting us back to two sockets sharing one listener set.
-      if (this.ws !== sock) return
+      if (!current() || this.ws !== sock) return
       this.ws = null
-      if (!this.intentionalClose) this.scheduleReconnect()
+      if (!this.intentionalClose) this.scheduleReconnect(generation, token, epoch)
     }
     sock.onerror = () => { /* onclose follows */ }
   }
 
-  private scheduleReconnect() {
+  private scheduleReconnect(generation: number, token: string, epoch: number) {
+    if (generation !== this.generation || this.intentionalClose || token !== getAuthToken()
+      || epoch !== useAuth.getState().contextEpoch || this.retryTimer !== null) return
     const d = this.reconnectDelay
     this.reconnectDelay = Math.min(this.reconnectDelay * 2, 8000)
-    setTimeout(() => { void this.connect() }, d)
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null
+      if (generation === this.generation && !this.intentionalClose && token === getAuthToken()
+        && epoch === useAuth.getState().contextEpoch) void this.connect()
+    }, d)
   }
 
   on(l: Listener): () => void {
@@ -2075,26 +2120,33 @@ class WsClient {
    *  callers should re-emit on `hello` reconnect rather than queuing. */
   send(payload: unknown): boolean {
     const sock = this.ws
-    if (!sock || sock.readyState !== WebSocket.OPEN) return false
+    if (!this.identityCurrent() || !sock || sock.readyState !== WebSocket.OPEN) return false
     try { sock.send(JSON.stringify(payload)); return true } catch { return false }
   }
 
   isOpen(): boolean {
-    return !!this.ws && this.ws.readyState === WebSocket.OPEN
+    return this.identityCurrent() && !!this.ws && this.ws.readyState === WebSocket.OPEN
   }
 
   close() {
     this.intentionalClose = true
-    this.ws?.close()
+    ++this.generation
+    this.identity = null
+    this.ticketAbort?.abort()
+    this.ticketAbort = null
+    if (this.retryTimer !== null) clearTimeout(this.retryTimer)
+    this.retryTimer = null
+    this.connecting = null
+    const socket = this.ws
+    this.ws = null
+    socket?.close()
   }
 
   /** Force a fresh ticket fetch + reconnect. Used when the auth context
    *  changes (login, logout, company switch) so the socket re-handshakes
    *  with the new identity instead of staying on the old session. */
   reconnect() {
-    this.intentionalClose = true
-    this.ws?.close()
-    this.ws = null
+    this.close()
     this.intentionalClose = false
     this.reconnectDelay = 500
     void this.connect()

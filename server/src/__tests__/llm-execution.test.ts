@@ -495,7 +495,9 @@ test('F04/F10: explicit DashScope direct route stays direct with gateway keys an
     const row = inserts.at(-1)
     assert.equal(row[8], 20); assert.equal(row[11], 100); assert.equal(row[15], true)
     assert.deepEqual(extras(row).rawUsage, { input_tokens: 20, output_tokens: 100 })
-    assert.equal(extras(row).unpriced, 'image-pricing-unavailable')
+    assert.equal(extras(row).unpriced, model === 'qwen-image-plus' ? undefined : 'no-price')
+    assert.deepEqual(extras(row).units, { unit: 'image', quantity: 1 })
+    assert.equal(row[13], model === 'qwen-image-plus' ? 0.028671 : 0)
   }
   assert.equal(calls.length, 3)
   assert.ok(calls.every(call => call.url.startsWith('https://dashscope.invalid/api/v1/')))
@@ -625,10 +627,11 @@ test('F10: Images usage survives storage failure; missing usage remains unknown'
   assert.equal(inserts[0][8], 15); assert.equal(inserts[0][9], 5); assert.equal(inserts[0][11], 100)
   assert.equal(inserts[0][15], true)
   assert.deepEqual(extras(inserts[0]).rawUsage, rawUsage)
-  assert.equal(extras(inserts[0]).unpriced, 'image-pricing-unavailable')
+  assert.equal(extras(inserts[0]).unpriced, 'media-tier-pricing-unavailable')
   usage = undefined
   await assert.rejects(image(), /storage failed/)
-  assert.equal(inserts[1][15], false)
+  assert.equal(inserts[1][15], true, 'returned image count is measured without tokens')
+  assert.deepEqual(extras(inserts[1]).units, { unit: 'image', quantity: 1 })
   assert.equal(extras(inserts[1]).rawUsage, null)
 })
 

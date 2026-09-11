@@ -1,7 +1,7 @@
 import { create } from 'zustand'
 import { api, ws, type ApiComputer } from '@/api/client'
 import type { Computer, ComputerStatus } from '@/types'
-import { commitIfContextCurrent } from '@/stores/auth'
+import { commitIfContextCurrent, useAuth } from '@/stores/auth'
 
 interface ComputersState {
   byId: Record<string, Computer>
@@ -9,7 +9,7 @@ interface ComputersState {
   /** Hard reload — clears first; used at boot / workspace switch. */
   load: () => Promise<void>
   /** Quiet re-fetch — keeps the list visible during the round-trip. */
-  refresh: () => Promise<void>
+  refresh: (afterWrite?: boolean) => Promise<void>
   /** Patch a single computer's status from a WS event. */
   applyStatus: (id: string, status: ComputerStatus) => void
 }
@@ -44,13 +44,20 @@ function computersEqual(a: Record<string, Computer>, b: Record<string, Computer>
   return true
 }
 
-let inflight: Promise<void> | null = null
+const flights = new Map<string, Promise<void>>()
+const generations = new Map<string, number>()
 
-async function fetchInto(set: (partial: Partial<ComputersState> | ((s: ComputersState) => ComputersState | Partial<ComputersState>)) => void): Promise<void> {
+async function fetchInto(set: (partial: Partial<ComputersState> | ((s: ComputersState) => ComputersState | Partial<ComputersState>)) => void, afterWrite = false): Promise<void> {
+  const { contextEpoch, activeCompanyId } = useAuth.getState()
+  const key = JSON.stringify([contextEpoch, activeCompanyId])
+  const inflight = afterWrite ? undefined : flights.get(key)
   if (inflight) return inflight
+  const generation = (generations.get(key) ?? 0) + 1
+  generations.set(key, generation)
   const mine = (async () => {
     try {
       await commitIfContextCurrent(() => api.getComputers(), (list) => {
+        if (generations.get(key) !== generation) return
         const byId: Record<string, Computer> = {}
         for (const c of list) byId[c.id] = fromApi(c)
         set((s) => (s.loaded && computersEqual(s.byId, byId) ? s : { byId, loaded: true }))
@@ -59,11 +66,11 @@ async function fetchInto(set: (partial: Partial<ComputersState> | ((s: Computers
       console.warn('[computers] fetch failed', err)
     }
   })()
-  inflight = mine
+  flights.set(key, mine)
   try {
     await mine
   } finally {
-    if (inflight === mine) inflight = null
+    if (flights.get(key) === mine) flights.delete(key)
   }
 }
 
@@ -74,8 +81,8 @@ export const useComputers = create<ComputersState>((set) => ({
     set({ byId: {}, loaded: false })
     await fetchInto(set)
   },
-  async refresh() {
-    await fetchInto(set)
+  async refresh(afterWrite = false) {
+    await fetchInto(set, afterWrite)
   },
   applyStatus(id, status) {
     set((s) => {

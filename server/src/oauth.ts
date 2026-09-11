@@ -457,11 +457,18 @@ export async function findOrCreateUserByProfile(
       }
     }
 
-    // Path C: brand new user. If the waitlist gate is on AND this email
-    // isn't on the bootstrap admin allow-list, enqueue them instead of
-    // creating a real account. Admins on the env allow-list bypass the
-    // gate so the first deploy can onboard without a chicken-and-egg.
-    if (await isWaitlistEnabled() && !isAllowlistedAdmin(profile.email)) {
+    // Admission priority: a currently valid workspace invitation whose email
+    // restriction matches the verified OAuth identity bypasses the waitlist.
+    // Missing, expired, revoked, consumed or wrong-email tokens never bypass it.
+    // Acceptance still revalidates under lock; this check does not consume a use.
+    const validInvite = inviteToken ? await client.query(
+      `SELECT 1 FROM company_invitations
+        WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > NOW()
+          AND use_count < max_uses AND (email IS NULL OR LOWER(email) = LOWER($2))`,
+      [createHash('sha256').update(inviteToken).digest('base64url'), profile.email],
+    ) : null
+    const hasValidInvite = Boolean(validInvite?.rowCount)
+    if (await isWaitlistEnabled() && !isAllowlistedAdmin(profile.email) && !hasValidInvite) {
       await client.query('ROLLBACK').catch(() => {})
       await enqueueWaitlist({
         provider: p,
@@ -473,7 +480,7 @@ export async function findOrCreateUserByProfile(
       throw new WaitlistedError(profile.email, profile.displayName)
     }
 
-    // Mint user. Personal-workspace creation is GATED on `inviteToken`:
+    // Mint user. Personal-workspace creation is GATED on `hasValidInvite`:
     // if the OAuth flow started from /invite/<token>, the user is here to
     // join someone *else's* workspace — auto-creating their own would
     // leave a stray "Their Name's workspace" they never wanted (the
@@ -505,7 +512,7 @@ export async function findOrCreateUserByProfile(
     await client.query(`UPDATE users SET avatar_url = $1 WHERE id = $2`, [avatar, userId])
 
     let companyId: string | null = null
-    if (!inviteToken) {
+    if (!hasValidInvite) {
       companyId = `co-${randomUUID().slice(0, 10)}`
       await insertPersonalWorkspace(client, {
         companyId,

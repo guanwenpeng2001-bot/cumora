@@ -184,7 +184,7 @@ export function MobileMe() {
                         />
                       </div>
                       <span className="font-mono text-[9.5px] font-semibold text-ink-500 tabular-nums">
-                        {threshold.toFixed(2)}
+                        {threshold.toFixed(2)} · {t('me.trustPending')}
                       </span>
                     </div>
                   </button>

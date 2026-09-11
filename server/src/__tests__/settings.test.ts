@@ -1,3 +1,4 @@
+import { PaginationError } from '../api/list-pagination.js'
 import assert from 'node:assert/strict'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { readFileSync } from 'node:fs'
@@ -214,7 +215,7 @@ function routes(f: ReturnType<typeof fixture>) {
   let admin = true
   let invalidations = 0
   runInNewContext(ts.transpileModule(selected, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, {
-    ...f.settings,
+    ...f.settings, PaginationError,
     api: {
       get(path: string, handler: Handler) { handlers.set('GET ' + path, handler) },
       put(path: string, handler: Handler) { handlers.set('PUT ' + path, handler) },

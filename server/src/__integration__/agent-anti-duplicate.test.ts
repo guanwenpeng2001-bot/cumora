@@ -350,3 +350,37 @@ test('[unit] the declared relay carries the bypass, last', async () => {
     'the declared relay no longer bypasses the anti-monologue gate — after the intent message the rules require, the agent\'s answer is refused and the room gets a failure notice instead',
   )
 })
+
+test('[integration] simultaneous replies serialize conversation before counter without deadlock', { timeout: 15000 }, async () => {
+  const { agentA, agentB, convoId } = await seedGroupWithTwoAgents()
+  // Widen the old shared-lock upgrade race using real PostgreSQL connections.
+  // With exclusive locking the second transaction waits before claiming a counter.
+  const originalConnect = pool.connect.bind(pool)
+  const connect = async (...connectArgs: any[]) => {
+    if (connectArgs.length) return (originalConnect as any)(...connectArgs)
+    const client = await originalConnect()
+    const query = client.query.bind(client)
+    client.query = (async (...args: any[]) => {
+      const result = await (query as any)(...args)
+      if (typeof args[0] === 'string' && /SELECT c.id FROM conversations c/.test(args[0])) {
+        await new Promise(resolve => setTimeout(resolve, 100))
+      }
+      return result
+    }) as typeof client.query
+    const release = client.release.bind(client)
+    client.release = (...args) => { client.query = query; release(...args) }
+    return client
+  }
+  pool.connect = connect as typeof pool.connect
+  try {
+    const replies = await Promise.all([
+      runCli(['--as', agentA, 'reply', convoId, 'independent reply A']),
+      runCli(['--as', agentB, 'reply', convoId, 'independent reply B']),
+    ])
+    for (const reply of replies) assert.equal(reply.ok, true, reply.text)
+    const { rows } = await pool.query('SELECT sequence FROM messages WHERE conversation_id = $1 ORDER BY sequence', [convoId])
+    assert.deepEqual(rows.map(row => row.sequence), [1, 2])
+  } finally {
+    pool.connect = originalConnect as typeof pool.connect
+  }
+})

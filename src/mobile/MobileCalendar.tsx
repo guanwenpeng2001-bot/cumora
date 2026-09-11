@@ -1,3 +1,4 @@
+import { useApp } from '@/stores/app'
 /**
  * Mobile Calendar — month grid + day detail sheet.
  *
@@ -11,7 +12,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useCalendar } from '@/stores/calendar'
 import { useParticipants } from '@/stores/participants'
-import { EventEditor, type EventEditorPrefill } from '@/components/EventEditor'
+import { EventEditor } from '@/components/EventEditor'
 import { Avatar } from '@/components/Avatar'
 import { ICalendar, IClock, IRepeat } from '@/components/icons'
 import { tapHaptic } from '@/lib/native'
@@ -95,13 +96,11 @@ export function MobileCalendar() {
   const loaded = useCalendar((s) => s.loaded)
   const load = useCalendar((s) => s.load)
   const byId = useParticipants((s) => s.byId)
-  const [cursor, setCursor] = useState<Date>(() => startOfMonth(new Date()))
-  const [selectedDay, setSelectedDay] = useState<Date | null>(() => startOfDay(new Date()))
-  const [editing, setEditing] = useState<
-    | { mode: 'edit'; event: CalendarEvent }
-    | { mode: 'new'; prefill?: EventEditorPrefill }
-    | null
-  >(null)
+  const cursor = useApp(s => s.calendarCursor)
+  const setCursor = useApp(s => s.setCalendarCursor)
+  const [selectedDay, setSelectedDay] = useState<Date | null>(() => startOfDay(cursor))
+  const editing = useApp(s => s.calendarEditing)
+  const setEditing = useApp(s => s.setCalendarEditing)
 
   useEffect(() => { void load() }, [load])
 

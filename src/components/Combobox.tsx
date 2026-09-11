@@ -321,7 +321,7 @@ export function Combobox<T extends string = string>({
           {filtered.length === 0 && !customValue && (
             <div className="px-3 py-3 text-[12.5px] font-semibold text-ink-400">{emptyText}</div>
           )}
-        </div>, document.body,
+        </div>, rootRef.current?.closest('[role="dialog"]') ?? document.body,
       )}
     </div>
   )

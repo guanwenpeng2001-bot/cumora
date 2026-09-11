@@ -98,6 +98,7 @@ interface ModelCatalogState {
   ensure: (scope: string, opts?: { refresh?: boolean }) => Promise<void>
 }
 
+const generations = new Map<string, number>()
 let inflight: { scope: string; refresh: boolean; promise: Promise<void> } | null = null
 
 export const useModelCatalogStore = create<ModelCatalogState>((set, get) => ({
@@ -116,8 +117,11 @@ export const useModelCatalogStore = create<ModelCatalogState>((set, get) => ({
     if (inflight && inflight.scope === scope && (!refresh || inflight.refresh)) {
       return inflight.promise
     }
+    const generation = (generations.get(scope) ?? 0) + 1
+    generations.set(scope, generation)
     const session = useAuth.getState()
-    const stillCurrent = () => useAuth.getState().contextEpoch === session.contextEpoch
+    const stillCurrent = () => generations.get(scope) === generation
+      && useAuth.getState().contextEpoch === session.contextEpoch
       && useAuth.getState().token === session.token
       && useAuth.getState().activeCompanyId === session.activeCompanyId
     if (current.scope !== scope) {

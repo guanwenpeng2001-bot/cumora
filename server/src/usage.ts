@@ -491,6 +491,9 @@ function usageLogFailureReason(status: string, reason: string | null, httpStatus
 }
 
 export interface UsageLogRow {
+  tokenMeasured?: boolean
+  units?: { unit: 'second' | 'image'; quantity: number } | null
+  unitPricing?: { unit?: string; usdPerUnit?: number; sourceUrl?: string | null; pricedAt?: string | null; note?: string | null } | null
   id: string
   createdAt: string
   agentId: string | null
@@ -548,6 +551,8 @@ export async function usageLogs(
     measured: boolean; cost_estimated: boolean; unpriced: boolean; route: string | null; platform: string | null
     requested_model: string | null; actual_model: string | null
     failure_reason: string | null; failure_stage: string | null; http_status: string | null
+    token_measured?: boolean
+    units?: UsageLogRow['units']; unit_pricing?: UsageLogRow['unitPricing']
     call_id: string | null; attempt: string | null
   }>(
     `SELECT l.id, l.created_at, l.agent_id, p.name AS agent_name,
@@ -561,6 +566,9 @@ export async function usageLogs(
             l.extras->>'failureReason' AS failure_reason, l.extras->>'failureStage' AS failure_stage,
             l.extras->>'httpStatus' AS http_status,
             COALESCE(NULLIF(l.extras->>'logicalCallId', ''), NULLIF(l.extras->>'callId', '')) AS call_id,
+            CASE WHEN l.extras->'units' IS NOT NULL AND l.extras->'units' <> 'null'::jsonb
+              THEN COALESCE(l.extras->'usage' <> 'null'::jsonb, FALSE) ELSE l.measured END AS token_measured,
+            l.extras->'units' AS units, l.extras->'pricing' AS unit_pricing,
             l.extras->>'attempt' AS attempt
        FROM llm_calls l
        LEFT JOIN participants p ON p.id = l.agent_id AND p.company_id = l.company_id
@@ -574,6 +582,8 @@ export async function usageLogs(
   const accessibleTotal = Math.min(total, Math.floor(MAX_LOG_ROWS / pageSize) * pageSize)
   return {
     items: rows.map((r) => ({
+      tokenMeasured: r.token_measured ?? r.measured,
+      units: r.units ?? null, unitPricing: r.unit_pricing ?? null,
       id: r.id,
       createdAt: new Date(r.created_at).toISOString(),
       agentId: r.agent_id,

@@ -200,3 +200,36 @@ test('[integration] a fresh process does not re-wake activity another replica al
   )
   assert.equal(rows.length, 1, 'exactly one audit row, not one per replica')
 })
+
+test('[integration] consumed inbox no longer prevents background scans', async () => {
+  const { agentId, conversationId, humanA, humanB } = await seedCompanyWithScannerAgent()
+  await pool.query('UPDATE conversations SET members = $2::jsonb WHERE id = $1', [conversationId, JSON.stringify([agentId, humanA, humanB])])
+  let wakes = 0
+  __setBackgroundScannerWakeForTesting(async () => { wakes++; return true })
+  await runBackgroundScans()
+  assert.equal(wakes, 0, 'unconsumed input takes precedence over scanning')
+  await pool.query(`INSERT INTO agent_message_consumptions (agent_id, message_id)
+    SELECT $1, id FROM messages WHERE conversation_id = $2`, [agentId, conversationId])
+  await runBackgroundScans()
+  assert.equal(wakes, 1, 'exact completion receipts release scanner without a range cursor')
+})
+
+for (const mode of ['muted', 'mention', 'directed-self'] as const) {
+  test(`[integration] scanner delivery eligibility agrees with inbox for ${mode}`, async () => {
+    const { agentId, companyId, conversationId, humanA, humanB } = await seedCompanyWithScannerAgent()
+    if (mode !== 'directed-self') {
+      await pool.query('UPDATE conversations SET members = $2::jsonb WHERE id = $1', [conversationId, JSON.stringify([agentId, humanA, humanB])])
+      await pool.query('INSERT INTO conversation_mutes (user_id, conversation_id) VALUES ($1, $2)', [agentId, conversationId])
+    }
+    if (mode !== 'muted') {
+      await pool.query(`INSERT INTO messages (id, conversation_id, author_id, kind, body, sequence, company_id, delivery_recipient_id)
+        VALUES ($1, $2, $3, 'text', $4, 9, $5, $6)`,
+      [`m-${randomUUID()}`, conversationId, mode === 'directed-self' ? agentId : humanA,
+        mode === 'mention' ? `@${agentId} please review` : 'self reminder', companyId, mode === 'directed-self' ? agentId : null])
+    }
+    let wakes = 0
+    __setBackgroundScannerWakeForTesting(async () => { wakes++; return true })
+    await runBackgroundScans()
+    assert.equal(wakes, mode === 'muted' ? 1 : 0)
+  })
+}

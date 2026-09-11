@@ -23,11 +23,11 @@ const BUSY_STATUS_TTL_MS = 90_000
 const STATUS_EXPIRY_TICK_MS = 5_000
 const BUSY_STATUSES = new Set<Status>(['thinking', 'working', 'waiting'])
 
-function coerceStatusUpdatedAt(value?: string): string {
+function coerceStatusUpdatedAt(value?: string | null): string {
   return value ?? new Date().toISOString()
 }
 
-function isStaleBusy(status: Status, updatedAt?: string): boolean {
+function isStaleBusy(status: Status, updatedAt?: string | null): boolean {
   if (!BUSY_STATUSES.has(status)) return false
   if (!updatedAt) return true
   const t = new Date(updatedAt).getTime()
@@ -35,7 +35,7 @@ function isStaleBusy(status: Status, updatedAt?: string): boolean {
   return Date.now() - t > BUSY_STATUS_TTL_MS
 }
 
-function normalizeStatus(status: Status, updatedAt?: string): Status {
+function normalizeStatus(status: Status, updatedAt?: string | null): Status {
   return isStaleBusy(status, updatedAt) ? 'avail' : status
 }
 

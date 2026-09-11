@@ -355,9 +355,9 @@ function dashscopeImageClient(apiKey: string, base: string, progress?: (stage: '
       usage?: unknown; model?: string
       output?: { choices?: { message?: { content?: { image?: string }[] } }[] }
     }
-    const url = body.output?.choices?.[0]?.message?.content?.find((c) => c.image)?.image
-    if (!url) throw new Error(`dashscope multimodal-generation returned no image: ${JSON.stringify(body).slice(0, 300)}`)
-    return { data: [{ url }], usage: body.usage, model: body.model }
+    const data = (body.output?.choices ?? []).flatMap(choice => (choice.message?.content ?? []).flatMap(c => c.image ? [{ url: c.image }] : []))
+    if (!data.length) throw new Error(`dashscope multimodal-generation returned no image: ${JSON.stringify(body).slice(0, 300)}`)
+    return { data, usage: body.usage, model: body.model }
   }
 
   async function generateAsync(model: string, prompt: string, size?: string, n?: number) {
@@ -398,9 +398,9 @@ function dashscopeImageClient(apiKey: string, base: string, progress?: (stage: '
       const status = (await poll.json()) as DashscopeTaskResponse
       const state = status.output?.task_status
       if (state === 'SUCCEEDED') {
-        const url = status.output?.results?.[0]?.url
-        if (!url) throw new Error('dashscope task succeeded with no result url')
-        return { data: [{ url }], usage: status.usage, model: status.model }
+        const data = (status.output?.results ?? []).flatMap(result => result.url ? [{ url: result.url }] : [])
+        if (!data.length) throw new Error('dashscope task succeeded with no result url')
+        return { data, usage: status.usage, model: status.model }
       }
       if (state === 'FAILED' || state === 'CANCELED') {
         throw dashscopeHttpError(`dashscope task ${state}: ${status.output?.message ?? 'no message'}`, 400)
@@ -480,7 +480,7 @@ export async function executeImage<T>(context: LlmCallContext,
   try {
     return await executeLlmPlan({ plan, context: { ...context, role: 'image' }, signal, sdkMaxRetries: 0,
     record: record => recordLlmCall({ ...record, extras: { ...record.extras,
-      n: args.n ?? 1, size: args.size, unpriced: 'image-pricing-unavailable',
+      n: args.n ?? 1, size: args.size,
       imageStage: stage, failureStage: record.status === 'ok' ? null : stage,
       taskId: taskId ?? null, generationCompleted } }),
     prepare: async (candidate, state) => {
@@ -500,6 +500,7 @@ export async function executeImage<T>(context: LlmCallContext,
       return async () => {
         const response = await client.images.generate({ ...args, model: candidate.requestModel }, { maxRetries: 0, signal })
         state.committed = true
+        state.units = Array.isArray(response.data) ? { unit: 'image', quantity: response.data.filter(image => image.b64_json || image.url).length } : null
         state.rawUsage = response.usage ?? null
         state.usage = measuredUsage(response.usage, 'responses')
         state.usageProtocol = 'responses'
@@ -583,6 +584,13 @@ export async function transcribeAudio(audioBase64: unknown, format: unknown = 'w
             ] }] }, maxRetries: 0, signal, timeout: remaining,
           })
           state.usage = measuredUsage(body?.usage, 'chat')
+          // Use provider-measured seconds only; request size and latency are not audio duration.
+          const audioUsage = body?.usage as { seconds?: unknown; duration?: unknown } | undefined
+          const seconds = audioUsage?.seconds ?? audioUsage?.duration
+          if (typeof seconds === 'number' && Number.isFinite(seconds) && seconds >= 0) {
+            state.units = { unit: 'second', quantity: seconds }
+          }
+
           state.usageProtocol = 'chat'
           state.actualModel = typeof body?.model === 'string' ? body.model : null
           const content = body?.choices?.[0]?.message?.content

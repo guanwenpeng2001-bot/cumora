@@ -2,7 +2,7 @@ import { create } from 'zustand'
 import type { Message, ReactionEntry } from '@/types'
 import { api, ApiError, ws, type WsEvent, type ApiMessage } from '@/api/client'
 import { useApp } from '@/stores/app'
-import { getMeId } from '@/stores/auth'
+import { commitIfContextCurrent, getMeId, useAuth } from '@/stores/auth'
 
 const EMPTY_MESSAGES: Message[] = []
 
@@ -345,8 +345,7 @@ export const useMessages = create<MessagesState>((set, get) => ({
       const { [id]: _drop, ...restErrors } = s.errors
       return { loading: new Set(s.loading).add(id), errors: restErrors }
     })
-    try {
-      const msgs = await api.getMessages(id, { limit: MESSAGES_PAGE_SIZE })
+    await commitIfContextCurrent(() => api.getMessages(id, { limit: MESSAGES_PAGE_SIZE }), (msgs) => {
       const normalized = msgs.map(fromApi)
       // Fewer rows than the page cap → we've already got everything older.
       // Equal-to-cap is ambiguous (could be exactly N or N+more) so default
@@ -359,7 +358,7 @@ export const useMessages = create<MessagesState>((set, get) => ({
         hasMoreOlder: { ...s.hasMoreOlder, [id]: hasMore },
         firstItemIndex: { ...s.firstItemIndex, [id]: s.firstItemIndex[id] ?? VIRTUOSO_FIRST_INDEX_BASE },
       }))
-    } catch (err) {
+    }, (err) => {
       console.warn('[messages] loadConversation failed', err)
       const msg = err instanceof Error ? err.message : 'Something went wrong.'
       // A 404 means the conversation no longer exists (deleted server-side,
@@ -379,14 +378,11 @@ export const useMessages = create<MessagesState>((set, get) => ({
         loading: new Set([...s.loading].filter((x) => x !== id)),
         errors: { ...s.errors, [id]: msg },
       }))
-    }
+    })
   },
 
   async reloadConversation(id) {
-    try {
-      // Reload pulls the same window the initial load did — last N. Older
-      // history that was already paged in stays in byConvo via the merge.
-      const msgs = await api.getMessages(id, { limit: MESSAGES_PAGE_SIZE })
+    await commitIfContextCurrent(() => api.getMessages(id, { limit: MESSAGES_PAGE_SIZE }), (msgs) => {
       const normalized = msgs.map(fromApi)
       const hasMore = normalized.length >= MESSAGES_PAGE_SIZE
       set((s) => ({
@@ -399,9 +395,9 @@ export const useMessages = create<MessagesState>((set, get) => ({
           [id]: s.hasMoreOlder[id] ?? hasMore,
         },
       }))
-    } catch (err) {
+    }, (err) => {
       console.warn('[messages] reload failed', err)
-    }
+    })
   },
 
   async loadOlder(id) {
@@ -428,8 +424,7 @@ export const useMessages = create<MessagesState>((set, get) => ({
       return
     }
     set((s) => ({ loadingOlder: new Set(s.loadingOlder).add(id) }))
-    try {
-      const msgs = await api.getMessages(id, { before: oldest, limit: MESSAGES_PAGE_SIZE })
+    await commitIfContextCurrent(() => api.getMessages(id, { before: oldest, limit: MESSAGES_PAGE_SIZE }), (msgs) => {
       const normalized = msgs.map(fromApi)
       const hasMore = normalized.length >= MESSAGES_PAGE_SIZE
       set((s) => {
@@ -448,12 +443,12 @@ export const useMessages = create<MessagesState>((set, get) => ({
           firstItemIndex: { ...s.firstItemIndex, [id]: base - prepended },
         }
       })
-    } catch (err) {
+    }, (err) => {
       console.warn('[messages] loadOlder failed', err)
       set((s) => ({
         loadingOlder: new Set([...s.loadingOlder].filter((x) => x !== id)),
       }))
-    }
+    })
   },
 
   async retryLoad(id) {
@@ -697,8 +692,9 @@ export async function sendUserMessage(
     },
   }))
 
-  try {
-    const { id: realId } = await api.sendMessage(convoId, v, attachment ?? null, quotedMessageId ?? null, clientId)
+  await commitIfContextCurrent(
+    () => api.sendMessage(convoId, v, attachment ?? null, quotedMessageId ?? null, clientId),
+    ({ id: realId, sequence }) => {
     // Reconcile the temp bubble with the server. Either the WS `message.new`
     // already raced ahead of us (real id already in the list → drop the temp)
     // or it hasn't (rename temp → real id so the eventual WS event dedupes
@@ -709,14 +705,14 @@ export async function sendUserMessage(
       const next = realExists
         ? list.filter((m) => m.id !== tempId)
         : list.map((m) =>
-            m.id === tempId ? { ...m, id: realId, pending: false, failed: false, unconfirmed: false } : m,
+            m.id === tempId ? { ...m, id: realId, sequence, pending: false, failed: false, unconfirmed: false } : m,
           )
-      return { byConvo: { ...s.byConvo, [convoId]: next } }
+      return { byConvo: { ...s.byConvo, [convoId]: sortMessagesStable(next) } }
     })
     console.info('[message-delivery]', {
       phase: 'client.confirmed', via: 'http', status: 'sent', clientId, messageId: realId,
     })
-  } catch (err) {
+  }, (err) => {
     console.warn('[messages] send failed', err)
     const failed = isDefinitiveSendFailure(err)
     useMessages.setState((s) => {
@@ -731,7 +727,7 @@ export async function sendUserMessage(
       via: 'http', status: failed ? 'failed' : 'unconfirmed',
       clientId, httpStatus: err instanceof ApiError ? err.status : undefined,
     })
-  }
+  })
 }
 
 /** Drop a failed or unconfirmed optimistic bubble from the local list. An
@@ -767,23 +763,18 @@ export async function toggleReaction(messageId: string, emoji: string): Promise<
   const previous = patchMessageReactions(messageId, (reactions) =>
     optimisticToggleReactions(reactions, emoji),
   )
-  try {
-    const res = await api.toggleReaction(messageId, emoji)
+  await commitIfContextCurrent(() => api.toggleReaction(messageId, emoji), (res) => {
     const incoming = deriveMineForReactions(res.reactions)
     patchMessageReactions(messageId, (reactions) => mergeReactionOrder(reactions, incoming))
-  } catch (err) {
+  }, (err) => {
     restoreMessageReactions(messageId, previous)
     console.warn('[reactions] toggle failed', err)
-  }
+  })
 }
 
 // Bound once; workspace switches reset the per-conversation message
 // caches so old-tenant message arrays don't linger past a remount.
-let wsBound = false
-export function bootMessagesStream() {
-  // Reset every time bootMessagesStream is called (App.tsx remounts on
-  // companyId change) — drops any messages the previous tenant left
-  // behind in the byConvo cache.
+function resetMessages() {
   clearAllTypingExpiries()
   useMessages.setState({
     byConvo: {},
@@ -792,7 +783,21 @@ export function bootMessagesStream() {
     loaded: new Set(),
     loading: new Set(),
     errors: {},
+    hasMoreOlder: {},
+    loadingOlder: new Set(),
+    firstItemIndex: {},
   })
+}
+useAuth.subscribe((state, previous) => {
+  if (state.contextEpoch !== previous.contextEpoch) resetMessages()
+})
+
+let wsBound = false
+export function bootMessagesStream() {
+  // Reset every time bootMessagesStream is called (App.tsx remounts on
+  // companyId change) — drops any messages the previous tenant left
+  // behind in the byConvo cache.
+  resetMessages()
   if (wsBound) return
   wsBound = true
   ws.connect()

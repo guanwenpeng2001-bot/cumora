@@ -101,3 +101,32 @@ test('[integration] concurrent requests with the same client id create one messa
   )
   assert.equal(rows[0]?.count, '1')
 })
+
+test('[integration] markRead validates the displayed boundary and keeps unseen arrivals unread', async () => {
+  for (let i = 1; i <= 3; i++) {
+    await pool.query(`INSERT INTO messages (id, conversation_id, author_id, kind, body, sequence, company_id, created_at)
+      VALUES ($1, $2, $3, 'text', 'message', $4, $5, '2026-01-01T00:00:00Z'::timestamptz + $4::integer * interval '1 second')`,
+    [`read-${i}`, CONVERSATION_ID, USER_ID, i, COMPANY_ID])
+  }
+  await pool.query(`INSERT INTO conversations (id, kind, title, members, company_id)
+    VALUES ('other-read-room', 'group', 'Other', $1::jsonb, $2)`, [JSON.stringify([USER_ID]), COMPANY_ID])
+  await pool.query(`INSERT INTO messages (id, conversation_id, author_id, kind, body, sequence, company_id)
+    VALUES ('other-read-message', 'other-read-room', $1, 'text', 'other', 1, $2)`, [USER_ID, COMPANY_ID])
+  const mark = (body: unknown) => fetch(`${baseUrl}/api/conversations/${CONVERSATION_ID}/read`, {
+    method: 'POST', headers: { 'content-type': 'application/json', 'x-company-id': COMPANY_ID }, body: JSON.stringify(body),
+  })
+  for (const body of [{}, { messageId: 'other-read-message', sequence: 1 }, { messageId: 'read-2', sequence: 3 }, { messageId: 'missing', sequence: 1 }, { messageId: 'read-1', sequence: 1.5 }]) {
+    assert.equal((await mark(body)).status, 400)
+  }
+  assert.equal((await mark({ messageId: 'read-2', sequence: 2 })).status, 200)
+  assert.equal((await mark({ messageId: 'read-1', sequence: 1 })).status, 200)
+  const concurrent = await Promise.all([mark({ messageId: 'read-1', sequence: 1 }), mark({ messageId: 'read-2', sequence: 2 })])
+  assert.deepEqual(concurrent.map(response => response.status), [200, 200])
+  const { rows } = await pool.query(`SELECT last_read_message_id, last_read_at FROM conversation_reads WHERE user_id = $1 AND conversation_id = $2`, [USER_ID, CONVERSATION_ID])
+  assert.equal(rows[0].last_read_message_id, 'read-2')
+  assert.equal(rows[0].last_read_at.toISOString(), '2026-01-01T00:00:02.000Z')
+  const unread = await pool.query(`SELECT m.id FROM messages m JOIN conversation_reads cr
+    ON cr.conversation_id = m.conversation_id AND cr.user_id = $1
+    WHERE m.conversation_id = $2 AND ROW(m.created_at, m.id) > ROW(cr.last_read_at, cr.last_read_message_id)`, [USER_ID, CONVERSATION_ID])
+  assert.deepEqual(unread.rows.map(row => row.id), ['read-3'])
+})

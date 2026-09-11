@@ -473,13 +473,13 @@ export async function tBash(
   const timeoutMs = heavyOp ? 180_000 : 60_000
 
   let abortedByCaller = false
-  const result = await new Promise<{ stdout: string; stderr: string; code: number; signal: NodeJS.Signals | null }>((resolve) => {
+  const result = await new Promise<{ stdout: string; stderr: string; code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
     const child = spawn('bash', ['-c', command], { cwd, env: childEnv, timeout: timeoutMs })
     let stdout = ''
     let stderr = ''
     child.stdout.on('data', (d) => { stdout += d.toString() })
     child.stderr.on('data', (d) => { stderr += d.toString() })
-    child.on('close', (code, signal) => resolve({ stdout, stderr, code: code ?? 0, signal: signal ?? null }))
+    child.on('close', (code, signal) => resolve({ stdout, stderr, code, signal: signal ?? null }))
     child.on('error', (err) => resolve({ stdout, stderr: stderr + String(err), code: 127, signal: null }))
     // Caller-supplied abort (steer interrupt). Two-phase kill mirrors
     // the docker/k8s shutdown pattern: SIGTERM first to let the shell
@@ -505,13 +505,14 @@ export async function tBash(
         // leak a timer if the child closes cleanly after SIGTERM.
         const killer = setTimeout(() => {
           try {
-            if (child.pid && !child.killed) child.kill('SIGKILL')
+            if (child.pid && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
           } catch { /* ignore */ }
         }, 2000)
         child.on('close', () => clearTimeout(killer))
       }
       if (signal.aborted) onAbort()
       else signal.addEventListener('abort', onAbort, { once: true })
+      child.once('close', () => signal.removeEventListener('abort', onAbort))
     }
   })
   let sideEffects: CliSideEffect[] = []
@@ -565,9 +566,10 @@ export async function tBash(
     }
   }
 
-  const ok = result.code === 0
+  const ok = result.code === 0 && result.signal === null
   const combined = (result.stdout + (result.stderr ? '\n--- stderr ---\n' + result.stderr : '')).trim()
   const output: Record<string, unknown> = { stdout: result.stdout, stderr: result.stderr, exitCode: result.code }
+  if (result.signal) output.signal = result.signal
   if (sideEffects.length > 0) output.sideEffects = sideEffects
   if (sideEffectsMalformedLineCount > 0) {
     output.sideEffectsParseFailed = true
@@ -582,11 +584,11 @@ export async function tBash(
     display: {
       name: 'bash',
       arg: command.length > 70 ? command.slice(0, 70) + '…' : command,
-      status: ok ? `ok · ${Date.now() - t0}ms` : `exit ${result.code}`,
+      status: ok ? `ok · ${Date.now() - t0}ms` : result.signal ? `signal ${result.signal}` : `exit ${result.code}`,
       detail: combined.length > 1400 ? combined.slice(0, 1400) + '\n…' : (combined || '(no output)'),
       icon: 'github',
     },
-    error: ok ? undefined : combined.slice(0, 400),
+    error: ok ? undefined : (combined.slice(0, 400) || (result.signal ? `bash terminated by ${result.signal}` : `bash exited with code ${result.code}`)),
   }
 }
 

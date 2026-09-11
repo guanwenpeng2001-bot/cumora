@@ -1,3 +1,4 @@
+import type { PoolClient } from 'pg'
 /**
  * Calendar — scheduled + recurring events shared by humans and agents.
  *
@@ -89,9 +90,9 @@ function renderDispatchBody(event: CalendarEventRow, scheduledFor: Date): string
  *  direct DM between the creator and the assignee when no explicit target
  *  was set on the event. Returns null when we can't safely post (assignee
  *  missing, target conversation deleted, etc.). */
-async function resolveTargetConversation(event: CalendarEventRow): Promise<string | null> {
+async function resolveTargetConversation(event: CalendarEventRow, db: PoolClient): Promise<string | null> {
   if (event.target_conversation_id) {
-    const { rows } = await pool.query<{ assignee_is_member: boolean }>(
+    const { rows } = await db.query<{ assignee_is_member: boolean }>(
       `SELECT ($3::text IS NULL OR EXISTS (
                 SELECT 1 FROM conversation_members member
                  WHERE member.conversation_id = c.id
@@ -114,7 +115,7 @@ async function resolveTargetConversation(event: CalendarEventRow): Promise<strin
   // Fallback: look for an existing direct conversation between the
   // creator and the assignee. We don't auto-create one — if it doesn't
   // exist the dispatch records 'skipped'.
-  const { rows } = await pool.query<{ id: string }>(
+  const { rows } = await db.query<{ id: string }>(
     `SELECT c.id FROM conversations c
       WHERE c.company_id = $1 AND c.kind = 'direct'
         AND EXISTS (
@@ -139,125 +140,99 @@ async function postDispatchMessage(args: {
   event: CalendarEventRow
   conversationId: string
   body: string
+  client: PoolClient
 }): Promise<string> {
-  const { event, conversationId, body } = args
-  return withOutboxTransaction(async (client) => {
-    const target = await client.query(
-      `SELECT c.id FROM conversations c
-        WHERE c.id = $1 AND c.company_id = $2
-        FOR UPDATE OF c`,
-      [conversationId, event.company_id],
-    )
-    if (!target.rowCount) throw new Error('calendar target conversation disappeared')
-    const membership = await client.query(
-      `SELECT 1 FROM conversation_members
-        WHERE conversation_id = $1
-          AND company_id = $2
-          AND participant_id = $3`,
-      [conversationId, event.company_id, event.assignee_id],
-    )
-    if (!membership.rowCount) throw new Error('calendar assignee is no longer a target member')
-    const seqResult = await client.query<{ seq: number }>(
-      `INSERT INTO conversation_counters (conversation_id, next_sequence)
-       VALUES ($1, 2)
-       ON CONFLICT (conversation_id) DO UPDATE SET next_sequence = conversation_counters.next_sequence + 1
-       RETURNING next_sequence - 1 AS seq`,
-      [conversationId],
-    )
-    const sequence = seqResult.rows[0]?.seq ?? 1
-    const messageId = `m-${randomUUID()}`
-    // Author: Calendar itself. The creator is preserved in the payload, but the
-    // agent should read this as a scheduled Calendar event, not as the creator
-    // manually sending a generic system row.
-    await client.query(
-      `INSERT INTO messages (id, conversation_id, author_id, kind, body, sequence, company_id)
-       VALUES ($1,$2,$3,'system',$4,$5,$6)`,
-      [messageId, conversationId, CALENDAR_SYSTEM_AUTHOR_ID, body, sequence, event.company_id],
-    )
-    await client.query(`UPDATE conversations SET updated_at = NOW() WHERE id = $1`, [conversationId])
-    await enqueueBroadcast(client, CH_MESSAGE_NEW, {
-      type: 'message.new',
+  const { event, conversationId, body, client } = args
+  const target = await client.query(
+    `SELECT c.id FROM conversations c
+      WHERE c.id = $1 AND c.company_id = $2
+      FOR UPDATE OF c`,
+    [conversationId, event.company_id],
+  )
+  if (!target.rowCount) throw new Error('calendar target conversation disappeared')
+  const membership = await client.query(
+    `SELECT 1 FROM conversation_members
+      WHERE conversation_id = $1
+        AND company_id = $2
+        AND participant_id = $3`,
+    [conversationId, event.company_id, event.assignee_id],
+  )
+  if (!membership.rowCount) throw new Error('calendar assignee is no longer a target member')
+  const seqResult = await client.query<{ seq: number }>(
+    `INSERT INTO conversation_counters (conversation_id, next_sequence)
+     VALUES ($1, 2)
+     ON CONFLICT (conversation_id) DO UPDATE SET next_sequence = conversation_counters.next_sequence + 1
+     RETURNING next_sequence - 1 AS seq`,
+    [conversationId],
+  )
+  const sequence = seqResult.rows[0]?.seq ?? 1
+  const messageId = `m-${randomUUID()}`
+  // Author: Calendar itself. The creator is preserved in the payload, but the
+  // agent should read this as a scheduled Calendar event, not as the creator
+  // manually sending a generic system row.
+  await client.query(
+    `INSERT INTO messages (id, conversation_id, author_id, kind, body, sequence, company_id)
+     VALUES ($1,$2,$3,'system',$4,$5,$6)`,
+    [messageId, conversationId, CALENDAR_SYSTEM_AUTHOR_ID, body, sequence, event.company_id],
+  )
+  await client.query(`UPDATE conversations SET updated_at = NOW() WHERE id = $1`, [conversationId])
+  await enqueueBroadcast(client, CH_MESSAGE_NEW, {
+    type: 'message.new',
+    conversationId,
+    companyId: event.company_id,
+    message: {
+      id: messageId,
       conversationId,
-      companyId: event.company_id,
-      message: {
-        id: messageId,
-        conversationId,
-        authorId: CALENDAR_SYSTEM_AUTHOR_ID,
-        kind: 'system',
-        body,
-        sequence,
-        at: new Date().toISOString(),
-      },
-    })
-    return messageId
+      authorId: CALENDAR_SYSTEM_AUTHOR_ID,
+      kind: 'system',
+      body,
+      sequence,
+      at: new Date().toISOString(),
+    },
   })
+  return messageId
 }
 
-/** Dispatch a single event's occurrence. Inserts the dispatch row first
- *  (unique-key dedup against (event_id, scheduled_for)) so concurrent
- *  ticks fall through gracefully. */
+/** Claim, message, outbox and completion commit together. A crash rolls back
+ * the claim, so the same occurrence can be retried without duplicate messages. */
 export async function dispatchEvent(event: CalendarEventRow, scheduledFor: Date): Promise<{
   status: 'dispatched' | 'skipped' | 'failed' | 'duplicate'
   messageId?: string
   conversationId?: string
   error?: string
 }> {
-  const dispatchId = `cd-${randomUUID()}`
   try {
-    const claim = await pool.query(
-      `INSERT INTO calendar_dispatches (id, event_id, company_id, scheduled_for, status)
-       VALUES ($1,$2,$3,$4,'pending')
-       ON CONFLICT (event_id, scheduled_for) DO NOTHING
-       RETURNING id`,
-      [dispatchId, event.id, event.company_id, scheduledFor],
-    )
-    if (claim.rows.length === 0) {
-      // Another tick (or replica) already owns this slot — let it finish.
-      return { status: 'duplicate' }
-    }
-  } catch (e) {
-    return { status: 'failed', error: e instanceof Error ? e.message : String(e) }
-  }
-
-  // Personal events don't dispatch; we only fire agent_task. The row
-  // exists so the history view can show "(personal) at <time>", but no
-  // conversation is touched.
-  if (event.kind !== 'agent_task' || !event.assignee_id) {
-    await pool.query(
-      `UPDATE calendar_dispatches SET status = 'skipped', error = $2
-        WHERE id = $1`,
-      [dispatchId, event.kind === 'personal' ? 'personal event' : 'no assignee'],
-    )
-    return { status: 'skipped' }
-  }
-
-  let conversationId: string | null = null
-  try {
-    conversationId = await resolveTargetConversation(event)
-    if (!conversationId) {
-      await pool.query(
-        `UPDATE calendar_dispatches SET status = 'skipped', error = $2 WHERE id = $1`,
-        [dispatchId, 'no target conversation'],
+    return await withOutboxTransaction(async (client) => {
+      const claim = await client.query<{ id: string }>(
+        `INSERT INTO calendar_dispatches (id, event_id, company_id, scheduled_for, status)
+         VALUES ($1,$2,$3,$4,'pending')
+         ON CONFLICT (event_id, scheduled_for) DO UPDATE SET status = 'pending', error = NULL
+           WHERE calendar_dispatches.status IN ('pending', 'failed')
+         RETURNING id`,
+        [`cd-${randomUUID()}`, event.id, event.company_id, scheduledFor],
       )
-      return { status: 'skipped', error: 'no target conversation' }
-    }
-    const body = renderDispatchBody(event, scheduledFor)
-    const messageId = await postDispatchMessage({ event, conversationId, body })
-    await pool.query(
-      `UPDATE calendar_dispatches
-          SET status = 'dispatched', conversation_id = $2, message_id = $3
-        WHERE id = $1`,
-      [dispatchId, conversationId, messageId],
-    )
-    return { status: 'dispatched', messageId, conversationId }
-  } catch (e) {
-    const err = e instanceof Error ? e.message : String(e)
-    await pool.query(
-      `UPDATE calendar_dispatches SET status = 'failed', error = $2,
-              conversation_id = $3 WHERE id = $1`,
-      [dispatchId, err, conversationId],
-    )
-    return { status: 'failed', error: err, conversationId: conversationId ?? undefined }
+      const dispatchId = claim.rows[0]?.id
+      if (!dispatchId) return { status: 'duplicate' as const }
+      const conversationId = event.kind === 'agent_task' && event.assignee_id
+        ? await resolveTargetConversation(event, client) : null
+      if (!conversationId) {
+        await client.query(
+          `UPDATE calendar_dispatches SET status = 'skipped', error = $2 WHERE id = $1`,
+          [dispatchId, event.kind === 'personal' ? 'personal event' : 'no target conversation'],
+        )
+        return { status: 'skipped' as const }
+      }
+      const messageId = await postDispatchMessage({
+        event, conversationId, body: renderDispatchBody(event, scheduledFor), client,
+      })
+      await client.query(
+        `UPDATE calendar_dispatches SET status = 'dispatched', conversation_id = $2, message_id = $3 WHERE id = $1`,
+        [dispatchId, conversationId, messageId],
+      )
+      return { status: 'dispatched' as const, messageId, conversationId }
+    })
+  } catch (error) {
+    return { status: 'failed', error: error instanceof Error ? error.message : String(error) }
   }
 }
 
@@ -521,7 +496,7 @@ export async function tickCalendar(now: Date = new Date()): Promise<{ scanned: n
       }
     }
     const result = await dispatchEvent(row, slot)
-    if (result.status === 'dispatched' || result.status === 'skipped' || result.status === 'failed') {
+    if (result.status === 'dispatched' || result.status === 'skipped' || result.status === 'duplicate') {
       await withOutboxTransaction(async (client) => {
         await client.query(
           `UPDATE calendar_events SET last_fired_at = $2, updated_at = NOW() WHERE id = $1`,

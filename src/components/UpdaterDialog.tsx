@@ -1,3 +1,4 @@
+import { Dialog } from './Dialog'
 /**
  * UpdaterDialog — UI shell for the auto-update flow.
  *
@@ -223,7 +224,7 @@ export function UpdaterDialog({ open, onClose }: DialogProps) {
   const isUnsupported = kind === 'unsupported' || appInfo?.autoUpdateSupported === false
 
   return (
-    <div
+    <Dialog onClose={onClose}
       className="fixed inset-0 z-50 grid place-items-center p-6"
       style={{
         background: kind === 'downloading' ? 'rgba(15, 30, 50, 0.34)' : 'rgba(15, 30, 50, 0.48)',
@@ -384,7 +385,7 @@ export function UpdaterDialog({ open, onClose }: DialogProps) {
           )}
         </div>
       </div>
-    </div>
+    </Dialog>
   )
 }
 
