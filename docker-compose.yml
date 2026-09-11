@@ -77,9 +77,9 @@ services:
       migrate:
         condition: service_completed_successfully
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://localhost:5181/api/livez').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      test: ["CMD", "node", "server/src/scripts/dependency-readiness.mjs"]
       interval: 10s
-      timeout: 5s
+      timeout: 10s
       retries: 12
       # Match the k8s startupProbe budget (~300s). Schema verification retries
       # with exponential backoff plus bounded connection timeouts can exceed

@@ -18,6 +18,7 @@ COPY index.html vite.config.ts tsconfig.json tsconfig.node.json postcss.config.j
 RUN npm run build
 
 # ─── stage 2: nginx runtime ─────────────────────────────────────────
-FROM nginx:1.27-alpine
+FROM nginx:1.27.5-alpine
 COPY deploy/nginx.conf /etc/nginx/conf.d/default.conf
 COPY --from=build /app/dist /usr/share/nginx/html
+HEALTHCHECK --interval=10s --timeout=3s --retries=3 CMD wget -q -O /dev/null http://127.0.0.1/index.html || exit 1

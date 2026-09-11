@@ -57,6 +57,9 @@ test('BYOA admission is mandatory and a changed stop generation cannot renew an 
   generation = '6'
   assert.equal(await methods.admitSafety.call(fixture, 'token'), false)
   assert.equal(fixture.safetyGeneration, '5')
+  assert.equal(fixture.turnCancelled, true, 'admission records cancellation even before the stop event arrives')
+  // runTurn clears the previous cancellation only when starting a fresh turn.
+  fixture.turnCancelled = false
   assert.equal(await methods.admitSafety.call(fixture, 'token', true), true)
   fixture.turnCancelled = true
   assert.equal(await methods.admitSafety.call(fixture, 'token'), false)

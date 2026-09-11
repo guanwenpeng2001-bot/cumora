@@ -5,8 +5,7 @@
 #      the proxy tunnels to Cloud SQL using Workload Identity.
 #   2. ServiceAccount has the Workload Identity annotation (binds the
 #      K8s SA to a GCP IAM service account).
-#   3. `imagePullSecrets` — for pulling cumora images from a private
-#      registry (quay.io, gcr.io with restricted access, etc.).
+#   3. Artifact Registry images — pulled using the GKE node service account.
 #   4. PodDisruptionBudget — rolling updates / node maintenance can't
 #      take all replicas down at once.
 #   5. Slightly bigger resource requests / limits.
@@ -18,14 +17,15 @@
 #   - Bind the K8s SA `cumora-server` → that GCP SA via Workload Identity
 #   - Create the `cumora` Secret with DATABASE_URL etc. (DATABASE_URL
 #     should point at 127.0.0.1:5432 — the proxy sidecar listens there)
-#   - Create the `quay-pull` Secret with quay.io credentials (or whatever
-#     registry holds the cumora-server / cumora-agent-computer images)
+#   - Grant the GKE node service account roles/artifactregistry.reader.
 #
 # Apply:
 #   export CUMORA_NAMESPACE=default # set to the server ServiceAccount namespace
 #   # Create the namespace and required Secrets in that namespace first.
-#   envsubst '${CUMORA_NAMESPACE}' < server/k8s/cumora-server.gke.yaml | kubectl apply -f -
-# This is a template: render CUMORA_NAMESPACE before applying. Using kubectl -n
+#   node scripts/render-k8s.mjs gke > "$TMPDIR/cumora-gke.yaml"
+#   kubectl apply --dry-run=client -f "$TMPDIR/cumora-gke.yaml" -o yaml
+#   kubectl apply -f "$TMPDIR/cumora-gke.yaml"
+# This is a template: render all variables with scripts/render-k8s.mjs. kubectl -n
 # alone cannot rewrite the cluster-scoped binding's ServiceAccount subject.
 # FUSE device plugin is required; see server/k8s/generic-device-plugin.note.
 ---
@@ -39,7 +39,7 @@ metadata:
   name: cumora-server
   annotations:
     # REPLACE: project-id + service-account email
-    iam.gke.io/gcp-service-account: cumora-server@REPLACE-WITH-PROJECT-ID.iam.gserviceaccount.com
+    iam.gke.io/gcp-service-account: cumora-server@${GCP_PROJECT}.iam.gserviceaccount.com
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -125,12 +125,7 @@ spec:
       labels: { app: cumora-server }
     spec:
       serviceAccountName: cumora-server
-      # Image registry credentials. Create the Secret first:
-      #   kubectl create secret docker-registry quay-pull \
-      #     --docker-server=quay.io \
-      #     --docker-username=... --docker-password=...
-      imagePullSecrets:
-      - name: quay-pull
+      # GKE node service account needs Artifact Registry Reader; no pull secret.
       containers:
       # Cloud SQL Proxy sidecar — exposes Cloud SQL on 127.0.0.1:5432.
       # Authentication via Workload Identity, no SA key file needed.
@@ -142,9 +137,10 @@ spec:
           - "--port=5432"
           - "--health-check"          # exposes a /readiness HTTP probe on :9090
           - "--http-port=9090"
+          - "--http-address=0.0.0.0"
           # REPLACE with your Cloud SQL instance connection name:
           # <project>:<region>:<instance>
-          - "REPLACE-WITH-INSTANCE-CONNECTION-NAME"
+          - "${SQL_CONNECTION_NAME}"
         securityContext:
           runAsNonRoot: true
           allowPrivilegeEscalation: false
@@ -158,13 +154,28 @@ spec:
           requests: { cpu: "50m",  memory: "64Mi" }
           limits:   { cpu: "500m", memory: "256Mi" }
       - name: server
-        image: quay.io/yetoneful/cumora-server:REPLACE-TAG
+        image: ${AR_REGION}-docker.pkg.dev/${GCP_PROJECT}/${AR_REPO}/server:${IMAGE_TAG}
         imagePullPolicy: IfNotPresent
         ports:
         - { name: http, containerPort: 5181 }
         envFrom:
         - secretRef: { name: cumora }
         env:
+        # Shared storage is mandatory; empty values also fail at server startup.
+        - name: CUMORA_REQUIRE_R2
+          value: "true"
+        - name: R2_ENDPOINT
+          valueFrom:
+            secretKeyRef: { name: cumora, key: R2_ENDPOINT, optional: false }
+        - name: R2_BUCKET
+          valueFrom:
+            secretKeyRef: { name: cumora, key: R2_BUCKET, optional: false }
+        - name: R2_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef: { name: cumora, key: R2_ACCESS_KEY_ID, optional: false }
+        - name: R2_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef: { name: cumora, key: R2_SECRET_ACCESS_KEY, optional: false }
         # Agent pods reach the server via cluster-internal DNS.
         # CUMORA_NAMESPACE also sets the server ServiceAccount binding.
         - name: AGENT_RUNTIME_SERVER_URL
@@ -177,13 +188,13 @@ spec:
         # Image for agent-computer pods. Must be pushed to a registry
         # reachable from the cluster (and pull-secret-able if private).
         - name: CUMORA_AGENT_COMPUTER_IMAGE
-          value: "quay.io/yetoneful/cumora-agent-computer:REPLACE-TAG"
+          value: "${AR_REGION}-docker.pkg.dev/${GCP_PROJECT}/${AR_REPO}/agent-computer:${IMAGE_TAG}"
         - name: WORKSPACE_RUNTIME_CLEANUP_ENABLED
           value: "true"
         # Pull secrets the orchestrator attaches to each agent Pod
         # spec. Comma-separated. Must exist in CUMORA_AGENT_NAMESPACE.
         - name: CUMORA_AGENT_PULL_SECRETS
-          value: "quay-pull"
+          value: ""
         # Optional: pin agent pods to a specific node pool / GKE
         # Workload Identity SA via CUMORA_AGENT_SERVICE_ACCOUNT
         # (defaults to namespace `default` SA when unset).

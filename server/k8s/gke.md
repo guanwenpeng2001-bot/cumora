@@ -62,7 +62,7 @@ docker push $AR/agent-computer:$TAG
 > Older revisions of this guide pushed to `quay.io/yetoneful/cumora-*`. That
 > path is legacy: nothing in CI or production reads it any more.
 
-Substitute `REPLACE-TAG` in `cumora-server.gke.yaml` with `$TAG`.
+Render the template using the variables in step 6; server and agent use the same Artifact Registry repository and tag.
 
 When a change touches either the runtime API contract or
 `server/docker/agent-computer-cumora.sh`, deploy `cumora-server` and
@@ -91,9 +91,7 @@ To wipe a permanently off-boarded agent's PVC, call the orchestrator's
 `deleteChromeProfilePvc(agentId)` helper. The normal idle-exit path
 deliberately leaves the PVC bound so the next pod re-uses it.
 
-GKE nodes pull from Artifact Registry with their default service account, so
-no `imagePullSecrets` are needed. If you are resurrecting the legacy quay.io
-path instead, you'll also need the `quay-pull` secret described in step 4.
+GKE nodes pull from Artifact Registry using the **node service account**, which needs `roles/artifactregistry.reader` on the repository project and a suitable node OAuth access scope (for example `cloud-platform`). This is separate from the Pod Workload Identity account used for Cloud SQL. No `imagePullSecrets` or `CUMORA_AGENT_PULL_SECRETS` are needed on this path.
 
 ## 2. Cloud SQL + Memorystore
 
@@ -160,15 +158,13 @@ Paste `cumora-server@$PROJECT.iam.gserviceaccount.com` into the
 kubectl create secret generic cumora \
   --from-literal=DATABASE_URL="postgres://$SQL_USER:PASSWORD@127.0.0.1:5432/$SQL_DB" \
   --from-literal=REDIS_URL="redis://REDIS_PRIVATE_IP:6379" \
+  --from-literal=R2_ENDPOINT="$R2_ENDPOINT" \
+  --from-literal=R2_BUCKET="$R2_BUCKET" \
+  --from-literal=R2_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID" \
+  --from-literal=R2_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY" \
   --from-literal=OPENAI_API_KEY="sk-..." \
   --from-literal=AGENT_RUNTIME_SECRET="$(openssl rand -hex 32)"
 
-# Not needed on the Artifact Registry path above. Only for the legacy
-# quay.io registry, and only if you also set QUAY_USER / QUAY_PASSWORD:
-# kubectl create secret docker-registry quay-pull \
-#   --docker-server=quay.io \
-#   --docker-username=$QUAY_USER \
-#   --docker-password="$QUAY_PASSWORD"
 ```
 
 ## 5. Generic Device Plugin (for FUSE)
@@ -210,8 +206,9 @@ with extra annotations — read the Autopilot security docs).
 
 ## 6. Apply the manifest
 
-After replacing `REPLACE-*` placeholders in
-`server/k8s/cumora-server.gke.yaml`:
+Both K8s templates require shared R2 storage. Missing Secret keys prevent container creation; empty values fail server startup. Provision the bucket and validate write/read access before migration. Local Compose uploads must be copied into the bucket under the same keys before moving traffic; setting R2 variables alone does not migrate historical files. See `deploy/README.md` for backup and recovery scope.
+
+Render and validate without applying resources:
 
 ```sh
 # For a manual installation, run the candidate image's migration command once
@@ -219,11 +216,19 @@ After replacing `REPLACE-*` placeholders in
 # production Deploy workflow creates and verifies this one-shot Job for you.
 npm run migrate
 export CUMORA_NAMESPACE=default # or the namespace prepared for the server
-envsubst '${CUMORA_NAMESPACE}' < server/k8s/cumora-server.gke.yaml | kubectl apply -f -
+export GCP_PROJECT="$PROJECT" AR_REGION="$REGION" AR_REPO IMAGE_TAG="$TAG"
+export SQL_CONNECTION_NAME="$PROJECT:$REGION:$SQL_INSTANCE"
+node scripts/render-k8s.mjs gke > "${TMPDIR:-/tmp}/cumora-gke.yaml"
+kubectl apply --dry-run=client -f "${TMPDIR:-/tmp}/cumora-gke.yaml" -o yaml > "${TMPDIR:-/tmp}/cumora-gke.checked.yaml"
+# Inspect images, namespace, Cloud SQL address and required storage keys.
+# Only after reviewing the rendered file and successful migration:
+kubectl apply -f "${TMPDIR:-/tmp}/cumora-gke.checked.yaml"
 kubectl -n "$CUMORA_NAMESPACE" rollout status deployment/cumora-server
 ```
 
-The YAML is a namespace template. Render it with `envsubst` as above; `kubectl -n`
+The renderer rejects empty/unsafe variables and unresolved placeholders. Inspect the rendered server image and agent image: both must start with `$REGION-docker.pkg.dev/$PROJECT/$AR_REPO/` and carry `$TAG`; no quay pull secret should remain. `kubectl --dry-run=client` checks resource shape, not IAM, image existence, bucket access, or Cloud SQL connectivity.
+
+The YAML is a namespace and registry template. Render it as above; `kubectl -n`
 alone does not change a ClusterRoleBinding subject. The namespace must already
 exist, with the `cumora` and `quay-pull` Secrets and Workload Identity binding
 prepared for that namespace. `CUMORA_NAMESPACE` sets the server ServiceAccount,

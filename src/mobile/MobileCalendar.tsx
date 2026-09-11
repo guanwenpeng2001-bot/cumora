@@ -22,7 +22,7 @@ import { nextOccurrenceOnOrAfter } from '@/lib/recurrence'
 import type { CalendarEvent } from '@/types'
 
 const DAY_MS = 86_400_000
-const WEEK = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+const WEEK = ['mcal.sun', 'mcal.mon', 'mcal.tue', 'mcal.wed', 'mcal.thu', 'mcal.fri', 'mcal.sat'] as const
 
 interface AgendaItem {
   event: CalendarEvent
@@ -202,7 +202,7 @@ export function MobileCalendar() {
 
       {/* Weekday row */}
       <div className="grid grid-cols-7 px-3 pt-1 pb-1.5 text-[10px] uppercase tracking-wide text-ink-400 select-none">
-        {WEEK.map((d) => <div key={d} className="text-center">{d}</div>)}
+        {WEEK.map((d) => <div key={d} className="text-center">{t(d)}</div>)}
       </div>
 
       {/* Month grid — always 6 rows visible. Cells are tall enough to

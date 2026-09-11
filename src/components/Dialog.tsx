@@ -1,7 +1,7 @@
 import { useId, useLayoutEffect, useRef, type HTMLAttributes } from 'react'
 
 const stack: HTMLElement[] = []
-const focusable = 'button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+const focusable = 'button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), summary, [tabindex]:not([tabindex="-1"])'
 
 /** Shared modal focus lifecycle, including nested dialogs and focus restoration. */
 export function Dialog({ onClose, children, ...props }: HTMLAttributes<HTMLDivElement> & { onClose: () => void }) {
@@ -20,7 +20,15 @@ export function Dialog({ onClose, children, ...props }: HTMLAttributes<HTMLDivEl
     }
     stack.push(el)
     const candidates = () => [...el.querySelectorAll<HTMLElement>(focusable)]
-      .filter(node => node.tabIndex >= 0 && !node.closest('[hidden], [inert]') && node.getClientRects().length > 0)
+      .filter(node => {
+        if (node.tabIndex < 0 || node.closest('[hidden], [inert]') || !node.getClientRects().length || getComputedStyle(node).visibility !== 'visible') return false
+        // Closed details can still give descendants client rects. Only its
+        // first summary (and controls inside that summary) stays tabbable.
+        for (let parent = node.parentElement; parent && parent !== el; parent = parent.parentElement) {
+          if (parent instanceof HTMLDetailsElement && !parent.open && !parent.querySelector('summary')?.contains(node)) return false
+        }
+        return true
+      })
     const focusFirst = () => (candidates()[0] ?? el).focus()
     if (!el.contains(document.activeElement)) focusFirst()
     const onKey = (event: KeyboardEvent) => {

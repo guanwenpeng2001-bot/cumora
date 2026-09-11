@@ -28,6 +28,7 @@ import {
 } from '@aws-sdk/client-s3'
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
 import { env } from './env.js'
+import { checkStorageConfig } from './storage-config.js'
 import {
   normalizeStorageKey,
   storageKeyFromPublicUrl as storageKeyFromPublicUrlForBase,
@@ -271,8 +272,11 @@ class R2Storage implements Storage {
 }
 
 function buildStorage(): Storage {
-  const have = env.R2_ENDPOINT && env.R2_BUCKET && env.R2_ACCESS_KEY_ID && env.R2_SECRET_ACCESS_KEY
-  if (have) {
+  if (checkStorageConfig({
+    CUMORA_REQUIRE_R2: process.env.CUMORA_REQUIRE_R2,
+    R2_ENDPOINT: env.R2_ENDPOINT, R2_BUCKET: env.R2_BUCKET,
+    R2_ACCESS_KEY_ID: env.R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY: env.R2_SECRET_ACCESS_KEY,
+  }) === 'r2') {
     const signingActive = Boolean(env.R2_URL_SIGNING_SECRET)
     console.log(
       `[storage] R2 active · bucket=${env.R2_BUCKET} ` +

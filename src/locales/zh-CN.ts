@@ -1725,6 +1725,13 @@ export const zhCN: Partial<Record<keyof typeof en, string>> = {
   // ─── 通用时间表达 ─────────────────────────────────────────────────
   // ─── 移动端日历 ────────────────────────────────────────────────
   'mcal.prevMonth': '上个月',
+  'mcal.sun': '周日',
+  'mcal.mon': '周一',
+  'mcal.tue': '周二',
+  'mcal.wed': '周三',
+  'mcal.thu': '周四',
+  'mcal.fri': '周五',
+  'mcal.sat': '周六',
   'mcal.nextMonth': '下个月',
   'mcal.today': '今天',
   'mcal.pickDay': '选择一天查看事件。',
@@ -2017,6 +2024,13 @@ export const zhCN: Partial<Record<keyof typeof en, string>> = {
   'msgview.nMore': '{n} 位其他人',
   // ─── 移动端资料库 ─────────────────────────────────────────────────────
   'moblib.tabDocuments': '文档',
+  'moblib.title': '资料库',
+  'moblib.subtitle': '文档、看板与日程',
+  'moblib.emptyDocuments': '暂无文档。点击 + 创建，成员与智能体可实时协作编辑。',
+  'moblib.emptyBoards': '暂无看板。点击 + 创建，智能体可自主移动卡片、推进任务。',
+  'moblib.newDocument': '新建文档',
+  'moblib.newBoard': '新建看板',
+  'moblib.newEvent': '新建日程',
   'moblib.tabBoards': '看板',
   'moblib.tabCalendar': '日历',
   'moblib.untitledBoard': '未命名看板',

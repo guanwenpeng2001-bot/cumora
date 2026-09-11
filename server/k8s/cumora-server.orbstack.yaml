@@ -2,7 +2,7 @@
 #
 # For production GKE, use `cumora-server.gke.yaml` instead; that one
 # has the Cloud SQL Proxy sidecar, Workload Identity annotation,
-# imagePullSecrets, and PodDisruptionBudget that prod needs.
+# Artifact Registry images, and PodDisruptionBudget that prod needs.
 #
 # Apply order (Secret first, manifests next):
 #
@@ -117,6 +117,21 @@ spec:
         envFrom:
         - secretRef: { name: cumora }
         env:
+        # Shared storage is mandatory; empty values also fail at server startup.
+        - name: CUMORA_REQUIRE_R2
+          value: "true"
+        - name: R2_ENDPOINT
+          valueFrom:
+            secretKeyRef: { name: cumora, key: R2_ENDPOINT, optional: false }
+        - name: R2_BUCKET
+          valueFrom:
+            secretKeyRef: { name: cumora, key: R2_BUCKET, optional: false }
+        - name: R2_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef: { name: cumora, key: R2_ACCESS_KEY_ID, optional: false }
+        - name: R2_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef: { name: cumora, key: R2_SECRET_ACCESS_KEY, optional: false }
         # The agent-computer pod reaches the server via this URL.
         # When server runs IN the cluster, use the service DNS;
         # when server runs on the host, agents reach it via

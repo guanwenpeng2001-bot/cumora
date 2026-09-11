@@ -206,11 +206,11 @@ test('schema history errors remain fail-closed without transport retries', async
   assert.equal(calls, 1)
 })
 
-test('compose livez healthcheck grace covers the schema boot retry budget', async () => {
+test('compose dependency healthcheck grace covers the schema boot retry budget', async () => {
   const compose = load(await readRepo('docker-compose.yml')) as ComposeFile
   const healthcheck = compose.services?.server?.healthcheck
   assert.ok(healthcheck, 'compose server must declare a healthcheck')
-  assert.match(JSON.stringify(healthcheck.test), /\/api\/livez/, 'compose healthcheck must stay on /api/livez')
+  assert.match(JSON.stringify(healthcheck.test), /dependency-readiness\.mjs/, 'compose checks dependencies independently of K8s liveness')
   const startPeriodMs = durationMs(healthcheck.start_period, 'compose server start_period')
   const delays: number[] = []
   let attempts = 0

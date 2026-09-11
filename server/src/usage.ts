@@ -102,6 +102,7 @@ const WINDOW_SQL = `${COVERAGE_SQL}, usage_window AS (
     FROM ownership o JOIN llm_calls l ON l.company_id = $1
       AND l.created_at >= o.from_at AND l.created_at < o.to_at
    WHERE o.owner = 'raw'
+     AND l.created_at >= $2::timestamptz AND l.created_at < $3::timestamptz
 ) `
 
 function windowParams(tenant: string, range: UsageRange, option: string | number | null = null): unknown[] {

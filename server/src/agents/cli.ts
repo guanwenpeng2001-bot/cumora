@@ -1074,10 +1074,6 @@ async function loadInbox(agentId: string): Promise<InboxItem[]> {
         AND NOT EXISTS (SELECT 1 FROM agent_message_consumptions consumed
           WHERE consumed.agent_id = $1 AND consumed.message_id = m.id)
         AND (m.author_id <> $1 OR m.delivery_recipient_id = $1)
-        AND m.created_at > COALESCE(
-          (SELECT last_read_at FROM conversation_reads
-            WHERE user_id = $1 AND conversation_id = c.id),
-          '1970-01-01T00:00:00Z'::timestamptz)
         AND (
           m.delivery_recipient_id = $1
           OR c.kind = 'direct'
@@ -1248,6 +1244,8 @@ async function cmdGlance(parsed: ParsedArgs): Promise<CliResult> {
 }
 
 async function cmdAck(parsed: ParsedArgs): Promise<CliResult> {
+  // Read/coordination state only. A turn commits exact message IDs after
+  // successful completion; ack must never consume its unfinished inputs.
   const me = resolveAs(parsed)
   if (parsed.flags.all) {
     // Ack every conversation that currently has unread items for me

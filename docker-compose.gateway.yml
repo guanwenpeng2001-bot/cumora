@@ -21,6 +21,12 @@ services:
       # fork first if the image should reflect committed state.
       context: ../sub2api
     container_name: cumora-sub2api
+    # Keep the local fake-IP DNS workaround with the optional service.
+    dns:
+      - 223.5.5.5
+      - 119.29.29.29
+    extra_hosts:
+      - host.docker.internal:host-gateway
     restart: unless-stopped
     environment:
       AUTO_SETUP: "true"

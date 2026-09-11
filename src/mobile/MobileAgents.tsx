@@ -90,12 +90,12 @@ export function MobileAgents() {
           {[
             ['working', agents.filter((a) => a.status === 'working').length],
             ['thinking', agents.filter((a) => a.status === 'thinking').length],
-            ['available', agents.filter((a) => a.status === 'avail').length],
+            ['avail', agents.filter((a) => a.status === 'avail').length],
             ['resting', agents.filter((a) => a.status === 'resting').length],
           ].map(([lbl, n]) => (
             <div key={lbl as string} className="py-1 px-2.5 bg-cloud rounded-full text-ink-700 whitespace-nowrap"
               style={{ border: '1px solid var(--ink-100)' }}>
-              <b className="font-semibold text-skype-deep mr-1">{n as number}</b>{lbl as string}
+              <b className="font-semibold text-skype-deep mr-1">{n as number}</b>{tLabel(statusLabelsKey[lbl as string], statusLabels[lbl as string])}
             </div>
           ))}
         </div>

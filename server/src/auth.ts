@@ -102,7 +102,13 @@ export async function resolveSession(token: string): Promise<{ userId: string } 
     // cleanup already happened (or is happening) atomically.
     return null
   }
-  void pool.query(`UPDATE sessions SET last_used_at = NOW() WHERE token_hash = $1`, [tokenHash])
+  // Persist activity at most once a minute, including across replicas. The
+  // predicate is rechecked after a concurrent updater releases the row lock.
+  // Await the infrequent touch so a successful request has durable activity.
+  if (new Date(rows[0].last_used_at).getTime() <= now - 60_000) {
+    await pool.query(`UPDATE sessions SET last_used_at = NOW()
+      WHERE token_hash = $1 AND last_used_at <= NOW() - INTERVAL '1 minute'`, [tokenHash])
+  }
   return { userId: rows[0].user_id }
 }
 

@@ -936,6 +936,8 @@ export interface EngineAdapter {
    *  `run()` per wake. The session reports via carriesStandingPrompt whether the
    *  standing prompt was delivered out-of-band. */
   startSession?(args: EngineSessionArgs): EngineSession | null
+  /** A known execution mode that cannot use saved session pointers. */
+  sessionResumeUnavailableReason?(): string | null
   /** Run a LOCAL small-brain triage completion, returning raw text. */
   classify(args: EngineClassifyArgs): Promise<EngineClassifyResult>
   /** `doctor` liveness probe for one brain tier (big/small). Same one-shot spawn
@@ -2736,6 +2738,13 @@ class CodexAdapter implements EngineAdapter {
   readonly id = 'codex' as const
   readonly bin = 'codex'
 
+  sessionResumeUnavailableReason(): string | null {
+    if (IS_WIN) return 'Windows one-shot codex exec'
+    if (unsafeEngineArgs('CUMORA_CODEX_ARGS').length) return 'custom-argv one-shot codex exec'
+    if (process.env.CUMORA_CODEX_NO_APP_SERVER === '1') return 'app-server disabled; one-shot codex exec'
+    return null
+  }
+
   classify(args: EngineClassifyArgs): Promise<EngineClassifyResult> {
     // Codex on a ChatGPT account can't pick an arbitrary small model
     // (`gpt-5-mini` is rejected), but it DOES accept `gpt-5.4-mini` — Cumora's
@@ -2881,6 +2890,7 @@ class CodexAdapter implements EngineAdapter {
     // filesystem/network/environment profile and reaches Cumora only through
     // local IPC. Historical full-access flags and argv overrides remain
     // available exclusively behind the explicit compatibility opt-in.
+    args.onLog('[codex] one-shot codex exec; starting fresh, session not resumed')
     const flags = unsafeEngineArgs('CUMORA_CODEX_ARGS')
     const base = flags.length
       ? ['exec', ...flags]
@@ -2900,8 +2910,8 @@ class CodexAdapter implements EngineAdapter {
       // A rejected -c override aborts codex before it reads the prompt, so the
       // turn fails with a config error that never mentions Cumora. Say it once.
       noteCodexConfigRejection(res.error, args.onLog)
-      // `codex exec` does not accept a thread id, so this one-shot fallback
-      // always starts fresh even if the daemon currently owns a saved id.
+      // This fallback does not invoke the separate `exec resume` subcommand.
+      // Its returned id is execution evidence, not proof of continuity.
       return classifyEngineResult(res, false)
     })
   }
@@ -2925,9 +2935,7 @@ class CodexAdapter implements EngineAdapter {
     // mcp_servers — a narrower gap than losing every agent's continuity, on the
     // operator's own machine, with their own config. CUMORA_CODEX_NO_APP_SERVER=1
     // still opts out, and a failing session degrades to one-shot (see daemon.ts).
-    if (unsafeEngineArgs('CUMORA_CODEX_ARGS').length) return null
-    if (process.env.CUMORA_CODEX_NO_APP_SERVER === '1') return null
-    if (IS_WIN) return null
+    if (this.sessionResumeUnavailableReason()) return null
     try { ensureGitRepoForCodex(args.home) }
     catch (err) { args.onLog(`[codex] could not init git repo for app-server (${err instanceof Error ? err.message : String(err)}) — falling back to one-shot exec`); return null }
     // Standing prompt rides the thread's developerInstructions (see CodexSession),

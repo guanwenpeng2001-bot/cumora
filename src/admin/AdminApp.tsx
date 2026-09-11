@@ -14,7 +14,7 @@
  * localhost dev (or any host where the panel mounts under `/admin`)
  * the basePath is `/admin`.
  */
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useAuth } from '@/stores/auth'
 import { useT } from '@/lib/i18n'
 import { CloudLogo } from '@/components/Avatar'
@@ -61,7 +61,19 @@ export function AdminApp() {
   // Mobile nav drawer. Auto-closes after each navigation so a phone
   // user doesn't have to dismiss it manually after picking a route.
   const [navOpen, setNavOpen] = useState(false)
+  const navButton = useRef<HTMLButtonElement>(null)
   useEffect(() => { setNavOpen(false) }, [route])
+  useEffect(() => {
+    if (!navOpen) return
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || event.defaultPrevented) return
+      event.preventDefault()
+      setNavOpen(false)
+      navButton.current?.focus()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [navOpen])
 
   useEffect(() => {
     const onPop = () => setRoute(parseRoute())
@@ -107,7 +119,7 @@ export function AdminApp() {
   return (
     <div className={`admin-shell${navOpen ? ' nav-open' : ''}`}>
       <header className="admin-topbar">
-        <button type="button" className="admin-topbar-burger" onClick={() => setNavOpen((v) => !v)} aria-label={t('admin.toggleNav')}>
+        <button ref={navButton} type="button" className="admin-topbar-burger" onClick={() => setNavOpen((v) => !v)} aria-label={t('admin.toggleNav')} aria-expanded={navOpen}>
           <span /><span /><span />
         </button>
         <div className="admin-topbar-brand">

@@ -5,9 +5,13 @@
 # production mutation. GitHub's protected `production` environment supplies
 # the independent approval step; this workflow then pins the selected tag to
 # a digest, captures the previous revision, rolls out, runs authenticated
-# smoke, and automatically rolls back if the evidence fails.
+# smoke, and only rolls back when the exact old image passes the schema/ledger gate.
 
 name: Deploy
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
 
 on:
   workflow_dispatch:
@@ -126,6 +130,33 @@ jobs:
             fi
           fi
 
+      - name: Capture exact rollback evidence
+        id: rollback_gate
+        env:
+          CANDIDATE_IMAGE: ${{ steps.digest.outputs.server }}
+        run: |
+          set -euo pipefail
+          echo "compatible=false" >> "$GITHUB_OUTPUT"
+          kubectl get deployment cumora-server -o json > "$RUNNER_TEMP/rollback-deployment.json"
+          PREVIOUS=$(jq -r '.spec.template.spec.containers[] | select(.name == "server") | .image' "$RUNNER_TEMP/rollback-deployment.json")
+          REVISION=$(jq -r '.metadata.annotations["deployment.kubernetes.io/revision"]' "$RUNNER_TEMP/rollback-deployment.json")
+          echo "revision=$REVISION" >> "$GITHUB_OUTPUT"
+          echo "server=$PREVIOUS" >> "$GITHUB_OUTPUT"
+          # Mutable tags cannot identify the old binary. Deployment may proceed
+          # with forward repair, but missing evidence never enables auto-undo.
+          if ! [[ "$PREVIOUS" =~ @sha256:[a-f0-9]{64}$ && "$REVISION" =~ ^[0-9]+$ ]]; then
+            echo "::warning::Rollback baseline is not digest-pinned; automatic rollback disabled. Plan forward repair."
+            exit 0
+          fi
+          gcloud auth configure-docker "${{ env.AR_REGION }}-docker.pkg.dev" --quiet
+          if docker run --rm --network none --entrypoint cat "$PREVIOUS" /app/server/src/db/migrations/manifest.ts > "$RUNNER_TEMP/rollback-manifest.ts" &&
+             docker run --rm --network none --entrypoint cat "$CANDIDATE_IMAGE" /app/server/src/db/migrations/manifest.ts > "$RUNNER_TEMP/candidate-manifest.ts" &&
+             node scripts/rollback-precheck.mjs "$RUNNER_TEMP/rollback-manifest.ts" "$RUNNER_TEMP/candidate-manifest.ts"; then
+            echo "compatible=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Schema/ledger evidence failed; automatic rollback disabled. Plan forward repair."
+          fi
+
       - name: Run candidate migrations once
         id: migrate
         env:
@@ -188,13 +219,13 @@ jobs:
                             name: "migrate",
                             image: $server,
                             imagePullPolicy: "IfNotPresent",
-                            command: ["npm", "run", "migrate"],
+                            command: ["sh", "-ec", "node --import tsx server/src/scripts/storage-precheck.ts && npm run migrate"],
                             envFrom: [{ secretRef: { name: "cumora" } }],
                             # After envFrom on purpose: an explicit `env` entry
                             # wins over one supplied by envFrom, so the
                             # operator choice for this one run cannot be
                             # shadowed by whatever the Secret happens to hold.
-                            env: [{ name: "MIGRATION_0002_REPAIR", value: $repair }],
+                            env: [{ name: "CUMORA_REQUIRE_R2", value: "true" }, { name: "MIGRATION_0002_REPAIR", value: $repair }],
                             resources: {
                               requests: { cpu: "100m", memory: "256Mi" },
                               limits: { cpu: "1000m", memory: "1Gi" }
@@ -240,7 +271,13 @@ jobs:
       - name: Patch deployment
         id: patch
         run: |
+          set -euo pipefail
           SERVER="${{ steps.digest.outputs.server }}"
+          CURRENT_REVISION=$(kubectl get deployment cumora-server -o jsonpath='{.metadata.annotations.deployment\.kubernetes\.io/revision}')
+          if [ "$CURRENT_REVISION" != "${{ steps.rollback_gate.outputs.revision }}" ]; then
+            echo "::error::Deployment changed since rollback evidence capture; refusing stale patch."
+            exit 1
+          fi
 
           PREVIOUS_SERVER=$(kubectl get deployment cumora-server -o jsonpath='{.spec.template.spec.containers[?(@.name=="server")].image}')
           PREVIOUS_AGENT=$(kubectl get deployment cumora-server -o jsonpath='{.spec.template.spec.containers[?(@.name=="server")].env[?(@.name=="CUMORA_AGENT_COMPUTER_IMAGE")].value}')
@@ -269,6 +306,7 @@ jobs:
                   ({
                     name: "server",
                     image: $server,
+                    env: [{ name: "CUMORA_REQUIRE_R2", value: "true" }],
                     startupProbe: {
                       httpGet: { path: "/api/livez", port: "http" },
                       periodSeconds: 5,
@@ -286,7 +324,7 @@ jobs:
                       timeoutSeconds: 3
                     }
                   } + if $agent == "" then {} else {
-                    env: [{ name: "CUMORA_AGENT_COMPUTER_IMAGE", value: $agent }]
+                    env: [{ name: "CUMORA_REQUIRE_R2", value: "true" }, { name: "CUMORA_AGENT_COMPUTER_IMAGE", value: $agent }]
                   } end)
                 ]
               } } }
@@ -359,8 +397,19 @@ jobs:
       - name: Automatic rollback when smoke evidence fails
         if: steps.smoke.outcome == 'failure'
         run: |
-          echo "::warning::Authenticated smoke failed; rolling deployment back to the previous revision."
-          kubectl rollout undo deployment/cumora-server
+          set -euo pipefail
+          if [ "${{ steps.rollback_gate.outputs.compatible }}" != "true" ]; then
+            echo "::error::Smoke failed and rollback schema/ledger evidence is incompatible or missing. Automatic undo blocked; use forward repair. Database was NOT downgraded."
+            exit 1
+          fi
+          CURRENT=$(kubectl get deployment cumora-server -o jsonpath='{.spec.template.spec.containers[?(@.name=="server")].image}')
+          if [ "$CURRENT" != "${{ steps.digest.outputs.server }}" ]; then
+            echo "::error::Deployment changed after candidate patch; refusing to undo another release."
+            exit 1
+          fi
+          node scripts/rollback-precheck.mjs "$RUNNER_TEMP/rollback-manifest.ts" "$RUNNER_TEMP/candidate-manifest.ts"
+          echo "::warning::Smoke failed; schema/ledger gate passed for exact previous digest."
+          kubectl rollout undo deployment/cumora-server --to-revision="${{ steps.rollback_gate.outputs.revision }}"
           kubectl rollout status deployment/cumora-server --timeout=10m
           echo "::error::Candidate was rolled back. Previous server was ${{ steps.patch.outputs.previous_server }}."
 

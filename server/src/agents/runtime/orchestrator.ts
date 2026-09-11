@@ -1161,13 +1161,15 @@ async function ensurePodImpl(agentId: string, signal: AbortSignal, initialTriage
  *  terminates by exiting 0 after its idle timer fires; this is the
  *  manual / cleanup path. */
 export async function deletePod(agentId: string): Promise<void> {
-  // --wait=false here (unlike the in-ensurePod reap which uses --wait=true):
-  // this is the manual cleanup path, callers don't care to block until
-  // termination completes.
-  await kubectlWithRetry(
-    ['delete', 'pod', podName(agentId), '--ignore-not-found=true', '--wait=false'],
-    { timeoutMs: 20_000 },
+  // A successful DELETE request only starts termination. Durable cleanup must
+  // wait for absence; timeouts/finalizers/API failures remain retryable jobs.
+  const result = await kubectlWithRetry(
+    ['delete', 'pod', podName(agentId), '--ignore-not-found=true', '--wait=true', '--timeout=15s'],
+    { timeoutMs: 20_000, maxAttempts: 1 },
   )
+  if (result.code !== 0 || result.timedOut) {
+    throw new Error(`pod deletion failed for ${agentId}: ${(result.err || result.out || `kubectl exit ${result.code}`).trim()}`)
+  }
 }
 
 /** Drop an agent's chrome-profile PVC. NOT called on normal idle-exit
@@ -1175,11 +1177,18 @@ export async function deletePod(agentId: string): Promise<void> {
  *  state. Call this only when the agent is being permanently
  *  off-boarded; otherwise the next pod will rebind to the existing
  *  PVC. Idempotent (--ignore-not-found). */
-export async function deleteChromeProfilePvc(agentId: string): Promise<void> {
-  await kubectlWithRetry(
-    ['delete', 'pvc', chromeProfilePvcName(agentId), '--ignore-not-found=true', '--wait=false'],
-    { timeoutMs: 20_000 },
+export async function deleteChromeProfilePvc(agentId: string, options: { waitForDeletion?: boolean } = {}): Promise<void> {
+  // Off-boarding still requests deletion asynchronously. Workspace cleanup
+  // opts into confirmed absence and lets its durable job own the retry budget.
+  const waitForDeletion = options.waitForDeletion ?? false
+  const result = await kubectlWithRetry(
+    ['delete', 'pvc', chromeProfilePvcName(agentId), '--ignore-not-found=true',
+      ...(waitForDeletion ? ['--wait=true', '--timeout=15s'] : ['--wait=false'])],
+    { timeoutMs: 20_000, ...(waitForDeletion ? { maxAttempts: 1 } : {}) },
   )
+  if (result.code !== 0 || result.timedOut) {
+    throw new Error(`chrome-profile PVC deletion failed for ${agentId}: ${(result.err || result.out || `kubectl exit ${result.code}`).trim()}`)
+  }
 }
 
 // ─── Idle chrome-profile PVC garbage collection ──────────────────────

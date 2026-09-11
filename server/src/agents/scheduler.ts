@@ -20,7 +20,7 @@
  * server doesn't track Pod lifetimes — the next wake re-creates the
  * Pod via the orchestrator.
  */
-import { enqueueWakeJob, claimWakeJobs, finishWakeJob, renewWakeJob, type ClaimedWakeJob } from './wake-queue.js'
+import { enqueueWakeJob, claimFairWakeJobs as claimWakeJobs, wakeQueueMetrics, finishWakeJob, renewWakeJob, type ClaimedWakeJob } from './wake-queue.js'
 import { pool } from '../db/pool.js'
 import { env } from '../env.js'
 import { inboxTriageBoundary } from './runtime/wake-options.js'
@@ -216,8 +216,8 @@ async function runClaimedWakeJob(queue: string, claimed: ClaimedWakeJob, task: (
   } finally { clearInterval(renewal) }
 }
 
-async function pollWakeRetriesOnce(): Promise<void> {
-  const events = await claimWakeJobs(redis, WAKE_EVENT_QUEUE, Date.now(), WAKE_RETRY_BATCH_SIZE)
+async function pollWakeRetriesOnce(kind: 'events' | 'retries' | 'both' = 'both'): Promise<number> {
+  const events = kind === 'retries' ? [] : await claimWakeJobs(redis, WAKE_EVENT_QUEUE, Date.now(), WAKE_RETRY_BATCH_SIZE)
   const eventResults = await Promise.allSettled(events.map(claimed => runClaimedWakeJob(WAKE_EVENT_QUEUE, claimed, async () => {
     await wake(JSON.parse(claimed.raw) as MessageNewEvent)
     return true // fanOutWake has durably enqueued every recipient before returning.
@@ -225,7 +225,7 @@ async function pollWakeRetriesOnce(): Promise<void> {
   for (const result of eventResults) {
     if (result.status === 'rejected') console.error('[scheduler] durable event fan-out failed; retained for retry', result.reason)
   }
-  const claimed = await claimWakeJobs(redis, WAKE_RETRY_QUEUE, Date.now(), WAKE_RETRY_BATCH_SIZE)
+  const claimed = kind === 'events' ? [] : await claimWakeJobs(redis, WAKE_RETRY_QUEUE, Date.now(), WAKE_RETRY_BATCH_SIZE)
   const results = await Promise.allSettled(claimed.map(entry => runClaimedWakeJob(WAKE_RETRY_QUEUE, entry, async () => {
     const job = JSON.parse(entry.raw) as WakeRetryJob
     try {
@@ -244,20 +244,35 @@ async function pollWakeRetriesOnce(): Promise<void> {
   })))
   const failures = results.filter(result => result.status === 'rejected')
   if (failures.length > 0) throw new AggregateError(failures.map(result => result.reason), 'wake retry batch failed')
+  return events.length + claimed.length
 }
 
-function startWakeRetryWorker(intervalMs: number = 5_000): NodeJS.Timeout {
+function startWakeRetryWorker(intervalMs: number = 100, kind: 'events' | 'retries' = 'events'): NodeJS.Timeout {
   let polling = false
   const tick = (): void => {
     if (polling) return
     polling = true
-    pollWakeRetriesOnce().catch((err) =>
+    let consumed = 0
+    pollWakeRetriesOnce(kind).then(count => { consumed = count }).catch((err) =>
       console.error('[scheduler] wake retry worker failed:', err instanceof Error ? err.message : err),
-    ).finally(() => { polling = false })
+    ).finally(() => {
+      polling = false
+      // Yield the event loop, then drain available work without a fixed sleep.
+      if (consumed > 0) setImmediate(tick)
+    })
   }
   setImmediate(tick)
   const t = setInterval(tick, intervalMs)
   t.unref?.()
+  const metricsStarted = Date.now()
+  const metricsTimer = setInterval(() => {
+    const queue = kind === 'events' ? WAKE_EVENT_QUEUE : WAKE_RETRY_QUEUE
+    const metrics = wakeQueueMetrics.get(queue)
+    if (metrics) console.log('[scheduler.queue]', JSON.stringify({
+      queue, ...metrics, completedPerSecond: metrics.completed * 1000 / Math.max(1, Date.now() - metricsStarted),
+    }))
+  }, 10_000)
+  metricsTimer.unref?.()
   return t
 }
 
@@ -1105,6 +1120,8 @@ export function startScheduler(): void {
     }
   })
   startWakeRetryWorker()
+  // Slow pod startup/retry I/O must not hold up durable message fan-out.
+  startWakeRetryWorker(100, 'retries')
   console.log(`[scheduler] mailbox scheduler listening on ${CH_MESSAGE_NEW}, ${CH_POLLS} · runtime=pod-only`)
 }
 

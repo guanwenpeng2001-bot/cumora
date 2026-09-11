@@ -90,7 +90,7 @@ docker compose -f docker-compose.yml -f docker-compose.gateway.yml config --serv
 docker compose -f docker-compose.yml -f docker-compose.gateway.yml -f docker-compose.override.yml config --quiet
 ```
 
-反之不带 `-f` 直接 `docker compose up` 时,override 会被自动叠加,但它不应声明基础层没有的服务名。
+反之不带 `-f` 直接 `docker compose up` 时,override 会被自动叠加,但它不应声明基础层没有的服务名。sub2api 的 DNS / extra_hosts 已移入 gateway 层；已有本机忽略文件应删除 `services.sub2api` 整段，保留 server、网络和挂载设置。基础加 override、基础加 dev 加 override 与裸 `docker compose config --quiet` 均应独立成功。
 
 ## 形态三:网关 + env 后备
 
@@ -156,11 +156,11 @@ Web 发布端口为 8080,API 为 5181;外部实际域名由部署填写。若通
 node scripts/rollback-precheck.mjs <rollback-image-manifest.ts>
 ```
 
-预检读取本仓库候选 manifest 的目标 schema 与回滚 manifest 的支持范围，不连接数据库、不运行迁移。缺少证据或范围不兼容时打印警告并以 1 退出；范围兼容只代表静态必要条件通过，仍会提醒核验 ledger/checksum 和业务兼容性。这是维护人员的发布前检查，尚未自动接入部署 workflow。
+第二个可选参数为准确候选镜像的 manifest 路径（workflow 必传）；省略时读取本仓库候选 manifest。预检比较候选目标 schema、回滚支持范围及完整迁移元数据，不连接数据库、不运行迁移。缺少证据或范围不兼容时打印警告并以 1 退出；范围兼容只代表静态必要条件通过，仍会提醒核验 ledger/checksum 和业务兼容性。Deploy workflow 已在迁移前提取候选及准确旧 digest 镜像内的 manifest，自动检查范围和完整迁移元数据一致性；不是读取 checkout 来猜测候选版本。无 digest、证据缺失、版本不兼容或 ledger/checksum 不一致都会禁用自动回滚。smoke 失败时再次预检，仅 undo 到已记录的具体 revision；若 Deployment 已被其他发布改变则拒绝 undo。
 
-发布验收还必须在隔离环境验证“准确回滚镜像 × 候选迁移后的数据库”，包括旧镜像重新启动的 schema gate 和关键读写。审计中的旧范围 13–14 无法接受 schema 15；当前版本可能继续增长，须每次重新读取制品，不能复用该数字或仅比较镜像标签。
+发布验收还必须在隔离环境验证“准确回滚镜像 × 候选迁移后的数据库”，包括旧镜像重新启动的 schema gate 和关键读写。当前 `server/src/db/migrations/manifest.ts` 的支持范围严格为 **18–18**。自动回滚仅支持相同迁移历史及兼容范围的代码回退；跨 schema 回退/降级不受支持。每次必须重新读取制品，不能复用版本数字或仅比较标签。
 
-若无通过验证的回滚制品，发布方案应明确采用向前修复，不得承诺 undo 能恢复服务。可选长期策略为经过验证的扩展/收缩迁移兼容窗口，或构建兼容新 schema 的专用回滚制品；扩大支持范围、数据降级/恢复和自动发布失败分支属于需用户决定的 schema 政策，本次不改变。数据库备份恢复涉及停写及备份之后的数据损失，不能当作镜像回退自动执行。
+若无通过验证的回滚制品，发布方案应明确采用向前修复，不得承诺 undo 能恢复服务。可选长期策略为经过验证的扩展/收缩迁移兼容窗口，或构建兼容新 schema 的专用回滚制品；本次不扩大 manifest 支持范围，不做数据降级或自动数据库恢复。范围与 checksum 通过不等于旧业务逻辑已经在新数据上验证。数据库备份恢复涉及停写及备份之后的数据损失，不能当作镜像回退自动执行。
 
 
 ## 自有服务器与 fork 发布坐标
@@ -170,3 +170,40 @@ node scripts/rollback-precheck.mjs <rollback-image-manifest.ts>
 GitHub 发布坐标由 `CUMORA_GITHUB_OWNER` / `CUMORA_GITHUB_REPO` 覆盖，空值默认保持 `guanwenpeng2001-bot/cumora`。Electron 构建与 Vite 前端构建使用构建环境变量；API server 在启动环境中配置相同值，用于查找 CLI Releases。自有仓库需提供对应 CLI tag/tgz 和桌面更新制品；更换坐标不会自动复制 Releases。变量需注入实际构建或 server 进程，仅写宿主机 `.env` 不保证传入容器。详见 `docs/RELEASE.md`。
 
 BYOA 首次配对命令应带 `--server https://<your-server>`，同源网页生成的命令已显式带入地址。daemon 的优先级为显式参数 → 本地配对配置 → 运行时 `CUMORA_SERVER_URL` → Release 构建时 bake 的 `CUMORA_DEFAULT_SERVER`；全部缺失则报错退出。CLI Release workflow 可从同名 repository variable bake 默认服务器，未配置时不内置上游地址。
+
+
+## 部署健康与共享存储检查
+
+两份 K8s 模板都显式设置 `CUMORA_REQUIRE_R2=true`，并用非可选 Secret key 引用四个核心 R2 变量。缺 key 时 Kubernetes 阻止容器启动，空值/非法 endpoint 在 storage 初始化时失败，避免落到 Pod 本地文件系统。Compose 不设置此强制开关，继续使用 `cumora-uploads`。Deploy workflow 的迁移 Job 对实际 Secret 注入的环境执行 `storage-precheck.ts`，成功后才执行迁移；候选 Pod 上同样重申强制开关。此门只验证配置，不证明对象存储权限、历史附件迁移或远端可达性；发布 smoke 还需抽查历史附件和新上传下载。
+
+web 镜像的 HEALTHCHECK 校验 nginx 能返回实际 `index.html`。Compose server 使用独立依赖探针，检查数据库 `SELECT 1`、Redis 认证 `PING` 和 API 的 livez/health；8 秒总限时，输出不含连接凭据。K8s startup/liveness 仍只用 livez，readiness 仍用 health，不因数据库故障反复杀进程。使用新镜像后可手动运行：
+
+```sh
+docker exec cumora-server node server/src/scripts/dependency-readiness.mjs
+# 仅适用本 Compose gateway（共享 PG/Redis，数据库名 sub2api）：
+docker exec cumora-server node server/src/scripts/dependency-readiness.mjs --gateway
+```
+
+sub2api 自带 `/health` 仍仅代表进程存活；独立检查增加共享数据库/Redis/API 可达证据，不修改网关源码。`healthy` 不证明账号授权、余额、模型、图片、SSE 或端到端业务可用。远程独立网关需在其自身网络用其依赖配置另行验证，不能套用共享 Compose 探针。
+
+## 可执行备份与恢复演练
+
+默认运维策略：每日 02:00 做完整备份，升级/迁移前额外做一次；保留最近 7 个日备份、4 个周备份、6 个按月备份，至少一份放在异机受访问控制的备份存储。建议备份位置为宿主专用目录 `/srv/backups/cumora/<UTC时间>/`（Windows 使用仓库外备份盘目录）；演练写到另一个空目录。每次备份包含 `database.dump`、`uploads/` 与 SHA-256/表行指纹 `manifest.json`。机密配置单独加密保管，不放进此备份包或日志。本仓库提供执行脚本，不会自动安装调度任务或执行保留清理；部署负责人需配置计划任务并告警备份失败。
+
+**一致性前提**：在维护窗口暂停所有写入方（API 上传、后台任务、头像生成、GC，以及其他数据库客户端），保留 DB/Redis 运行，才复制 uploads 和数据库。脚本前后比对数据库表行指纹和源 uploads，发现变化即失败；这不能替代业务停写，也不能保证跨资源事务快照。`pg_dump` 自身提供数据库一致快照。目标目录必须不存在；失败包没有有效 manifest，不得用于恢复。禁止覆盖现有卷或向正式库执行 pg_restore。
+
+```sh
+# 先停写；BACKUP_ROOT/DRILL_ROOT 由运维设为仓库外目录。
+mkdir -p "$BACKUP_ROOT/staging-uploads"
+docker cp cumora-server:/app/server/uploads/. "$BACKUP_ROOT/staging-uploads"
+node scripts/backup-restore-drill.mjs backup cumora-postgres "$BACKUP_ROOT/staging-uploads" "$BACKUP_ROOT/20260911T140000Z"
+node scripts/backup-restore-drill.mjs restore "$BACKUP_ROOT/20260911T140000Z" "$DRILL_ROOT/20260911T140000Z"
+# 不接触正式数据库/卷的端到端自测：
+node scripts/backup-restore-drill.mjs self-test "$DRILL_ROOT/self-test-unique"
+```
+
+恢复脚本先校验 dump 和每个 uploads 文件的大小/SHA-256，再创建随机名称 `cumora-restore-*` 的 PostgreSQL 16 + pgvector 临时容器（无网络、无发布端口、PGDATA 为 tmpfs，不创建 Docker 卷），用 `pg_restore --exit-on-error` 恢复。随后逐表比对行数及排序行指纹（包括迁移账本），复制 uploads 到全新演练目录并再次逐文件校验。输出 `restore-result.json` 记录表数、行数、文件数、字节数和毫秒耗时；无论成功失败都移除本次临时容器，不删除任何卷。需预先具备 Docker、Node 及本地 `pgvector/pgvector:pg16` 镜像；不新增软件依赖。自测覆盖 vector、空表、二进制/中文文件名，并验证损坏的 dump/uploads 在恢复前被拒绝。
+
+校验成功后，真实灾备仍需在隔离应用环境使用备份对应的镜像 digest 验证登录、历史附件、新上传及关键业务，再在人工维护窗口决定切换数据库/存储；脚本不会切换正式服务。保存部署文件、镜像 digest、备份时间与演练结果，以便复核。目标 RPO 为 24 小时（迁移前备份另计），初始目标 RTO 为 60 分钟；以实际完整数据演练修订，脚本耗时仅覆盖恢复和校验，不含下载备份、应用启动、流量切换。每月至少演练一次，升级 PG 大版本后重做。
+
+适用范围为当前 Compose PostgreSQL 16 + 本地 uploads；脚本按 postgres socket 管理访问、数据库名 `cumora` 执行，不恢复角色/权限（由部署另行准备）。表数据会完整读入用于校验，单次子进程输出上限 256 MiB，大库应先评估内存与演练时间。GKE Cloud SQL 使用其原生备份/PITR 与隔离实例恢复，R2 使用独立备份桶/对象快照并保留相同 key，按对象清单导出到本地后复核文件 SHA-256；此脚本的本机自测不认证 Cloud SQL PITR、R2 灾备或正式数据 RPO/RTO。

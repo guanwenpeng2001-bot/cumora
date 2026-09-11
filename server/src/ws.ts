@@ -24,6 +24,7 @@ import {
   type DocSubscriber,
 } from './documents/rooms.js'
 import { randomUUID } from 'node:crypto'
+import { WsDispatch } from './ws-dispatch.js'
 
 interface AuthedSocket {
   ws: WebSocket
@@ -47,14 +48,13 @@ interface AuthedSocket {
 }
 
 const clients = new Set<AuthedSocket>()
-const redisFanoutQueues = new Map<string, Promise<void>>()
 
 // Per-client WebSocket send backpressure caps (OOM fix). A socket that can't
 // drain makes `ws` buffer unsent frames in process memory; without a cap, a high
 // broadcast rate grows that buffer unbounded across clients until the pod OOMs.
-// Above MAX we stop sending new frames to that client (let it drain); above
-// TERMINATE it's hopelessly behind, so we kill it to reclaim the memory (it
-// reconnects + re-syncs via REST).
+// Above MAX we close with an explicit REST recovery reason; above TERMINATE
+// we kill the connection immediately to reclaim memory. Both reconnect paths
+// reconcile through REST instead of silently skipping frames.
 const WS_MAX_BUFFERED_BYTES = 2 * 1024 * 1024        // 2 MB
 const WS_TERMINATE_BUFFERED_BYTES = 8 * 1024 * 1024  // 8 MB
 const DOC_SYNC_MAX_BYTES = 32 * 1024 * 1024          // bounded one-shot snapshot
@@ -215,10 +215,15 @@ export async function resolveWsEventRecipientUserIds(
     return new Set(rows.map((row) => row.user_id))
   }
 
-  const durableMessageId = event.type === 'message.new' && typeof event.message?.id === 'string'
-    ? event.message.id
-    : null
-  const { rows } = await pool.query<{ user_id: string }>(
+  return (await resolveWsConversationBatch([event]))[0]
+}
+
+/** One fresh DB snapshot for a bounded room batch; terminal notices keep their
+ * own recipients and never confer access to the other frames in the batch. */
+export async function resolveWsConversationBatch(events: RoutedRedisEvent[]): Promise<Set<string>[]> {
+  const { conversationId, companyId } = events[0]
+  const ids = events.filter(e => e.type === 'message.new' && e.message?.id).map(e => e.message!.id!)
+  const { rows } = await pool.query<{ user_id: string; message_id: string | null }>(
     `WITH scoped_conversation AS (
        SELECT id, company_id
          FROM conversations
@@ -238,10 +243,10 @@ export async function resolveWsEventRecipientUserIds(
            ON company_member.user_id = p.id
           AND company_member.company_id = c.company_id
      ), durable_recipient AS (
-       SELECT cm.user_id
+       SELECT cm.user_id, m.id AS message_id
          FROM scoped_conversation c
          JOIN messages m
-           ON m.id = $3
+           ON m.id = ANY($3::text[])
           AND m.conversation_id = c.id
           AND m.company_id = c.company_id
           AND m.kind = 'system'
@@ -255,12 +260,15 @@ export async function resolveWsEventRecipientUserIds(
            ON cm.user_id = p.id
           AND cm.company_id = c.company_id
      )
-     SELECT user_id FROM current_members
+     SELECT user_id, NULL::text AS message_id FROM current_members
      UNION
-     SELECT user_id FROM durable_recipient`,
-    [conversationId, companyId, durableMessageId],
+     SELECT user_id, message_id FROM durable_recipient`,
+    [conversationId, companyId, ids],
   )
-  return new Set(rows.map((row) => row.user_id))
+  const current = rows.filter(row => row.message_id === null).map(row => row.user_id)
+  return events.map(event => new Set([...current, ...rows.filter(row =>
+    row.message_id !== null && event.type === 'message.new' && row.message_id === event.message?.id,
+  ).map(row => row.user_id)]))
 }
 
 /** Look up a doc + verify the caller's tenant membership in one shot.
@@ -922,6 +930,51 @@ export function attachWebSocket(httpServer: Server) {
     console.log(`[ws] subscribed to ${count} redis channels`)
   })
 
+  const resync = () => {
+    // No event identifiers/payload are exposed on lookup failure or overflow.
+    // Reconnect's hello drives the existing REST reconciliation in all stores.
+    for (const c of clients) {
+      if (c.ws.readyState !== c.ws.OPEN) continue
+      try {
+        c.ws.send(JSON.stringify({ type: 'sync.required', reason: 'realtime_backlog',
+          recovery: 'reconnect_then_rest', messages: '/api/conversations/:id/messages?limit=500&before=:oldestSequence' }))
+        c.ws.close(1013, 'REST sync required; reconnect')
+      } catch { c.ws.terminate() }
+    }
+  }
+  const dispatch = new WsDispatch<{ event: RoutedRedisEvent; payload: string }>(async (batch, expired) => {
+    // Targeted workspace frames keep their specialized authorization rules.
+    const isRoom = (e: RoutedRedisEvent) => !!e.conversationId &&
+      !['workspace.membership', 'doc.mention', 'calendar.reminder'].includes(e.type ?? '')
+    const ordinary = batch.filter(item => isRoom(item.event))
+    const recipients = new Map<RoutedRedisEvent, Set<string>>()
+    if (ordinary.length) {
+      const sets = await resolveWsConversationBatch(ordinary.map(item => item.event))
+      ordinary.forEach((item, i) => { recipients.set(item.event, sets[i]) })
+    }
+    for (const item of batch) {
+      if (!isRoom(item.event)) recipients.set(item.event, await resolveWsEventRecipientUserIds(item.event))
+    }
+    // No await between the authorization snapshot and ordered batch sends.
+    if (expired()) throw new Error('dispatch authorization exceeded age budget')
+    for (const { event, payload } of batch) {
+      for (const c of clients) {
+        if (!recipients.get(event)?.has(c.userId) || c.ws.readyState !== c.ws.OPEN) continue
+        if (c.ws.bufferedAmount > WS_MAX_BUFFERED_BYTES) {
+          if (c.ws.bufferedAmount > WS_TERMINATE_BUFFERED_BYTES) c.ws.terminate()
+          else c.ws.close(1013, 'REST sync required; reconnect')
+          continue
+        }
+        try { c.ws.send(payload) } catch { c.ws.terminate() }
+      }
+    }
+  }, resync)
+  const metrics = setInterval(() => {
+    console.log('[ws.dispatch]', JSON.stringify(dispatch.snapshot()))
+  }, 10_000)
+  metrics.unref()
+  wss.on('close', () => clearInterval(metrics))
+
   sub.on('message', (channel, payload) => {
     // Doc channels are room-scoped, not company-scoped — skip them here.
     if (channel === 'cumora:doc.update' || channel === 'cumora:doc.awareness') return
@@ -942,42 +995,10 @@ export function attachWebSocket(httpServer: Server) {
       return
     }
 
-    // Membership resolution is asynchronous. Serialize per conversation (or
-    // company for workspace-wide frames) so a message and its delta/reaction
-    // cannot be reordered while independent rooms still route in parallel.
     const routeKey = event.conversationId
       ? `${companyId}:conversation:${event.conversationId}`
       : `${companyId}:workspace`
-    const previous = redisFanoutQueues.get(routeKey) ?? Promise.resolve()
-    const current = previous.catch(() => {}).then(async () => {
-      const recipients = await resolveWsEventRecipientUserIds(event)
-      for (const c of clients) {
-        if (!recipients.has(c.userId)) continue
-        if (c.ws.readyState !== c.ws.OPEN) continue
-        // Backpressure guard (OOM fix): `ws.send()` buffers unsent frames in
-        // process memory when a socket can't drain (slow/stuck client). Under a
-        // high broadcast rate that buffer grows UNBOUNDED across clients → the pod
-        // OOMs. If a socket is backed up past the cap it isn't keeping up — drop
-        // this frame for it; if it's wildly backed up, terminate it to reclaim the
-        // memory (it reconnects and re-syncs via REST). Bounds WS memory to
-        // ~WS_MAX_BUFFERED_BYTES per client.
-        const buffered = c.ws.bufferedAmount
-        if (buffered > WS_TERMINATE_BUFFERED_BYTES) {
-          try { c.ws.terminate() } catch { /* ignore */ }
-          continue
-        }
-        if (buffered > WS_MAX_BUFFERED_BYTES) continue // skip frame; let it drain
-        try { c.ws.send(payload) } catch { /* ignore */ }
-      }
-    })
-    redisFanoutQueues.set(routeKey, current)
-    void current.catch((error) => {
-      // Fail closed: a routing lookup failure drops the frame instead of
-      // falling back to the stale socket membership snapshot.
-      console.warn(`[ws] live authorization lookup failed for ${routeKey}`, error)
-    }).finally(() => {
-      if (redisFanoutQueues.get(routeKey) === current) redisFanoutQueues.delete(routeKey)
-    })
+    dispatch.enqueue(routeKey, { event, payload }, Buffer.byteLength(payload))
   })
 
   // Heartbeat sweeper. Real-deal human presence used to drift because TCP

@@ -64,9 +64,9 @@ test('Compose uploads target matches image and storage; OrbStack PVC verbs match
 })
 
 test('nginx runtime preserves URI and forwards streaming responses without buffering', () => {
-  const runtime = read('deploy/nginx.conf').match(/location \/runtime\/ \{([\s\S]*?)\n    \}/)?.[1]
+  const runtime = read('deploy/nginx.conf').match(/location \/runtime\/ \{([\s\S]*?)\n {4}\}/)?.[1]
   assert.ok(runtime)
-  for (const directive of ['proxy_pass $upstream;', 'proxy_http_version 1.1;', 'proxy_buffering off;', 'proxy_cache off;', 'proxy_read_timeout 3600s;', 'proxy_send_timeout 3600s;']) assert.ok(runtime.includes(directive), directive)
+  for (const directive of ['proxy_pass http://cumora_api;', 'proxy_http_version 1.1;', 'proxy_buffering off;', 'proxy_cache off;', 'proxy_read_timeout 3600s;', 'proxy_send_timeout 3600s;']) assert.ok(runtime.includes(directive), directive)
 })
 
 test('rollback precheck rejects old gates, accepts compatible ranges and rejects missing evidence', async () => {

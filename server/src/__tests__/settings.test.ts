@@ -712,10 +712,11 @@ test('operations worker starts disabled, gates nudges, and recovers after failur
 })
 
 
-test('workspace cleanup uses configured batch and retention while default runtime cleanup makes no external call', async () => {
+test('workspace cleanup uses configured batch and retention with mandatory runtime cleanup', async () => {
   const f = fixture()
   await f.settings.loadServerSettings()
   const calls: { sql: string; params: unknown[] }[] = []
+  const runtimeCalls: string[] = []
   const api: Record<string, any> = {}
   const js = ts.transpileModule(readFileSync(new URL('../workspace-cleanup.ts', import.meta.url), 'utf8'),
     { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText
@@ -723,6 +724,13 @@ test('workspace cleanup uses configured batch and retention while default runtim
     './settings.js': f.settings,
     'node:crypto': { randomUUID: () => 'test-worker' },
     './storage.js': { storage: {}, normalizeStorageKey: (key: string) => key },
+    './agents/runtime/orchestrator.js': {
+      async deletePod(agentId: string) { runtimeCalls.push(`pod:${agentId}`) },
+      async deleteChromeProfilePvc(agentId: string, options: { waitForDeletion?: boolean }) {
+        assert.equal(options.waitForDeletion, true)
+        runtimeCalls.push(`pvc:${agentId}`)
+      },
+    },
     './db/pool.js': { pool: { async query(sql: string, params: unknown[] = []) {
       calls.push({ sql, params })
       if (sql.includes('UPDATE workspace_cleanup_jobs j')) return { rows: [{ id: 'job', agent_ids: ['agent'], storage_keys: [] }] }
@@ -736,6 +744,7 @@ test('workspace cleanup uses configured batch and retention while default runtim
   } })
   await f.settings.writeServerSettings({ workspace_cleanup_retention_days: '0', workspace_cleanup_batch: '3' })
   assert.equal((await api.drainWorkspaceCleanupJobs()).completed, 1)
+  assert.deepEqual(runtimeCalls, ['pod:agent', 'pvc:agent'])
   assert.ok(!calls.some(c => c.sql.startsWith('DELETE')))
   const claim = calls.find(c => c.sql.includes('SKIP LOCKED'))!
   assert.ok(claim)

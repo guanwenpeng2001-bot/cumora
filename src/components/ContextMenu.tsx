@@ -9,7 +9,8 @@
  * can travel right to it without the panel slamming shut mid-trajectory.
  * The whole stack closes on outside click / Esc / leaf activation.
  */
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { cn } from '@/lib/utils'
 
 export interface ContextMenuItem {
@@ -76,15 +77,14 @@ export function ContextMenu({ x, y, items, onClose, _isChild, _onBack, _focusOnO
   }, [onClose, _isChild])
 
   // Clamp to viewport so we don't open off-screen.
-  useEffect(() => {
+  useLayoutEffect(() => {
     const el = ref.current
     if (!el) return
-    const r = el.getBoundingClientRect()
     const vw = window.innerWidth
     const vh = window.innerHeight
-    let nx = x, ny = y
-    if (r.right > vw - 8) nx = Math.max(8, vw - r.width - 8)
-    if (r.bottom > vh - 8) ny = Math.max(8, vh - r.height - 8)
+    // Measure layout size, unaffected by the entrance animation's transform.
+    const nx = Math.max(8, Math.min(x, vw - el.offsetWidth - 8))
+    const ny = Math.max(8, Math.min(y, vh - el.offsetHeight - 8))
     el.style.left = `${nx}px`
     el.style.top = `${ny}px`
   }, [x, y])
@@ -92,7 +92,7 @@ export function ContextMenu({ x, y, items, onClose, _isChild, _onBack, _focusOnO
   const openItem = openSubmenuIdx !== null ? items[openSubmenuIdx] : null
   const submenuOpen = !!openItem?.submenu && submenuAnchor !== null
 
-  return (
+  return createPortal(
     <>
       <div
         ref={ref}
@@ -101,6 +101,11 @@ export function ContextMenu({ x, y, items, onClose, _isChild, _onBack, _focusOnO
         style={{
           left: x,
           top: y,
+          // Keep measurement stable when the click starts near the right edge.
+          width: 'max-content',
+          maxWidth: 'calc(100vw - 16px)',
+          maxHeight: 'calc(100vh - 16px)',
+          overflowY: 'auto',
           boxShadow: '0 10px 30px -8px rgba(10, 30, 60, 0.20), 0 4px 10px -4px rgba(10, 30, 60, 0.12), 0 0 0 1px rgba(0, 80, 140, 0.08)',
         }}
         onKeyDown={(event) => {
@@ -195,7 +200,8 @@ export function ContextMenu({ x, y, items, onClose, _isChild, _onBack, _focusOnO
           onClose={onClose}
         />
       )}
-    </>
+    </>,
+    document.body,
   )
 }
 

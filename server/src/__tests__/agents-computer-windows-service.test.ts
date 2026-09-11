@@ -1,5 +1,12 @@
 import assert from 'node:assert/strict'
+import { spawn, type ChildProcess } from 'node:child_process'
+import { once } from 'node:events'
+import { existsSync } from 'node:fs'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { test } from 'node:test'
+import { setTimeout as delay } from 'node:timers/promises'
 import {
   isWindowsSupervisorProcess,
   parseWindowsProcessList,
@@ -15,6 +22,7 @@ import {
   windowsScheduledTaskQueryCommand,
   windowsScheduledTaskSettingsCommand,
   windowsTaskName,
+  quiesceWindowsDaemons,
 } from '../agents/computer/daemon.js'
 
 test('service PATH includes the installed CLI shim and Node directories', async () => {
@@ -88,6 +96,100 @@ test('Windows scheduled task runs the watchdog at login with limited privileges'
   assert.match(settings, /-AllowStartIfOnBatteries/)
   assert.match(settings, /-DontStopIfGoingOnBatteries/)
   assert.match(settings, /-StartWhenAvailable/)
+  assert.match(settings, /-MultipleInstances IgnoreNew/)
+})
+
+test('Windows install and scheduled startup stop old supervisors before the final daemon sweep', async () => {
+  for (const endTask of [true, false]) {
+    const calls: string[] = []
+    await quiesceWindowsDaemons('test-task', endTask, {
+      stopDaemons: async () => { calls.push('daemons') },
+      stopWatchdog: async (name, end) => { calls.push(`${name}:${end}`) },
+    })
+    assert.deepEqual(calls, ['daemons', `test-task:${endTask}`, 'daemons'])
+  }
+})
+
+test('Windows startup cleanup fails closed when an old watchdog cannot stop', async () => {
+  let sweeps = 0
+  await assert.rejects(quiesceWindowsDaemons('test-task', false, {
+    stopDaemons: async () => { sweeps++ },
+    stopWatchdog: async () => { throw new Error('old watchdog still running') },
+  }), /old watchdog still running/)
+  assert.equal(sweeps, 1)
+})
+
+test('Windows supervisor acquires its mutex and cleans legacy processes before hosting', () => {
+  const script = renderWindowsSupervisor('http://localhost', 'C:/temp/log', 'C:/temp/disabled')
+  assert.match(script, /Global\\CumoraSupervisor-/)
+  assert.match(script, /WaitOne\(0\)/)
+  assert.match(script, /AbandonedMutexException/)
+  assert.ok(script.indexOf('--prepare-service-start') < script.indexOf('while (-not'))
+  assert.match(script, /if \(\$LASTEXITCODE -ne 0\) \{ exit \$LASTEXITCODE \}/)
+  assert.match(script, /if \(\$LASTEXITCODE -eq 73\) \{ exit \$LASTEXITCODE \}/)
+  assert.match(script, /finally[\s\S]*ReleaseMutex\(\)/)
+})
+
+test('two real Windows supervisor processes host once and stop retrying on daemon exit 73', { skip: process.platform !== 'win32', timeout: 20_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cumora-supervisor-'))
+  const children: ChildProcess[] = []
+  const log = join(root, 'supervisor.log')
+  const calls = join(root, 'calls.log')
+  const ready = join(root, 'ready')
+  const release = join(root, 'release')
+  const script = join(root, 'supervisor.ps1')
+  try {
+    // Exercise the generated PowerShell, mutex and exit-code propagation. The
+    // stub deliberately cannot call the installed CLI or touch scheduled tasks.
+    await writeFile(join(root, 'cumora.ps1'), [
+      'if ($args -contains "--prepare-service-start") {',
+      '  Add-Content -LiteralPath $env:TEST_SUPERVISOR_CALLS -Value "prepare"',
+      '  $global:LASTEXITCODE = 0; return',
+      '}',
+      'Add-Content -LiteralPath $env:TEST_SUPERVISOR_CALLS -Value "host"',
+      'New-Item -ItemType File -Path $env:TEST_SUPERVISOR_READY | Out-Null',
+      'while (-not (Test-Path -LiteralPath $env:TEST_SUPERVISOR_RELEASE)) { Start-Sleep -Milliseconds 50 }',
+      '$global:LASTEXITCODE = 73',
+    ].join('\r\n'))
+    await writeFile(script, renderWindowsSupervisor('http://127.0.0.1:1', log, join(root, 'disabled'), `${root};${process.env.PATH}`, false))
+    const start = () => {
+      const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script], {
+        windowsHide: true, env: { ...process.env, TEST_SUPERVISOR_CALLS: calls, TEST_SUPERVISOR_RELEASE: release, TEST_SUPERVISOR_READY: ready },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+      children.push(child)
+      return child
+    }
+    const first = start()
+    let errors = ''
+    first.stderr!.on('data', b => { errors += b })
+    // PowerShell Add-Content briefly holds an exclusive Windows file handle.
+    // Wait for a separate marker written AFTER it closes the trace file.
+    for (let n = 0; n < 100 && !existsSync(ready); n++) {
+      if (first.exitCode !== null) break
+      await delay(50)
+    }
+    assert.equal(first.exitCode, null, errors)
+    assert.ok(existsSync(calls), errors)
+    assert.match(await readFile(calls, 'utf8'), /host/)
+    const second = start()
+    const [secondCode] = await once(second, 'close')
+    assert.equal(secondCode, 73)
+    assert.match(await readFile(log, 'utf8'), /supervisor already running; mutex: Global\\CumoraSupervisor-/)
+    const firstClosed = once(first, 'close')
+    await writeFile(release, '')
+    const [firstCode] = await firstClosed
+    assert.equal(firstCode, 73, errors)
+    assert.deepEqual((await readFile(calls, 'utf8')).trim().split(/\r?\n/), ['prepare', 'host'])
+  } finally {
+    for (const child of children) {
+      if (child.exitCode !== null || child.signalCode !== null) continue
+      const exited = once(child, 'exit')
+      child.kill('SIGKILL')
+      await exited
+    }
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
+  }
 })
 
 test('Windows task names are stable and isolated per user home', () => {

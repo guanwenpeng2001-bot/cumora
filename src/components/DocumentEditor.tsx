@@ -277,7 +277,7 @@ function CollaborativeEditor({ session, synced, userName, userColor, documentId,
     // Disable StarterKit's undo/redo because Collaboration ships its own
     // (Yjs-aware) one — running both yields double-undos. TipTap v3
     // renamed this option from `history` to `undoRedo`.
-    StarterKit.configure({ undoRedo: false }),
+    StarterKit.configure({ undoRedo: false, link: false }),
     // Tables: agents write GFM tables in markdown docs (the server converts
     // them to ProseMirror table nodes in documents/markdown.ts); without
     // this extension those nodes are unknown to the schema and the doc

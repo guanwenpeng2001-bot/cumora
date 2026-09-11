@@ -183,7 +183,8 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
 
   async loadInbox(agentId: string, options: { excludeMessageIds?: string[]; onlyMessageIds?: string[] } = {}): Promise<InboxRow[]> {
     // Resolve membership through the normalized participant-led index, then
-    // pull each conversation's unread tail with the message index. This avoids
+    // pull each conversation's unconsumed messages. Read cursors are UI state,
+    // never evidence that an agent completed an input. This avoids
     // both the old JSONB seq-scan and its dedicated enable_seqscan=off session.
     const { rows } = await pool.query<InboxRow>(
       `WITH requesting_agent AS MATERIALIZED (
@@ -195,8 +196,6 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
          SELECT c.id, c.company_id,
                 c.title AS conversation_title, c.kind AS conversation_kind, c.topic AS conversation_topic,
                 c.project_id, pr.name AS project_name,
-                COALESCE(cr.last_read_at, '1970-01-01T00:00:00Z'::timestamptz) AS lr_at,
-                COALESCE(cr.last_read_message_id, '') AS lr_id,
                 (current_membership.participant_id IS NOT NULL) AS current_member,
                 EXISTS (
                   SELECT 1 FROM conversation_mutes mu
@@ -209,7 +208,6 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
              ON current_membership.conversation_id = c.id
             AND current_membership.company_id = c.company_id
             AND current_membership.participant_id = $1
-           LEFT JOIN conversation_reads cr ON cr.user_id = $1 AND cr.conversation_id = c.id
            LEFT JOIN projects pr ON pr.id = c.project_id
           WHERE current_membership.participant_id IS NOT NULL
              OR EXISTS (
@@ -217,10 +215,8 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
                  FROM messages delivered
                 WHERE delivered.conversation_id = c.id
                   AND delivered.delivery_recipient_id = $1
-                  AND ROW(delivered.created_at, delivered.id) > ROW(
-                    COALESCE(cr.last_read_at, '1970-01-01T00:00:00Z'::timestamptz),
-                    COALESCE(cr.last_read_message_id, '')
-                  )
+                  AND NOT EXISTS (SELECT 1 FROM agent_message_consumptions consumed
+                    WHERE consumed.agent_id = $1 AND consumed.message_id = delivered.id)
              )
        )
        SELECT
@@ -241,13 +237,12 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
           ) AS quoted
          FROM convos co
          JOIN LATERAL (
-           -- Unread tail of THIS conversation. ROW(created_at,id) > cursor uses
-           -- last_read_message_id as a tiebreaker for same-instant messages.
+           -- Exact receipts preserve gaps left by failed or cancelled turns,
+           -- even if a CLI ack advanced the conversation's read cursor.
            SELECT * FROM messages mm
             WHERE mm.conversation_id = co.id
               AND (co.current_member OR mm.delivery_recipient_id = $1)
               AND (mm.author_id <> $1 OR mm.delivery_recipient_id = $1)
-              AND ROW(mm.created_at, mm.id) > ROW(co.lr_at, co.lr_id)
               AND NOT (mm.id = ANY($2::text[]))
               AND ($3::text[] IS NULL OR mm.id = ANY($3::text[]))
               AND NOT EXISTS (SELECT 1 FROM agent_message_consumptions consumed

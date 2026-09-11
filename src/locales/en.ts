@@ -1723,6 +1723,13 @@ export const en = {
   // ─── misc helpers used by views ───────────────────────────────────
   // ─── mobile calendar ──────────────────────────────────────────────
   'mcal.prevMonth': 'Previous month',
+  'mcal.sun': 'Sun',
+  'mcal.mon': 'Mon',
+  'mcal.tue': 'Tue',
+  'mcal.wed': 'Wed',
+  'mcal.thu': 'Thu',
+  'mcal.fri': 'Fri',
+  'mcal.sat': 'Sat',
   'mcal.nextMonth': 'Next month',
   'mcal.today': 'Today',
   'mcal.pickDay': 'Pick a day to see events.',
@@ -2015,6 +2022,13 @@ export const en = {
   'msgview.nMore': '{n} more',
   // ─── Mobile library ───────────────────────────────────────────────────
   'moblib.tabDocuments': 'Documents',
+  'moblib.title': 'Library',
+  'moblib.subtitle': 'documents, boards & schedule',
+  'moblib.emptyDocuments': 'No documents yet. Tap the + to create one — humans and agents both edit live.',
+  'moblib.emptyBoards': 'No boards yet. Tap the + to start one — agents can move cards through it on their own.',
+  'moblib.newDocument': 'New document',
+  'moblib.newBoard': 'New board',
+  'moblib.newEvent': 'New event',
   'moblib.tabBoards': 'Boards',
   'moblib.tabCalendar': 'Calendar',
   'moblib.untitledBoard': 'Untitled board',

@@ -54,6 +54,7 @@ import { type ActionSurface, actionSurfaceFor, actionSurfaceText, calendarExampl
 import { buildEngineCodexMcpInjection, runnableEngineIds, allowUnsandboxedByoa, detectEnginesWithStatus, ENGINE_IDS, engineFailureOf, type DetectedEngineSnapshot, type EngineHopReport, type EngineId, type EngineRunResult, type EngineSession, type EngineUsage, enrichDetectedEngines, evaluateRunnableEngines, getAdapter, runEngineDoctor, type RunnableEngineEvaluation, snapshotDetectedEngines } from './engine.js'
 import { EngineSessionStore, sessionIdPreview } from './session-store.js'
 import { runWithSessionRecovery } from './session-recovery.js'
+import { acquireDaemonLock, DAEMON_ALREADY_RUNNING_EXIT_CODE } from './daemon-lock.js'
 
 export { conversationHeader }
 
@@ -591,6 +592,7 @@ interface RuntimeTriagePayload {
 function parseArgs(argv: string[]): {
   pair?: string; server?: string; engine?: string; provider?: string
   installService?: boolean; uninstallService?: boolean; restart?: boolean; stop?: boolean
+  prepareServiceStart?: boolean
   status?: boolean; logs?: boolean; version?: boolean; doctor?: boolean; help?: boolean
 } {
   const out: ReturnType<typeof parseArgs> = {}
@@ -605,6 +607,7 @@ function parseArgs(argv: string[]): {
     else if (argv[i] === '--engine') out.engine = argv[++i]
     else if (argv[i].startsWith('--engine=')) out.engine = argv[i].slice('--engine='.length)
     else if (argv[i] === '--install-service') out.installService = true
+    else if (argv[i] === '--prepare-service-start') out.prepareServiceStart = true
     else if (argv[i] === '--uninstall-service') out.uninstallService = true
     else if (argv[i] === '--restart') out.restart = true
     else if (argv[i] === '--stop') out.stop = true
@@ -1692,6 +1695,7 @@ export function resolveTriageModel(
 export class AgentRunner {
   private safetyGeneration = '0'
   private turnCancelled = false
+  private turnCancellationReason: 'aborted_by_user' | 'safety_validation_failed' = 'aborted_by_user'
   private cancellingSafety = false
   private async admitSafety(token: string, initial = false): Promise<boolean> {
     const admission = await api<{ allowed: boolean; generation: string; reason?: string }>(this.cfg.serverUrl, '/runtime/turn-admission', {
@@ -1700,15 +1704,23 @@ export class AgentRunner {
     if (initial && !admission.allowed && admission.reason === 'emergency_stop') {
       await runtimeBest(this.cfg.serverUrl, '/stop-confirmed', token, { generation: admission.generation })
     }
-    if (!initial && this.safetyGeneration !== admission.generation) return false
+    if (!initial && (this.safetyGeneration !== admission.generation || admission.reason === 'emergency_stop')) {
+      // Admission can observe the stop before the SSE/poll cancellation does.
+      // The run row already exists at this point; close it as a cancellation.
+      this.turnCancelled = true
+      this.turnCancellationReason = 'aborted_by_user'
+      this.pendingRerun = false
+      return false
+    }
     if (initial) this.safetyGeneration = admission.generation
     return admission.allowed && !this.turnCancelled
   }
 
-  private async emergencyCancel(generation: string): Promise<void> {
+  private async emergencyCancel(generation: string, reason: 'aborted_by_user' | 'safety_validation_failed' = 'aborted_by_user'): Promise<void> {
     if (this.cancellingSafety || this.stopped) return
     this.cancellingSafety = true
     this.turnCancelled = true
+    this.turnCancellationReason = reason
     this.pendingRerun = false
     this.teardown.abort(new DOMException('Emergency stop', 'AbortError'))
     await this.engineSession?.stop({ force: true })
@@ -1894,13 +1906,14 @@ export class AgentRunner {
     const previous = this.sessionId
     this.sessionId = id
     void this.sessionStore.save(id)
-    if (id) console.log(`[computer] ${this.agent.id} saved ${this.engine} session ${sessionIdPreview(id)}`)
+    if (id) console.log(`[computer] ${this.agent.id} saved ${this.engine} session ${sessionIdPreview(id)}${this.adapter.sessionResumeUnavailableReason?.() ? ' (last execution only; not a resume target)' : ''}`)
     else if (previous) console.log(`[computer] ${this.agent.id} cleared ${this.engine} session ${sessionIdPreview(previous)}`)
   }
 
   /** Defense in depth: the store and adapter are both fixed at construction.
    * Refuse resume if a future refactor ever lets those bindings diverge. */
   private resumeSessionId(): string | null {
+    if (this.adapter.sessionResumeUnavailableReason?.()) return null
     if (this.engine === this.adapter.id && this.sessionStore.engine === this.engine) return this.sessionId
     console.error(`[computer] ${this.agent.id} refused cross-engine resume: store=${this.sessionStore.engine}, runner=${this.engine}, adapter=${this.adapter.id}`)
     return null
@@ -2029,7 +2042,10 @@ export class AgentRunner {
     const s = await this.sessionStore.load()
     if (s) {
       this.sessionId = s
-      console.log(`[computer] ${this.agent.id} restored ${this.engine} session ${sessionIdPreview(s)} from disk — will --resume (continuity across restart)`)
+      const unavailable = this.adapter.sessionResumeUnavailableReason?.()
+      console.log(unavailable
+        ? `[computer] ${this.agent.id} loaded last ${this.engine} execution ${sessionIdPreview(s)} from disk — ${unavailable}; not resumed`
+        : `[computer] ${this.agent.id} loaded ${this.engine} session ${sessionIdPreview(s)} from disk — resume candidate; awaiting engine confirmation`)
     }
   }
 
@@ -2357,6 +2373,25 @@ export class AgentRunner {
       dedupeKey: `byoa_engine_failed:${this.agent.id}:${conversationId}:${hashText(args.error)}`,
       dedupeTtlSec: 900,
     })))
+  }
+
+  /** Cancellation is a terminal non-failure outcome. Reuse the existing
+   * skipped status and keep the reason in both the run and its audit event. */
+  private async finishCancelledTurn(token: string, runId: string | undefined, model: string | null | undefined, usage: EngineUsage | undefined): Promise<boolean> {
+    if (!this.turnCancelled) return false
+    this.pendingRerun = false
+    if (runId) {
+      await runtimeBest(this.cfg.serverUrl, '/events', token, {
+        runId, kind: 'turn.cancelled', level: 'info', title: this.turnCancellationReason,
+        data: { reason: this.turnCancellationReason, generation: this.safetyGeneration },
+        stage: 'skipped',
+      })
+      await runtimeBest(this.cfg.serverUrl, `/runs/${runId}/finish`, token, {
+        status: 'skipped', summary: this.turnCancellationReason, error: null,
+        model: model ?? this.agent.model, usage: usage ? usageFromClaude(usage) : null,
+      })
+    }
+    return true
   }
 
   private async failureConversationIds(token: string, conversationId: string | null): Promise<string[]> {
@@ -2823,7 +2858,7 @@ export class AgentRunner {
       exitCode = result.exitCode
       turnUsage = result.usage
       turnModel = result.model
-      if (result.error) engineError = this.visibleEngineError(exitCode, result.failure?.message ?? result.error)
+      if (result.error || exitCode !== 0) engineError = this.visibleEngineError(exitCode, result.failure?.message ?? result.error)
       if (engineError && result.failure?.kind !== 'resume-not-found' && this.mustResetSession(engineError, false)) {
         await this.resetEngineSession(this.resetReason(engineError))
       }
@@ -2845,6 +2880,7 @@ export class AgentRunner {
     // Rate-limit: same as chat-turn path — suppress the user-facing notice
     // and just defer (no inbox state to keep here since agenda turns are
     // proactive; next heartbeat re-evaluates after cooldown).
+    if (await this.finishCancelledTurn(token, run?.runId, turnModel, turnUsage)) return
     const outcome = classifyTurnOutcome(engineError)
     if (engineError && outcome !== 'rate-limited') {
       await this.publishEngineFailure({ token, runId: run?.runId, conversationId: null, error: engineError, exitCode })
@@ -3008,7 +3044,7 @@ export class AgentRunner {
         body: JSON.stringify({ generation: this.safetyGeneration }), signal: AbortSignal.timeout(5000),
       }).then(result => {
         if (!result.valid) void this.emergencyCancel(this.safetyGeneration).catch(console.error)
-      }).catch(() => { void this.emergencyCancel(this.safetyGeneration).catch(console.error) })
+      }).catch(() => { void this.emergencyCancel(this.safetyGeneration, 'safety_validation_failed').catch(console.error) })
         .finally(() => { safetyChecking = false })
     }, 2000)
     safetyTimer.unref()
@@ -3210,7 +3246,7 @@ export class AgentRunner {
           exitCode = result.exitCode
           turnUsage = result.usage
           turnModel = result.model
-          if (result.error) engineError = this.visibleEngineError(exitCode, result.failure?.message ?? result.error)
+          if (result.error || exitCode !== 0) engineError = this.visibleEngineError(exitCode, result.failure?.message ?? result.error)
           // A stale resume OR a context-window overflow means this session can't
           // be carried forward — drop it AND tear down any persistent process so
           // the next wake starts clean (otherwise --resume re-overflows forever).
@@ -3244,6 +3280,10 @@ export class AgentRunner {
         // user from seeing a row of "byoa_engine_failed" markers in chat for
         // what is really a transient provider throttle. Persist a quieter
         // signal to the run row instead so it shows up in observability.
+        if (await this.finishCancelledTurn(token, run?.runId, turnModel, turnUsage)) {
+          await runtimeBest(this.cfg.serverUrl, '/status', token, { status: 'avail' })
+          break
+        }
         const outcome = classifyTurnOutcome(engineError)
         const rateLimited = outcome === 'rate-limited'
         // An engine nobody has logged into will fail the same way on the next
@@ -3439,6 +3479,17 @@ function installTimestampedLogging(): void {
 
 async function doRun(serverOverride?: string): Promise<void> {
   installTimestampedLogging()
+  let lock: Awaited<ReturnType<typeof acquireDaemonLock>> | undefined
+  try {
+    lock = await acquireDaemonLock(CONFIG_DIR)
+    await refuseLiveLegacyDaemon()
+    console.log(`[computer] acquired single-instance lock: ${lock.location} (state directory: ${CONFIG_DIR}; exclusive OS bind, released on process exit)`)
+  } catch (error) {
+    await lock?.release()
+    console.error(error instanceof Error ? error.message : String(error))
+    process.exitCode = DAEMON_ALREADY_RUNNING_EXIT_CODE
+    return
+  }
   if (allowUnsandboxedByoa()) {
     console.warn('[computer] SECURITY WARNING: CUMORA_BYOA_ALLOW_UNSANDBOXED=1 — local model engines may read host files, inherit credentials, and use the network')
   } else {
@@ -3890,17 +3941,37 @@ export function renderWindowsSupervisor(
   path = process.env.PATH ?? '',
   unsandboxed = allowUnsandboxedByoa(),
 ): string {
+  const mutexName = `Global\\CumoraSupervisor-${createHash('sha256').update(win32.resolve(disabledPath).toLowerCase()).digest('hex')}`
   return [
     "$ErrorActionPreference = 'Continue'",
     "$env:CUMORA_SUPERVISED = '1'",
     ...(unsandboxed ? ["$env:CUMORA_BYOA_ALLOW_UNSANDBOXED = '1'"] : []),
     `$env:PATH = ${quotePowerShell(path)}`,
     '$utf8 = New-Object System.Text.UTF8Encoding($false)',
+    `if (Test-Path -LiteralPath ${quotePowerShell(disabledPath)}) { exit 0 }`,
+    `$mutex = New-Object System.Threading.Mutex($false, ${quotePowerShell(mutexName)})`,
+    '$ownsMutex = $false',
+    'try {',
+    '  try { $ownsMutex = $mutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $ownsMutex = $true }',
+    '  if (-not $ownsMutex) {',
+    `    [System.IO.File]::AppendAllText(${quotePowerShell(logPath)}, "[computer] supervisor already running; mutex: ${mutexName}" + [Environment]::NewLine, $utf8)`,
+    `    exit ${DAEMON_ALREADY_RUNNING_EXIT_CODE}`,
+    '  }',
+    // Old scripts have no mutex. The installed CLI stops those watchdogs and
+    // their daemons before the new supervisor enters its restart loop.
+    '  & cumora agent computer --prepare-service-start',
+    '  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }',
     `while (-not (Test-Path -LiteralPath ${quotePowerShell(disabledPath)})) {`,
     `  & cumora agent computer --server ${quotePowerShell(serverUrl)} 2>&1 | ForEach-Object {`,
     `    [System.IO.File]::AppendAllText(${quotePowerShell(logPath)}, ([string]$_ + [Environment]::NewLine), $utf8)`,
     '  }',
+    // Do not continuously retry against a foreground or legacy daemon.
+    `  if ($LASTEXITCODE -eq ${DAEMON_ALREADY_RUNNING_EXIT_CODE}) { exit $LASTEXITCODE }`,
     '  Start-Sleep -Seconds 5',
+    '}',
+    '} finally {',
+    '  if ($ownsMutex) { $mutex.ReleaseMutex() }',
+    '  $mutex.Dispose()',
     '}',
     '',
   ].join('\r\n')
@@ -3941,7 +4012,7 @@ export function windowsScheduledTaskCreateArgs(
 }
 
 export function windowsScheduledTaskSettingsCommand(taskName = windowsTaskName()): string {
-  return `$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable; Set-ScheduledTask -TaskName ${quotePowerShell(taskName)} -Settings $settings | Out-Null`
+  return `$settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable; Set-ScheduledTask -TaskName ${quotePowerShell(taskName)} -Settings $settings | Out-Null`
 }
 
 export function windowsScheduledTaskQueryCommand(taskName = windowsTaskName()): string {
@@ -4002,6 +4073,10 @@ async function installService(serverUrl: string): Promise<void> {
     const disabledPath = windowsSupervisorDisabledPath()
     const taskName = windowsTaskName()
     const replacing = await isWindowsTaskInstalled(taskName)
+    // Quiesce the old code BEFORE replacing its scripts/task definition. /F
+    // updates configuration but does not stop already-running watchdogs.
+    await writeFile(disabledPath, '', 'utf8')
+    await quiesceWindowsDaemons(taskName)
     await writeFile(scriptPath, renderWindowsSupervisor(serverUrl, logPath, disabledPath, servicePath), 'utf8')
     await writeFile(launcherPath, renderWindowsSupervisorLauncher(scriptPath), 'utf8')
     try {
@@ -4023,12 +4098,6 @@ async function installService(serverUrl: string): Promise<void> {
       }
       throw err
     }
-    await writeFile(disabledPath, '', 'utf8')
-    await killRunningDaemons()
-    await stopWindowsWatchdog(taskName)
-    // The old watchdog could have spawned a daemon between the first process
-    // sweep and its own exit. Sweep once more only after it cannot relaunch one.
-    await killRunningDaemons()
     await rm(disabledPath, { force: true })
     try {
       await execFileP('schtasks.exe', ['/Run', '/TN', taskName])
@@ -4141,7 +4210,7 @@ export async function restartService(hooks: RestartServiceHooks = {}): Promise<v
  *  match incidentally elsewhere in the command line. */
 export const ONE_SHOT_FLAGS = [
   'stop', 'status', 'restart', 'logs', 'version', 'install-service',
-  'uninstall-service', 'pair', 'doctor', 'provider', 'help',
+  'uninstall-service', 'pair', 'doctor', 'provider', 'help', 'prepare-service-start',
 ] as const
 const ONE_SHOT_FLAG_RE = new RegExp(`--(?:${ONE_SHOT_FLAGS.join('|')})\\b`)
 
@@ -4212,25 +4281,29 @@ export function isWindowsSupervisorProcess(
   if (!item.Name || !['powershell.exe', 'pwsh.exe'].includes(item.Name.toLowerCase())) return false
   const match = item.CommandLine.match(/(?:^|\s)-File\s+(?:"([^"]+)"|(\S+))(?:\s|$)/i)
   const invokedScript = match?.[1] ?? match?.[2]
-  return invokedScript?.toLowerCase() === scriptPath.toLowerCase()
+  return !!invokedScript && win32.resolve(invokedScript).toLowerCase() === win32.resolve(scriptPath).toLowerCase()
 }
 
-async function stopWindowsWatchdog(taskName: string): Promise<void> {
-  await execFileP('schtasks.exe', ['/End', '/TN', taskName]).catch(() => { /* deleted/already stopped */ })
+async function stopWindowsWatchdog(taskName: string, endTask = true): Promise<void> {
+  if (endTask) await execFileP('schtasks.exe', ['/End', '/TN', taskName]).catch(() => { /* deleted/already stopped */ })
+  // Startup preparation runs UNDER the new watchdog. Never end its task or
+  // kill its parent while removing surviving pre-mutex supervisors.
+  const list = async () => (await windowsSupervisorProcesses()).filter(item =>
+    item.ProcessId !== process.pid && item.ProcessId !== process.ppid)
   const deadline = Date.now() + 2_000
-  let watchdogs = await windowsSupervisorProcesses()
+  let watchdogs = await list()
   while (watchdogs.length > 0 && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 100))
-    watchdogs = await windowsSupervisorProcesses()
+    watchdogs = await list()
   }
   for (const watchdog of watchdogs) {
     await execFileP('taskkill.exe', ['/PID', String(watchdog.ProcessId), '/T', '/F']).catch(() => {})
   }
   const forceDeadline = Date.now() + 2_000
-  watchdogs = await windowsSupervisorProcesses()
+  watchdogs = await list()
   while (watchdogs.length > 0 && Date.now() < forceDeadline) {
     await new Promise((resolve) => setTimeout(resolve, 100))
-    watchdogs = await windowsSupervisorProcesses()
+    watchdogs = await list()
   }
   if (watchdogs.length > 0) {
     throw new Error(`Windows watchdog process(es) still running: ${watchdogs.map((item) => item.ProcessId).join(', ')}`)
@@ -4387,6 +4460,46 @@ async function printStatus(): Promise<void> {
 
 const RUNNING_STATE_PATH = join(CONFIG_DIR, 'running.json')
 
+/** Pre-lock releases do not participate in the kernel lock. Never overwrite
+ * their status file and begin hosting beside them; service preparation must
+ * stop them first. PID reuse is checked against the actual command line. */
+async function refuseLiveLegacyDaemon(): Promise<void> {
+  let pid: number | undefined
+  try { pid = (JSON.parse(await readFile(RUNNING_STATE_PATH, 'utf8')) as { pid?: number }).pid }
+  catch { return }
+  if (!Number.isInteger(pid) || !pid || pid <= 0 || pid === process.pid) return
+  try { process.kill(pid, 0) }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ESRCH') return; throw error }
+  const command = await commandLineForPid(pid)
+  if (isStoppableDaemonCommand(command)) {
+    throw new Error(`[computer] daemon startup refused: legacy daemon PID ${pid} is still running (${RUNNING_STATE_PATH}, verified by live PID and command line). Stop the old supervisor via --restart/--install-service before starting this version.`)
+  }
+}
+
+/** A second daemon sweep closes the old watchdog's spawn-during-stop race.
+ * Shared by install/upgrade and scheduled startup; stop failures abort startup. */
+export async function quiesceWindowsDaemons(
+  taskName: string,
+  endTask = true,
+  hooks = { stopDaemons: killRunningDaemons, stopWatchdog: stopWindowsWatchdog },
+): Promise<void> {
+  await hooks.stopDaemons()
+  await hooks.stopWatchdog(taskName, endTask)
+  await hooks.stopDaemons()
+}
+
+async function prepareWindowsServiceStart(): Promise<void> {
+  if (process.platform !== 'win32' || !SUPERVISED) throw new Error('--prepare-service-start is reserved for the Windows supervisor')
+  const parent = await commandLineForPid(process.ppid)
+  if (!isWindowsSupervisorProcess({ ProcessId: process.ppid, Name: 'powershell.exe', CommandLine: parent })) {
+    throw new Error('--prepare-service-start requires the installed supervisor as parent')
+  }
+  const disabledPath = windowsSupervisorDisabledPath()
+  await writeFile(disabledPath, '', 'utf8')
+  await quiesceWindowsDaemons(windowsTaskName(), false)
+  await rm(disabledPath, { force: true })
+}
+
 /** On startup the live daemon records {version, pid, startedAt} here so
  *  `--status` can report the running instance's exact version — verified by pid
  *  so a stale file (from a since-exited process) is ignored. */
@@ -4518,6 +4631,7 @@ export async function runComputerDaemon(argv: string[]): Promise<void> {
   const args = parseArgs(argv)
   if (args.provider !== undefined && !args.doctor) throw new Error('--provider requires --doctor')
   if (args.help) { console.log(helpText()); return }
+  if (args.prepareServiceStart) { await prepareWindowsServiceStart(); return }
   if (args.version) { console.log(CURRENT_VERSION); return }
   if (args.doctor) { await runDoctor(args.provider); return }
   if (args.restart) { await restartService(); return }

@@ -20,6 +20,7 @@ import { afterEach, test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import assert from 'node:assert/strict'
 import { getAdapter, type EngineHopReport, type EngineRunResult } from '../agents/computer/engine.js'
+import { EngineSessionStore } from '../agents/computer/session-store.js'
 
 const IS_WIN = process.platform === 'win32'
 const ORIGINAL_PATH = process.env.PATH
@@ -188,6 +189,43 @@ async function fakeLog(f: Fixture): Promise<Array<{ argv: string[]; stdin: strin
 }
 
 const noop = { onLog: () => {}, signal: new AbortController().signal }
+
+test('Codex one-shot logs match argv and disk state never promises an unperformed resume', async t => {
+  const f = await fixture(FAKE_CODEX_EXEC)
+  process.env.CUMORA_CODEX_NO_APP_SERVER = '1'
+  const adapter = getAdapter('codex')
+  const store = new EngineSessionStore(join(f.root, 'sessions'), 'test-agent', 'codex')
+  await store.save('original-saved-thread')
+  const lines: string[] = []
+  t.mock.method(console, 'log', (...args: unknown[]) => { lines.push(args.join(' ')) })
+  const runner = { agent: { id: 'test-agent' }, engine: 'codex', adapter, sessionStore: store, sessionId: null } as unknown as AgentRunner
+  await AgentRunner.prototype['loadSessionId'].call(runner)
+  assert.equal(AgentRunner.prototype['resumeSessionId'].call(runner), null)
+  assert.match(lines.join('\n'), /loaded last codex execution.*one-shot codex exec; not resumed/)
+  assert.doesNotMatch(lines.join('\n'), /will --resume|continuity across restart/)
+  assert.equal(adapter.startSession?.({ home: f.home, env: f.env, standingPrompt: '', ...noop }), null)
+  // Even a direct adapter caller supplying a saved id receives an honest log.
+  const result = await adapter.run({ home: f.home, env: f.env, prompt: 'hello', resumeSessionId: 'original-saved-thread', ...noop,
+    onLog: line => lines.push(line),
+  })
+  assert.equal(result.exitCode, 0, result.error)
+  assert.equal(result.sessionId, '0199a213-81c0-7800-8aa1-bbab2a035a53')
+  const [call] = await fakeLog(f)
+  assert.ok(call.argv.includes('exec'))
+  assert.ok(!call.argv.some(arg => ['resume', '--resume', 'original-saved-thread'].includes(arg)))
+  assert.match(lines.join('\n'), /one-shot codex exec; starting fresh, session not resumed/)
+  AgentRunner.prototype['setSessionId'].call(runner, result.sessionId ?? null)
+  await store.flush()
+  assert.match(lines.join('\n'), /saved codex session.*last execution only; not a resume target/)
+  assert.equal(await store.load(), result.sessionId)
+  assert.equal(AgentRunner.prototype['resumeSessionId'].call(runner), null)
+})
+
+test('Windows Codex reports one-shot mode even without an app-server opt-out', { skip: !IS_WIN }, () => {
+  delete process.env.CUMORA_CODEX_NO_APP_SERVER
+  delete process.env.CUMORA_CODEX_ARGS
+  assert.equal(getAdapter('codex').sessionResumeUnavailableReason?.(), 'Windows one-shot codex exec')
+})
 
 test('codex exec --json reports turn.completed usage as one hop without reading a local DB', async () => {
   const f = await fixture(FAKE_CODEX_EXEC)

@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import type { PoolClient } from 'pg'
 import { pool } from './db/pool.js'
-import { automationEnabled, automationNumber, createOperationsWorker } from './settings.js'
+import { automationNumber, createOperationsWorker } from './settings.js'
 import {
   messageAttachmentStorageKey,
   normalizeStorageKey,
@@ -145,9 +145,13 @@ export async function findReferencedStorageKeys(keys: string[], client?: PoolCli
 }
 
 async function defaultDeleteAgentRuntime(agentId: string): Promise<void> {
-  if (!automationEnabled('workspace_runtime_cleanup_enabled')) return
+  // agent_ids is captured before the tenant rows are removed. Do not resolve
+  // placement from the now-deleted participant, or let a legacy opt-out turn
+  // skipped runtime cleanup into a successfully completed durable job.
   const { deletePod, deleteChromeProfilePvc } = await import('./agents/runtime/orchestrator.js')
-  await Promise.all([deletePod(agentId), deleteChromeProfilePvc(agentId)])
+  await deletePod(agentId)
+  // PVC protection can only finish once its consuming Pod is gone.
+  await deleteChromeProfilePvc(agentId, { waitForDeletion: true })
 }
 
 async function performCleanup(job: CleanupJob, dependencies: WorkspaceCleanupDependencies): Promise<void> {
@@ -158,7 +162,10 @@ async function performCleanup(job: CleanupJob, dependencies: WorkspaceCleanupDep
       throw new Error(`storage deletion failed for ${key}`)
     }
   }
-  await Promise.all(job.agent_ids.map(dependencies.deleteAgentRuntime))
+  const results = await Promise.allSettled(job.agent_ids.map(dependencies.deleteAgentRuntime))
+  for (const result of results) {
+    if (result.status === 'rejected') throw result.reason
+  }
 }
 
 async function markCompleted(id: string): Promise<void> {
@@ -216,6 +223,7 @@ export async function drainWorkspaceCleanupJobs(options: {
       completed += 1
     } catch (error) {
       await markFailed(row, error)
+      console.warn(`[workspace-cleanup] job ${row.id} failed; cleanup will retry:`, error instanceof Error ? error.message : String(error))
       failed += 1
     }
   }))
