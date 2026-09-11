@@ -100,7 +100,7 @@ export const SCHEMA_MIGRATIONS = [
   {
     version: 17,
     name: '0017_agent_message_consumptions',
-    checksum: 'ec45f4f9ee5c87bfcd1c5be5ae80fe680aa026eb81e2df17170052cdc4c24358',
+    checksum: '86d9248919580d966126e5fdcf5aebf58175e1079b92fd0e8790f94cd8914ba6',
   },
 ] as const satisfies readonly MigrationMetadata[]
 
