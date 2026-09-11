@@ -1057,12 +1057,18 @@ function ResourceApplication({ agentId, refresh, saving }: { agentId: string | n
     : state?.status === 'failed' ? (translate(zh ? 'zh-CN' : 'en', 'settings.applicationFailed')) : (translate(zh ? 'zh-CN' : 'en', 'settings.pendingApplication'))
   // Keep every status/detail in its own intrinsic-height row, including when
   // the panel reaches its scroll limit. Do not compress rows to fit that limit.
-  return <div
-    className="px-6 py-3 border-t border-ink-100 text-[12px] shrink-0 min-w-0 max-h-[30vh] overflow-y-auto break-words"
-    style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr)', gridAutoRows: 'max-content', rowGap: 6, lineHeight: 1.625 }}
-    aria-live="polite"
-  >
-    <div className="font-semibold">{translate(zh ? 'zh-CN' : 'en', 'settings.skillsMcpResourceApplication')}</div>
+  const summary = saving ? translate(zh ? 'zh-CN' : 'en', 'settings.savingApplicationStatusWillRefreshAfterSaving')
+    : error ? translate(zh ? 'zh-CN' : 'en', 'settings.applicationStatusUnavailable')
+    : state ? label : translate(zh ? 'zh-CN' : 'en', 'settings.loadingApplicationStatus')
+  return <details className="px-6 py-3 border-t border-ink-100 text-[12px] shrink-0 min-w-0">
+    <summary className="cursor-pointer select-none font-semibold" aria-live="polite">
+      {translate(zh ? 'zh-CN' : 'en', 'settings.skillsMcpResourceApplication')}
+      <span className="ml-2 font-normal text-ink-500">{summary}</span>
+    </summary>
+    <div
+      className="mt-2 max-h-[30vh] overflow-y-auto break-words"
+      style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr)', gridAutoRows: 'max-content', rowGap: 6, lineHeight: 1.625 }}
+    >
     {saving ? <div>{translate(zh ? 'zh-CN' : 'en', 'settings.savingApplicationStatusWillRefreshAfterSaving')}</div>
       : error ? <div role="alert" className="text-coral-deep">{translate(zh ? 'zh-CN' : 'en', 'settings.applicationStatusUnavailable')}{error}</div>
       : state ? <>
@@ -1073,8 +1079,9 @@ function ResourceApplication({ agentId, refresh, saving }: { agentId: string | n
         {state.status === 'failed' && <div role="alert" className="text-coral-deep">{state.error ?? (translate(zh ? 'zh-CN' : 'en', 'settings.theRuntimeCouldNotApplyResources'))}</div>}
       </> : <div>{translate(zh ? 'zh-CN' : 'en', 'settings.loadingApplicationStatus')}</div>}
     <div className="text-ink-500">{translate(zh ? 'zh-CN' : 'en', 'settings.savedChangesApplyAtTheNextSafeTurnBoundary')}</div>
-    <button type="button" disabled={saving} className="underline mt-1 justify-self-start text-left" onClick={() => setReload((n) => n + 1)}>{translate(zh ? 'zh-CN' : 'en', 'settings.refreshApplicationStatus')}</button>
-  </div>
+      <button type="button" disabled={saving} className="underline mt-1 justify-self-start text-left" onClick={() => setReload((n) => n + 1)}>{translate(zh ? 'zh-CN' : 'en', 'settings.refreshApplicationStatus')}</button>
+    </div>
+  </details>
 }
 
 function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
