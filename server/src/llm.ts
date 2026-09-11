@@ -163,8 +163,11 @@ async function routePlatformForModel(
   if (context.baseURL !== baseURL || !sameKeyMap(context.keys, keys)) {
     throw new Error('Tenant LLM authorization changed; resolve the client again')
   }
-  const snapshot = await tenantRoutingSnapshot(context)
-  if (!snapshot) return fallback
+  const snapshot = await tenantRoutingSnapshot(context, undefined, { waitMs: 16_000 })
+  // A cold catalog must not send a non-OpenAI model to the OpenAI key: wait for
+  // the bounded discovery above and fail retryable if it never lands, instead
+  // of silently picking the wrong platform.
+  if (!snapshot) throw new Error('Tenant LLM discovery unavailable; resolve the client again')
   if (snapshot.authorizationVersion !== context.authorizationVersion) {
     throw new Error('Tenant LLM authorization changed; resolve the client again')
   }

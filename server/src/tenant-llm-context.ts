@@ -201,7 +201,7 @@ export async function tenantModelSnapshot(context: TenantLlmContext, refresh = f
 }
 
 /** Business routes use only this authorization version; refresh never blocks a warm call. */
-export async function tenantRoutingSnapshot(context: TenantLlmContext, signal?: AbortSignal): Promise<TenantModelSnapshot | null> {
+export async function tenantRoutingSnapshot(context: TenantLlmContext, signal?: AbortSignal, options: { waitMs?: number } = {}): Promise<TenantModelSnapshot | null> {
   signal?.throwIfAborted()
   assertTenantLlmContextCurrent(context)
   const existing = snapshots.get(context.companyId)
@@ -212,7 +212,10 @@ export async function tenantRoutingSnapshot(context: TenantLlmContext, signal?: 
   // Background discovery can fail after the caller has returned or cancelled.
   void refresh.catch(() => {})
   if (previous && !hasExpiredMembership(previous)) return previous
-  // Discovery is advisory. Cold/expired catalogs never block explicit routes or
-  // configured direct fallback; a later call can use the background result.
-  return null
+  // Discovery is advisory for the candidate planner: a cold catalog never blocks
+  // explicit routes or the configured direct fallback. A caller that routes by
+  // model name alone (the legacy client proxy) passes waitMs, because returning
+  // null there silently sends a non-OpenAI model to the OpenAI key.
+  if (!options.waitMs) return null
+  return waitForLlmResolution(refresh, options.waitMs, signal)
 }
