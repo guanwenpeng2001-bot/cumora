@@ -140,7 +140,7 @@ test('runner replacement waits for in-flight triage and cannot respawn a stopped
   await Promise.resolve()
   assert.equal(internals.teardown.signal.aborted, true)
   assert.equal(stopped, false, 'the replacement must not start while old triage is alive')
-  assert.equal(internals.ensureEngineSession(), null)
+  assert.throws(() => internals.ensureEngineSession(), { name: 'AbortError' })
   finish()
   await stopping
   assert.equal(stopped, true)
