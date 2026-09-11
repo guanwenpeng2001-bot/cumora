@@ -99,6 +99,9 @@ WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY package.json package-lock.json ./
 COPY server ./server
+# Shared contracts live outside server/ (the SPA imports them too), so the
+# server image has to carry them or `/app/server/src/models/*` fails to load.
+COPY shared ./shared
 # Keep `bin/cumora` available for any in-process CLI calls the server
 # itself might make (e.g. from the test endpoints).
 COPY bin ./bin
