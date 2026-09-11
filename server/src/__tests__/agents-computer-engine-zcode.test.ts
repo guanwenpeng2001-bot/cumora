@@ -42,7 +42,7 @@ rl.on('line', (line) => {
   const fail = (message) => out({ jsonrpc: '2.0', id: req.id, error: { message } })
   if (req.method === 'initialize') return reply({})
   if (req.method === 'session/load') {
-    if (mode === 'stale-load') return fail('Internal error')
+    if (mode === 'stale-load') return fail('Session not found')
     loaded = true
     return reply({ sessionId: req.params.sessionId })
   }
@@ -121,6 +121,7 @@ test('zcode persistent session pins the model once and rides one session across 
   await session.stop()
 
   assert.equal(first.exitCode, 0)
+  assert.equal(first.executionPhase, 'completed')
   assert.equal(first.sessionId, 'fresh-1')
   assert.equal(second.exitCode, 0)
   assert.equal(second.sessionId, 'fresh-1', 'the same bridge session carries both wakes')
@@ -214,6 +215,7 @@ test('zcode a bridge dying MID-TURN resolves the turn as a failure, never reject
   await session.stop()
 
   assert.equal(result.exitCode, 3)
+  assert.equal(result.executionPhase, 'prompt-submitted')
   assert.ok(result.error)
   assert.notEqual(result.failure?.kind, 'resume-not-found', 'no resume involved — the generic classifier owns this kind')
 })

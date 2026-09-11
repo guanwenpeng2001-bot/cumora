@@ -682,12 +682,12 @@ export interface EngineFailure {
 }
 
 const RESUME_NOT_FOUND_RE = new RegExp([
-  String.raw`\bno (?:such )?(?:\w+ )?(?:conversation|session|thread)s?\b`,
-  String.raw`\b(?:conversation|session|thread)s?(?: id)?\b[^\n]{0,24}?\b(?:not found|no longer exists?|do(?:es)? not exist|doesn't exist|has expired|is expired|is invalid|is unknown)\b`,
-  String.raw`\b(?:invalid|unknown|expired|stale|malformed) (?:\w+ )?(?:conversation|session|thread)s?\b`,
-  String.raw`\b(?:could ?n(?:o|')?t|cannot|can't|unable to|failed to)\b[^\n]{0,24}?\bresume\b`,
-  String.raw`\bthread/resume failed\b`,
-  // zcode-acp-server: backend session gone; not in the generic "not found" set.
+  String.raw`\bno (?:conversation|session|thread) found\b`,
+  String.raw`\bno such (?:conversation|session|thread)(?=\s*(?:$|[.:,;\n]|with (?:id|ID)\b))`,
+  // An identifier must be explicitly labelled or quoted; do not bridge arbitrary
+  // prose such as "session resume request failed: endpoint not found".
+  String.raw`\b(?:conversation|session|thread)(?:(?:\s+id\s*:?\s*|\s*:\s*)[a-z0-9_-]+|\s+["'][^"'\n]+["'])?\s+(?:was |is )?(?:not found|no longer exists?|do(?:es)? not exist|doesn't exist|has expired|expired)\b`,
+  String.raw`\b(?:unknown|expired) (?:conversation|session|thread)(?=\s*(?:$|[.:,;\n]|id\b))`,
   String.raw`\bsession is not active\b`,
 ].join('|'), 'i')
 
@@ -746,7 +746,13 @@ function classifyEngineResult(result: EngineRunResult, hadResume = false): Engin
   return result
 }
 
+export type EngineExecutionPhase = 'not-started' | 'prompt-submitted' | 'effects-possible' | 'completed'
+
 export interface EngineRunResult {
+  /** Only explicit not-started permits replay. Set before attempting the prompt
+   * write: asynchronous pipe errors cannot prove the peer received no bytes.
+   * completed means a successful protocol terminal, not merely process exit 0. */
+  executionPhase?: EngineExecutionPhase
   exitCode: number
   /** Concise operator-facing compatibility field. New control flow must use
    * `failure.kind`, never parse this presentation string. */
@@ -854,6 +860,8 @@ export interface EngineHopReport {
 
 /** Args to start a PERSISTENT engine session (spawned ONCE per agent). */
 export interface EngineSessionArgs {
+  /** Lifetime cancellation, including handshake and queued prompts. */
+  signal?: AbortSignal
   home: string
   env: NodeJS.ProcessEnv
   model?: string | null
@@ -875,6 +883,14 @@ export interface EngineSessionArgs {
    *  inserts upstream so the universal ledger sees BYOA trajectory at the same
    *  granularity it sees cloud trajectory. Omit to disable. */
   onHopUsage?: (report: EngineHopReport) => void
+}
+
+function bindSessionAbort(child: ChildProcess, signal: AbortSignal | undefined, abort: () => void): void {
+  if (!signal) return
+  const cancel = () => { abort() }
+  signal.addEventListener('abort', cancel, { once: true })
+  child.once('close', () => signal.removeEventListener('abort', cancel))
+  if (signal.aborted) cancel()
 }
 
 /** A long-lived engine process for ONE agent. Spawned once; each wake feeds a
@@ -1144,7 +1160,7 @@ function spawnEngine(
   bin: string,
   args: string[],
   { home, env, onLog, signal, onHopUsage }: EngineRunArgs,
-  spawnOpts: { shell?: boolean; stdinText?: string; onStdoutLine?: (line: string) => void } = {},
+  spawnOpts: { shell?: boolean; stdinText?: string; onStdoutLine?: (line: string) => void; requireResult?: boolean } = {},
 ): Promise<EngineRunResult> {
   return new Promise((resolve, reject) => {
     const child = spawnEngineChild(bin, args, {
@@ -1161,6 +1177,8 @@ function spawnEngine(
 
     const stderrTail: string[] = []
     const stdoutTail: string[] = []
+    let sawResult = false
+    let terminalError: string | undefined
     let sessionId: string | null = null
     let usage: EngineUsage | undefined
     let model: string | null = null
@@ -1195,9 +1213,9 @@ function spawnEngine(
         // Sniff the engine's session id (to `--resume` next wake), the final
         // `result` event's usage (cache-aware cost), and the actual model id
         // (real pricing). Cheap: only parse stdout JSON objects carrying one.
-        if (stream === 'stdout' && cleaned.startsWith('{') && (cleaned.includes('"session_id"') || cleaned.includes('"sessionID"') || cleaned.includes('"usage"') || cleaned.includes('"model"'))) {
+        if (stream === 'stdout' && cleaned.startsWith('{')) {
           try {
-            const obj = JSON.parse(cleaned) as { session_id?: unknown; sessionID?: unknown; type?: unknown; usage?: EngineUsage; model?: unknown; message?: { model?: unknown; usage?: EngineUsage; content?: unknown } }
+            const obj = JSON.parse(cleaned) as { session_id?: unknown; sessionID?: unknown; type?: unknown; is_error?: unknown; result?: unknown; subtype?: unknown; usage?: EngineUsage; model?: unknown; message?: { model?: unknown; usage?: EngineUsage; content?: unknown } }
             const sniffedSessionId = typeof obj.session_id === 'string' ? obj.session_id : obj.sessionID
             if (typeof sniffedSessionId === 'string' && sniffedSessionId) sessionId = sniffedSessionId
             // The terminal `result` event carries the authoritative turn total.
@@ -1219,7 +1237,11 @@ function spawnEngine(
             } else if (hopStartedAt == null && (obj.type === 'assistant' || obj.type === 'user' || obj.type === 'system')) {
               hopStartedAt = Date.now()
             }
-            if (obj.type === 'result') { hopStartedAt = null; hopIndex = 0 }
+            if (obj.type === 'result') {
+              sawResult = true
+              if (obj.is_error === true) terminalError = engineDiagnosticText(cleaned) || `engine turn error (${String(obj.subtype ?? 'result.is_error')})`
+              hopStartedAt = null; hopIndex = 0
+            }
           } catch { /* partial / non-json line — ignore */ }
         }
         if (stream === 'stdout') spawnOpts.onStdoutLine?.(cleaned)
@@ -1240,10 +1262,16 @@ function spawnEngine(
       settled = true
       abort.dispose()
       await abort.wait()
-      const exitCode = code ?? (signalName ? 128 : 1)
+      const processCode = code ?? (signalName ? 128 : 1)
+      const protocolError = terminalError ?? (spawnOpts.requireResult && !sawResult ? 'engine stream ended without terminal result' : undefined)
+      const exitCode = processCode || (protocolError ? 1 : 0)
       resolve({
         exitCode,
-        error: exitCode === 0 ? undefined : failurePreview({ exitCode, signalName, stderr: stderrTail, stdout: stdoutTail }),
+        error: exitCode === 0 ? undefined : [
+          terminalError,
+          processCode !== 0 ? failurePreview({ exitCode: processCode, signalName, stderr: stderrTail, stdout: stdoutTail }) : undefined,
+          !terminalError ? protocolError : undefined,
+        ].filter(Boolean).join('\n'),
         sessionId,
         usage,
         model,
@@ -1497,6 +1525,7 @@ const PERSONA_HEADER = (
  *  on that turn's `result` event — so wakes 2..N skip the cold start the one-shot
  *  `run()` pays each time. The daemon calls `send()` serially (one turn at a time). */
 class ClaudeSession implements EngineSession {
+  private phase: EngineExecutionPhase = 'not-started'
   private readonly child: ChildProcess
   private readonly onLog: (line: string) => void
   private readonly onHopUsage?: (r: EngineHopReport) => void
@@ -1535,12 +1564,15 @@ class ClaudeSession implements EngineSession {
     // .cmd shim runs (Node can't spawn it with shell:false). The prompt already
     // travels via stdin (stream-json), so no arg-quoting concerns here.
     const { command, shell } = resolveSpawn(bin)
+    opts.signal?.throwIfAborted()
     this.child = spawnEngineChild(command, args, { cwd: opts.home, env: opts.env, stdio: ['pipe', 'pipe', 'pipe'], shell })
     this.child.stdout?.on('data', (b: Buffer) => this.onStdout(b))
     this.child.stderr?.on('data', (b: Buffer) => this.onStderr(b))
     this.child.on('error', (err) => this.die(1, err.message))
     this.child.on('close', (code, signalName) =>
       this.die(code ?? (signalName ? 128 : 1), signalName ? `terminated by ${signalName}` : `exited with code ${code}`))
+    bindSessionAbort(this.child, opts.signal, () => { this.die(130, 'engine session aborted'); void this.stop({ force: true }) })
+
   }
 
   get alive(): boolean { return !this.exited && this.child.stdin?.writable === true }
@@ -1548,13 +1580,14 @@ class ClaudeSession implements EngineSession {
 
   send(prompt: string): Promise<EngineRunResult> {
     if (this.pending) {
-      return Promise.resolve(classifyEngineResult({ exitCode: 1, error: 'engine session busy — a turn is already in flight', sessionId: this.sid }, this.resumePending))
+      return Promise.resolve(classifyEngineResult({ executionPhase: 'not-started', exitCode: 1, error: 'engine session busy — a turn is already in flight', sessionId: this.sid }, this.resumePending))
     }
     if (!this.alive) {
       const exitCode = this.exitCode || 1
       const detail = failurePreview({ exitCode, signalName: null, stderr: this.stderrTail, stdout: this.stdoutTail })
-      return Promise.resolve(classifyEngineResult({ exitCode, error: detail || 'engine session is not alive (process gone)', sessionId: this.sid }, this.resumePending))
+      return Promise.resolve(classifyEngineResult({ executionPhase: 'not-started', exitCode, error: detail || 'engine session is not alive (process gone)', sessionId: this.sid }, this.resumePending))
     }
+    this.phase = 'not-started'
     return new Promise<EngineRunResult>((resolve) => {
       this.pending = { resolve, stderr: [], stdout: [] }
       // Opt-in runaway backstop only (CUMORA_TURN_TIMEOUT_MS); OFF by default so a
@@ -1568,6 +1601,7 @@ class ClaudeSession implements EngineSession {
         this.pendingTimer.unref?.()
       }
       const msg = JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: stripLoneSurrogates(prompt) }] } }) + '\n'
+      this.phase = 'prompt-submitted'
       if (!writeStdin(this.child, msg)) {
         this.settle({ exitCode: 1, error: 'failed to write turn to engine (stdin closed)', sessionId: this.sid })
       }
@@ -1645,6 +1679,7 @@ class ClaudeSession implements EngineSession {
       // ran without our intervention; the small per-turn delta keeps it able to.
       if (ev.subtype === 'status' && ev.status === 'compacting') this.onLog('[claude] native context compaction started')
       else if (ev.subtype === 'compact_boundary') this.onLog('[claude] native context compaction finished')
+      if (this.pending && ev.type === 'assistant') this.phase = 'effects-possible'
       if (ev.type === 'result') {
         this.hopStartedAt = null // turn boundary — drop any half-set hop timer
         this.hopIndex = 0        // reset the per-turn hop counter
@@ -1660,6 +1695,7 @@ class ClaudeSession implements EngineSession {
         const wasResume = this.resumePending
         this.resumePending = false
         this.settle({
+          executionPhase: isErr ? this.phase : 'completed',
           exitCode: isErr ? 1 : 0,
           error: isErr ? message : undefined,
           failure: isErr ? {
@@ -1695,7 +1731,7 @@ class ClaudeSession implements EngineSession {
     if (this.pendingTimer) { clearTimeout(this.pendingTimer); this.pendingTimer = null }
     const p = this.pending
     this.pending = null
-    if (p) p.resolve(classifyEngineResult(r, this.resumePending))
+    if (p) p.resolve(classifyEngineResult({ executionPhase: this.phase, ...r }, this.resumePending))
   }
 
   /** Process died (error/close). Mark dead and fail any in-flight turn. */
@@ -1998,11 +2034,12 @@ class ClaudeAdapter implements EngineAdapter {
     const argv = wantsStdinPrompt ? base : (flags.length ? [...base, args.prompt] : ['-p', args.prompt, ...base.slice(1)])
     // Agent turns can be substantial engineering/design work. Preserve the
     // operator's reasoning preferences; only triage/doctor force thinking off.
-    return spawnEngine(command, argv, { ...args, env }, { shell, stdinText: wantsStdinPrompt ? args.prompt : undefined })
+    return spawnEngine(command, argv, { ...args, env }, { shell, stdinText: wantsStdinPrompt ? args.prompt : undefined, requireResult: base.includes('stream-json') })
       .then((result) => classifyEngineResult(result, !!args.resumeSessionId))
   }
 
   startSession(args: EngineSessionArgs): EngineSession | null {
+    args.signal?.throwIfAborted()
     // Respect a user's custom flag override (CUMORA_CLAUDE_ARGS) by NOT using the
     // persistent path — those flags are tuned for the one-shot run; fall back to run().
     if (unsafeEngineArgs('CUMORA_CLAUDE_ARGS').length) return null
@@ -2282,6 +2319,7 @@ function codexExecErrorMessage(event: CodexExecEvent): string | null {
  *  `turn.completed` carrying OpenAI-shaped usage. One hop per turn — same
  *  granularity as Gemini / the app-server path. */
 class CodexExecTurnTracker {
+  completed = false
   sessionId: string | null = null
   model: string | null = null
   usage: EngineUsage | undefined
@@ -2316,6 +2354,7 @@ class CodexExecTurnTracker {
       return
     }
     if (event.type !== 'turn.completed') return
+    this.completed = true
     this.finish(codexNativeUsage(event.usage))
   }
 
@@ -2348,15 +2387,15 @@ async function spawnCodexExec(
     processResult = await spawnEngine(
       command,
       argv,
+      args,
       {
-        ...args,
-        onLog: (line) => {
+        shell: spawnOpts.shell,
+        stdinText: args.prompt,
+        onStdoutLine: (line) => {
           const event = parseCodexExecLine(line)
           if (event) tracker.observe(event)
-          args.onLog(line)
         },
       },
-      { shell: spawnOpts.shell, stdinText: args.prompt },
     )
   } catch (err) {
     return {
@@ -2369,8 +2408,9 @@ async function spawnCodexExec(
   }
   const eventError = tracker.error
     ? `engine turn error: ${tracker.error.slice(0, MAX_FAILURE_CHARS)}`
-    : null
+    : tracker.completed ? null : 'codex stream ended without turn.completed'
   return {
+    executionPhase: processResult.exitCode === 0 && !eventError ? 'completed' : 'effects-possible',
     exitCode: processResult.exitCode !== 0 ? processResult.exitCode : (eventError ? 1 : 0),
     error: processResult.exitCode !== 0
       ? [processResult.error, eventError].filter(Boolean).join('\n')
@@ -2389,6 +2429,7 @@ async function spawnCodexExec(
  *  prompt as developerInstructions) → turn/start per wake. The daemon calls send()
  *  serially; each resolves on that turn's `turn/completed`. */
 class CodexSession implements EngineSession {
+  private phase: EngineExecutionPhase = 'not-started'
   private readonly child: ChildProcess
   private readonly onLog: (line: string) => void
   private readonly onHopUsage?: (r: EngineHopReport) => void
@@ -2444,11 +2485,13 @@ class CodexSession implements EngineSession {
     this.threadReq = opts.resumeSessionId
       ? { method: 'thread/resume', params: { threadId: opts.resumeSessionId, ...params } }
       : { method: 'thread/start', params }
+    opts.signal?.throwIfAborted()
     this.child = spawnEngineChild(bin, spawnArgs, { cwd: home, env, stdio: ['pipe', 'pipe', 'pipe'], shell: false })
     this.child.stdout?.on('data', (b: Buffer) => this.onStdout(b))
     this.child.stderr?.on('data', (b: Buffer) => { for (const raw of b.toString('utf8').split('\n')) { const l = cleanLine(raw); if (l) this.onLog(l) } })
     this.child.on('error', (err) => this.die(1, err.message))
     this.child.on('close', (code, sig) => this.die(code ?? (sig ? 128 : 1), sig ? `terminated by ${sig}` : `exited with code ${code}`))
+    bindSessionAbort(this.child, opts.signal, () => { this.die(130, 'engine session aborted'); void this.stop({ force: true }) })
     // Begin the handshake once handlers are attached.
     queueMicrotask(() => { this.initializeId = this.req('initialize', { clientInfo: { name: 'cumora-daemon', version: '1.0.0' }, capabilities: { experimentalApi: true } }) })
   }
@@ -2457,8 +2500,9 @@ class CodexSession implements EngineSession {
   get sessionId(): string | null { return this.threadId }
 
   send(prompt: string): Promise<EngineRunResult> {
-    if (this.pending) return Promise.resolve(classifyEngineResult({ exitCode: 1, error: 'engine session busy — a turn is already in flight', sessionId: this.threadId }, this.threadWasResume))
-    if (!this.alive) return Promise.resolve(classifyEngineResult({ exitCode: this.exitCode || 1, error: this.handshakeError ?? 'engine session is not alive (process gone)', sessionId: this.threadId }, this.threadWasResume))
+    if (this.pending) return Promise.resolve(classifyEngineResult({ executionPhase: 'not-started', exitCode: 1, error: 'engine session busy — a turn is already in flight', sessionId: this.threadId }, this.threadWasResume))
+    if (!this.alive) return Promise.resolve(classifyEngineResult({ executionPhase: 'not-started', exitCode: this.exitCode || 1, error: this.handshakeError ?? 'engine session is not alive (process gone)', sessionId: this.threadId }, this.threadWasResume))
+    this.phase = 'not-started'
     return new Promise<EngineRunResult>((resolve) => {
       this.pending = { resolve }
       this.turnStart = { ...this.cum }
@@ -2492,6 +2536,7 @@ class CodexSession implements EngineSession {
   private startTurn(prompt: string): void {
     if (this.threadId) {
       this.turnStartedAt = Date.now()
+      this.phase = 'prompt-submitted'
       this.req('turn/start', { threadId: this.threadId, input: [{ type: 'text', text: stripLoneSurrogates(prompt) }] })
     }
   }
@@ -2526,11 +2571,10 @@ class CodexSession implements EngineSession {
       if (this.threadReq) { this.threadReqId = this.req(this.threadReq.method, this.threadReq.params); this.threadReq = null }
       return
     }
-    // resume_or_fresh: a failed thread/resume — e.g. a stale id, or
-    // a session id left over from a DIFFERENT engine after an engine switch — falls
-    // back to a brand-new thread instead of wedging the agent.
+    // Only an explicit missing thread can open a fresh one before submission.
+    // Authentication, transport and unknown resume errors retain the old ID.
     if (msg.error && msg.id !== undefined && msg.id === this.threadReqId) {
-      if (this.threadWasResume) {
+      if (this.threadWasResume && classifyEngineFailure(String(msg.error.message ?? ''), true) === 'resume-not-found') {
         this.onLog(`[codex] thread/resume failed (${String(msg.error.message || '')}) — starting a fresh thread`)
         this.threadWasResume = false
         this.threadId = null
@@ -2561,6 +2605,7 @@ class CodexSession implements EngineSession {
     }
     // items: observe native compaction; log the commands the agent runs
     // + its final answer (concise signal); a completed item briefly gates steering.
+    if (this.pending && msg.method?.startsWith('item/')) this.phase = 'effects-possible'
     if (msg.method === 'item/started' || msg.method === 'item/completed') {
       const item = msg.params?.item as { type?: unknown; command?: unknown; text?: unknown } | undefined
       const ty = item?.type
@@ -2577,7 +2622,8 @@ class CodexSession implements EngineSession {
     if (msg.method === 'turn/completed') {
       const turn = msg.params?.turn as { status?: unknown; error?: { message?: unknown }; model?: unknown } | undefined
       this.noteActualModel(turn)
-      const failed = turn?.status === 'failed' ? String(turn?.error?.message || 'codex turn failed') : undefined
+      const failed = turn?.status === 'completed' ? undefined : String(turn?.error?.message || `codex turn stopped: ${String(turn?.status ?? 'missing status')}`)
+      if (!failed) this.phase = 'completed'
       // Per-hop trajectory for Codex: app-server doesn't expose per-message
       // usage (only running thread totals via thread/tokenUsage/updated), so
       // the finest granularity we can honestly report is ONE row per turn
@@ -2647,7 +2693,7 @@ class CodexSession implements EngineSession {
   private settle(error?: string): void {
     const p = this.pending
     this.pending = null
-    if (p) p.resolve(classifyEngineResult({ exitCode: error ? 1 : 0, error, sessionId: this.threadId, usage: this.turnUsage(), model: this.actualModel }, this.threadWasResume))
+    if (p) p.resolve(classifyEngineResult({ executionPhase: this.phase, exitCode: error ? 1 : 0, error, sessionId: this.threadId, usage: this.turnUsage(), model: this.actualModel }, this.threadWasResume))
   }
   private failPending(error: string): void {
     if (this.pending) this.settle(error)
@@ -2676,7 +2722,7 @@ class CodexSession implements EngineSession {
     }
     const p = this.pending
     this.pending = null
-    if (p) p.resolve(classifyEngineResult({ exitCode: code, error: why, sessionId: this.threadId, usage: this.turnUsage(), model: this.actualModel }, this.threadWasResume))
+    if (p) p.resolve(classifyEngineResult({ executionPhase: this.phase, exitCode: code || 1, error: why, sessionId: this.threadId, usage: this.turnUsage(), model: this.actualModel }, this.threadWasResume))
   }
 }
 
@@ -2855,6 +2901,7 @@ class CodexAdapter implements EngineAdapter {
   }
 
   startSession(args: EngineSessionArgs): EngineSession | null {
+    args.signal?.throwIfAborted()
     // Escape hatches → fall back to one-shot `codex exec` (run()): a custom-args
     // override, an explicit opt-out, or Windows (JSON-RPC over a .cmd shell is
     // fragile; exec is the safe path there).
@@ -2919,6 +2966,7 @@ type AcpMsg = {
  *  Mid-turn steer is not in the ACP surface Grok exposes — steer() is a no-op
  *  and the daemon's next-wake coalescing carries the ping instead. */
 class GrokSession implements EngineSession {
+  private phase: EngineExecutionPhase = 'not-started'
   private readonly child: ChildProcess
   private readonly onLog: (line: string) => void
   private readonly onHopUsage?: (r: EngineHopReport) => void
@@ -2931,6 +2979,7 @@ class GrokSession implements EngineSession {
   private sessionReqId: number | null = null
   private sessionWasLoad = false
   private readonly sessionNewParams: Record<string, unknown>
+  private handshakeError: string | null = null
   private ready = false
   private pending: { resolve: (r: EngineRunResult) => void; id: number; startedAt: number } | null = null
   private queuedPrompt: string | null = null
@@ -2955,6 +3004,7 @@ class GrokSession implements EngineSession {
     this.sessionNewParams = { cwd: home, mcpServers: [], _meta: meta }
     this.sessionWasLoad = !!opts.resumeSessionId
     const grokEnv: NodeJS.ProcessEnv = { ...env, GROK_DISABLE_AUTOUPDATER: env.GROK_DISABLE_AUTOUPDATER ?? '1' }
+    opts.signal?.throwIfAborted()
     this.child = spawnEngineChild(bin, spawnArgs, { cwd: home, env: grokEnv, stdio: ['pipe', 'pipe', 'pipe'], shell: false })
     this.child.stdout?.on('data', (b: Buffer) => this.onStdout(b))
     this.child.stderr?.on('data', (b: Buffer) => {
@@ -2965,6 +3015,7 @@ class GrokSession implements EngineSession {
     })
     this.child.on('error', (err) => this.die(1, err.message))
     this.child.on('close', (code, sig) => this.die(code ?? (sig ? 128 : 1), sig ? `terminated by ${sig}` : `exited with code ${code}`))
+    bindSessionAbort(this.child, opts.signal, () => { this.die(130, 'engine session aborted'); void this.stop({ force: true }) })
     queueMicrotask(() => {
       this.initializeId = this.req('initialize', {
         protocolVersion: 1,
@@ -2978,8 +3029,9 @@ class GrokSession implements EngineSession {
   get sessionId(): string | null { return this.sid }
 
   send(prompt: string): Promise<EngineRunResult> {
-    if (this.pending) return Promise.resolve({ exitCode: 1, error: 'engine session busy — a turn is already in flight', sessionId: this.sid })
-    if (!this.alive) return Promise.resolve({ exitCode: this.exitCode || 1, error: 'engine session is not alive (process gone)', sessionId: this.sid })
+    if (this.pending) return Promise.resolve({ executionPhase: 'not-started', exitCode: 1, error: 'engine session busy — a turn is already in flight', sessionId: this.sid })
+    if (!this.alive) return Promise.resolve({ executionPhase: 'not-started', exitCode: this.exitCode || 1, error: this.handshakeError ?? 'engine session is not alive (process gone)', sessionId: this.sid })
+    this.phase = 'not-started'
     return new Promise<EngineRunResult>((resolve) => {
       this.pending = { resolve, id: 0, startedAt: Date.now() }
       if (this.ready && this.sid) this.startPrompt(prompt)
@@ -3011,6 +3063,7 @@ class GrokSession implements EngineSession {
 
   private startPrompt(prompt: string): void {
     if (!this.sid || !this.pending) return
+    this.phase = 'prompt-submitted'
     const id = this.req('session/prompt', {
       sessionId: this.sid,
       prompt: [{ type: 'text', text: stripLoneSurrogates(prompt) }],
@@ -3045,7 +3098,7 @@ class GrokSession implements EngineSession {
       return
     }
     if (msg.error && msg.id !== undefined && msg.id === this.sessionReqId) {
-      if (this.sessionWasLoad) {
+      if (this.sessionWasLoad && classifyEngineFailure(String(msg.error.message ?? ''), true) === 'resume-not-found') {
         this.onLog(`[grok] session/load failed (${String(msg.error.message || '')}) — starting a fresh session`)
         this.sessionWasLoad = false
         this.sid = null
@@ -3059,6 +3112,7 @@ class GrokSession implements EngineSession {
       const sid = typeof msg.result.sessionId === 'string' ? msg.result.sessionId : this.sid
       this.sessionReqId = null
       if (typeof sid === 'string' && sid) this.sid = sid
+      this.sessionWasLoad = false
       this.ready = true
       if (this.queuedPrompt && this.pending) {
         const p = this.queuedPrompt
@@ -3076,6 +3130,7 @@ class GrokSession implements EngineSession {
       return
     }
     if (msg.method === 'session/update') {
+      if (this.pending && this.phase !== 'not-started') this.phase = 'effects-possible'
       const update = (msg.params?.update ?? msg.params?.sessionUpdate) as Record<string, unknown> | undefined
       const kind = typeof update?.sessionUpdate === 'string' ? update.sessionUpdate
         : typeof update?.sessionUpdate === 'undefined' && typeof (msg.params as { sessionUpdate?: unknown } | undefined)?.sessionUpdate === 'string'
@@ -3107,7 +3162,8 @@ class GrokSession implements EngineSession {
       }
       const p = this.pending
       this.pending = null
-      p.resolve({ exitCode: 0, sessionId: this.sid, usage, model: this.curModel || this.model })
+      const error = acpCompletionError('grok', msg.result)
+      p.resolve({ executionPhase: error ? this.phase : 'completed', exitCode: error ? 1 : 0, error, sessionId: this.sid, usage, model: this.curModel || this.model })
       return
     }
     if (msg.error && msg.id !== undefined) {
@@ -3116,13 +3172,15 @@ class GrokSession implements EngineSession {
   }
 
   private failPending(error: string): void {
+    if (!this.ready) this.handshakeError = error
     if (this.pending) {
       const p = this.pending
       this.pending = null
-      p.resolve({ exitCode: 1, error, sessionId: this.sid })
+      p.resolve(classifyEngineResult({ executionPhase: this.phase, exitCode: 1, error, sessionId: this.sid }, this.sessionWasLoad))
     } else {
       this.onLog(`[grok] ${error}`)
     }
+    if (!this.ready) void this.stop()
   }
 
   private die(code: number, why: string): void {
@@ -3135,9 +3193,14 @@ class GrokSession implements EngineSession {
     if (this.pending) {
       const p = this.pending
       this.pending = null
-      p.resolve({ exitCode: code, error: why, sessionId: this.sid })
+      p.resolve(classifyEngineResult({ executionPhase: this.phase, exitCode: code || 1, error: why, sessionId: this.sid }, this.sessionWasLoad))
     }
   }
+}
+
+function acpCompletionError(engine: string, result: unknown): string | undefined {
+  const stopReason = (result as { stopReason?: unknown } | undefined)?.stopReason
+  return stopReason === 'end_turn' ? undefined : `${engine} turn stopped: ${String(stopReason ?? 'missing stopReason')}`
 }
 
 function extractAcpUsage(result: unknown): EngineUsage | undefined {
@@ -3304,10 +3367,11 @@ class GrokAdapter implements EngineAdapter {
       : ['-p', ...resume, ...model, '--output-format', 'streaming-messages-json', '--always-approve', '--no-auto-update']
     const argv = wantsStdinPrompt ? base : (flags.length ? [...base, args.prompt] : ['-p', args.prompt, ...base.slice(1)])
     const env: NodeJS.ProcessEnv = { ...args.env, GROK_DISABLE_AUTOUPDATER: args.env.GROK_DISABLE_AUTOUPDATER ?? '1' }
-    return spawnEngine(command, argv, { ...args, env }, { shell, stdinText: wantsStdinPrompt ? args.prompt : undefined })
+    return spawnEngine(command, argv, { ...args, env }, { shell, stdinText: wantsStdinPrompt ? args.prompt : undefined, requireResult: base.includes('streaming-messages-json') || base.includes('stream-json') })
   }
 
   startSession(args: EngineSessionArgs): EngineSession | null {
+    args.signal?.throwIfAborted()
     if (extraArgs('CUMORA_GROK_ARGS').length) return null
     if (process.env.CUMORA_GROK_NO_ACP === '1') return null
     // JSON-RPC over a Windows .cmd shim is the same trap Codex hits — exec
@@ -3362,17 +3426,12 @@ interface ZcodeSessionOptions extends EngineSessionArgs {
   signal?: AbortSignal
 }
 
-/** The bridge's backend rejects an unknown / no-longer-live zcode session with
- *  this phrasing (its dispatch code documents the literal: "Session is not
- *  active"). The shared stale-resume patterns don't match it, so a resumed
- *  session that dies mid-life maps through this adapter-aware rule. */
-const ZCODE_MISSING_SESSION_RE = /session is not active|no such session|unknown session/i
-
 /** Persistent ZCode session over ACP stdio. Handshake, JSON-RPC, and death
  *  live here (same shape as GrokSession / KimiSession — no shared connection
  *  type). Mid-turn steer is a no-op; the daemon coalesces the ping onto the
  *  next wake. */
 class ZcodeSession implements EngineSession {
+  private phase: EngineExecutionPhase = 'not-started'
   readonly carriesStandingPrompt = false
 
   private readonly child: ChildProcess
@@ -3403,6 +3462,7 @@ class ZcodeSession implements EngineSession {
     this.modelUnapplied = !!opts.model
     this.sid = opts.resumeSessionId ?? null
     const spawnSpec = resolveZcodeAcpSpawn(env)
+    opts.signal?.throwIfAborted()
     this.child = spawnEngineChild(spawnSpec.command, spawnSpec.args, {
       cwd: home, env, stdio: ['pipe', 'pipe', 'pipe'], shell: spawnSpec.shell,
     })
@@ -3415,11 +3475,7 @@ class ZcodeSession implements EngineSession {
     })
     this.child.on('error', (err) => this.die(1, err.message))
     this.child.on('close', (code, sig) => this.die(code ?? (sig ? 128 : 1), sig ? `terminated by ${sig}` : `exited with code ${code}`))
-    if (opts.signal) {
-      const abort = () => { void terminateEngineTree(this.child, true) }
-      if (opts.signal.aborted) abort()
-      else opts.signal.addEventListener('abort', abort, { once: true })
-    }
+    bindSessionAbort(this.child, opts.signal, () => { this.die(130, 'engine session aborted'); void this.stop({ force: true }) })
     this.ready = this.handshake()
     // An idle failed handshake (no send()/whenReady() consumer) must not
     // become an unhandled rejection — the next send() reports it as dead.
@@ -3431,20 +3487,22 @@ class ZcodeSession implements EngineSession {
   whenReady(): Promise<void> { return this.ready }
 
   async send(prompt: string): Promise<EngineRunResult> {
-    if (this.turn) return { exitCode: 1, error: 'engine session busy — a turn is already in flight', sessionId: this.sid }
-    if (!this.alive) return { exitCode: this.exitCode || 1, error: 'engine session is not alive (process gone)', sessionId: this.sid }
+    if (this.turn) return { executionPhase: 'not-started', exitCode: 1, error: 'engine session busy — a turn is already in flight', sessionId: this.sid }
+    if (!this.alive) return { executionPhase: 'not-started', exitCode: this.exitCode || 1, error: 'engine session is not alive (process gone)', sessionId: this.sid }
+    this.phase = 'not-started'
     let resolveTurn!: (r: EngineRunResult) => void
     const done = new Promise<EngineRunResult>((resolve) => { resolveTurn = resolve })
     // Only the first settler wins: process death (onDeath → this.turn.resolve)
     // races the async body below, and whichever lands first closes the turn.
     let settled = false
-    const settle = (r: EngineRunResult) => { if (!settled) { settled = true; this.turn = null; resolveTurn(r) } }
+    const settle = (r: EngineRunResult) => { if (!settled) { settled = true; this.turn = null; resolveTurn({ executionPhase: this.phase, ...r }) } }
     this.turn = { resolve: settle }
     try {
       await this.ready
       await this.applyModelPin()
       if (!this.alive) throw new Error('engine session is not alive (process gone)')
       const startedAt = Date.now()
+      this.phase = 'prompt-submitted'
       const resp = await this.rpc('session/prompt', {
         sessionId: this.sid,
         prompt: [{ type: 'text', text: stripLoneSurrogates(prompt) }],
@@ -3461,7 +3519,8 @@ class ZcodeSession implements EngineSession {
           })
         } catch { /* never break the stream */ }
       }
-      settle({ exitCode: 0, sessionId: this.sid, usage, model: this.model })
+      const error = acpCompletionError('zcode', resp.result)
+      settle({ executionPhase: error ? this.phase : 'completed', exitCode: error ? 1 : 0, error, sessionId: this.sid, usage, model: this.model })
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       const wasResume = this.resumed
@@ -3503,9 +3562,7 @@ class ZcodeSession implements EngineSession {
     return {
       exitCode,
       error: message,
-      failure: wasResume && ZCODE_MISSING_SESSION_RE.test(message)
-        ? { kind: 'resume-not-found', message, diagnostic: message }
-        : undefined,
+      failure: { kind: classifyEngineFailure(message, wasResume), message, diagnostic: message },
       sessionId: this.sid,
     }
   }
@@ -3521,6 +3578,7 @@ class ZcodeSession implements EngineSession {
 
   private onUpdate(msg: AcpMsg): void {
     if (msg.method !== 'session/update') return
+    if (this.turn && this.phase !== 'not-started') this.phase = 'effects-possible'
     const u = (msg.params?.update ?? msg.params) as Record<string, unknown> | undefined
     const kind = typeof u?.sessionUpdate === 'string' ? u.sessionUpdate : null
     if (kind === 'tool_call' && typeof u?.title === 'string') {
@@ -3560,6 +3618,8 @@ class ZcodeSession implements EngineSession {
         return
       } catch (err) {
         const why = err instanceof Error ? err.message : String(err)
+        this.resumed = true
+        if (classifyEngineFailure(why, true) !== 'resume-not-found') throw err
         this.resumed = false
         this.sid = null
         this.onLog(`[zcode] session/load failed (${why}) — starting a fresh session`)
@@ -3655,6 +3715,7 @@ class ZcodeAdapter implements EngineAdapter {
   }
 
   startSession(args: EngineSessionArgs): EngineSession | null {
+    args.signal?.throwIfAborted()
     return new ZcodeSession(args.home, args.env, args)
   }
 
@@ -4722,6 +4783,7 @@ function spawnPiJson(
  *  itself before the agent's next model call — so there is no stream-boundary
  *  bookkeeping here. The daemon calls send() serially. */
 class PiSession implements EngineSession {
+  private phase: EngineExecutionPhase = 'not-started'
   private readonly child: ChildProcess
   private readonly onLog: (line: string) => void
   private readonly tracker: PiTurnTracker
@@ -4745,12 +4807,14 @@ class PiSession implements EngineSession {
     // Cross-platform spawn (Windows: `pi.cmd` via the shell). Everything travels
     // over stdin as JSON here, so there are no argv-quoting concerns.
     const { command, shell } = resolveSpawn(bin)
+    opts.signal?.throwIfAborted()
     this.child = spawnEngineChild(command, args, { cwd: opts.home, env: opts.env, stdio: ['pipe', 'pipe', 'pipe'], shell })
     this.child.stdout?.on('data', (b: Buffer) => this.onStdout(b))
     this.child.stderr?.on('data', (b: Buffer) => this.onStderr(b))
     this.child.on('error', (err) => this.die(1, err.message))
     this.child.on('close', (code, signalName) =>
       this.die(code ?? (signalName ? 128 : 1), signalName ? `terminated by ${signalName}` : `exited with code ${code}`))
+    bindSessionAbort(this.child, opts.signal, () => { this.die(130, 'engine session aborted'); void this.stop({ force: true }) })
     // Ask pi which session it actually opened. It should be the --session-id we
     // passed; if a future pi ever rewrites it, we resume the REAL one next time.
     this.write({ id: 'state', type: 'get_state' })
@@ -4761,13 +4825,14 @@ class PiSession implements EngineSession {
 
   send(prompt: string): Promise<EngineRunResult> {
     if (this.pending) {
-      return Promise.resolve({ exitCode: 1, error: 'engine session busy — a turn is already in flight', sessionId: this.sessionId })
+      return Promise.resolve({ executionPhase: 'not-started', exitCode: 1, error: 'engine session busy — a turn is already in flight', sessionId: this.sessionId })
     }
     if (!this.alive) {
       const exitCode = this.exitCode || 1
       const detail = failurePreview({ exitCode, signalName: null, stderr: this.stderrTail, stdout: this.stdoutTail })
-      return Promise.resolve({ exitCode, error: detail || 'engine session is not alive (process gone)', sessionId: this.sessionId })
+      return Promise.resolve({ executionPhase: 'not-started', exitCode, error: detail || 'engine session is not alive (process gone)', sessionId: this.sessionId })
     }
+    this.phase = 'not-started'
     return new Promise<EngineRunResult>((resolve) => {
       const id = `turn-${++this.reqId}`
       this.pending = { id, resolve, stderr: [], stdout: [] }
@@ -4783,6 +4848,7 @@ class PiSession implements EngineSession {
         }, TURN_TIMEOUT_MS)
         this.pendingTimer.unref?.()
       }
+      this.phase = 'prompt-submitted'
       if (!this.write({ id, type: 'prompt', message: stripLoneSurrogates(prompt) })) {
         this.settle({ exitCode: 1, error: 'failed to write turn to engine', sessionId: this.sessionId })
       }
@@ -4832,12 +4898,14 @@ class PiSession implements EngineSession {
       if (this.pending) pushTail(this.pending.stdout, shown)
       this.onLog(shown)
       if (!ev) continue
+      if (this.pending && ev.type !== 'response') this.phase = 'effects-possible'
       if (ev.type === 'response') { this.onResponse(ev); continue }
       // Observe pi's NATIVE auto-compaction (telemetry only), like the Claude path.
       if (ev.type === 'compaction_start') this.onLog('[pi] native context compaction started')
       else if (ev.type === 'compaction_end') this.onLog('[pi] native context compaction finished')
       if (this.tracker.observe(ev) && this.pending) {
         this.settle({
+          executionPhase: this.tracker.error ? this.phase : 'completed',
           exitCode: this.tracker.error ? 1 : 0,
           error: this.tracker.error ? `engine turn error: ${this.tracker.error.slice(0, MAX_FAILURE_CHARS)}` : undefined,
           sessionId: this.sessionId,
@@ -4875,7 +4943,7 @@ class PiSession implements EngineSession {
     if (this.pendingTimer) { clearTimeout(this.pendingTimer); this.pendingTimer = null }
     const p = this.pending
     this.pending = null
-    if (p) p.resolve(r)
+    if (p) p.resolve({ executionPhase: this.phase, ...r })
   }
 
   /** Process died (error/close). Mark dead and fail any in-flight turn — always
@@ -5041,7 +5109,7 @@ class PiAdapter implements EngineAdapter {
     // is simply a session that lives for one turn. Same parser, same ledger.
     const session = this.startSession({
       home: args.home, env: args.env, model: args.model, fastModel: args.fastModel,
-      resumeSessionId: args.resumeSessionId, onLog: args.onLog, onHopUsage: args.onHopUsage,
+      resumeSessionId: args.resumeSessionId, signal: args.signal, onLog: args.onLog, onHopUsage: args.onHopUsage,
     })
     if (!session) return { exitCode: 1, error: 'pi session could not be started', sessionId: args.resumeSessionId ?? null }
     const onAbort = (): void => { void session.stop({ force: true }) }
@@ -5064,6 +5132,7 @@ class PiAdapter implements EngineAdapter {
   }
 
   startSession(args: EngineSessionArgs): EngineSession | null {
+    args.signal?.throwIfAborted()
     // Respect a user's custom flag override by NOT using the persistent path —
     // those flags are tuned for one-shot print mode; fall back to run().
     if (extraArgs('CUMORA_PI_ARGS').length) return null
@@ -5681,7 +5750,7 @@ class QwenAdapter implements EngineAdapter {
       // Prompt on stdin on every platform: `qwen` reads it there when no -p is
       // given, which avoids argv limits and the Windows .cmd shim's inability
       // to carry a multi-line argument.
-      { shell, stdinText: args.prompt },
+      { shell, stdinText: args.prompt, requireResult: true },
     )
   }
 
@@ -5854,6 +5923,7 @@ class AntigravityTurnTracker {
 }
 
 class AntigravitySession implements EngineSession {
+  private phase: EngineExecutionPhase = 'not-started'
   private readonly child: ChildProcess
   private readonly tracker: AntigravityTurnTracker
   private readonly decoder = new StringDecoder('utf8')
@@ -5874,6 +5944,7 @@ class AntigravitySession implements EngineSession {
     pin: string | null,
   ) {
     this.tracker = new AntigravityTurnTracker(pin, opts.onHopUsage)
+    opts.signal?.throwIfAborted()
     this.child = spawnEngineChild(command, argv, {
       cwd: opts.home,
       env: opts.env,
@@ -5887,6 +5958,8 @@ class AntigravitySession implements EngineSession {
       this.flushStdout()
       this.die(code ?? (signalName ? 128 : 1), signalName ? `terminated by ${signalName}` : `exited with code ${code}`)
     })
+    bindSessionAbort(this.child, opts.signal, () => { this.die(130, 'engine session aborted'); void this.stop({ force: true }) })
+
   }
 
   get alive(): boolean { return !this.exited && this.child.stdin?.writable === true }
@@ -5894,18 +5967,21 @@ class AntigravitySession implements EngineSession {
   get text(): string { return this.tracker.text }
 
   send(prompt: string): Promise<EngineRunResult> {
-    if (this.pending) return Promise.resolve({ exitCode: 1, error: 'engine session busy — a turn is already in flight', sessionId: this.sessionId })
+    if (this.pending) return Promise.resolve({ executionPhase: 'not-started', exitCode: 1, error: 'engine session busy — a turn is already in flight', sessionId: this.sessionId })
     if (!this.alive) {
       return Promise.resolve({
+        executionPhase: 'not-started',
         exitCode: this.exitCode || 1,
         error: failurePreview({ exitCode: this.exitCode || 1, signalName: null, stderr: this.stderrTail, stdout: this.stdoutTail }),
         sessionId: this.sessionId,
       })
     }
+    this.phase = 'not-started'
     this.tracker.beginTurn()
     return new Promise((resolve) => {
       this.pending = { resolve }
       const message = JSON.stringify({ event: 'user', message: { content: stripLoneSurrogates(prompt) } })
+      this.phase = 'prompt-submitted'
       if (!writeStdin(this.child, `${message}\n`)) {
         this.settle({ exitCode: 1, error: 'failed to write turn to antigravity', sessionId: this.sessionId })
       }
@@ -5953,10 +6029,12 @@ class AntigravitySession implements EngineSession {
     if (!line) return
     pushTail(this.stdoutTail, line)
     this.opts.onLog(line)
+    if (this.pending) this.phase = 'effects-possible'
     const event = parseAntigravityLine(line)
     if (event && this.tracker.observe(event)) {
       const eventError = this.tracker.error
       this.settle({
+        executionPhase: eventError ? this.phase : 'completed',
         exitCode: eventError ? 1 : 0,
         error: eventError ? `engine turn error: ${eventError.slice(0, MAX_FAILURE_CHARS)}` : undefined,
         sessionId: this.tracker.sessionId,
@@ -5979,7 +6057,7 @@ class AntigravitySession implements EngineSession {
     const pending = this.pending
     if (!pending) return
     this.pending = null
-    pending.resolve(result)
+    pending.resolve({ executionPhase: this.phase, ...result })
   }
 
   private die(code: number, detail: string): void {
@@ -6025,6 +6103,7 @@ class AntigravityAdapter implements EngineAdapter {
   }
 
   startSession(args: EngineSessionArgs): EngineSession | null {
+    args.signal?.throwIfAborted()
     return this.start(args, 'accept-edits')
   }
 
@@ -6036,6 +6115,7 @@ class AntigravityAdapter implements EngineAdapter {
       model: args.model,
       fastModel: args.fastModel,
       resumeSessionId: args.resumeSessionId,
+      signal: args.signal,
       onLog: args.onLog,
       onHopUsage: args.onHopUsage,
     }
@@ -6202,6 +6282,7 @@ async function seedKimiMcp(home: string, connectors: EngineMcpConnector[]): Prom
 
 /** Kimi's ACP JSON-RPC transport, kept separate from Grok's vendor extensions. */
 export class KimiSession implements EngineSession {
+  private phase: EngineExecutionPhase = 'not-started'
   private readonly child: ChildProcess
   private readonly requests = new Map<number, { resolve: (value: Record<string, unknown>) => void; reject: (error: Error) => void; timer?: ReturnType<typeof setTimeout> }>()
   private readonly ready: Promise<void>
@@ -6223,11 +6304,13 @@ export class KimiSession implements EngineSession {
   constructor(command: string, argv: string[], private readonly opts: EngineSessionArgs) {
     this.resumePending = !!opts.resumeSessionId
     this.sid = opts.resumeSessionId ?? null
+    opts.signal?.throwIfAborted()
     this.child = spawnEngineChild(command, argv, { cwd: opts.home, env: opts.env, stdio: ['pipe', 'pipe', 'pipe'], shell: false })
     this.child.stdout?.on('data', (chunk: Buffer) => this.consume(this.decoder.write(chunk)))
     this.child.stderr?.on('data', (chunk: Buffer) => opts.onLog(cleanLine(chunk.toString('utf8'))))
     this.child.on('error', (err) => this.fail((err as NodeJS.ErrnoException).code === 'ENOENT' ? KIMI_INSTALL_HINT : err.message))
     this.child.on('close', (code) => { this.consume(this.decoder.end() + '\n'); this.fail(`kimi ACP exited (${code})`) })
+    bindSessionAbort(this.child, opts.signal, () => { this.fail('engine session aborted'); void this.stop({ force: true }) })
     this.ready = this.initialize().catch((err: unknown) => { this.fail(String(err)); void this.stop() })
   }
 
@@ -6259,7 +6342,8 @@ export class KimiSession implements EngineSession {
   }
 
   async send(prompt: string): Promise<EngineRunResult> {
-    if (this.busy) return classifyEngineResult({ exitCode: 1, error: 'kimi session busy', sessionId: this.sid }, this.resumePending)
+    if (this.busy) return classifyEngineResult({ executionPhase: 'not-started', exitCode: 1, error: 'kimi session busy', sessionId: this.sid }, this.resumePending)
+    this.phase = 'not-started'
     this.busy = true
     this.turnText = ''
     this.permissionCancelled = false
@@ -6267,6 +6351,7 @@ export class KimiSession implements EngineSession {
       await this.ready
       if (this.failure || !this.alive) throw new Error(this.failure ?? 'kimi session stopped')
       this.turnText = ''
+      this.phase = 'prompt-submitted'
       this.promptInFlight = true
       const result = await this.rpc('session/prompt', { sessionId: this.sid, prompt: [{ type: 'text', text: stripLoneSurrogates(prompt) }] }, false)
       const usage = extractAcpUsage(result)
@@ -6275,11 +6360,11 @@ export class KimiSession implements EngineSession {
       }
       const error = this.permissionCancelled ? 'kimi permission request cancelled in unattended mode'
         : result.stopReason === 'end_turn' ? undefined : `kimi turn stopped: ${String(result.stopReason ?? 'missing stopReason')}`
-      const classified = classifyEngineResult({ exitCode: error ? 1 : 0, error, sessionId: this.sid, usage, model: this.currentModel }, this.resumePending)
+      const classified = classifyEngineResult({ executionPhase: error ? this.phase : 'completed', exitCode: error ? 1 : 0, error, sessionId: this.sid, usage, model: this.currentModel }, this.resumePending)
       this.resumePending = false
       return classified
     } catch (err) {
-      const classified = classifyEngineResult({ exitCode: 1, error: String(err), sessionId: this.sid, model: this.currentModel }, this.resumePending)
+      const classified = classifyEngineResult({ executionPhase: this.phase, exitCode: 1, error: String(err), sessionId: this.sid, model: this.currentModel }, this.resumePending)
       this.resumePending = false
       return classified
     } finally { this.busy = false; this.promptInFlight = false }
@@ -6337,6 +6422,7 @@ export class KimiSession implements EngineSession {
         if (msg.error) pending.reject(new Error(msg.error.message ?? 'kimi ACP request failed'))
         else pending.resolve(msg.result ?? {})
       } else if (msg.method === 'session/update' && msg.params?.sessionId === this.sid) {
+        if (this.promptInFlight) this.phase = 'effects-possible'
         const update = msg.params.update as { sessionUpdate?: string; content?: { type?: string; text?: string }; configOptions?: Array<{ category?: string; currentValue?: string }> } | undefined
         if (this.promptInFlight && update?.sessionUpdate === 'agent_message_chunk' && update.content?.type === 'text') {
           this.turnText += update.content.text ?? ''
@@ -6378,6 +6464,7 @@ class KimiAdapter implements EngineAdapter {
   }
 
   startSession(args: EngineSessionArgs): EngineSession {
+    args.signal?.throwIfAborted()
     const command = resolveKimiCommand(args.env)
     const error = kimiPermissionError(args.env)
     if (error) throw new Error(error)
@@ -6413,7 +6500,7 @@ class KimiAdapter implements EngineAdapter {
     let session: EngineSession | undefined
     const abort = () => { void session?.stop() }
     try {
-      session = this.startSession({ home: args.cwd, env: args.env, onLog: () => {} })
+      session = this.startSession({ home: args.cwd, env: args.env, signal: args.signal, onLog: () => {} })
       args.signal.addEventListener('abort', abort, { once: true })
       if (args.signal.aborted) abort()
       const result = await session.send(DOCTOR_PROMPT)

@@ -11,6 +11,8 @@ import { afterEach, test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { type EngineHopReport, type EngineRunResult, getAdapter, headlessSpawnOptions, resolveSpawn, runnableEngineIds, secureEngineCapabilityReason } from '../agents/computer/engine.js'
 import { type ProviderProfile, providerProfileEnv } from '../agents/computer/provider-profiles.js'
+import { AgentRunner, AdaptivePacer, acquireRunnerSlot } from '../agents/computer/daemon.js'
+import { ByoaSemaphore } from '../agents/computer/runtime-policy.js'
 import { CLAUDE_CORE_ENV_KEYS, CLAUDE_TURN_ENV_KEYS } from '../agents/computer/claude-user-settings.js'
 
 const IS_WIN = process.platform === 'win32'
@@ -572,7 +574,7 @@ test('unsandboxed Codex forwards IPC to the engine, tool environment and MCP bri
   const home = join(root, 'agent home')
   await mkdir(binDir)
   await mkdir(home)
-  const source = "process.stdin.resume(); process.stdin.on('end', () => console.log(JSON.stringify({ argv: process.argv.slice(2), ipc: process.env.CUMORA_AGENT_IPC_DIR, shim: process.env.CUMORA_AGENT_MCP_SHIM })))"
+  const source = "if (process.argv.includes('--json')) console.log(JSON.stringify({ type: 'turn.completed' })); process.stdin.resume(); process.stdin.on('end', () => console.log(JSON.stringify({ argv: process.argv.slice(2), ipc: process.env.CUMORA_AGENT_IPC_DIR, shim: process.env.CUMORA_AGENT_MCP_SHIM })))"
   await writeFakeCli(binDir, 'codex', source)
   if (IS_WIN) {
     const packageBin = join(binDir, 'node_modules', '@openai', 'codex', 'bin')
@@ -625,7 +627,7 @@ test('Codex one-shot paths send prompts through stdin', async () => {
   await mkdir(home)
 
   const capture = join(binDir, 'capture.js')
-  const captureSource = "let stdin = ''\n" +
+  const captureSource = "if (process.argv.includes('--json')) console.log(JSON.stringify({ type: 'turn.completed' })); let stdin = ''\n" +
     "process.stdin.setEncoding('utf8')\n" +
     "process.stdin.on('data', (chunk) => { stdin += chunk })\n" +
     "process.stdin.on('end', () => process.stdout.write(JSON.stringify({ argv: process.argv.slice(2), stdin })))\n"
@@ -1269,4 +1271,156 @@ if (argv.includes('--input-format')) {
     const triageArgv = JSON.parse(triage.text).argv as string[]
     assert.equal(triageArgv[triageArgv.indexOf('--model') + 1], profile.fastModel)
   }))
+})
+
+
+test('runner semaphore cancellation returns promptly and returns a late grant', async () => {
+  const sem = new ByoaSemaphore(1)
+  await sem.acquire()
+  const abort = new AbortController()
+  const waiting = acquireRunnerSlot(sem, abort.signal)
+  abort.abort()
+  await assert.rejects(waiting, { name: 'AbortError' })
+  assert.equal(sem.active, 1)
+  sem.release()
+  await Promise.resolve()
+  assert.equal(sem.active, 0)
+  assert.equal(sem.queueDepth, 0)
+  await acquireRunnerSlot(sem, new AbortController().signal)
+  assert.equal(sem.active, 1)
+  sem.release()
+})
+
+test('runner pacer cancellation clears the pending delay without waiting for its slot', async () => {
+  const pacer = new AdaptivePacer(60_000)
+  await pacer.gate()
+  const abort = new AbortController()
+  const waiting = pacer.gate(abort.signal)
+  abort.abort()
+  await assert.rejects(waiting, { name: 'AbortError' })
+  await assert.rejects(pacer.gate(abort.signal), { name: 'AbortError' })
+})
+
+function executionRunner(): AgentRunner {
+  return new AgentRunner(
+    { serverUrl: 'https://fixture.invalid', computerId: 'fixture', deviceToken: 'fixture' },
+    { id: 'stop-contract', name: 'Fixture', role: null, systemPrompt: null, model: null, fastModel: null, engine: 'claude' },
+    'claude',
+  )
+}
+
+test('runner stop waits for input preparation and prevents a later engine start', async () => {
+  const runner = executionRunner()
+  let ready!: () => void
+  const preparation = new Promise<void>((resolve) => { ready = resolve })
+  let tokenCalls = 0
+  let preparations = 0
+  const internals = runner as unknown as {
+    applyPendingResources(): Promise<boolean>
+    ensureToken(): Promise<string>
+    runTurn(reason: string): Promise<void>
+    ensureEngineSession(): unknown
+    runEngineAttempt(prompt: string, resume: string | null): Promise<EngineRunResult>
+  }
+  internals.applyPendingResources = async () => { preparations++; if (preparations === 1) await preparation; return true }
+  internals.ensureToken = async () => { tokenCalls++; throw new Error('must not request inputs after stop') }
+  const turning = internals.runTurn('fixture')
+  let stopped = false
+  const stopping = runner.stop().then(() => { stopped = true })
+  await Promise.resolve()
+  assert.equal(stopped, false)
+  ready()
+  await Promise.all([turning, stopping])
+  assert.equal(stopped, true)
+  assert.equal(tokenCalls, 0)
+  assert.equal(runner.isBusy, false)
+  assert.throws(() => internals.ensureEngineSession(), /abort|stopped/i)
+  await assert.rejects(internals.runEngineAttempt('late prompt', null), /abort|stopped/i)
+})
+
+test('persistent fallback uses submission phase even when usage is absent or present', async () => {
+  for (const phase of [undefined, 'not-started', 'prompt-submitted', 'effects-possible', 'completed'] as const) {
+    for (const usage of [undefined, { input_tokens: 1 }]) {
+      const runner = executionRunner()
+      let oneShots = 0
+      let saved: string | null = null
+      const failed: EngineRunResult = { exitCode: 1, error: 'read ECONNRESET', executionPhase: phase, usage }
+      const internals = runner as unknown as {
+        ensureEngineSession(): unknown
+        turnPrompt(session: unknown, delta: string): string
+        setSessionId(id: string | null): void
+        adapter: { id: string; run(): Promise<EngineRunResult> }
+        runEngineAttempt(prompt: string, resume: string | null): Promise<EngineRunResult>
+      }
+      internals.ensureEngineSession = () => ({ alive: false, sessionId: 'retained-session', send: async () => failed })
+      internals.turnPrompt = (_session, delta) => delta
+      internals.setSessionId = (id) => { saved = id }
+      internals.adapter = { id: 'claude', run: async () => { oneShots++; return { exitCode: 0, executionPhase: 'completed' } } }
+      const result = await internals.runEngineAttempt('external action', 'retained-session')
+      assert.equal(oneShots, phase === 'not-started' ? 1 : 0, `${phase}, usage=${!!usage}`)
+      assert.equal(saved, 'retained-session')
+      if (phase !== 'not-started') assert.equal(result, failed)
+      await runner.stop()
+    }
+  }
+})
+
+
+test('runner stop cancels turns queued on semaphore or pacer before flushing the session', async () => {
+  for (const stage of ['semaphore', 'pacer'] as const) {
+    const runner = executionRunner()
+    const sem = new ByoaSemaphore(1)
+    await sem.acquire()
+    const pacer = new AdaptivePacer(60_000)
+    await pacer.gate()
+    let entered!: () => void
+    const waiting = new Promise<void>((resolve) => { entered = resolve })
+    let cleanupFinished = false
+    let calls = 0
+    const internals = runner as unknown as {
+      teardown: AbortController
+      applyPendingResources(): Promise<boolean>
+      runTurn(reason: string): Promise<void>
+      sessionStore: { flush(): Promise<void> }
+    }
+    internals.applyPendingResources = async () => {
+      if (++calls > 1) { cleanupFinished = true; return false }
+      entered()
+      if (stage === 'semaphore') await acquireRunnerSlot(sem, internals.teardown.signal)
+      else await pacer.gate(internals.teardown.signal)
+      assert.fail('cancelled wait must not continue preparing a turn')
+    }
+    internals.sessionStore = { flush: async () => { assert.equal(cleanupFinished, true) } }
+    const turning = internals.runTurn('queued-stop')
+    await waiting
+    await runner.stop()
+    await turning
+    assert.equal(runner.isBusy, false)
+    sem.release()
+    await Promise.resolve()
+    assert.equal(sem.active, 0)
+  }
+})
+
+
+test('stop during a pre-submission failure blocks the otherwise eligible fallback', async () => {
+  const runner = executionRunner()
+  let fail!: (result: EngineRunResult) => void
+  const pending = new Promise<EngineRunResult>((resolve) => { fail = resolve })
+  let oneShots = 0
+  const internals = runner as unknown as {
+    ensureEngineSession(): unknown
+    turnPrompt(session: unknown, delta: string): string
+    adapter: { id: string; run(): Promise<EngineRunResult> }
+    runEngineAttempt(prompt: string, resume: string | null): Promise<EngineRunResult>
+  }
+  internals.ensureEngineSession = () => ({ alive: false, sessionId: null, send: () => pending })
+  internals.turnPrompt = (_session, delta) => delta
+  internals.adapter = { id: 'claude', run: async () => { oneShots++; return { exitCode: 0 } } }
+  const attempt = internals.runEngineAttempt('task', null)
+  const stopping = runner.stop()
+  const rejected = assert.rejects(attempt, /abort|stopped/i)
+  fail({ exitCode: 1, error: 'handshake failed', executionPhase: 'not-started' })
+  await Promise.all([rejected, stopping])
+  assert.equal(oneShots, 0)
 })

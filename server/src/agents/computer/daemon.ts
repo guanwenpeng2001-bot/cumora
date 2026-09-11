@@ -310,7 +310,30 @@ const TRIAGE_TIMEOUT_MS = 30_000
  *  daemon binary work across very different account tiers without env
  *  tuning, and converges to the user's actual quota in a minute or two
  *  of natural traffic. */
-class AdaptivePacer {
+/** Cancel the runner's wait immediately; a subsequently granted slot is returned
+ * without entering runner code. The policy controller retains queue ownership. */
+export async function acquireRunnerSlot(
+  semaphore: { acquire(): Promise<void>; release(): void }, signal: AbortSignal,
+): Promise<void> {
+  signal.throwIfAborted()
+  await new Promise<void>((resolve, reject) => {
+    let cancelled = false
+    const abort = () => { cancelled = true; reject(signal.reason) }
+    signal.addEventListener('abort', abort, { once: true })
+    semaphore.acquire().then(() => {
+      signal.removeEventListener('abort', abort)
+      if (cancelled || signal.aborted) {
+        semaphore.release()
+        reject(signal.reason)
+      } else resolve()
+    }, (error) => {
+      signal.removeEventListener('abort', abort)
+      reject(error)
+    })
+  })
+}
+
+export class AdaptivePacer {
   private next = 0
   private current: number
   private consecutiveOk = 0
@@ -323,13 +346,22 @@ class AdaptivePacer {
     this.consecutiveOk = 0
     this.next = Math.max(this.next, Date.now() + base)
   }
-  async gate(): Promise<void> {
+  async gate(signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted()
     if (this.current <= 0) return
     const now = Date.now()
     const earliest = Math.max(now, this.next)
     this.next = earliest + this.current
     const wait = earliest - now
-    if (wait > 0) await new Promise((r) => setTimeout(r, wait))
+    if (wait > 0) await new Promise<void>((resolve, reject) => {
+      const abort = () => { clearTimeout(timer); reject(signal?.reason) }
+      const timer = setTimeout(() => {
+        signal?.removeEventListener('abort', abort)
+        resolve()
+      }, wait)
+      signal?.addEventListener('abort', abort, { once: true })
+    })
+    signal?.throwIfAborted()
   }
   /** Called when a spawn after gate() ends up rate-limited. Doubles the
    *  interval (capped) and resets the success streak so we don't halve
@@ -1700,7 +1732,7 @@ export class AgentRunner {
   /** The engine session id to `--resume` next wake, so the agent keeps
    *  continuous context (its place in a running task) instead of waking cold
    *  on a frozen inbox snapshot. Captured from each run's stream-json output;
-   *  cleared if a resume fails so the next wake starts a clean session. */
+   *  retained on ambiguous failure; only an explicitly invalid session resets it. */
   private sessionId: string | null = null
   /** Set when the persistent engine process proved unusable on this machine, so
    *  the runner stops trying it and stays on the one-shot path. Without this a
@@ -1891,6 +1923,7 @@ export class AgentRunner {
   /** Execute exactly one engine attempt. Session capture and the persistent to
    * one-shot transport fallback live here so chat and agenda cannot drift. */
   private async runEngineAttempt(delta: string, resumeSessionId: string | null): Promise<EngineRunResult> {
+    this.assertRunning()
     const session = this.ensureEngineSession(resumeSessionId)
     const prompt = this.turnPrompt(session, delta)
     let result: EngineRunResult
@@ -1908,10 +1941,11 @@ export class AgentRunner {
       if (persistentFailure && !result.failure) result.failure = persistentFailure
       // A dead persistent transport that never reached the model is safe to
       // retry one-shot. Preserve the same resume target for continuity.
-      if (result.error && !result.usage && !session.alive && persistentFailure?.kind !== 'resume-not-found') {
+      if (result.error && result.executionPhase === 'not-started' && !session.alive && persistentFailure?.kind !== 'resume-not-found') {
+        this.assertRunning()
         this.persistentUnusable = true
         this.engineSession = null
-        this.logEngineLine(`[engine] persistent session failed to produce a turn (${result.error.slice(0, 160)}) — falling back to one-shot for the rest of this process`)
+        this.logEngineLine(`[engine] persistent session failed before prompt submission (${result.error.slice(0, 160)}) — falling back to one-shot for the rest of this process`)
         result = await this.trackEngineRun(this.adapter.run({
           home: this.home,
           prompt: this.turnPrompt(null, delta),
@@ -1941,13 +1975,14 @@ export class AgentRunner {
     return result
   }
 
-  /** A missing resume target proves the model never began the requested turn,
-   * so one fresh retry is safe. Every other failure returns immediately to
-   * avoid duplicating tool side effects after an ambiguous crash or timeout. */
+  /** Retry a missing resume target only with explicit pre-submission evidence.
+   * A missing-session message after submission cannot authorize replay: it may
+   * describe a tool failure after the turn has already produced side effects. */
   private async runWithSessionRecovery(delta: string): Promise<EngineRunResult> {
     const resumeSessionId = this.resumeSessionId()
     return runWithSessionRecovery({
       resumeSessionId,
+      signal: this.teardown.signal,
       run: (resume) => this.runEngineAttempt(delta, resume),
       reset: () => this.resetEngineSession(`${this.engine} resume target ${sessionIdPreview(resumeSessionId ?? '')} does not exist`),
       onFreshRetry: () => console.warn(`[computer] ${this.agent.id} retrying turn once with a fresh ${this.engine} session`),
@@ -2019,14 +2054,14 @@ export class AgentRunner {
     this.teardown.abort()
     // Drain any hops queued at shutdown so the ledger doesn't lose the tail
     // (e.g. the agent was mid-turn when the daemon restarts for an update).
-    this.hopReporter?.stop()
-    this.hopReporter = null
     await Promise.allSettled([
       session?.stop({ force: options.forceEngine }) ?? Promise.resolve(),
       this.activeEngineRun ?? Promise.resolve(),
       this.activeTriage ?? Promise.resolve(),
       this.activeTurn ?? Promise.resolve(),
     ])
+    this.hopReporter?.stop()
+    this.hopReporter = null
     await this.sessionStore.flush()
   }
 
@@ -2199,8 +2234,13 @@ export class AgentRunner {
    *  fallback, or custom args) — the caller then uses one-shot run(). If the
    *  prior process has died it respawns, resuming this.sessionId so context
    *  carries across the restart. */
+  private assertRunning(): void {
+    this.teardown.signal.throwIfAborted()
+    if (this.stopped) throw new Error('runner stopped')
+  }
+
   private ensureEngineSession(resumeSessionId = this.resumeSessionId()): EngineSession | null {
-    if (this.stopped) return null
+    this.assertRunning()
     if (!this.adapter.startSession) return null
     if (this.persistentUnusable) return null
     if (this.engineSession?.alive) return this.engineSession
@@ -2211,6 +2251,7 @@ export class AgentRunner {
       fastModel: this.engineFastModel(),
       resumeSessionId,
       standingPrompt: this.standingPrompt(),
+      signal: this.teardown.signal,
       onLog: (line) => this.logEngineLine(line),
       // Trajectory hook — every assistant hop (Claude) / turn-completed (Codex)
       // shows up here and gets batched to the universal ledger. Purpose is
@@ -2339,19 +2380,23 @@ export class AgentRunner {
     // with the big-brain path (same Anthropic/OpenAI account quota, same
     // local CLI process pool) — every spawn waits its turn so the provider
     // never sees a burst of N simultaneous starts. See SpawnPacer doc.
-    await triageSem.acquire()
-    await spawnPacer.gate()
+    this.assertRunning()
+    await acquireRunnerSlot(triageSem, this.teardown.signal)
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), runtimePolicy.values.triageTimeoutMs)
     const onStop = () => controller.abort(this.teardown.signal.reason)
     this.teardown.signal.addEventListener('abort', onStop, { once: true })
+    if (this.teardown.signal.aborted) onStop()
     const callId = randomUUID()
     const startedAt = Date.now()
     let attempted = false
     let res: { text: string; error?: string; usage?: EngineUsage; model?: string | null }
     try {
+      await spawnPacer.gate(controller.signal)
+      this.assertRunning()
       await mkdir(TRIAGE_DIR, { recursive: true })
-      this.teardown.signal.throwIfAborted()
+      this.assertRunning()
+      controller.signal.throwIfAborted()
       attempted = true
       const pending = this.adapter.classify({
         cwd: TRIAGE_DIR,
@@ -2731,14 +2776,18 @@ export class AgentRunner {
     // heartbeat in the same tick (they often do — same poll interval, all
     // due at once), staggering AND capping concurrent spawns keeps the
     // provider's short-window burst limit from rejecting them all.
-    await bigBrainSem.acquire()
-    await spawnPacer.gate()
+    let acquired = false
     try {
+      await acquireRunnerSlot(bigBrainSem, this.teardown.signal)
+      acquired = true
+      this.assertRunning()
+      await spawnPacer.gate(this.teardown.signal)
+      this.assertRunning()
       const [memoryDigest, roster] = await Promise.all([
         this.memoryDigest(),
         runtimeGet<{ roster: string }>(this.cfg.serverUrl, '/roster', token).then((r) => r?.roster ?? '').catch(() => ''),
       ])
-      this.teardown.signal.throwIfAborted()
+      this.assertRunning()
       const result = await this.runWithSessionRecovery(this.agendaDelta(ag.brief, memoryDigest, roster))
       exitCode = result.exitCode
       turnUsage = result.usage
@@ -2760,7 +2809,7 @@ export class AgentRunner {
       void this.reporter.flush()
       await runtimeBest(this.cfg.serverUrl, '/status', token, { status: 'avail' })
       // Mirror chat path: release the concurrency slot regardless of outcome.
-      bigBrainSem.release()
+      if (acquired) bigBrainSem.release()
     }
     // Rate-limit: same as chat-turn path — suppress the user-facing notice
     // and just defer (no inbox state to keep here since agenda turns are
@@ -2806,8 +2855,8 @@ export class AgentRunner {
     const turn = this.runTurn(reason).catch((err) => {
       console.error(`[computer] ${this.agent.id} runTurn rejected (swallowed):`,
         redactProviderSecret(err instanceof Error ? err.message : String(err), this.provider))
-    }).finally(() => { if (this.activeTurn === turn) this.activeTurn = null })
-    if (!this.activeTurn) this.activeTurn = turn
+    })
+    void turn
   }
 
   /** Debounced entry to a turn (debounce + coalesce).
@@ -2908,17 +2957,22 @@ export class AgentRunner {
    *  (e.g. a turn that only ever fires via 'poll' means SSE wakes aren't
    *  arriving and you're eating up to INBOX_POLL_MS of delay). */
   private async runTurn(reason: string): Promise<void> {
+    if (this.stopped || this.teardown.signal.aborted) return
     if (this.busy) {
       this.pendingRerun = true
       console.log(`[computer] ${this.agent.id} turn busy — coalescing (${reason})`)
       return
     }
     this.busy = true
+    let finishTurn!: () => void
+    const turn = new Promise<void>((resolve) => { finishTurn = resolve })
+    this.activeTurn = turn
     let activeBackgroundBrief: WakeBackgroundBrief | null = null
     try {
       do {
         this.pendingRerun = false
         if (!await this.applyPendingResources()) break
+        this.assertRunning()
         // Big-brain rate-limit cooldown: the last attempt got throttled by the
         // provider. Skip this turn cleanly (no triage call either — even small
         // brain is wasted if we can't follow up with the big one). Unread is
@@ -3080,13 +3134,15 @@ export class AgentRunner {
         // zero and still slam the API; deterministic pacing makes the
         // burst rate a hard 1/(MIN_SPAWN_INTERVAL_MS) regardless of
         // concurrent waiter count.
-        await bigBrainSem.acquire()
-        await spawnPacer.gate()
-        const semQueueDepth = bigBrainSem.queueDepth
-        if (semQueueDepth > 0) {
-          console.log(`[computer] ${this.agent.id} big-brain sem acquired (queue depth was ${semQueueDepth + 1} including self)`)
-        }
+        let acquired = false
+        let semQueueDepth = 0
         try {
+          await acquireRunnerSlot(bigBrainSem, this.teardown.signal)
+          acquired = true
+          this.assertRunning()
+          await spawnPacer.gate(this.teardown.signal)
+          this.assertRunning()
+          semQueueDepth = bigBrainSem.queueDepth
           const turnBackgroundBrief = activeBackgroundBrief
           const [memoryDigest, triageNote, roster] = await Promise.all([
             this.memoryDigest(projectIds),
@@ -3098,7 +3154,7 @@ export class AgentRunner {
             runtimeGet<{ roster: string }>(this.cfg.serverUrl, '/roster', token)
               .then((r) => r?.roster ?? '').catch(() => ''),
           ])
-          this.teardown.signal.throwIfAborted()
+          this.assertRunning()
           const delta = turnBackgroundBrief
             ? this.manualBriefDelta(turnBackgroundBrief, memoryDigest, digest, roster)
             : this.chatDelta(memoryDigest, triageNote, digest, roster)
@@ -3131,7 +3187,7 @@ export class AgentRunner {
           // next queued agent can now spawn. MUST be in the same finally
           // that runs after the spawn await completes (success / error /
           // abort), otherwise a stuck slot starves the whole computer.
-          bigBrainSem.release()
+          if (acquired) bigBrainSem.release()
         }
         // Rate-limit case: when the underlying provider (Anthropic / OpenAI)
         // throttles us, this is NOT an agent-visible failure — the unread
@@ -3222,7 +3278,11 @@ export class AgentRunner {
         redactProviderSecret(err instanceof Error ? err.message : String(err), this.provider))
     } finally {
       try { await this.applyPendingResources() }
-      finally { this.busy = false }
+      finally {
+        this.busy = false
+        if (this.activeTurn === turn) this.activeTurn = null
+        finishTurn()
+      }
     }
   }
 

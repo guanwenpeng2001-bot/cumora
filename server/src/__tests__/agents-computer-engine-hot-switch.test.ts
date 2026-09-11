@@ -41,7 +41,7 @@ test('Claude to Codex to Claude never crosses session ownership and recovers a s
       run: async (resumeSessionId): Promise<EngineRunResult> => {
         attempts.push({ engine: 'claude', resumeSessionId })
         return resumeSessionId
-          ? { exitCode: 1, error: `No conversation found with session ID: ${resumeSessionId}` }
+          ? { exitCode: 1, executionPhase: 'not-started', error: `No conversation found with session ID: ${resumeSessionId}` }
           : { exitCode: 0, sessionId: 'claude-session-fresh' }
       },
       reset: () => claude.save(null),
