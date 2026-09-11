@@ -159,13 +159,31 @@ test('prepare failures are recorded and advance without sending the failed candi
   assert.equal(extras(inserts[0]).failureReason, 'prepare-failed')
 })
 test('programming, local request and arbitrary no-status errors do not advance', async () => {
-  for(const err of [new TypeError('bug'),new Error('oops'),new SyntaxError('JSON'),httpError(400),Object.assign(new Error('cancel'),{name:'APIUserAbortError'})]) {
+  for(const err of [new TypeError('bug'),new Error('oops'),new SyntaxError('JSON'),Object.assign(new Error('cancel'),{name:'APIUserAbortError'})]) {
     const count=inserts.length
     await assert.rejects(execute(()=>{throw err}),e=>e===err)
     assert.equal(inserts.length,count+1)
     assert.equal(extras(inserts.at(-1)).nextCandidate,null)
   }
 })
+test('a gateway 400 advances only the cloud cerebellum (support), other roles still stop', async () => {
+  // Support role: candidate-specific 400 (model not schedulable in its group)
+  // must degrade to the next candidate and record the reason.
+  const count=inserts.length
+  await assert.rejects(execute(()=>{throw httpError(400)}),e=>(e as {status?:number}).status===400)
+  // Every candidate 400s here: the chain walks all three attempts instead of
+  // stopping at the first.
+  assert.equal(inserts.length,count+3)
+  assert.equal(extras(inserts[count]).failureReason,'upstream-http-400')
+  assert.equal(extras(inserts[count]).nextCandidate,'b')
+  assert.equal(extras(inserts.at(-1)).nextCandidate,null)
+  // Any other role keeps the non-fallbackable contract for 400.
+  const before=inserts.length
+  await assert.rejects(executeLlmPlan({ plan: { ...plan(), role: 'brain' }, context: ctx, sdkMaxRetries: 0, log: () => {}, prepare: async (candidate: any) => async () => { sent.push(candidate.model); throw httpError(400) } }))
+  assert.equal(inserts.length,before+1)
+  assert.equal(extras(inserts.at(-1)).nextCandidate,null)
+})
+
 test('recognized transport failures advance; unknown and cancelled failures do not', () => {
   for(const err of [new Error('ECONNRESET'),Object.assign(new TypeError('fetch failed'),{cause:{code:'ECONNREFUSED'}}),Object.assign(new Error('connection'),{name:'APIConnectionError'})]) assert.ok(fallbackReason(err))
   for(const err of [undefined,null,{},new Error('network?'),new TypeError('oops'),new DOMException('aborted','AbortError'),httpError(600)]) assert.equal(isFallbackableError(err),false)

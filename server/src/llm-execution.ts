@@ -80,7 +80,13 @@ export async function executeLlmPlan<T>(options: LlmExecutionOptions<T>): Promis
     }
     const cancelled = signal?.aborted || isLlmCancellation(error)
     const transport = failed && prepared && !cancelled && options.transportRetry?.shouldRetry(error)
-    const reason = failed && !cancelled ? (!prepared ? 'prepare-failed' : fallbackReason(error)) ?? (transport ? 'transport:provider-connection' : null) : null
+    const rawReason = failed && !cancelled ? (!prepared ? 'prepare-failed' : fallbackReason(error)) ?? (transport ? 'transport:provider-connection' : null) : null
+    // The cloud cerebellum is best-effort: a candidate-specific gateway 400
+    // (model not schedulable, group mismatch) must not kill the call —
+    // advance to the next candidate and record why.
+    const support400 = rawReason === null && failed && !cancelled && prepared && plan.role === 'support'
+      && (error as { status?: unknown } | null)?.status === 400
+    const reason = support400 ? 'upstream-http-400' : rawReason
     const imageRetry = failed && prepared && !state.committed && !cancelled && options.retry
       && retryCount < options.retry.maxRetries
       && options.retry.shouldRetry(error, candidate)
