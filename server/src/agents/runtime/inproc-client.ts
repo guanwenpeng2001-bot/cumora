@@ -1110,7 +1110,7 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
        SELECT $1, m.id FROM messages m
        JOIN conversations c ON c.id = m.conversation_id AND c.company_id = m.company_id
        JOIN participants p ON p.id = $1 AND p.company_id = c.company_id
-         AND p.kind = 'agent' AND p.departed_at IS NULL
+         AND p.kind = 'agent' AND (p.departed_at IS NULL OR m.delivery_recipient_id = $1)
        WHERE m.conversation_id = $2 AND m.id = ANY($3::text[])
          AND ($4::text IS NULL OR c.company_id = $4)
          AND (EXISTS (SELECT 1 FROM conversation_members cm

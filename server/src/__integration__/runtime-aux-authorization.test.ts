@@ -711,16 +711,16 @@ test('[integration] runtime mark-read accepts only the kicked agent\'s durable d
   })
   assert.equal(departure.status, 200, JSON.stringify(departure.body))
 
-  // A retry is harmless and does not create a second cursor row.
+  // A retry is harmless and does not create a second receipt row.
   const retry = await call('/runtime/conversation/mark-read', {
     token: target.token,
     body: { conversationId, upToMessageId: departureMessage },
   })
   assert.equal(retry.status, 200, JSON.stringify(retry.body))
-  const { rows } = await pool.query<{ last_read_message_id: string }>(
-    `SELECT last_read_message_id FROM conversation_reads
-      WHERE user_id = $1 AND conversation_id = $2`,
-    [target.agentId, conversationId],
+  const { rows } = await pool.query<{ message_id: string }>(
+    `SELECT message_id FROM agent_message_consumptions
+      WHERE agent_id = $1 AND message_id = $2`,
+    [target.agentId, departureMessage],
   )
-  assert.deepEqual(rows, [{ last_read_message_id: departureMessage }])
+  assert.deepEqual(rows, [{ message_id: departureMessage }])
 })
