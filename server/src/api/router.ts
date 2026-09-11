@@ -772,6 +772,27 @@ api.put('/settings/models', safe(async (req, res) => {
 /** Available-models catalog: sub2api live (caller's keys) + BYOA computer
  *  catalogs + configured settings, bucketed by capability. 5min cache,
  *  ?refresh=1 forces a rebuild. */
+api.get('/models/catalog', safe(async (req, res) => {
+  const { userId, companyId } = await requireCompany(req)
+  const query: import('../models/catalog.js').CatalogQuery = {}
+  for (const key of ['domain', 'computerId', 'engine', 'profileId', 'capability'] as const) {
+    const value = req.query[key]
+    if (value === undefined) continue
+    if (typeof value !== 'string' || value.length > 200) throw new HttpError(400, `Invalid ${key}`)
+    if (key === 'domain' && !['server', 'managed', 'byoa'].includes(value)) throw new HttpError(400, 'Invalid domain')
+    if (key === 'capability' && !['text', 'image', 'audio', 'embed', 'video'].includes(value)) throw new HttpError(400, 'Invalid capability')
+    Object.assign(query, { [key]: value })
+  }
+  try {
+    const { modelCatalog } = await import('../models/catalog.js')
+    res.json(await modelCatalog(userId, companyId, query))
+  } catch (e) {
+    if (e instanceof TenantLlmAccessError) throw new HttpError(e.status, e.message)
+    throw e
+  }
+}))
+
+// Compatibility window: the existing bucket projection remains authoritative for old consumers.
 api.get('/models/available', safe(async (req, res) => {
   const { userId, companyId } = await requireCompany(req)
   const computerId = typeof req.query?.computerId === 'string' ? req.query.computerId : undefined
