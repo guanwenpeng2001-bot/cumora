@@ -970,9 +970,9 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
   // and entries are checked for staleness on read, so a 5-min cap
   // works fine in practice.
   //
-  // Race safety: HSETNX is atomic, so two agents claiming the same
-  // (taskType, subject) at the same moment have a clear winner. The
-  // loser gets {accepted: false, existing}.
+  // Race safety: HSETNX gates fresh claims; Lua compares and replaces
+  // stale claims atomically. Two agents claiming the same (taskType,
+  // subject) have a clear winner; the loser gets {accepted: false, existing}.
 
   async claimWork(args: {
     scopeKey: string
@@ -1035,11 +1035,20 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
       }
       const ageMs = now - existing.startedAt
       if (ageMs > ttl * 1000) {
-        // Stale claim — evict and take it over.
-        await redis.hdel(key, field)
-        const retake = await redis.hsetnx(key, field, JSON.stringify(entry))
+        // Recheck the observed claim and its age atomically: a late contender
+        // must never evict a new owner (or a refreshed claim).
+        const retake = await redis.eval(`
+          local current = redis.call('HGET', KEYS[1], ARGV[1])
+          if current ~= ARGV[2] then return 0 end
+          local existing = cjson.decode(current)
+          if tonumber(ARGV[3]) - existing.startedAt <= tonumber(ARGV[4]) * 1000 then
+            return 0
+          end
+          redis.call('HSET', KEYS[1], ARGV[1], ARGV[5])
+          redis.call('EXPIRE', KEYS[1], ARGV[4])
+          return 1
+        `, 1, key, field, rawExisting, now, ttl, JSON.stringify(entry))
         if (retake === 1) {
-          await redis.expire(key, ttl)
           return { accepted: true }
         }
         // Lost the eviction race; fall through with the latest holder.
