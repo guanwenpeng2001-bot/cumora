@@ -695,7 +695,7 @@ api.post('/audio/transcription', requireAuthBeforeLargeBody, audioJsonParser, sa
     if (controller.signal.aborted) return
     if (error instanceof AudioInputError) throw new HttpError(error.status, error.message)
     // Provider accepted the clip but returned no speech — client-fixable, not a 500.
-    if (error instanceof Error && error.message === 'ASR returned invalid transcription') {
+    if (error instanceof Error && (error as Error & { code?: string }).code === 'AUDIO_NO_SPEECH') {
       throw new HttpError(422, 'No speech recognized in the audio clip')
     }
     throw error

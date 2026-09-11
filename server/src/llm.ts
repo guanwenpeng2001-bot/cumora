@@ -581,13 +581,15 @@ export async function transcribeAudio(audioBase64: unknown, format: unknown = 'w
           state.usageProtocol = 'chat'
           state.actualModel = typeof body?.model === 'string' ? body.model : null
           const content = body?.choices?.[0]?.message?.content
-          if (typeof content !== 'string' || !content.trim()) throw new Error('ASR returned invalid transcription')
+          if (typeof content !== 'string') throw new Error('ASR returned invalid transcription')
+          if (!content.trim()) throw Object.assign(new Error('No speech recognized in the audio clip'), { code: 'AUDIO_NO_SPEECH' })
           return content.trim()
         } catch (error) {
           // Provider errors can echo the request or transcript; retain only routing diagnostics.
           const reason = fallbackReason(error)
           const status = (error as { status?: unknown } | null)?.status
           const safe = new Error('ASR request failed')
+          if ((error as { code?: unknown } | null)?.code === 'AUDIO_NO_SPEECH') Object.assign(safe, { code: 'AUDIO_NO_SPEECH' })
           if (typeof status === 'number' && Number.isInteger(status) && status >= 100 && status <= 599) Object.assign(safe, { status })
           if (isLlmCancellation(error)) safe.name = 'AbortError'
           else if (reason?.startsWith('transport:')) {

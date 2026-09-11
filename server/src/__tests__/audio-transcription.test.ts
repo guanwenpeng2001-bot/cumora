@@ -260,3 +260,26 @@ test('F13: one absolute deadline caps the entire ASR chain, including fallback',
   await assert.rejects(expired.audio.transcribeAudio(wav(), 'wav', 'company-a', { deadlineAt: Date.now() - 1 }))
   assert.equal(expired.requests.length, 0)
 })
+
+
+test('deep-1: empty valid ASR reaches API as 422; malformed provider content stays an upstream failure', async () => {
+  const source = read('../api/router.ts')
+  const start = source.indexOf("api.post('/audio/transcription'")
+  const block = source.slice(start, source.indexOf('\n}))', start) + 4)
+  for (const content of ['', '  ', null, {}, 42]) {
+    const f = fixture([], false, content)
+    class HttpError extends Error { constructor(readonly status: number, message: string) { super(message) } }
+    let handler: any
+    compile(block, {}, { api: { post: (...args: any[]) => { handler = args.at(-1) } },
+      requireAuthBeforeLargeBody: () => {}, audioJsonParser: () => {}, safe: (fn: any) => fn,
+      requireCompany: async () => ({ companyId: 'company-a' }), HttpError, AudioInputError: f.audio.AudioInputError,
+      transcribeAudio: f.audio.transcribeAudio })
+    const res = Object.assign(new EventEmitter(), { json: () => assert.fail('must reject') })
+    await assert.rejects(handler({ body: { audio: wav(), format: 'wav' } }, res), (error: any) => {
+      if (typeof content === 'string') return error.status === 422 && /No speech/.test(error.message)
+      return !(error instanceof HttpError) && error.message === 'ASR request failed'
+    })
+    assert.equal(f.requests.length, 1)
+    assert.equal(f.records.length, 1)
+  }
+})

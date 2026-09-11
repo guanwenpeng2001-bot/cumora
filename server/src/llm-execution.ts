@@ -135,7 +135,7 @@ function roleForContext(ctx: LlmCallContext): RoleCallPlan['role'] {
   return 'support'
 }
 
-async function textPlan(ctx: LlmCallContext, model?: string): Promise<RoleCallPlan> {
+async function textPlan(ctx: LlmCallContext, model?: string, signal?: AbortSignal): Promise<RoleCallPlan> {
   const role = roleForContext(ctx)
   const snapshot = getServerSettingsSnapshot()
   let captured = snapshot
@@ -148,7 +148,7 @@ async function textPlan(ctx: LlmCallContext, model?: string): Promise<RoleCallPl
     captured = { ...snapshot, settings: { ...snapshot.settings, [`${role}_model`]: model, llm_config: JSON.stringify(config) } }
   }
   return resolveRoleCall(ctx.companyId, ctx.domain ?? (ctx.companyId ? 'managed' : 'server'), role, ctx.purpose,
-    { ...ctx.agent, id: ctx.agentId ?? ctx.agent?.id }, captured)
+    { ...ctx.agent, id: ctx.agentId ?? ctx.agent?.id }, captured, signal)
 }
 
 export function responsesToChat(args: TextArgs): TextArgs {
@@ -157,9 +157,18 @@ export function responsesToChat(args: TextArgs): TextArgs {
   if (args.instructions) messages.push({ role: 'system', content: args.instructions })
   const input = typeof args.input === 'string' ? [{ role: 'user', content: args.input }] : args.input
   if (!Array.isArray(input)) throw new Error('Responses input must be text or an array')
+  let pendingCalls: Record<string, unknown>[] = []
+  const flushCalls = () => {
+    if (pendingCalls.length) messages.push({ role: 'assistant', content: null, tool_calls: pendingCalls })
+    pendingCalls = []
+  }
   for (const item of input) {
-    if (item.type === 'function_call') messages.push({ role: 'assistant', content: null, tool_calls: [{ id: item.call_id, type: 'function', function: { name: item.name, arguments: item.arguments } }] })
-    else if (item.type === 'function_call_output') messages.push({ role: 'tool', tool_call_id: item.call_id, content: item.output })
+    if (item.type === 'function_call') {
+      pendingCalls.push({ id: item.call_id, type: 'function', function: { name: item.name, arguments: item.arguments } })
+      continue
+    }
+    flushCalls()
+    if (item.type === 'function_call_output') messages.push({ role: 'tool', tool_call_id: item.call_id, content: item.output })
     else if (item.role) {
       const content = Array.isArray(item.content) ? item.content.map((part: Record<string, unknown>) => {
         if (part.type === 'input_text' || part.type === 'output_text') return { type: 'text', text: part.text }
@@ -169,6 +178,7 @@ export function responsesToChat(args: TextArgs): TextArgs {
       messages.push({ role: item.role, content })
     } else throw new Error('Unsupported Responses item for Chat route')
   }
+  flushCalls()
   const { input: _input, instructions: _instructions, max_output_tokens, reasoning, text, ...rest } = args
   const body: TextArgs = { ...rest, messages }
   if (max_output_tokens !== undefined) body.max_completion_tokens = max_output_tokens
@@ -209,7 +219,7 @@ export async function executeTrackedText(ctx: LlmCallContext, api: 'responses' |
   const opts = (options ?? {}) as TextOptions
   const signal = opts.signal ?? args.signal as AbortSignal | undefined
   if (signal?.aborted) throw signal.reason ?? new DOMException('Aborted', 'AbortError')
-  const plan = await textPlan(ctx, args.model)
+  const plan = await textPlan(ctx, args.model, signal)
   return executeLlmPlan({ plan, context: ctx, signal, sdkMaxRetries: opts.maxRetries,
     prepare: async (candidate, state) => {
       if (!['responses', 'chat'].includes(candidate.protocol)) throw new Error('Non-text LLM protocol')

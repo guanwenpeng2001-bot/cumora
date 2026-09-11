@@ -17,6 +17,7 @@ export interface TenantLlmContext {
 
 export interface PlatformSnapshot extends KeyModelsResult {
   stale: boolean
+  lastSuccessAt: number | null
 }
 export interface TenantModelSnapshot {
   authorizationVersion: string
@@ -33,6 +34,10 @@ const SNAPSHOT_TTL_MS = 30_000
 const CONTEXT_TTL_MS = SNAPSHOT_TTL_MS
 const CONTEXT_MAX = 2_048
 const SNAPSHOT_MAX = 2_048
+const MAX_STALE_MS = SNAPSHOT_TTL_MS * 4
+function hasExpiredMembership(snapshot: TenantModelSnapshot): boolean {
+  return Object.values(snapshot.platforms).some(p => p.models.size > 0 && (p.lastSuccessAt === null || Date.now() - p.lastSuccessAt >= MAX_STALE_MS))
+}
 const contexts = new Map<string, { context: TenantLlmContext; at: number }>()
 const planAuth = new WeakMap<object, TenantLlmContext>()
 
@@ -153,7 +158,7 @@ export async function tenantModelSnapshot(context: TenantLlmContext, refresh = f
   }
   const existing = snapshots.get(companyId)
   const previous = existing?.authorizationVersion === authorizationVersion ? existing : undefined
-  if (!refresh && previous && Date.now() - previous.at < SNAPSHOT_TTL_MS) return previous
+  if (!refresh && previous && Date.now() - previous.at < SNAPSHOT_TTL_MS && !hasExpiredMembership(previous)) return previous
   const running = refreshes.get(companyId)
   if (running?.version === authorizationVersion) return running.promise
   const promise = (async () => {
@@ -163,8 +168,10 @@ export async function tenantModelSnapshot(context: TenantLlmContext, refresh = f
         ? { models: new Set<string>(), ok: false, status: 'unavailable', diagnostic: 'gateway-unconfigured' }
         : await listKeyModelsWithStatus(context.baseURL, key)
       const old = previous?.platforms[platform]
-      const stale = !result.ok && result.status !== 'no-key' && !!old && (old.ok || old.stale)
-      return [platform, { ...result, models: stale ? old.models : result.models, stale }] as const
+      const lastSuccessAt = result.ok ? Date.now() : old?.lastSuccessAt ?? null
+      const stale = !result.ok && (result.status === 'timeout' || result.status === 'unavailable')
+        && !!old && lastSuccessAt !== null && Date.now() - lastSuccessAt < MAX_STALE_MS
+      return [platform, { ...result, models: stale ? old.models : result.models, stale, lastSuccessAt }] as const
     }))
     const current = getManagedPodSettings()?.gateway ?? contexts.get(companyId)?.context
     if (context.generation !== (generations.get(companyId) ?? 0)
@@ -190,15 +197,12 @@ export async function tenantRoutingSnapshot(context: TenantLlmContext, signal?: 
   const existing = snapshots.get(context.companyId)
   const previous = existing?.authorizationVersion === context.authorizationVersion ? existing : null
   // Warm catalog: return the snapshot and do not start another /models round-trip.
-  if (previous && Date.now() - previous.at < SNAPSHOT_TTL_MS) return previous
+  if (previous && Date.now() - previous.at < SNAPSHOT_TTL_MS && !hasExpiredMembership(previous)) return previous
   const refresh = tenantModelSnapshot(context)
   // Background discovery can fail after the caller has returned or cancelled.
   void refresh.catch(() => {})
-  if (previous) return previous
-  try { return await waitForLlmResolution(refresh, 250, signal) }
-  catch (error) {
-    signal?.throwIfAborted()
-    if (error instanceof Error && error.name === 'TimeoutError') return null
-    throw error
-  }
+  if (previous && !hasExpiredMembership(previous)) return previous
+  // Discovery has a 15s HTTP deadline. Cold/expired routes must finish discovery
+  // or raise a retryable timeout, never become an unavailable plan.
+  return waitForLlmResolution(refresh, 16_000, signal)
 }

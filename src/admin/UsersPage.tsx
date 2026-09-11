@@ -13,6 +13,8 @@ type UserSync = {
   sub2apiSync?: {
     targetTier: Tier
     version: string
+    expectedConfigVersion?: string
+    appliedConfigVersion?: string | null
     status: 'pending' | 'processing' | 'failed' | 'succeeded'
     attempts: number
     nextAttemptAt: string | null
@@ -35,6 +37,7 @@ function TierSync({ user }: { user: AdminUser & UserSync }) {
     <div>{text('目标套餐', 'Target tier')}: {sync?.targetTier ?? text('未知', 'Unknown')}</div>
     <div>{sync ? labels[sync.status] ?? text('同步状态未知', 'Sync status unknown') : sync === null ? text('无同步记录', 'No sync record') : text('同步状态未知；展开或刷新读取', 'Sync unknown; expand or refresh to load')}</div>
     {sync && <div>{text('同步版本 / 尝试次数', 'Sync version / attempts')}: {sync.version} / {sync.attempts}</div>}
+    {sync?.expectedConfigVersion && <div>{text('组配置期望 / 已应用', 'Group config expected / applied')}: {sync.expectedConfigVersion} / {sync.appliedConfigVersion ?? text('待应用', 'Pending')}</div>}
     {sync?.nextAttemptAt && <div>{text('下次重试', 'Next retry')}: {fmtDateTime(sync.nextAttemptAt)}</div>}
     {sync?.status === 'failed' && <div className="admin-banner-err">{text('网关对账失败，有效套餐保持原值。服务端将按重试计划继续同步。', 'Gateway reconciliation failed; the effective tier is unchanged. The server will retry as scheduled.')}</div>}
   </div>

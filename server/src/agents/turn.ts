@@ -1201,7 +1201,7 @@ async function executeAuxiliaryStream<T>(args: {
   const timeoutMs = Number.isSafeInteger(configuredTimeout) && configuredTimeout > 0 && configuredTimeout <= 2_147_483_647
     ? configuredTimeout : 30_000
   const plan = await resolveRoleCall(args.companyId, args.companyId ? 'managed' : 'server',
-    'compaction', args.purpose, { id: args.agentId })
+    'compaction', args.purpose, { id: args.agentId }, undefined, args.signal)
   return executeLlmPlan({
     plan, context: { role: 'compaction', purpose: args.purpose, companyId: args.companyId,
       agentId: args.agentId, extras: args.extras }, signal: args.signal, sdkMaxRetries: 0,
@@ -1611,7 +1611,7 @@ export async function executeAgentTurnHop(args: {
         const requestController = new AbortController()
         const requestSignal = AbortSignal.any([signal, requestController.signal])
         attempt.protocol = candidate.protocol
-        attempt.usageProtocol = 'responses'
+        attempt.usageProtocol = candidate.protocol === 'chat' ? 'chat' : 'responses'
         await args.requestEvent?.({ model: candidate.model, requestedModel: args.plan.candidates[0]?.model,
           requestModel: candidate.requestModel, actualModel: null, route: candidate.route.id,
           inputItems: input.length, maxOutputTokens: output, contextWindow: window,
@@ -1626,8 +1626,15 @@ export async function executeAgentTurnHop(args: {
               try { applyResponseStreamEvent(state, event, { traceItem: traceResponseOutputItem }) }
               finally {
                 attempt.actualModel = state.actualModel ?? null
-                attempt.rawUsage = state.responseUsage
-                attempt.usage = measuredUsage(state.responseUsage, 'responses')
+                const chatResponse = (event as unknown as { response?: { raw_chat_usage?: unknown } }).response
+                if (chatResponse && 'raw_chat_usage' in chatResponse) {
+                  attempt.rawUsage = chatResponse.raw_chat_usage
+                  attempt.usageProtocol = 'chat'
+                  attempt.usage = measuredUsage(chatResponse.raw_chat_usage, 'chat')
+                } else if (!useChat) {
+                  attempt.rawUsage = state.responseUsage
+                  attempt.usage = measuredUsage(state.responseUsage, 'responses')
+                }
                 const reasoning = (state.responseUsage as { output_tokens_details?: { reasoning_tokens?: number } } | null)?.output_tokens_details?.reasoning_tokens
                 if (typeof reasoning === 'number' && Number.isSafeInteger(reasoning) && reasoning >= 0) attempt.reasoningTokens = reasoning
                 // Text and tool declarations remain private until this hop returns.

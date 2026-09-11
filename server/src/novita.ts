@@ -230,9 +230,9 @@ function toResponseUsage(raw: unknown): Record<string, unknown> | null {
   } | null | undefined
   if (!u) return null
   return {
-    input_tokens: u.prompt_tokens ?? 0,
+    input_tokens: u.prompt_tokens,
     input_tokens_details: { cached_tokens: u.prompt_tokens_details?.cached_tokens ?? 0 },
-    output_tokens: u.completion_tokens ?? 0,
+    output_tokens: u.completion_tokens,
     output_tokens_details: { reasoning_tokens: u.completion_tokens_details?.reasoning_tokens ?? 0 },
     total_tokens: u.total_tokens ?? 0,
   }
@@ -337,16 +337,16 @@ async function* createStreaming(
   const toolCallsByIndex = new Map<number, { id: string; name: string; arguments: string }>()
   let usage: unknown = null
   let actualModel: string | undefined
-  let finished = false
+  let finishReason: string | null = null
   let seq = 1
 
   for await (const chunk of stream as AsyncIterable<ChatCompletionChunk>) {
     if (chunk.model) actualModel = chunk.model
-    if (chunk.choices?.[0]?.finish_reason) finished = true
+    if (chunk.choices?.[0]?.finish_reason) finishReason = chunk.choices[0].finish_reason
     if (chunk.usage) usage = chunk.usage
     if (chunk.model || chunk.usage) yield {
       type: 'response.in_progress', sequence_number: seq++,
-      response: { id: responseId, model: actualModel, usage: toResponseUsage(usage), status: 'in_progress' },
+      response: { id: responseId, model: actualModel, usage: toResponseUsage(usage), raw_chat_usage: usage, status: 'in_progress' },
     } as unknown as ResponseStreamEvent
     const delta = chunk.choices?.[0]?.delta
     if (!delta) continue
@@ -364,7 +364,7 @@ async function* createStreaming(
       const idx = tc.index
       let entry = toolCallsByIndex.get(idx)
       if (!entry) {
-        entry = { id: tc.id ?? `call_${idx}`, name: tc.function?.name ?? '', arguments: '' }
+        entry = { id: tc.id ?? '', name: tc.function?.name ?? '', arguments: '' }
         toolCallsByIndex.set(idx, entry)
         yield {
           type: 'response.output_item.added',
@@ -379,6 +379,8 @@ async function* createStreaming(
           },
         } as unknown as ResponseStreamEvent
       }
+      if (tc.id) entry.id = tc.id
+      if (tc.function?.name) entry.name = tc.function.name
       if (tc.function?.arguments) {
         entry.arguments += tc.function.arguments
         yield {
@@ -392,7 +394,19 @@ async function* createStreaming(
     }
   }
 
-  if (!finished) throw Object.assign(new Error('Chat response stream ended before finish_reason'), { code: 'ECONNRESET' })
+  if (!finishReason) throw Object.assign(new Error('Chat response stream ended before finish_reason'), { code: 'ECONNRESET' })
+  const validTools = [...toolCallsByIndex.values()].every(entry => {
+    if (!entry.id || !entry.name) return false
+    try { const args: unknown = JSON.parse(entry.arguments); return !!args && typeof args === 'object' && !Array.isArray(args) } catch { return false }
+  })
+  if (!['stop', 'tool_calls'].includes(finishReason) || !validTools || (finishReason === 'tool_calls' && !toolCallsByIndex.size)) {
+    yield { type: 'response.incomplete', sequence_number: seq++, response: {
+      id: responseId, model: actualModel, status: 'incomplete', output: [],
+      incomplete_details: { reason: finishReason === 'length' ? 'max_output_tokens' : 'content_filter' },
+      usage: toResponseUsage(usage), raw_chat_usage: usage,
+    } } as unknown as ResponseStreamEvent
+    return
+  }
   for (const [idx, entry] of toolCallsByIndex) {
     yield {
       type: 'response.function_call_arguments.done',
@@ -427,6 +441,7 @@ async function* createStreaming(
       status: 'completed',
       output,
       usage: toResponseUsage(usage),
+      raw_chat_usage: usage,
     },
   } as unknown as ResponseStreamEvent
 }

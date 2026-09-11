@@ -720,6 +720,22 @@ export async function writeServerSettings(entries: Record<string, string | null>
         }
       }
     }
+    if (rows.some(([key]) => key === 'sub2api_group_config')) {
+      const current = await client.query<{ key: string; value: string }>('SELECT key, value FROM server_settings')
+      const before = makeSnapshot(current.rows)
+      const raw = entries.sub2api_group_config ?? SETTING_DEFS.find(d => d.key === 'sub2api_group_config')!.envValue()
+      if (raw !== before.settings.sub2api_group_config) {
+        const { tierGroups } = await import('./sub2api.js')
+        const groups = Object.fromEntries((['free', 'pro', 'max'] as const).map(tier => [tier, tierGroups(tier, raw)]))
+        // One durable cursor job; the worker expands bounded user batches after
+        // commit. No per-user HTTP in this settings transaction.
+        await client.query(
+          `INSERT INTO server_settings (key, value) VALUES ($1, $2)
+           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+          ['__sub2api_group_resync', JSON.stringify({ version: String(BigInt(before.revision) + 1n), groups, cursor: null, done: false })],
+        )
+      }
+    }
     for (const [key, value] of rows) {
       await client.query('DELETE FROM server_settings WHERE key = $1', [value === null ? key : INHERIT_PREFIX + key])
       await client.query(

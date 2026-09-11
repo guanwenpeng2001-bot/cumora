@@ -6,12 +6,33 @@ import {
   type Tier, type Platform, type ManagedIntegrationKeys, type ProvisionResult,
 } from './sub2api.js'
 
+interface SyncTarget {
+  groups: Record<Platform, number>
+  configVersion: string
+  appliedVersion: string | null
+}
+interface GroupResyncJob {
+  version: string
+  groups: Record<Tier, Record<Platform, number>>
+  cursor: string | null
+  done: boolean
+}
+const GROUP_JOB_KEY = '__sub2api_group_resync'
+function syncTarget(raw: SyncIntent['target_groups']): SyncTarget {
+  if (raw.groups && typeof raw.groups === 'object') return raw as SyncTarget
+  return { groups: raw as Record<Platform, number>, configVersion: '0', appliedVersion: null }
+}
+async function groupJob(client: Pick<PoolClient, 'query'>): Promise<GroupResyncJob | null> {
+  const { rows } = await client.query<{ value: string }>('SELECT value FROM server_settings WHERE key = $1', [GROUP_JOB_KEY])
+  return rows[0] ? JSON.parse(rows[0].value) as GroupResyncJob : null
+}
+
 interface SyncIntent {
   user_id: string
   intent_id: string
   version: string
   target_tier: Tier
-  target_groups: Record<Platform, number>
+  target_groups: SyncTarget | Record<Platform, number>
   status: 'pending' | 'processing' | 'failed' | 'succeeded'
   attempts: number
   remote_user_id: string | null
@@ -19,6 +40,8 @@ interface SyncIntent {
 }
 export interface Sub2apiSyncStatus {
   targetTier: Tier
+  expectedConfigVersion: string
+  appliedConfigVersion: string | null
   version: string
   status: SyncIntent['status']
   attempts: number
@@ -27,7 +50,8 @@ export interface Sub2apiSyncStatus {
 }
 
 /** Caller owns the transaction. Never contacts the gateway. */
-export async function enqueueSub2apiSync(client: Pick<PoolClient, 'query'>, userId: string, tier: Tier): Promise<void> {
+export async function enqueueSub2apiSync(client: Pick<PoolClient, 'query'>, userId: string, tier: Tier, capturedJob?: GroupResyncJob | null): Promise<void> {
+  const job = capturedJob === undefined ? await groupJob(client) : capturedJob
   if (!['free', 'pro', 'max'].includes(tier)) throw new Error('invalid_tier')
   const user = await client.query('SELECT id FROM users WHERE id = $1 AND deleted_at IS NULL FOR UPDATE', [userId])
   if (!user.rowCount) throw new Error('user_not_found')
@@ -36,9 +60,12 @@ export async function enqueueSub2apiSync(client: Pick<PoolClient, 'query'>, user
      SELECT id, $2, $3, $4::jsonb, sub2api_user_id FROM users WHERE id = $1
      ON CONFLICT (user_id) DO UPDATE SET
        intent_id = EXCLUDED.intent_id, version = sub2api_sync_intents.version + 1,
-       target_tier = EXCLUDED.target_tier, target_groups = EXCLUDED.target_groups,
+       target_tier = EXCLUDED.target_tier,
+       target_groups = EXCLUDED.target_groups || jsonb_build_object('appliedVersion',
+         CASE WHEN sub2api_sync_intents.status = 'succeeded' THEN COALESCE(sub2api_sync_intents.target_groups->>'configVersion', '0')
+              ELSE sub2api_sync_intents.target_groups->>'appliedVersion' END),
        status = 'pending', attempts = 0, next_attempt_at = NOW(), last_error = NULL, updated_at = NOW()`,
-    [userId, randomUUID(), tier, JSON.stringify(tierGroups(tier))],
+    [userId, randomUUID(), tier, JSON.stringify({ groups: job?.groups[tier] ?? tierGroups(tier), configVersion: job?.version ?? '0', appliedVersion: null })],
   )
 }
 
@@ -55,12 +82,26 @@ export async function requestSub2apiSync(userId: string, tier: Tier): Promise<vo
 }
 
 export async function getSub2apiSyncStatus(userId: string): Promise<Sub2apiSyncStatus | null> {
-  const { rows } = await pool.query<Sub2apiSyncStatus>(
-    `SELECT target_tier AS "targetTier", version::text AS version, status, attempts,
+  const job = await groupJob(pool)
+  const { rows } = await pool.query<Sub2apiSyncStatus & { target_groups: SyncIntent['target_groups'] }>(
+    `SELECT target_tier AS "targetTier", version::text AS version, status, attempts, target_groups,
        CASE WHEN status = 'succeeded' THEN NULL ELSE next_attempt_at END AS "nextAttemptAt",
        last_error AS "lastError" FROM sub2api_sync_intents WHERE user_id = $1`, [userId],
   )
-  return rows[0] ?? null
+  const row = rows[0]
+  if (!row) {
+    if (!job) return null
+    const { rows: users } = await pool.query<{ tier: Tier }>('SELECT tier FROM users WHERE id = $1 AND deleted_at IS NULL', [userId])
+    return users[0] ? { targetTier: users[0].tier, version: '0', expectedConfigVersion: job.version,
+      appliedConfigVersion: null, status: 'pending', attempts: 0, nextAttemptAt: null, lastError: null } : null
+  }
+  const { target_groups, ...status } = row
+  const target = syncTarget(target_groups)
+  const expectedConfigVersion = job?.version ?? '0'
+  const appliedConfigVersion = row.status === 'succeeded' ? target.configVersion : target.appliedVersion
+  return { ...status, expectedConfigVersion, appliedConfigVersion,
+    status: target.configVersion !== expectedConfigVersion ? 'pending' : row.status }
+
 }
 
 /** Session lock serializes gateway work across processes; no transaction spans HTTP. */
@@ -84,7 +125,16 @@ export async function reconcileSub2apiSync(userId: string): Promise<ProvisionRes
           WHERE i.user_id = $1 AND u.deleted_at IS NULL`, [userId],
       )
       const intent = rows[0]
-      if (!intent || intent.status === 'succeeded') return null
+      if (!intent) return null
+      const target = syncTarget(intent.target_groups)
+      const job = await groupJob(client)
+      if (target.configVersion !== (job?.version ?? '0')) {
+        await client.query('BEGIN')
+        await enqueueSub2apiSync(client, userId, intent.target_tier, job)
+        await client.query('COMMIT')
+        continue
+      }
+      if (intent.status === 'succeeded') return null
       version = intent.version
       await client.query(
         `UPDATE sub2api_sync_intents SET status = 'processing', attempts = attempts + 1, updated_at = NOW()
@@ -92,7 +142,7 @@ export async function reconcileSub2apiSync(userId: string): Promise<ProvisionRes
       )
       const result = await reconcileSub2apiUser({
         cumoraUserId: userId, email: intent.email, displayName: intent.display_name,
-        intentId: intent.intent_id, groups: intent.target_groups,
+        intentId: intent.intent_id, groups: target.groups,
         remoteUserId: intent.remote_user_id ? Number(intent.remote_user_id) : null,
         existingKeys: parseApiKeyMap(intent.sub2api_api_key), managedKeys: intent.managed_keys,
         checkpoint: async (remoteId, keys) => {
@@ -104,11 +154,15 @@ export async function reconcileSub2apiSync(userId: string): Promise<ProvisionRes
         },
       })
       await client.query('BEGIN')
+      // Match the settings writer's lock order: settings before users.
+      // A new config cannot commit between this version check and confirmation.
+      await client.query('LOCK TABLE server_settings IN SHARE MODE')
+      const latestJob = await groupJob(client)
       const owner = await client.query('SELECT id FROM users WHERE id = $1 AND deleted_at IS NULL FOR UPDATE', [userId])
       const current = await client.query<{ version: string }>(
         'SELECT version FROM sub2api_sync_intents WHERE user_id = $1 FOR UPDATE', [userId],
       )
-      if (!owner.rowCount || current.rows[0]?.version !== version) {
+      if (!owner.rowCount || current.rows[0]?.version !== version || target.configVersion !== (latestJob?.version ?? '0')) {
         await client.query('ROLLBACK')
         continue
       }
@@ -117,8 +171,8 @@ export async function reconcileSub2apiSync(userId: string): Promise<ProvisionRes
         [userId, result.sub2apiUserId, serializeApiKeyMap(result.apiKeys), intent.target_tier],
       )
       await client.query(
-        `UPDATE sub2api_sync_intents SET status = 'succeeded', last_error = NULL, confirmed_at = NOW(), updated_at = NOW()
-          WHERE user_id = $1 AND version = $2`, [userId, version],
+        `UPDATE sub2api_sync_intents SET status = 'succeeded', target_groups = target_groups || jsonb_build_object('appliedVersion', $3::text), last_error = NULL, confirmed_at = NOW(), updated_at = NOW()
+          WHERE user_id = $1 AND version = $2`, [userId, version, target.configVersion],
       )
       await client.query('COMMIT')
       // The committed users.xmin is also the cross-process authorization version.
@@ -164,8 +218,40 @@ export async function reconcileSub2apiSync(userId: string): Promise<ProvisionRes
   }
 }
 
+/** Cursor advancement and intent insertion commit together, so a crash loses no users. */
+export async function expandSub2apiGroupResync(): Promise<void> {
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    // Acquire the same table lock as settings writers before a row lock;
+    // otherwise table-lock upgrade and row-lock waits can deadlock each other.
+    await client.query('LOCK TABLE server_settings IN SHARE ROW EXCLUSIVE MODE')
+    const { rows: jobs } = await client.query<{ value: string }>(
+      'SELECT value FROM server_settings WHERE key = $1 FOR UPDATE', [GROUP_JOB_KEY],
+    )
+    const job = jobs[0] ? JSON.parse(jobs[0].value) as GroupResyncJob : null
+    if (job && !job.done) {
+      const { rows } = await client.query<{ id: string; tier: Tier; target_tier: Tier | null }>(
+        `SELECT u.id, u.tier, i.target_tier FROM users u
+         LEFT JOIN sub2api_sync_intents i ON i.user_id = u.id
+         WHERE u.deleted_at IS NULL AND ($1::text IS NULL OR u.id > $1)
+         ORDER BY u.id LIMIT 100 FOR UPDATE OF u`, [job.cursor],
+      )
+      for (const row of rows) await enqueueSub2apiSync(client, row.id, row.target_tier ?? row.tier, job)
+      job.cursor = rows.at(-1)?.id ?? job.cursor
+      job.done = rows.length < 100
+      await client.query('UPDATE server_settings SET value = $2, updated_at = NOW() WHERE key = $1', [GROUP_JOB_KEY, JSON.stringify(job)])
+    }
+    await client.query('COMMIT')
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally { client.release() }
+}
+
 export async function runSub2apiSyncTick(): Promise<void> {
   if (!sub2apiConfigured()) return
+  await expandSub2apiGroupResync()
   const { rows } = await pool.query<{ user_id: string }>(
     `SELECT i.user_id FROM sub2api_sync_intents i JOIN users u ON u.id = i.user_id
       WHERE i.status <> 'succeeded' AND i.next_attempt_at <= NOW() AND u.deleted_at IS NULL

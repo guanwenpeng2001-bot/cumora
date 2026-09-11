@@ -81,15 +81,28 @@ export async function resolveRoleCall(company: string | null, domain: RoleCallPl
   const targets = role !== 'embed' && selected?.fallbackPolicy === 'env_after_chain' ? selected.directTargets ?? [] : []
   const entries = [...models.map(model => ({ model, target: undefined as typeof targets[number] | undefined })),
     ...targets.map(target => ({ model: target.model, target }))]
-  const candidates = entries.map(({ model, target }): RoleCallCandidate => {
+  const expanded = entries.flatMap(entry => {
+    const translated = readLlmModelTarget(entry.model, config, entry.target)
+    if (entry.target || translated.route || role === 'embed' || !available.length || dashscopeMediaRole(translated.requestModel) === 'audio') return [{ ...entry, platformHint: undefined as Platform | undefined }]
+    const preferred = pickPlatformForModel(modelsByPlatform, translated.requestModel, available)
+    const membership = available.filter(p => [...modelsByPlatform[p] ?? []].some(id => id.trim().toLowerCase() === translated.requestModel.trim().toLowerCase()))
+    const routes = [...new Set([preferred, ...membership])].filter(p => available.includes(p))
+    if (!routes.length && available.some(p => {
+      const status = discovery?.platforms[p]
+      return !status || status.status === 'timeout' || status.status === 'unavailable'
+    })) throw new DOMException('LLM model discovery pending; resolve again', 'TimeoutError')
+    return (routes.length ? routes : [preferred]).map(platformHint => ({ ...entry, platformHint }))
+  })
+  const candidates = expanded.map(({ model, target, platformHint }): RoleCallCandidate => {
     const sourceKey = model === primary ? `${role}_model` : `${role}_fallback_models`
     const translated = readLlmModelTarget(model, config, target)
     const { metadata, route: explicit } = translated
     const slot: DirectLlmSlot = explicit?.env ?? (['image', 'audio', 'embed'].includes(role) ? role as DirectLlmSlot : 'text')
     const direct = resolveDirectLlmEnv(slot)
     const dashscope = dashscopeMediaRole(translated.requestModel) === role
-    const kind = explicit?.kind ?? (dashscope ? 'direct' : role === 'embed' ? direct.configured || !sub2apiRoutingConfigured() ? 'direct' : 'gateway' : available.length ? 'gateway' : 'direct')
-    const platform = kind === 'gateway' ? explicit?.platform ?? (role === 'embed' ? 'openai' : pickPlatformForModel(modelsByPlatform, model, available)) : undefined
+    const discoveredImage = role === 'image' && supportsGatewayImages(translated.requestModel) && available.some(p => [...modelsByPlatform[p] ?? []].some(id => id.toLowerCase() === translated.requestModel.toLowerCase()))
+    const kind = explicit?.kind ?? (dashscope && !discoveredImage ? 'direct' : role === 'embed' ? direct.configured || !sub2apiRoutingConfigured() ? 'direct' : 'gateway' : available.length ? 'gateway' : 'direct')
+    const platform = kind === 'gateway' ? explicit?.platform ?? platformHint ?? (role === 'embed' ? 'openai' : pickPlatformForModel(modelsByPlatform, model, available)) : undefined
     const protocol = translated.protocol ?? explicit?.protocol ?? (kind === 'direct' ? direct.protocol as LlmProtocol : role === 'image' ? 'images' : role === 'audio' ? 'chat' : role === 'embed' ? 'embeddings' : platform === 'zhipu' ? 'chat' : 'responses')
     const gatewaySupported = role !== 'image' || kind !== 'gateway' || protocol === 'images' && supportsGatewayImages(translated.requestModel)
     const platformDiscovery = kind === 'gateway' && platform && discovery ? discovery.platforms[platform] : undefined
@@ -112,7 +125,7 @@ export async function resolveRoleCall(company: string | null, domain: RoleCallPl
         env: kind === 'direct' ? slot : undefined,
         endpointSource: kind === 'gateway' ? 'sub2api-env' : direct.endpointSource,
         credentialSource: kind === 'gateway' ? 'owner-key-map' : direct.keySource },
-      protocol, available: compatible && gatewaySupported && audioSupported && gatewayGroupReady && (kind === 'gateway' ? Boolean(context?.baseURL && platform && context.keys[platform]) : direct.configured),
+      protocol, available: compatible && gatewaySupported && audioSupported && gatewayGroupReady && (kind === 'gateway' ? Boolean(context?.baseURL && platform && context.keys[platform] && platformDiscovery?.status !== 'unauthorized' && platformDiscovery?.status !== 'empty') : direct.configured),
       source: target ? 'llm_config:env_after_chain' : role === 'brain' && ((model === primary && agent?.model?.trim()) || (model !== primary && mc?.fallbackModels)) ? 'agent' : selected ? `${snapshot.sources.llm_config}:llm_config` : `${snapshot.sources[sourceKey] ?? 'env'}:${sourceKey}`,
       parameterSources: { effort: mc?.thinking !== undefined || mc?.effort !== undefined ? 'agent' : metadata?.thinking !== undefined || metadata?.effort !== undefined ? 'llm_config' : effortKey,
         maxOutputTokens: mc?.maxOutputTokens !== undefined ? 'agent:model-cap' : metadata?.maxOutputTokens !== undefined ? 'llm_config' : role === 'brain' ? 'agent_max_output_tokens' : 'caller-budget',

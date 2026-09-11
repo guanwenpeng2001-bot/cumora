@@ -18,6 +18,7 @@ import {
   __setNovitaClientOverrideForTesting,
   isNovitaModel,
   novitaResponsesShim,
+  chatResponseStream,
   stripNovitaPrefix,
 } from '../novita.js'
 
@@ -220,4 +221,49 @@ test('streaming: tool-call reply produces output_item.added + function_call_argu
   } finally {
     __setNovitaClientOverrideForTesting(null)
   }
+})
+
+
+for (const finish of ['length', 'content_filter', 'tool_calls', 'stop']) test('deep-1: Chat terminal validation rejects partial tools: ' + finish, async () => {
+  const usage = { prompt_tokens: 5, completion_tokens: 2 }
+  const events: any[] = []
+  const client = fakeClient(async () => asAsync([
+    { choices: [{ delta: { tool_calls: [{ index: 0, id: 'A', function: { name: 'lookup', arguments: '{' } }] }, finish_reason: null }] },
+    { choices: [{ delta: {}, finish_reason: finish }] },
+    { choices: [], usage },
+  ]))
+  for await (const event of chatResponseStream(client, { model: 'glm-4.6', messages: [] }, new AbortController().signal)) events.push(event)
+  assert.equal(events.at(-1).type, 'response.incomplete')
+  assert.equal(events.some(e => e.type === 'response.completed' || e.type === 'response.function_call_arguments.done'), false)
+  assert.deepEqual(events.at(-1).response.raw_chat_usage, usage)
+  const state = newResponseStreamState()
+  assert.throws(() => { for (const event of events) applyResponseStreamEvent(state, event) }, /incomplete/)
+  assert.equal(Boolean(state.completed), false)
+  assert.equal((state.responseUsage as { input_tokens?: number } | null)?.input_tokens, 5)
+})
+
+for (const raw of [{}, { prompt_tokens: 9 }, { completion_tokens: 4 }, { prompt_tokens: -1, completion_tokens: 2 }]) test('deep-1: Chat usage preserves missing and invalid counts ' + JSON.stringify(raw), async () => {
+  const client = fakeClient(async () => asAsync([
+    { choices: [{ delta: { content: 'ok' }, finish_reason: 'stop' }] },
+    { choices: [], usage: raw },
+  ]))
+  const events: any[] = []
+  for await (const event of chatResponseStream(client, { model: 'glm-4.6', messages: [] }, new AbortController().signal)) events.push(event)
+  const response = events.at(-1).response
+  assert.deepEqual(response.raw_chat_usage, raw)
+  assert.equal(response.usage.input_tokens, (raw as { prompt_tokens?: number }).prompt_tokens)
+  assert.equal(response.usage.output_tokens, (raw as { completion_tokens?: number }).completion_tokens)
+})
+
+test('deep-1: complete parallel Chat tools retain ids and validated arguments', async () => {
+  const client = fakeClient(async () => asAsync([
+    { choices: [{ delta: { tool_calls: [
+      { index: 0, id: 'A', function: { name: 'lookup', arguments: '{"id":1}' } },
+      { index: 1, id: 'B', function: { name: 'lookup', arguments: '{"id":2}' } },
+    ] }, finish_reason: 'tool_calls' }] },
+  ]))
+  const state = newResponseStreamState()
+  for await (const event of chatResponseStream(client, { model: 'glm-4.6', messages: [] }, new AbortController().signal)) applyResponseStreamEvent(state, event)
+  assert.equal(state.completed, true)
+  assert.deepEqual(Object.values(state.pendingTools).map(t => t.call_id), ['A', 'B'])
 })

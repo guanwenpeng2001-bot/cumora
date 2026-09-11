@@ -7,6 +7,7 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 import { compactHistoryWithSummary } from '../agents/turn-compaction.js'
 import * as compaction from '../agents/turn-compaction.js'
 import * as streams from '../agents/turn-stream.js'
+import { chatResponseStream } from '../novita.js'
 
 // Load the actual private consumers and executor with isolated I/O dependencies.
 function compile(source: string, dependencies: Record<string, unknown>, globals: Record<string, unknown> = {}) {
@@ -57,7 +58,7 @@ function fixture(behavior: (request: any, signal?: AbortSignal) => AsyncIterable
   const turn = compile(functions + '\nexport { ' + names.join(', ') + ' }', {
     '../llm-resolver.js': resolver, '../llm-execution.js': execution, '../llm.js': llm, './cost.js': cost,
     './turn-compaction.js': compaction, './fallback.js': fallback, '../novita.js': {},
-  }, { ...compaction, ...streams, ...resolver, ...execution, ...llm, ...cost, ...fallback, getServerSettingsSnapshot: settings.getServerSettingsSnapshot,
+  }, { chatResponseStream, ...compaction, ...streams, ...resolver, ...execution, ...llm, ...cost, ...fallback, getServerSettingsSnapshot: settings.getServerSettingsSnapshot,
     traceResponseOutputItem: () => ({}), errorText: (error: unknown) => String(error) })
   return { turn, records, requests, resolver, settings, snapshots,
     setClient: (factory: () => Promise<any>) => { clientOverride = factory },
@@ -490,4 +491,50 @@ test('turn budget: a larger fallback recovers from preparation failure without s
   assert.deepEqual(f.records.map(r => r.status), ['failed', 'ok'])
   assert.equal(f.records[0].extras.failureStage, 'prepare')
   assert.equal(f.records[0].extras.nextCandidate, 'brain-backup')
+})
+
+
+for (const usage of [{}, { prompt_tokens: 5 }, { completion_tokens: 3 }, { prompt_tokens: 5, completion_tokens: 3 }]) test('deep-1: main Chat hop records raw usage and honest measurement ' + JSON.stringify(usage), async () => {
+  const f = fixture(async function* () {
+    yield { model: 'glm-4.6', choices: [{ delta: { content: 'answer' }, finish_reason: 'stop' }] }
+    yield { choices: [], usage }
+  }, 'chat')
+  const result = await f.turn.executeAgentTurnHop({ plan: await budgetPlan(f, [10_000]), context: hopContext, input: [{ role: 'user', content: 'hello' }], instructions: '', tools: [] })
+  assert.equal(result.state.completed, true)
+  assert.equal(f.records.length, 1)
+  assert.deepEqual(f.records[0].extras.rawUsage, usage)
+  assert.equal(f.records[0].extras.usageProtocol, 'chat')
+  assert.equal(f.records[0].extras.measurement, 'prompt_tokens' in usage && 'completion_tokens' in usage ? 'measured' : 'unknown')
+})
+
+for (const finish of ['length', 'content_filter', 'tool_calls']) test('deep-1: main Chat rejects incomplete tools and retains usage: ' + finish, async () => {
+  const f = fixture(async function* () {
+    yield { model: 'glm-4.6', choices: [{ delta: { tool_calls: [{ index: 0, id: 'A', function: { name: 'bash', arguments: '{' } }] }, finish_reason: finish }] }
+    yield { choices: [], usage: { prompt_tokens: 5, completion_tokens: 3 } }
+  }, 'chat')
+  await assert.rejects(f.turn.executeAgentTurnHop({ plan: await budgetPlan(f, [10_000]), context: hopContext, input: [], instructions: '', tools: [] }), /incomplete/)
+  assert.equal(f.requests.length, 1)
+  assert.equal(f.records[0].status, 'failed')
+  assert.equal(f.records[0].extras.failureStage, 'execution')
+  assert.deepEqual(f.records[0].extras.rawUsage, { prompt_tokens: 5, completion_tokens: 3 })
+  assert.equal(f.records[0].usage.outputTokens, 3)
+})
+
+test('deep-1: main Chat replays parallel tool calls together then accepts complete tools', async () => {
+  const f = fixture(async function* () {
+    yield { choices: [{ delta: { tool_calls: [
+      { index: 0, id: 'C', function: { name: 'lookup', arguments: '{"id":3}' } },
+      { index: 1, id: 'D', function: { name: 'lookup', arguments: '{"id":4}' } },
+    ] }, finish_reason: 'tool_calls' }] }
+  }, 'chat')
+  const result = await f.turn.executeAgentTurnHop({ plan: await budgetPlan(f, [10_000]), context: hopContext, instructions: '', tools: [], input: [
+    { type: 'function_call', call_id: 'A', name: 'lookup', arguments: '{}' },
+    { type: 'function_call', call_id: 'B', name: 'lookup', arguments: '{}' },
+    { type: 'function_call_output', call_id: 'A', output: 'one' },
+    { type: 'function_call_output', call_id: 'B', output: 'two' },
+  ] })
+  assert.deepEqual(f.requests[0].messages.map((m: any) => m.role), ['assistant', 'tool', 'tool'])
+  assert.deepEqual(f.requests[0].messages[0].tool_calls.map((c: any) => c.id), ['A', 'B'])
+  assert.deepEqual(Object.values(result.state.pendingTools).map((c: any) => c.call_id), ['C', 'D'])
+  assert.equal(f.records[0].status, 'ok')
 })

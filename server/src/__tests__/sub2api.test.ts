@@ -1,4 +1,7 @@
 import { test, mock, after } from 'node:test'
+import { readFileSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
+import ts from 'typescript'
 import { pool } from '../db/pool.js'
 import assert from 'node:assert/strict'
 import { env } from '../env.js'
@@ -199,9 +202,10 @@ test('getUserQuota ignores active subscriptions past expires_at', async () => {
 })
 
 test('DeepSeek routing survives cold, empty and reseller-only discovery without inventing access', () => {
-  for (const models of [{}, { deepseek: new Set<string>() }, { openai: new Set(['deepseek-v4-flash']) }]) {
+  for (const models of [{}, { openai: new Set(['deepseek-v4-flash']) }]) {
     assert.equal(pickPlatformForModel(models, 'deepseek-v4-flash', ['openai', 'deepseek']), 'deepseek')
   }
+  assert.equal(pickPlatformForModel({ deepseek: new Set(), openai: new Set(['deepseek-v4-flash']) }, 'deepseek-v4-flash', ['openai', 'deepseek']), 'openai')
   assert.equal(pickPlatformForModel({}, ' DeepSeek-V4-Flash ', ['openai', 'deepseek']), 'deepseek')
   assert.equal(pickPlatformForModel({}, 'deepseek-v4-flash', ['openai']), 'openai')
   assert.equal(pickPlatformForModel({}, 'deepseekish-model', ['openai', 'deepseek']), 'openai')
@@ -268,17 +272,149 @@ test('gateway image catalog precheck only admits Images-capable models', () => {
   assert.equal(gatewayCatalogHasImages(undefined), false)
 })
 
-test('empty model catalogs are not treated as success', async () => {
+test('empty model catalogs are authoritative successful empty discoveries', async () => {
   const originalFetch = globalThis.fetch
   globalThis.fetch = (async () => new Response(JSON.stringify({ data: [] }), {
     status: 200, headers: { 'content-type': 'application/json' },
   })) as typeof fetch
   try {
     const result = await listKeyModelsWithStatus('https://gateway.invalid/v1', 'sk-test')
-    assert.equal(result.ok, false)
+    assert.equal(result.ok, true)
     assert.equal(result.status, 'empty')
     assert.equal(result.models.size, 0)
   } finally {
     globalThis.fetch = originalFetch
   }
+})
+
+
+// Execute the real durable worker against an in-memory transaction adapter.
+// No database connections, HTTP, timers, or migrations are allowed here.
+function syncFixture(count = 1) {
+  const users = new Map<string, any>(Array.from({ length: count }, (_, i) => [String(i).padStart(4, '0'), { tier: 'pro' }]))
+  let intents = new Map<string, any>()
+  let job: any = { version: '2', groups: { free: { openai: 1 }, pro: { openai: 2, zhipu: 42 }, max: { openai: 3 } }, cursor: null, done: false }
+  const calls: any[] = [], sqls: string[] = []
+  let transaction: { intents: Map<string, any>; job: any } | null = null
+  let failInsert = false
+  let remoteHook: (() => void) | undefined
+  const query = async (sql: string, values: any[] = []): Promise<any> => {
+    sqls.push(sql)
+    if (sql === 'BEGIN') { transaction = { intents: structuredClone(intents), job: structuredClone(job) }; return { rows: [] } }
+    if (sql === 'COMMIT') { transaction = null; return { rows: [] } }
+    if (sql === 'ROLLBACK') { if (transaction) { intents = transaction.intents; job = transaction.job }; transaction = null; return { rows: [] } }
+    if (sql.startsWith('LOCK TABLE server_settings')) { assert.ok(transaction); return { rows: [] } }
+    if (sql.startsWith('SELECT value FROM server_settings')) return { rows: job ? [{ value: JSON.stringify(job) }] : [] }
+    if (sql.startsWith('UPDATE server_settings')) { job = JSON.parse(values[1]); return { rows: [] } }
+    if (sql.includes('pg_try_advisory_lock')) return { rows: [{ locked: true }] }
+    if (sql.includes('pg_advisory_unlock')) return { rows: [] }
+    if (sql.startsWith('SELECT u.id, u.tier')) {
+      assert.ok(transaction)
+      assert.match(sql, /LIMIT 100 FOR UPDATE OF u/)
+      return { rows: [...users].filter(([id]) => !values[0] || id > values[0]).slice(0, 100).map(([id, user]) => ({ id, tier: user.tier, target_tier: intents.get(id)?.target_tier })) }
+    }
+    if (sql.startsWith('INSERT INTO sub2api_sync_intents')) {
+      assert.ok(transaction)
+      if (failInsert) throw new Error('injected insert failure')
+      const [id, intentId, tier, raw] = values, old = intents.get(id), target = JSON.parse(raw)
+      target.appliedVersion = old?.status === 'succeeded' ? old.target_groups.configVersion ?? '0' : old?.target_groups.appliedVersion ?? null
+      intents.set(id, { user_id: id, intent_id: intentId, target_tier: tier, target_groups: target, version: String(Number(old?.version ?? 0) + 1), status: 'pending', attempts: 0, managed_keys: {}, remote_user_id: null })
+      return { rows: [], rowCount: 1 }
+    }
+    if (sql.startsWith('SELECT i.*')) return { rows: intents.has(values[0]) ? [{ ...intents.get(values[0]), email: 'test@example.invalid', display_name: 'Test', sub2api_api_key: null }] : [] }
+    if (sql.startsWith('SELECT target_tier')) { const row = intents.get(values[0]); return { rows: row ? [{ ...row, targetTier: row.target_tier, nextAttemptAt: null, lastError: null }] : [] } }
+    if (sql.startsWith('SELECT tier FROM users')) return { rows: users.has(values[0]) ? [users.get(values[0])] : [] }
+    if (sql.startsWith('SELECT id FROM users')) return { rows: [], rowCount: sql.includes('pro_trial') ? 0 : Number(users.has(values[0])) }
+    if (sql.startsWith('SELECT version')) return { rows: [{ version: intents.get(values[0])?.version }] }
+    if (sql.startsWith('UPDATE users')) { users.get(values[0]).tier = values[3]; return { rows: [] } }
+    if (sql.startsWith('UPDATE sub2api_sync_intents')) {
+      const row = intents.get(values[0])
+      if (sql.includes("status = 'processing'")) { row.status = 'processing'; row.attempts++ }
+      if (sql.includes("status = 'succeeded'")) { row.status = 'succeeded'; row.target_groups.appliedVersion = values[2] }
+      if (sql.includes("status = 'failed'")) row.status = 'failed'
+      return { rows: [] }
+    }
+    throw new Error('Unexpected SQL: ' + sql)
+  }
+  const exports: any = {}
+  const source = readFileSync(new URL('../sub2api-sync.ts', import.meta.url), 'utf8')
+  const output = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText
+  new Function('exports', 'require', output)(exports, (name: string) => {
+    if (name === 'node:crypto') return { randomUUID }
+    if (name === './db/pool.js') return { pool: { query, connect: async () => ({ query, release() {} }) } }
+    if (name === './tenant-llm-context.js') return { invalidateOwnerLlmCaches: async () => {} }
+    assert.equal(name, './sub2api.js')
+    return { sub2apiConfigured: () => true, tierGroups: () => ({ openai: 1 }), parseApiKeyMap: () => ({}), serializeApiKeyMap: JSON.stringify,
+      reconcileSub2apiUser: async (args: any) => { assert.equal(transaction, null, 'HTTP must be outside a DB transaction'); calls.push(args.groups); remoteHook?.(); return { sub2apiUserId: 1, apiKeys: { openai: 'key' }, groupId: 2 } } }
+  })
+  return { api: exports, calls, sqls, get job() { return job }, get intents() { return intents }, setJob(value: any) { job = value }, onRemote(hook: () => void) { remoteHook = hook }, failInsert(value: boolean) { failInsert = value } }
+}
+
+test('deep-1: group job expands bounded durable batches, resumes and rolls back cursor with intents', async () => {
+  const f = syncFixture(205)
+  await f.api.expandSub2apiGroupResync()
+  assert.equal(f.intents.size, 100)
+  assert.equal(f.job.cursor, '0099')
+  assert.equal(f.job.done, false)
+  assert.equal(f.calls.length, 0)
+  f.failInsert(true)
+  await assert.rejects(f.api.expandSub2apiGroupResync(), /injected/)
+  assert.equal(f.intents.size, 100)
+  assert.equal(f.job.cursor, '0099')
+  f.failInsert(false)
+  await f.api.expandSub2apiGroupResync()
+  await f.api.expandSub2apiGroupResync()
+  assert.equal(f.intents.size, 205)
+  assert.equal(f.job.done, true)
+  assert.equal(f.job.cursor, '0204')
+  await f.api.expandSub2apiGroupResync()
+  assert.equal(f.intents.size, 205)
+})
+
+test('deep-1: old succeeded/failed intents reconcile newest groups and expose pending until confirmation', async () => {
+  for (const oldStatus of ['succeeded', 'failed']) {
+    const f = syncFixture()
+    f.intents.set('0000', { user_id: '0000', intent_id: 'old', version: '1', target_tier: 'pro', target_groups: { openai: 999 }, status: oldStatus, attempts: 7 })
+    const pending = await f.api.getSub2apiSyncStatus('0000')
+    assert.equal(pending.status, 'pending')
+    assert.equal(pending.expectedConfigVersion, '2')
+    await f.api.reconcileSub2apiSync('0000')
+    assert.deepEqual(f.calls, [{ openai: 2, zhipu: 42 }])
+    const applied = await f.api.getSub2apiSyncStatus('0000')
+    assert.equal(applied.status, 'succeeded')
+    assert.equal(applied.appliedConfigVersion, '2')
+    assert.equal(f.intents.get('0000').version, '2')
+  }
+})
+
+
+test('deep-1: configuration changed during HTTP cannot confirm obsolete groups', async () => {
+  const f = syncFixture()
+  await f.api.expandSub2apiGroupResync()
+  f.onRemote(() => {
+    if (f.job.version === '2') f.setJob({ ...f.job, version: '3', groups: { ...f.job.groups, pro: { openai: 2, zhipu: 55 } }, cursor: null, done: false })
+  })
+  await f.api.reconcileSub2apiSync('0000')
+  assert.deepEqual(f.calls, [{ openai: 2, zhipu: 42 }, { openai: 2, zhipu: 55 }])
+  const status = await f.api.getSub2apiSyncStatus('0000')
+  assert.equal(status.status, 'succeeded')
+  assert.equal(status.appliedConfigVersion, '3')
+  assert.equal(status.expectedConfigVersion, '3')
+  assert.equal(f.sqls.filter(sql => sql.includes("SET status = 'succeeded'")).length, 1)
+})
+
+test('deep-1: pending status exists before batch expansion and preserves previous applied version', async () => {
+  const f = syncFixture()
+  assert.equal((await f.api.getSub2apiSyncStatus('0000')).status, 'pending')
+  await f.api.expandSub2apiGroupResync()
+  await f.api.reconcileSub2apiSync('0000')
+  f.setJob({ ...f.job, version: '3', cursor: null, done: false })
+  const before = await f.api.getSub2apiSyncStatus('0000')
+  assert.equal(before.status, 'pending')
+  assert.equal(before.appliedConfigVersion, '2')
+  await f.api.expandSub2apiGroupResync()
+  const after = await f.api.getSub2apiSyncStatus('0000')
+  assert.equal(after.status, 'pending')
+  assert.equal(after.appliedConfigVersion, '2')
+  assert.equal(after.expectedConfigVersion, '3')
 })

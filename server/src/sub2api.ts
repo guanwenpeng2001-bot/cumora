@@ -76,8 +76,8 @@ function legacyTierGroupId(tier: Tier): number {
  *  kimi/deepseek/grok still fall back to the openai group when unmapped
  *  (deprecated compatibility). Every other platform is included only when
  *  explicitly mapped in sub2api_group_config or SUB2API_TIER_*_GROUP_*. */
-export function tierGroups(tier: Tier): Record<Platform, number> {
-  const configured = parseGroupConfig(getServerSetting('sub2api_group_config'))[tier] ?? {}
+export function tierGroups(tier: Tier, config = getServerSetting('sub2api_group_config')): Record<Platform, number> {
+  const configured = parseGroupConfig(config)[tier] ?? {}
   const fromEnv = readEnvTierPlatformGroups(tier)
   const valid = (id: number) => {
     if (Number.isSafeInteger(id) && id >= 0) return id
@@ -512,7 +512,7 @@ export async function getUserQuota(sub2apiUserId: number): Promise<QuotaSnapshot
 /** Matches sub2api's Images admission; discovery alone does not imply protocol support. */
 export function supportsGatewayImages(model: string): boolean {
   const id = model.trim().toLowerCase()
-  return id.startsWith('gpt-image-') || id === 'grok-imagine' || id === 'grok-imagine-edit' || id.startsWith('grok-imagine-image')
+  return /^(qwen-image|wanx)(?:$|[-.\d])|^wan\d+(?:\.\d+)?-image(?:$|-)/.test(id) || id.startsWith('gpt-image-') || id === 'grok-imagine' || id === 'grok-imagine-edit' || id.startsWith('grok-imagine-image')
 }
 
 /** True when a live group catalog lists at least one Images-admissible model. */
@@ -606,7 +606,7 @@ export function pickPlatformForModel(
 ): Platform {
   const id = model.trim().toLowerCase()
   const native = detectNativePlatform(model)
-  if (native && available.includes(native)) return native
+  if (native && available.includes(native) && (modelsByPlatform[native] === undefined || catalogContains(modelsByPlatform, native, id))) return native
 
   const seen = new Set<Platform>()
   const order: Platform[] = []
@@ -660,7 +660,7 @@ export async function listKeyModelsWithStatus(baseUrl: string, apiKey: string): 
     const models = new Set<string>(data.map((m) => m.id))
     if (models.size === 0) {
       console.warn('[sub2api] model discovery returned empty catalog')
-      return { models, ok: false, status: 'empty' }
+      return { models, ok: true, status: 'empty' }
     }
     return { models, ok: true, status: 'success' }
   } catch (e) {

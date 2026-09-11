@@ -85,7 +85,7 @@ function fixture(clock?: { now: number; ticks: Array<() => void> }, processEnv: 
         defaultOpenAIImageModel: () => env.OPENAI_IMAGE_MODEL ?? 'gpt-image-2',
         resolveDirectLlmEnv: () => ({ configured: false, protocol: 'images' }),
       }
-      if (name === './sub2api.js') return {}
+      if (name === './sub2api.js') return { validateSub2apiGroupSelection: async () => {}, tierGroups: (tier: string, raw: string) => JSON.parse(raw || '{}')[tier] ?? {} }
       if (name === './managed-pod-settings.js') return { getManagedPodSettings: () => null }
       throw new Error('unexpected dependency: ' + name)
     },
@@ -783,4 +783,26 @@ test('auxiliary stream deadline is validated, revisioned, resettable and fixed w
   await f.settings.writeServerSettings({ [key]: null })
   assert.equal(f.settings.getServerSetting(key), '30000')
   assert.equal(f.settings.getServerSettingsSnapshot().sources[key], 'default')
+})
+
+
+test('group configuration commits a durable versioned cursor job, preserves it on rollback and skips unrelated saves', async () => {
+  const f = fixture()
+  await f.settings.loadServerSettings()
+  const raw = JSON.stringify({ pro: { zhipu: 42 } })
+  const next = await f.settings.writeServerSettings({ sub2api_group_config: raw })
+  const job = JSON.parse(f.data.get('__sub2api_group_resync')!)
+  assert.equal(job.version, next.revision)
+  assert.deepEqual(job.groups.pro, { zhipu: 42 })
+  assert.equal(job.cursor, null)
+  assert.equal(job.done, false)
+  assert.ok(f.statements.every(sql => !sql.includes('users') && !sql.includes('sub2api_sync_intents')))
+  const persisted = f.data.get('__sub2api_group_resync')
+  await f.settings.writeServerSettings({ brain_model: 'other' })
+  await f.settings.writeServerSettings({ sub2api_group_config: raw })
+  assert.equal(f.data.get('__sub2api_group_resync'), persisted)
+  f.failCommit(true)
+  await assert.rejects(f.settings.writeServerSettings({ sub2api_group_config: JSON.stringify({ pro: { zhipu: 43 } }) }), /commit failure/)
+  assert.equal(f.data.get('__sub2api_group_resync'), persisted)
+  assert.equal(f.data.get('sub2api_group_config'), raw)
 })
