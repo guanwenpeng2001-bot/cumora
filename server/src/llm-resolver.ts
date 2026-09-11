@@ -60,7 +60,12 @@ export async function resolveRoleCall(company: string | null, domain: RoleCallPl
     || agent?.computerSupportModel?.trim() : undefined
   const primary = supportOverride || (role === 'brain' && agent?.model?.trim() ? agent.model.trim() : selected?.models[0] ?? inherited)
   const fallbacks = mc?.fallbackModels ?? selected?.models.slice(1) ?? (snapshot.settings[`${role}_fallback_models`] ?? '').split(',')
-  const models = primary ? [...new Set([primary, ...(role === 'embed' ? [] : fallbacks)].map(m => m.trim()).filter(Boolean))] : []
+  // A per-agent / per-computer cerebellum override must not remove the global
+  // support model from the chain: when the override is not servable by the
+  // gateway (wrong group, rate limited, not schedulable), the call degrades
+  // to the global cerebellum instead of dying with a single candidate.
+  const supportSafetyNet = role === 'support' && supportOverride && inherited && supportOverride !== inherited ? [inherited] : []
+  const models = primary ? [...new Set([primary, ...supportSafetyNet, ...(role === 'embed' ? [] : fallbacks)].map(m => m.trim()).filter(Boolean))] : []
   if (!primary) diagnostics.push(`missing-primary:${role}`)
   const context = company && sub2apiRoutingConfigured() ? await waitForLlmResolution(resolveTenantLlmContext(company), 500, signal) : null
   const discovery = role !== 'embed' && context && keyedPlatforms(context.keys).length ? await tenantRoutingSnapshot(context, signal) : null
