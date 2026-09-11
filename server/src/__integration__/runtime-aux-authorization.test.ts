@@ -15,6 +15,7 @@ import { createServer, type Server } from 'node:http'
 import { after, before, beforeEach, test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { Client } from 'pg'
+import * as Y from 'yjs'
 import { runCli } from '../agents/cli.js'
 import {
   thinkingKey, worklogField, worklogKey,
@@ -324,15 +325,38 @@ test('[integration] runtime CLI: 20 cold document reads do not self-exhaust the 
   }
 })
 
-test('[integration] document rooms reserve one connection across snapshot and tail hydration', async () => {
+test('[integration] document hydration releases transaction locks and shares a saturated pool with CLI reads', async () => {
   const agent = await seedAgent()
-  const documentIds = Array.from({ length: 20 }, () => `doc_${randomUUID().replace(/-/g, '').slice(0, 16)}`)
+  const poolSize = pool.options.max!
+  const documentIds = Array.from({ length: poolSize }, () => `doc_${randomUUID().replace(/-/g, '').slice(0, 16)}`)
   for (const [index, documentId] of documentIds.entries()) {
     await pool.query(
       `INSERT INTO documents (id, company_id, title, created_by)
        VALUES ($1, $2, $3, $4)`,
       [documentId, agent.companyId, `Hydration lease ${index}`, agent.agentId],
     )
+    const doc = new Y.Doc()
+    try {
+      const paragraph = new Y.XmlElement('paragraph')
+      const text = new Y.XmlText()
+      paragraph.insert(0, [text])
+      doc.getXmlFragment('default').insert(0, [paragraph])
+      text.insert(0, `Snapshot ${index}`)
+      const snapshot = Y.encodeStateAsUpdate(doc)
+      const vector = Y.encodeStateVector(doc)
+      text.insert(text.length, ` tail ${index}`)
+      await pool.query(
+        `INSERT INTO document_snapshots (document_id, state_bytes, snapshot_at_update_id)
+         VALUES ($1, $2, 0)`,
+        [documentId, Buffer.from(snapshot)],
+      )
+      await pool.query(
+        `INSERT INTO document_updates (document_id, author_id, update_bytes) VALUES ($1, $2, $3)`,
+        [documentId, agent.agentId, Buffer.from(Y.encodeStateAsUpdate(doc, vector))],
+      )
+    } finally {
+      doc.destroy()
+    }
   }
 
   const snapshotLocker = new Client({ connectionString: env.DATABASE_URL })
@@ -342,6 +366,9 @@ test('[integration] document rooms reserve one connection across snapshot and ta
   const cliPromises: Array<ReturnType<typeof call>> = []
   let snapshotReleased = false
   let participantsReleased = false
+  let peakConnections = pool.totalCount
+  const trackConnections = () => { peakConnections = Math.max(peakConnections, pool.totalCount) }
+  pool.on('acquire', trackConnections)
 
   await Promise.all([snapshotLocker.connect(), participantLocker.connect(), observer.connect()])
   try {
@@ -357,42 +384,70 @@ test('[integration] document rooms reserve one connection across snapshot and ta
         onAwareness: () => {},
       }))
     }
-    await waitForExternalBlockedQuery(observer, '%FROM document_snapshots%', 20)
+    await waitForExternalBlockedQuery(observer, '%FROM document_snapshots%', poolSize)
+    assert.equal(pool.totalCount, poolSize, 'hydrations must saturate the pool')
 
-    // These requests queue behind the 20 hydration leases. Once they receive
-    // a slot they intentionally block on `participants`; a buggy hydration
-    // that releases its client after the snapshot would let these requests
-    // consume every slot before the tail queries can run.
+    // Queue CLI authentication behind the preparation transactions. Snapshot
+    // and tail now share one MVCC statement; subscribe then releases its
+    // transaction before acquiring a connection to hydrate the live room.
     for (const documentId of documentIds) {
       cliPromises.push(call('/runtime/cli', {
         token: agent.token,
         body: { argv: ['doc', 'read', documentId, '--json'] },
       }))
     }
-    for (let attempt = 0; attempt < 500 && pool.waitingCount < 20; attempt++) await delay(10)
-    assert.ok(pool.waitingCount >= 20, `expected queued CLI requests, got ${pool.waitingCount}`)
+    for (let attempt = 0; attempt < 500 && pool.waitingCount < poolSize; attempt++) await delay(10)
+    assert.ok(pool.waitingCount >= poolSize, `expected queued CLI requests, got ${pool.waitingCount}`)
 
     await snapshotLocker.query('COMMIT')
     snapshotReleased = true
-    const hydrated = await withTimeout(
-      Promise.all(hydrationPromises),
-      '20 snapshot+tail hydrations while CLI requests are queued',
-      5_000,
-    )
-    assert.equal(hydrated.length, 20)
-    await waitForExternalBlockedQuery(observer, '%FROM participants%', 20)
+    await waitForExternalBlockedQuery(observer, '%FROM participants%', poolSize)
 
+    // CLI gets every released slot even though subscriptions are still in
+    // flight. Preparation must have released its document locks as well:
+    // retaining them while waiting for another pool slot could deadlock CLI.
+    await observer.query('BEGIN')
+    try {
+      const locked = await observer.query(
+        'SELECT id FROM documents WHERE id = ANY($1::text[]) FOR UPDATE NOWAIT',
+        [documentIds],
+      )
+      assert.equal(locked.rowCount, poolSize)
+    } finally {
+      await observer.query('ROLLBACK')
+    }
+
+    // Release the artificial auth barrier before waiting for subscriptions;
+    // otherwise the test itself withholds all connections they need.
     await participantLocker.query('COMMIT')
     participantsReleased = true
-    const responses = await withTimeout(Promise.all(cliPromises), 'queued document reads')
+    const [hydrated, responses] = await withTimeout(
+      Promise.all([Promise.all(hydrationPromises), Promise.all(cliPromises)]),
+      'concurrent subscriptions and queued document reads',
+    )
+    assert.equal(hydrated.length, poolSize)
+    for (const [index, result] of hydrated.entries()) {
+      const doc = new Y.Doc()
+      try {
+        Y.applyUpdate(doc, result.initialState)
+        assert.equal(doc.getXmlFragment('default').toString(), `<paragraph>Snapshot ${index} tail ${index}</paragraph>`)
+      } finally {
+        doc.destroy()
+      }
+    }
     for (const [index, response] of responses.entries()) {
       assert.equal(response.status, 200, `request ${index}: ${JSON.stringify(response.body)}`)
       assert.equal(response.body?.ok, true, `request ${index}: ${JSON.stringify(response.body)}`)
+      assert.ok(String(response.body?.text).includes(`Snapshot ${index} tail ${index}`))
     }
+    assert.ok(peakConnections <= poolSize, `pool grew to ${peakConnections} connections`)
+    assert.equal(pool.waitingCount, 0, 'requests remained queued after completion')
+    assert.equal(pool.idleCount, pool.totalCount, 'completed requests leaked pool connections')
   } finally {
     if (!snapshotReleased) await snapshotLocker.query('ROLLBACK').catch(() => {})
     if (!participantsReleased) await participantLocker.query('ROLLBACK').catch(() => {})
     await Promise.allSettled([...hydrationPromises, ...cliPromises])
+    pool.removeListener('acquire', trackConnections)
     await Promise.all([
       snapshotLocker.end().catch(() => {}),
       participantLocker.end().catch(() => {}),
