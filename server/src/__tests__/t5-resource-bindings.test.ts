@@ -105,14 +105,14 @@ test('T5 isolated PostgreSQL: tenant binding, rollback, delivery and summaries',
     const source = readFileSync(new URL('../agents/computer/registry.ts', import.meta.url), 'utf8')
     const start = source.indexOf('`SELECT p.id, p.name', source.indexOf('export async function listAgentsForComputer')) + 1
     const sql = source.slice(start, source.indexOf('`', start))
-    const delivered = (await db.query(sql, ['local'])).rows
+    const delivered = (await db.query(sql, ['local', true])).rows
     assert.equal(delivered.length, 1)
     assert.equal(delivered[0].id, 'a')
     assert.deepEqual(delivered[0].skillsJson.map((s: { name: string }) => s.name), ['one'])
     assert.deepEqual(delivered[0].mcpJson.map((c: { name: string }) => c.name), ['one'])
     assert.equal(delivered[0].mcpJson[0].env.TOKEN, 'env-secret')
     await db.query('UPDATE computers SET revoked_at = now()')
-    assert.equal((await db.query(sql, ['local'])).rowCount, 0)
+    assert.equal((await db.query(sql, ['local', true])).rowCount, 0)
   })
 
   await t.test('upsert cannot overwrite another company connector by id', async () => {
