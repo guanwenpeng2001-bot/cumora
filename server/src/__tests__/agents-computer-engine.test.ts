@@ -1091,7 +1091,7 @@ test('a normal run is unaffected by the abort wiring', { skip: IS_WIN }, async (
   const home = join(root, 'home')
   await mkdir(binDir); await mkdir(home)
   const fake = join(binDir, 'claude')
-  await writeFile(fake, '#!/bin/sh\necho ok\nexit 0\n', 'utf8')
+  await writeFile(fake, '#!/bin/sh\necho \'{"type":"result","subtype":"success","is_error":false,"result":"ok","model":"claude-test","usage":{"input_tokens":1,"output_tokens":1}}\'\nexit 0\n', 'utf8')
   await chmod(fake, 0o755)
 
   const r = await getAdapter('claude').run({
