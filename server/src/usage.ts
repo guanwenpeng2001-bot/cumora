@@ -10,8 +10,8 @@ import { isLlmRollupPaused } from './agents/llm-rollup.js'
 
 export interface UsageRange { from: Date; to: Date }
 
-const HOUR_MS = 3_600_000
 const DAY_MS = 86_400_000
+const MAX_LOG_ROWS = 10_000
 
 export class UsageInputError extends Error {}
 
@@ -47,28 +47,51 @@ export function parseUsagePagination(q: { page?: unknown; pageSize?: unknown }):
   }
   const page = integer(q.page, 1)
   const pageSize = integer(q.pageSize, 50)
-  if (pageSize > 200 || !Number.isSafeInteger((page - 1) * pageSize) || page * pageSize > 10_000) throw new UsageInputError('pagination exceeds supported bounds')
+  if (pageSize > 200 || !Number.isSafeInteger((page - 1) * pageSize) || page * pageSize > MAX_LOG_ROWS) throw new UsageInputError('pagination exceeds supported bounds')
   return { page, pageSize }
 }
 
-// Whole hours have one owner. Partial hours retain the exact [from,to) filter
-// and use idx_llm_calls_company_created, including a window inside one hour.
-const WINDOW_SQL = `WITH bounds AS (
-  SELECT date_trunc('hour', $2::timestamptz, 'UTC') +
-           CASE WHEN $2::timestamptz = date_trunc('hour', $2::timestamptz, 'UTC') THEN INTERVAL '0 hours' ELSE INTERVAL '1 hour' END AS lo,
-         date_trunc('hour', $3::timestamptz, 'UTC') AS hi
-), usage_window AS (
-  SELECT r.*, 0::bigint AS quality_unknown_calls FROM llm_calls_rollup_v2 r CROSS JOIN bounds b
-    JOIN llm_rollup_state st ON st.id
-   WHERE r.company_id = $1 AND r.bucket_hour >= b.lo AND r.bucket_hour < b.hi
-     AND r.bucket_hour >= st.coverage_from AND r.bucket_hour < st.completed_through
+// Watermarks certify v2, including empty hours. Legacy coverage is evidenced
+// only by surviving v1 buckets. Missing legacy hours always allow raw fallback.
+// $4 is the endpoint filter/granularity or metadata stale interval.
+const COVERAGE_SQL = `WITH bounds AS (
+  SELECT $2::timestamptz AS start_at, $3::timestamptz AS end_at, $4::text AS option,
+         CASE WHEN $6::double precision > 0 THEN NOW() - ($6 * INTERVAL '1 day') END AS raw_retention_from
+), coverage AS (
+  SELECT st.*,
+         CASE WHEN st.coverage_from IS NOT NULL THEN GREATEST(st.coverage_from,
+           CASE WHEN $5::int > 0 THEN
+             date_trunc('hour', st.aggregated_at - ($5::int * INTERVAL '1 hour'), 'UTC') +
+               CASE WHEN st.aggregated_at = date_trunc('hour', st.aggregated_at, 'UTC')
+                    THEN INTERVAL '0 hours' ELSE INTERVAL '1 hour' END END) END AS retained_from
+    FROM (SELECT TRUE AS id) singleton LEFT JOIN llm_rollup_state st USING (id)
+), legacy_hours AS (
+  SELECT DISTINCT r.bucket_hour FROM llm_calls_rollup r CROSS JOIN bounds b CROSS JOIN coverage c
+   WHERE r.company_id = $1 AND r.bucket_hour >= b.start_at
+     AND r.bucket_hour + INTERVAL '1 hour' <= b.end_at
+     AND r.bucket_hour < c.retained_from AND r.bucket_hour < c.completed_through
+), ownership AS (
+  SELECT h.bucket_hour,
+         GREATEST(h.bucket_hour, b.start_at) AS from_at,
+         LEAST(h.bucket_hour + INTERVAL '1 hour', b.end_at) AS to_at,
+         CASE WHEN h.bucket_hour >= b.start_at AND h.bucket_hour + INTERVAL '1 hour' <= b.end_at
+                   AND h.bucket_hour >= c.retained_from AND h.bucket_hour < c.completed_through THEN 'v2'
+              WHEN l.bucket_hour IS NOT NULL THEN 'v1' ELSE 'raw' END AS owner
+    FROM bounds b CROSS JOIN coverage c
+    CROSS JOIN LATERAL generate_series(date_trunc('hour', b.start_at, 'UTC'),
+      date_trunc('hour', b.end_at - INTERVAL '1 microsecond', 'UTC'), INTERVAL '1 hour') h(bucket_hour)
+    LEFT JOIN legacy_hours l ON l.bucket_hour = h.bucket_hour
+) `
+
+const WINDOW_SQL = `${COVERAGE_SQL}, usage_window AS (
+  SELECT r.*, 0::bigint AS quality_unknown_calls FROM llm_calls_rollup_v2 r
+    JOIN ownership o ON o.bucket_hour = r.bucket_hour AND o.owner = 'v2'
+   WHERE r.company_id = $1
   UNION ALL
   SELECT r.*, NULL::text AS route, NULL::text AS platform,
          0::bigint AS unknown_calls, 0::bigint AS unpriced_calls, r.calls AS quality_unknown_calls
-    FROM llm_calls_rollup r CROSS JOIN bounds b JOIN llm_rollup_state st ON st.id
-   WHERE r.company_id = $1 AND r.bucket_hour >= b.lo AND r.bucket_hour < b.hi
-     AND st.completed_through IS NOT NULL AND r.bucket_hour < st.completed_through
-     AND r.bucket_hour < st.coverage_from
+    FROM llm_calls_rollup r JOIN ownership o ON o.bucket_hour = r.bucket_hour AND o.owner = 'v1'
+   WHERE r.company_id = $1
   UNION ALL
   SELECT date_trunc('hour', l.created_at, 'UTC'), l.company_id, l.agent_id, l.purpose, l.model, l.source, l.daemon_version,
          1::bigint, (l.status = 'ok')::int, (l.status <> 'ok')::int, (l.status = 'rate_limited')::int,
@@ -76,18 +99,29 @@ const WINDOW_SQL = `WITH bounds AS (
          COALESCE(l.output_tokens, 0), COALESCE(l.reasoning_tokens, 0), l.cost_usd, l.cost_estimated,
          l.extras->>'route', l.extras->>'platform', (l.measured IS NOT TRUE)::int,
          (COALESCE(l.extras->>'unpriced', '') NOT IN ('', 'false'))::int, 0::bigint
-    FROM bounds b LEFT JOIN llm_rollup_state st ON st.id CROSS JOIN LATERAL (
-      SELECT * FROM llm_calls
-       WHERE company_id = $1 AND created_at >= $2::timestamptz
-         AND created_at < LEAST(b.lo, $3::timestamptz)
-      UNION ALL
-      SELECT * FROM llm_calls
-       WHERE company_id = $1 AND created_at >= GREATEST(b.lo, $2::timestamptz,
-           CASE WHEN st.coverage_from IS NULL OR st.completed_through IS NULL THEN b.lo
-                ELSE LEAST(b.hi, st.completed_through) END)
-         AND created_at < $3::timestamptz
-    ) l
+    FROM ownership o JOIN llm_calls l ON l.company_id = $1
+      AND l.created_at >= o.from_at AND l.created_at < o.to_at
+   WHERE o.owner = 'raw'
 ) `
+
+function windowParams(tenant: string, range: UsageRange, option: string | number | null = null): unknown[] {
+  return [tenant, range.from.toISOString(), range.to.toISOString(), option,
+    automationNumber('llm_rollup_retention_hours'), automationNumber('db_gc_llm_calls_days')]
+}
+
+export interface UsageCoverageInterval { from: string; to: string }
+
+/** Merge adjacent hours without filling holes between surviving legacy buckets. */
+function mergeCoverage(intervals: UsageCoverageInterval[]): UsageCoverageInterval[] {
+  const result: UsageCoverageInterval[] = []
+  for (const interval of intervals.map(r => ({ from: new Date(r.from).toISOString(), to: new Date(r.to).toISOString() }))
+    .sort((a, b) => a.from.localeCompare(b.from))) {
+    const previous = result.at(-1)
+    if (previous && interval.from <= previous.to) previous.to = previous.to > interval.to ? previous.to : interval.to
+    else result.push(interval)
+  }
+  return result
+}
 
 export interface UsageMetadata {
   timezone: 'UTC'
@@ -96,40 +130,57 @@ export interface UsageMetadata {
   aggregationStatus: 'pending' | 'ready' | 'failed' | 'paused' | 'stale'
   rawRetentionFrom: string | null
   earliestRawAt: string | null
+  /** Retention completeness only; delivery loss is not observable by this reader. */
   logsComplete: boolean
+  /** False for any uncovered interval, including whole hours lost to retention. */
   boundaryComplete: boolean
   aggregationVersion: 2
   legacyBefore: string | null
+  rollupCoverageFrom: string | null
+  retainedRollupFrom: string | null
+  legacyCoverage: UsageCoverageInterval[]
+  /** No certified rollup and raw may have expired; residual raw is still read. */
+  coverageGaps: UsageCoverageInterval[]
+  /** The ledger does not persist tenant-scoped delivery acknowledgements. */
+  deliveryComplete: null
 }
 
 export async function usageMetadata(tenant: string, range: UsageRange): Promise<UsageMetadata> {
   const intervalMs = automationNumber('llm_rollup_interval_ms')
-  const retentionDays = automationNumber('db_gc_llm_calls_days')
   const paused = isLlmRollupPaused()
   const { rows } = await pool.query<{
-    coverage_from: Date | null; aggregated_at: Date | null; completed_through: Date | null; status: UsageMetadata['aggregationStatus']
+    coverage_from: Date | null; retained_from: Date | null; aggregated_at: Date | null
+    completed_through: Date | null; status: UsageMetadata['aggregationStatus']
     raw_retention_from: Date | null; earliest_raw_at: Date | null; stale: boolean
-  }>(`SELECT st.coverage_from, st.aggregated_at, st.completed_through, st.status,
-             CASE WHEN $3::double precision > 0 THEN NOW() - ($3 * INTERVAL '1 day') END AS raw_retention_from,
+    coverage_gaps: UsageCoverageInterval[]; legacy_coverage: UsageCoverageInterval[]
+  }>(`${COVERAGE_SQL}SELECT c.*,
+             b.raw_retention_from,
              (SELECT created_at FROM llm_calls WHERE company_id = $1 ORDER BY created_at LIMIT 1) AS earliest_raw_at,
-             st.aggregated_at < NOW() - ($2::double precision * INTERVAL '1 millisecond') AS stale
-        FROM llm_rollup_state st WHERE st.id`,
-  [tenant, Math.max(300_000, intervalMs * 3),
-    retentionDays])
+             c.aggregated_at < NOW() - ($4::double precision * INTERVAL '1 millisecond') AS stale,
+             (SELECT jsonb_agg(jsonb_build_object('from', o.from_at, 'to', LEAST(o.to_at, b.raw_retention_from)))
+                FROM ownership o WHERE o.owner = 'raw' AND o.from_at < b.raw_retention_from) AS coverage_gaps,
+             (SELECT jsonb_agg(jsonb_build_object('from', o.from_at, 'to', o.to_at))
+                FROM ownership o WHERE o.owner = 'v1') AS legacy_coverage
+        FROM coverage c CROSS JOIN bounds b`,
+  windowParams(tenant, range, Math.max(300_000, intervalMs * 3)))
   const r = rows[0]!
   const retained = r.raw_retention_from ? new Date(r.raw_retention_from).getTime() : -Infinity
-  const from = range.from.getTime(), to = range.to.getTime()
+  const coverageGaps = mergeCoverage(r.coverage_gaps ?? [])
+  const legacyCoverage = mergeCoverage(r.legacy_coverage ?? [])
+  const retainedRollupFrom = r.retained_from ? new Date(r.retained_from).toISOString() : null
   return {
     timezone: 'UTC', aggregatedAt: r.aggregated_at ? new Date(r.aggregated_at).toISOString() : null,
     completedThrough: r.completed_through ? new Date(r.completed_through).toISOString() : null,
     aggregationStatus: paused ? 'paused'
-      : r.status === 'ready' && r.stale ? 'stale' : r.status,
+      : r.status === 'ready' && r.stale ? 'stale' : r.status ?? 'pending',
     rawRetentionFrom: Number.isFinite(retained) ? new Date(retained).toISOString() : null,
     earliestRawAt: r.earliest_raw_at ? new Date(r.earliest_raw_at).toISOString() : null,
-    logsComplete: from >= retained,
-    boundaryComplete: (from % HOUR_MS === 0 || from >= retained) && (to % HOUR_MS === 0 || Math.max(from, Math.floor(to / HOUR_MS) * HOUR_MS) >= retained),
+    logsComplete: range.from.getTime() >= retained,
+    boundaryComplete: coverageGaps.length === 0,
     aggregationVersion: 2,
-    legacyBefore: r.coverage_from ? new Date(r.coverage_from).toISOString() : null,
+    legacyBefore: legacyCoverage.length ? retainedRollupFrom : null,
+    rollupCoverageFrom: r.coverage_from ? new Date(r.coverage_from).toISOString() : null,
+    retainedRollupFrom, legacyCoverage, coverageGaps, deliveryComplete: null,
   }
 }
 
@@ -137,7 +188,7 @@ const USAGE_PLATFORM_LABELS: Record<string, string> = {
   openai: 'OpenAI', anthropic: 'Anthropic', google: 'Google', gemini: 'Gemini',
   xai: 'xAI', grok: 'Grok', kimi: 'Kimi', deepseek: 'DeepSeek', dashscope: 'DashScope',
   novita: 'Novita', orcarouter: 'OrcaRouter', 'chatgpt-web': 'ChatGPT Web',
-  antigravity: 'Antigravity', zhipu: 'Zhipu', minimax: 'MiniMax', composite: 'Composite',
+  mixed: 'mixed', antigravity: 'Antigravity', zhipu: 'Zhipu', minimax: 'MiniMax', composite: 'Composite',
 }
 
 /** Family heuristic for unlabeled ledger rows. Prefixes, not an exact-id whitelist. */
@@ -159,9 +210,10 @@ export function providerForModel(model: string | null | undefined): string {
   return 'other'
 }
 
-/** Prefer the ledger platform string; family prefixes only fill a missing platform. */
-export function usageProvider(model: string, platform: string | null | undefined): string {
-  const trimmed = platform?.trim() ?? ''
+/** Explicit platform, then recorded direct route, then the model family. */
+export function usageProvider(model: string, platform: string | null | undefined, route?: string | null): string {
+  const direct = /^direct:([^:]+)$/i.exec(route?.trim() ?? '')?.[1]?.trim().toLowerCase()
+  const trimmed = platform?.trim() || (direct && Object.hasOwn(USAGE_PLATFORM_LABELS, direct) ? direct : '')
   const key = trimmed.toLowerCase()
   if (key) return USAGE_PLATFORM_LABELS[key] ?? trimmed
   return providerForModel(model)
@@ -211,7 +263,7 @@ export async function usageSummary(tenant: string, range: UsageRange, source?: s
        FROM usage_window
       WHERE company_id = $1
         AND ($4::text IS NULL OR source = $4)`,
-    [tenant, range.from.toISOString(), range.to.toISOString(), source ?? null],
+    windowParams(tenant, range, source ?? null),
   )
   const r = rows[0]
   if (!r) return { requests: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, costUsd: 0, costEstimated: false, cacheHitRate: 0, successRate: 0 }
@@ -242,19 +294,21 @@ export interface TrendPoint {
   inputTokens: number
   outputTokens: number
   cacheReadTokens: number
+  cacheWriteTokens: number
 }
 
 export async function usageTrend(tenant: string, range: UsageRange, granularity: 'hour' | 'day'): Promise<TrendPoint[]> {
-  const { rows } = await pool.query<{ bucket: Date; cost_usd: string; input_tokens: string; output_tokens: string; cache_read: string }>(
+  const { rows } = await pool.query<{ bucket: Date; cost_usd: string; input_tokens: string; output_tokens: string; cache_read: string; cache_write: string }>(
     `${WINDOW_SQL}SELECT date_trunc($4, bucket_hour, 'UTC') AS bucket,
             COALESCE(SUM(cost_usd), 0)::text            AS cost_usd,
             COALESCE(SUM(input_tokens), 0)::text        AS input_tokens,
             COALESCE(SUM(output_tokens), 0)::text       AS output_tokens,
-            COALESCE(SUM(cached_input_tokens), 0)::text AS cache_read
+            COALESCE(SUM(cached_input_tokens), 0)::text AS cache_read,
+            COALESCE(SUM(cache_creation_tokens), 0)::text AS cache_write
        FROM usage_window
       WHERE company_id = $1
       GROUP BY 1 ORDER BY 1`,
-    [tenant, range.from.toISOString(), range.to.toISOString(), granularity],
+    windowParams(tenant, range, granularity),
   )
   const byBucket = new Map(rows.map((r) => [new Date(r.bucket).toISOString(), r]))
   // Gap-fill so the chart axis is continuous.
@@ -269,6 +323,7 @@ export async function usageTrend(tenant: string, range: UsageRange, granularity:
       inputTokens: Number(r?.input_tokens ?? 0),
       outputTokens: Number(r?.output_tokens ?? 0),
       cacheReadTokens: Number(r?.cache_read ?? 0),
+      cacheWriteTokens: Number(r?.cache_write ?? 0),
     })
   }
   return out
@@ -281,6 +336,7 @@ export interface AgentUsageRow {
   source: 'managed' | 'byoa'
   actualSource?: string
   requests: number
+  /** All input tokens: fresh + cache read + cache write. */
   inputTokens: number
   outputTokens: number
   costUsd: number
@@ -296,7 +352,7 @@ export async function usageByAgent(tenant: string, range: UsageRange): Promise<A
             p.name, p.avatar_url, l.source
             ,
             COALESCE(SUM(l.calls), 0)::text          AS requests,
-            COALESCE(SUM(l.input_tokens + l.cached_input_tokens), 0)::text  AS input_tokens,
+            COALESCE(SUM(l.input_tokens + l.cached_input_tokens + l.cache_creation_tokens), 0)::text  AS input_tokens,
             COALESCE(SUM(l.output_tokens), 0)::text  AS output_tokens,
             COALESCE(SUM(l.cost_usd), 0)::text       AS cost_usd,
             COALESCE(SUM(l.ok_calls), 0)::text       AS ok
@@ -305,7 +361,7 @@ export async function usageByAgent(tenant: string, range: UsageRange): Promise<A
       WHERE l.company_id = $1
       GROUP BY l.agent_id, p.name, p.avatar_url, l.source
       ORDER BY SUM(l.cost_usd) DESC NULLS LAST`,
-    [tenant, range.from.toISOString(), range.to.toISOString()],
+    windowParams(tenant, range),
   )
   return rows.map((r) => ({
     agentId: r.agent_id,
@@ -325,12 +381,14 @@ export interface ModelUsageRow {
   model: string
   provider: string
   requests: number
+  /** All input tokens: fresh + cache read + cache write. */
   inputTokens: number
   outputTokens: number
   costUsd: number
   costEstimated: boolean
   route?: string | null
   platform?: string | null
+  platforms?: string[]
   source?: string
   unknownRequests?: number
   unpricedRequests?: number
@@ -341,6 +399,7 @@ interface ModelRollupRow {
   model: string
   route: string | null
   platform: string | null
+  platforms: string[] | null
   source: string
   unknown_calls: string
   unpriced_calls: string
@@ -352,25 +411,31 @@ interface ModelRollupRow {
   cost_estimated: boolean
 }
 
+const DIRECT_PLATFORM_PATTERN = `^direct:(${Object.keys(USAGE_PLATFORM_LABELS).filter(key => key !== 'mixed').join('|')})$`
+const EFFECTIVE_PLATFORM_SQL = `COALESCE(NULLIF(LOWER(BTRIM(platform)), ''),
+  CASE WHEN BTRIM(route) ~* '${DIRECT_PLATFORM_PATTERN}' THEN NULLIF(LOWER(BTRIM(SUBSTRING(BTRIM(route) FROM 8))), '') END)`
+
 async function queryUsageByModelRows(tenant: string, range: UsageRange, byPlatform = false): Promise<ModelRollupRow[]> {
   const { rows } = await pool.query<ModelRollupRow>(
     `${WINDOW_SQL}SELECT model,
             CASE WHEN COUNT(route) = COUNT(*) AND COUNT(DISTINCT route) = 1 THEN MIN(route) END AS route,
-            CASE WHEN COUNT(DISTINCT LOWER(platform)) = 1 THEN MIN(LOWER(platform)) END AS platform,
+            CASE WHEN COUNT(DISTINCT effective_platform) = 1 AND COUNT(effective_platform) = COUNT(*) THEN MIN(effective_platform)
+                 WHEN COUNT(effective_platform) > 0 THEN 'mixed' END AS platform,
+            ARRAY_AGG(DISTINCT effective_platform) FILTER (WHERE effective_platform IS NOT NULL) AS platforms,
             CASE WHEN COUNT(DISTINCT source) = 1 THEN MIN(source) ELSE 'mixed' END AS source,
             COALESCE(SUM(calls), 0)::text AS requests,
-            COALESCE(SUM(input_tokens + cached_input_tokens), 0)::text AS input_tokens,
+            COALESCE(SUM(input_tokens + cached_input_tokens + cache_creation_tokens), 0)::text AS input_tokens,
             COALESCE(SUM(output_tokens), 0)::text AS output_tokens,
             COALESCE(SUM(cost_usd), 0)::text AS cost_usd,
             COALESCE(BOOL_OR(cost_estimated), false) AS cost_estimated,
             COALESCE(SUM(unknown_calls), 0)::text AS unknown_calls,
             COALESCE(SUM(unpriced_calls), 0)::text AS unpriced_calls,
             COALESCE(SUM(quality_unknown_calls), 0)::text AS quality_unknown_calls
-       FROM usage_window
+       FROM (SELECT *, ${EFFECTIVE_PLATFORM_SQL} AS effective_platform FROM usage_window) labeled
       WHERE company_id = $1
-      GROUP BY model${byPlatform ? ', LOWER(platform)' : ''}
+      GROUP BY model${byPlatform ? ', effective_platform' : ''}
       ORDER BY SUM(cost_usd) DESC NULLS LAST`,
-    [tenant, range.from.toISOString(), range.to.toISOString()],
+    windowParams(tenant, range),
   )
   return rows
 }
@@ -379,8 +444,8 @@ export async function usageByModel(tenant: string, range: UsageRange): Promise<M
   const rows = await queryUsageByModelRows(tenant, range)
   return rows.map((r) => ({
     model: r.model,
-    provider: usageProvider(r.model, r.platform),
-    route: r.route, platform: r.platform, source: r.source,
+    provider: usageProvider(r.model, r.platform, r.route),
+    route: r.route, platform: r.platform, platforms: (r.platforms ?? []).sort(), source: r.source,
     unknownRequests: Number(r.unknown_calls ?? 0), unpricedRequests: Number(r.unpriced_calls ?? 0),
     qualityUnknownRequests: Number(r.quality_unknown_calls ?? 0),
     requests: Number(r.requests),
@@ -394,6 +459,7 @@ export async function usageByModel(tenant: string, range: UsageRange): Promise<M
 export interface ProviderUsageRow {
   provider: string
   requests: number
+  /** All input tokens: fresh + cache read + cache write. */
   inputTokens: number
   outputTokens: number
   costUsd: number
@@ -403,7 +469,7 @@ export async function usageByProvider(tenant: string, range: UsageRange): Promis
   const models = await queryUsageByModelRows(tenant, range, true)
   const acc = new Map<string, ProviderUsageRow>()
   for (const model of models) {
-    const provider = usageProvider(model.model, model.platform)
+    const provider = usageProvider(model.model, model.platform, model.route)
     const row = acc.get(provider) ?? { provider, requests: 0, inputTokens: 0, outputTokens: 0, costUsd: 0 }
     row.requests += Number(model.requests)
     row.inputTokens += Number(model.input_tokens)
@@ -433,6 +499,7 @@ export interface UsageLogRow {
   provider: string
   purpose: string
   source: string
+  /** All input tokens: fresh + cache read + cache write. */
   inputTokens: number
   outputTokens: number
   costUsd: number
@@ -457,6 +524,9 @@ export interface UsageLogPage {
   total: number
   page: number
   pageSize: number
+  accessibleTotal: number
+  maxPage: number
+  truncated: boolean
 }
 
 export async function usageLogs(
@@ -482,7 +552,7 @@ export async function usageLogs(
   }>(
     `SELECT l.id, l.created_at, l.agent_id, p.name AS agent_name,
             l.model, l.purpose, l.source,
-            l.input_tokens + COALESCE(l.cached_input_tokens, 0) AS input_tokens,
+            COALESCE(l.input_tokens, 0) + COALESCE(l.cached_input_tokens, 0) + COALESCE(l.cache_creation_tokens, 0) AS input_tokens,
             l.output_tokens, l.cost_usd::text, l.latency_ms, l.status, l.measured, l.cost_estimated,
             (COALESCE(l.extras->>'unpriced', '') NOT IN ('', 'false')) AS unpriced,
             l.extras->>'route' AS route, l.extras->>'platform' AS platform,
@@ -499,6 +569,9 @@ export async function usageLogs(
       LIMIT $5 OFFSET $6`,
     [...params, pageSize, (page - 1) * pageSize],
   )
+  const total = Number(countRows[0]?.total ?? 0)
+  // A non-divisor page size cannot access the remainder beyond its last legal page.
+  const accessibleTotal = Math.min(total, Math.floor(MAX_LOG_ROWS / pageSize) * pageSize)
   return {
     items: rows.map((r) => ({
       id: r.id,
@@ -506,7 +579,7 @@ export async function usageLogs(
       agentId: r.agent_id,
       agentName: r.agent_name,
       model: r.model,
-      provider: usageProvider(r.model, r.platform),
+      provider: usageProvider(r.model, r.platform, r.route),
       purpose: r.purpose,
       source: r.source,
       inputTokens: Number(r.input_tokens ?? 0),
@@ -518,12 +591,12 @@ export async function usageLogs(
       requestedModel: r.requested_model || r.model,
       actualModel: r.actual_model || null,
       failureReason: usageLogFailureReason(r.status, r.failure_reason, r.http_status),
-      failureStage: r.status !== 'ok' && ['generation', 'poll', 'download', 'storage'].includes(r.failure_stage ?? '') ? r.failure_stage : null,
+      failureStage: r.status !== 'ok' && ['prepare', 'execution', 'generation', 'poll', 'download', 'storage'].includes(r.failure_stage ?? '') ? r.failure_stage : null,
       httpStatus: r.http_status && /^[1-5]\d{2}$/.test(r.http_status) ? Number(r.http_status) : null,
       callId: r.call_id || null,
       attempt: r.attempt && /^[1-9]\d*$/.test(r.attempt) && Number.isSafeInteger(Number(r.attempt)) ? Number(r.attempt) : null,
     })),
-    total: Number(countRows[0]?.total ?? 0),
+    total, accessibleTotal, maxPage: Math.ceil(accessibleTotal / pageSize), truncated: accessibleTotal < total,
     page,
     pageSize,
   }

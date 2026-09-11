@@ -175,7 +175,8 @@ test('metadata distinguishes retained raw logs from a 92-day summary and reports
   const retained = new Date(Date.now() - 90 * 86400000)
   for (const status of ['paused', 'failed', 'pending', 'ready']) {
     const usage = loadUsage(async () => ({ rows: [{ raw_retention_from: retained, earliest_raw_at: retained,
-      aggregated_at: null, completed_through: null, coverage_from: null, status, stale: false }] }))
+      aggregated_at: null, completed_through: null, coverage_from: null, status, stale: false,
+      coverage_gaps: [{ from: new Date(Date.now() - 92 * 86400000).toISOString(), to: retained.toISOString() }] }] }))
     const meta = await usage.usageMetadata('tenant', { from: new Date(Date.now() - 92 * 86400000), to: new Date() })
     assert.equal(meta.logsComplete, false)
     assert.equal(meta.boundaryComplete, false)
@@ -225,10 +226,10 @@ test('metadata uses settings for pause, stale interval and raw-retention boundar
   assert.equal(paused.aggregationStatus, 'paused', 'settings override persisted ready status')
   assert.equal(paused.rawRetentionFrom, null)
   assert.equal(paused.logsComplete, true)
-  assert.deepEqual(parameters[0], ['tenant', 300_000, 0])
+  assert.deepEqual(parameters[0], ['tenant', range.from.toISOString(), range.to.toISOString(), 300_000, 2280, 0])
   Object.assign(settings, { llm_rollup_interval_ms: 600_000, db_gc_llm_calls_days: 120 })
   assert.equal((await usage.usageMetadata('tenant', range)).aggregationStatus, 'ready')
-  assert.deepEqual(parameters[1], ['tenant', 1_800_000, 120])
+  assert.deepEqual(parameters[1], ['tenant', range.from.toISOString(), range.to.toISOString(), 1_800_000, 2280, 120])
   assert.ok(!readFileSync(new URL('../usage.ts', import.meta.url), 'utf8').includes('process.env'))
 })
 
@@ -293,4 +294,58 @@ test('dashboard renders unknown actual model in both log cell and details while 
   const html = renderToStaticMarkup(exports.render({ actualModel: 'provider-reported', requestedModel: 'requested-only' }))
   assert.match(html, /^<td[^>]*>provider-reported<details/)
   assert.match(html, /实际模型: provider-reported/)
+})
+
+test('direct platform labels use known routes, respect explicit platforms and ignore env slot names', () => {
+  assert.equal(usageProvider('deepseek-v4-pro', null, 'direct:novita'), 'Novita')
+  assert.equal(usageProvider('deepseek-v4-pro', '  ', ' DIRECT:NOVITA '), 'Novita')
+  assert.equal(usageProvider('deepseek-v4-pro', 'anthropic', 'direct:novita'), 'Anthropic')
+  for (const route of ['direct:text', 'direct:image', 'direct:audio', 'direct:embed', 'direct:unknown-slot']) {
+    assert.equal(usageProvider('deepseek-v4-pro', null, route), 'DeepSeek')
+  }
+  assert.equal(usageProvider('deepseek-v4-pro', 'mixed'), 'mixed')
+})
+
+test('log pagination discloses the accessible last page including non-divisor sizes', async () => {
+  for (const pageSize of [1, 3, 50, 128, 200]) {
+    const lastLegalPage = Math.floor(10_000 / pageSize)
+    for (const total of [0, 1, 9999, 10_000, 10_001, 20_000]) {
+      const queries: unknown[][] = []
+      const usage = loadUsage(async (sql, params) => {
+        queries.push(params)
+        return { rows: sql.includes('COUNT(*)') ? [{ total: String(total) }] : [] }
+      })
+      const result = await usage.usageLogs('tenant', { from: new Date(0), to: new Date(1) }, { page: lastLegalPage, pageSize })
+      assert.equal(result.total, total)
+      assert.equal(result.accessibleTotal, Math.min(total, lastLegalPage * pageSize))
+      assert.equal(result.maxPage, Math.ceil(result.accessibleTotal / pageSize))
+      assert.equal(result.truncated, result.accessibleTotal < total)
+      assert.deepEqual(queries[1].slice(-2), [pageSize, (lastLegalPage - 1) * pageSize])
+      await assert.rejects(usage.usageLogs('tenant', { from: new Date(0), to: new Date(1) }, { page: lastLegalPage + 1, pageSize }))
+      assert.equal(queries.length, 2, 'reject unreachable pages before querying')
+    }
+  }
+})
+
+test('metadata preserves disjoint gaps and legacy evidence even when the worker is ready', async () => {
+  const usage = loadUsage(async () => ({ rows: [{
+    status: 'ready', stale: false, coverage_from: new Date('2026-09-01T00:00:00Z'),
+    retained_from: new Date('2026-09-03T00:00:00Z'), raw_retention_from: new Date('2026-09-03T00:00:00Z'),
+    coverage_gaps: [
+      { from: '2026-09-01T01:00:00Z', to: '2026-09-01T02:00:00Z' },
+      { from: '2026-09-01T00:00:00Z', to: '2026-09-01T01:00:00Z' },
+      { from: '2026-09-01T03:00:00Z', to: '2026-09-01T04:00:00Z' },
+    ],
+    legacy_coverage: [{ from: '2026-09-01T02:00:00Z', to: '2026-09-01T03:00:00Z' }],
+  }] }))
+  const meta = await usage.usageMetadata('tenant', { from: new Date('2026-09-01T00:00:00Z'), to: new Date('2026-09-01T04:00:00Z') })
+  assert.equal(meta.aggregationStatus, 'ready')
+  assert.equal(meta.logsComplete, false)
+  assert.equal(meta.boundaryComplete, false)
+  assert.equal(meta.deliveryComplete, null)
+  assert.equal(meta.coverageGaps.length, 2)
+  assert.deepEqual(meta.coverageGaps[0], { from: '2026-09-01T00:00:00.000Z', to: '2026-09-01T02:00:00.000Z' })
+  assert.deepEqual(meta.legacyCoverage, [{ from: '2026-09-01T02:00:00.000Z', to: '2026-09-01T03:00:00.000Z' }])
+  assert.equal(meta.rollupCoverageFrom, '2026-09-01T00:00:00.000Z')
+  assert.equal(meta.retainedRollupFrom, '2026-09-03T00:00:00.000Z')
 })

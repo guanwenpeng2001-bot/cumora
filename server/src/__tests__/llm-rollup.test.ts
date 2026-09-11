@@ -88,7 +88,7 @@ test('rollup retention zero disables pruning; configured raw retention bounds ca
   assert.equal(f.calls.find(c => c.sql.includes('AS retained_from'))!.params[1], 30)
   const deletes = f.calls.filter(c => c.sql.startsWith('DELETE FROM llm_calls_rollup'))
   assert.equal(deletes.length, 2)
-  for (const call of deletes) assert.deepEqual(call.params, [3000])
+  for (const call of deletes) assert.deepEqual(call.params, [3000, new Date('2026-09-02T12:43:00Z')])
 })
 
 
@@ -116,5 +116,18 @@ test('either retention deletion failure rolls back the entire tick before publis
     assert.ok(sql.findIndex(s => s.includes("status = 'failed'")) > sql.indexOf('ROLLBACK'))
     assert.match(sql.at(-1)!, /pg_advisory_unlock/)
     assert.equal(f.released(), 1)
+  }
+})
+
+test('pruning and coverage publication share the exact timestamp and configured retention', async () => {
+  const f = fixture(false, true, 3, { llm_rollup_retention_hours: 24 })
+  await f.exports.runLlmRollupTick()
+  const publication = f.calls.find(c => c.sql.includes('coverage_from ='))!
+  assert.equal(publication.params[2], 24)
+  const deletes = f.calls.filter(c => c.sql.startsWith('DELETE FROM llm_calls_rollup'))
+  assert.equal(deletes.length, 2)
+  for (const deletion of deletes) {
+    assert.deepEqual(deletion.params, [24, publication.params[1]])
+    assert.doesNotMatch(deletion.sql, /NOW\(\)/, 'pruning cannot use a different sub-millisecond timestamp')
   }
 })

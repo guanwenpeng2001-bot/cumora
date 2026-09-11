@@ -6,13 +6,13 @@ import { pathToFileURL } from 'node:url'
 import { RUNTIME_CALL_ID_INDEX_SQL } from '../db/migrations/0014-runtime-call-id-index.js'
 import { USAGE_ROLLUP_V2_SQL } from '../db/migrations/0013-usage-rollup-v2.js'
 
-function compile(path: string, pool: unknown) {
+function compile(path: string, pool: unknown, settings: Record<string, number> = {}) {
   const js = ts.transpileModule(readFileSync(new URL(path, import.meta.url), 'utf8'),
     { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText
   const exports: Record<string, any> = {}
   new Function('exports', 'require', js)(exports, (name: string) => {
     if (name === './agents/llm-rollup.js') return { isLlmRollupPaused: () => false }
-    if (name.endsWith('/settings.js')) return { automationNumber: (key: string) => ({ llm_rollup_interval_ms: 120_000, db_gc_llm_calls_days: 90, llm_rollup_retention_hours: 2280 }[key]), createOperationsWorker: () => ({ start() {}, stop() {} }) }
+    if (name.endsWith('/settings.js')) return { automationNumber: (key: string) => settings[key] ?? ({ llm_rollup_interval_ms: 120_000, db_gc_llm_calls_days: 90, llm_rollup_retention_hours: 2280 }[key]), createOperationsWorker: () => ({ start() {}, stop() {} }) }
     assert.ok(['./db/pool.js', '../db/pool.js'].includes(name))
     return { pool }
   })
@@ -62,12 +62,15 @@ test('PostgreSQL: exact windows, versioned rollup convergence, routes, quality a
     await client.query('CREATE TEMP TABLE participants(id text, company_id text, name text, avatar_url text, PRIMARY KEY(id, company_id))')
     await client.query(USAGE_ROLLUP_V2_SQL.replaceAll('CREATE TABLE ', 'CREATE TEMP TABLE '))
     let failPrune = false
+    let publicationSql = ''
     const query = (sql: string, values: unknown[]) => {
+      if (sql.includes('coverage_from = GREATEST')) publicationSql = sql
       if (failPrune && sql.startsWith('DELETE FROM llm_calls_rollup_v2')) throw new Error('injected prune failure')
       return client.query(sql, values)
     }
     const pool = { query, connect: async () => ({ query, release() {} }) }
-    const usage = compile('../usage.ts', pool), rollup = compile('../agents/llm-rollup.ts', pool)
+    const settings = { llm_rollup_retention_hours: 2280, db_gc_llm_calls_days: 90 }
+    const usage = compile('../usage.ts', pool, settings), rollup = compile('../agents/llm-rollup.ts', pool, settings)
     const base = Math.floor(Date.now() / 3600000) * 3600000 - 4 * 3600000
     const from = new Date(base + 17 * 60000), to = new Date(base + 2 * 3600000 + 43 * 60000)
     const range = { from, to }
@@ -177,6 +180,138 @@ test('PostgreSQL: exact windows, versioned rollup convergence, routes, quality a
       assert.equal((await client.query(`SELECT COUNT(*)::int AS n FROM ${table} WHERE model = 'expired'`)).rows[0].n, 0)
     }
     await check()
+
+    // Shrink 95 days of rollups to 24 hours while 90 days of raw still exist.
+    // All five aggregate endpoints must continue to match the exact raw window.
+    const wide = { from: new Date(base - 7 * 86400000), to: new Date() }
+    for (const [index, days] of [6, 4, 2].entries()) {
+      await insert(`retention-${index}`, base - days * 86400000 + 17 * 60000, 'direct:novita')
+      await client.query(`UPDATE llm_calls SET model = 'claude-retention-test', input_tokens = 100,
+        cached_input_tokens = 200, cache_creation_tokens = 300, output_tokens = 50,
+        extras = $2 WHERE id = $1`, [`retention-${index}`, JSON.stringify({ route: 'direct:novita',
+        ...(index === 1 ? { platform: 'anthropic' } : {}), actualModel: 'claude-retention-test' })])
+    }
+    const checkAll = async (window = wide) => {
+      await check(window)
+      const raw = await expected(window)
+      for (const method of ['usageByAgent', 'usageByModel', 'usageByProvider']) {
+        const rows = await usage[method]('tenant', window)
+        assert.equal(rows.reduce((sum: number, row: any) => sum + row.requests, 0), raw.requests, method)
+        assert.equal(rows.reduce((sum: number, row: any) => sum + row.costUsd, 0), raw.cost ?? 0, method)
+      }
+    }
+    await rollup.refreshLlmRollup(95 * 24)
+    await checkAll()
+    settings.llm_rollup_retention_hours = 24
+    await rollup.refreshLlmRollup(3)
+    const state = (await client.query('SELECT * FROM llm_rollup_state')).rows[0]
+    const deletionFloor = Math.ceil((new Date(state.aggregated_at).getTime() - 24 * 3600000) / 3600000) * 3600000
+    assert.equal(new Date(state.coverage_from).getTime(), deletionFloor)
+    for (const table of ['llm_calls_rollup', 'llm_calls_rollup_v2']) {
+      assert.equal((await client.query(`SELECT COUNT(*)::int AS n FROM ${table} WHERE bucket_hour < $1`, [new Date(deletionFloor)])).rows[0].n, 0)
+    }
+    await checkAll()
+    await checkAll({ from: new Date(wide.from.getTime() + 17 * 60000), to: new Date(base - 86400000 + 43 * 60000) })
+    const complete = await usage.usageMetadata('tenant', wide)
+    assert.equal(complete.logsComplete, true)
+    assert.equal(complete.boundaryComplete, true)
+    assert.deepEqual(complete.coverageGaps, [])
+    assert.deepEqual(complete.legacyCoverage, [])
+    assert.equal(complete.retainedRollupFrom, new Date(deletionFloor).toISOString())
+    assert.equal(complete.deliveryComplete, null)
+    // The reader also defends against a stale pre-fix watermark under the
+    // currently configured retention, before the first fixed refresh runs.
+    await client.query('UPDATE llm_rollup_state SET coverage_from = $1', [wide.from])
+    await checkAll()
+    await rollup.refreshLlmRollup(3)
+    for (const hours of [2280, 0]) {
+      settings.llm_rollup_retention_hours = hours
+      await rollup.refreshLlmRollup(3)
+      assert.equal(new Date((await client.query('SELECT coverage_from FROM llm_rollup_state')).rows[0].coverage_from).getTime(), deletionFloor,
+        'increasing/disabling retention must not resurrect deleted coverage')
+      await checkAll()
+    }
+    await rollup.refreshLlmRollup(95 * 24)
+    assert.ok(new Date((await client.query('SELECT coverage_from FROM llm_rollup_state')).rows[0].coverage_from).getTime() < wide.from.getTime(),
+      'an actual wide rebuild can restore coverage')
+    await checkAll()
+    const tokenSummary = await usage.usageSummary('tenant', wide)
+    const totalTokens = tokenSummary.inputTokens + tokenSummary.cacheReadTokens + tokenSummary.cacheWriteTokens + tokenSummary.outputTokens
+    for (const method of ['usageByAgent', 'usageByModel', 'usageByProvider']) {
+      const rows = await usage[method]('tenant', wide)
+      assert.equal(rows.reduce((sum: number, row: any) => sum + row.inputTokens + row.outputTokens, 0), totalTokens)
+    }
+    const tokenLogs = await usage.usageLogs('tenant', wide, { page: 1, pageSize: 200 })
+    assert.equal(tokenLogs.items.reduce((sum: number, row: any) => sum + row.inputTokens + row.outputTokens, 0), totalTokens)
+    assert.equal(tokenLogs.items.find((row: any) => row.id === 'retention-0').provider, 'Novita')
+    const tokenModels = await usage.usageByModel('tenant', wide)
+    const mixedPlatforms = tokenModels.find((row: any) => row.model === 'claude-retention-test')
+    assert.equal(mixedPlatforms.provider, 'mixed')
+    assert.deepEqual(mixedPlatforms.platforms, ['anthropic', 'novita'])
+    const tokenProviders = await usage.usageByProvider('tenant', wide)
+    assert.equal(tokenProviders.find((row: any) => row.provider === 'Novita').requests, 2)
+    assert.equal(tokenProviders.find((row: any) => row.provider === 'Anthropic').requests, 1)
+
+    // When both storage tiers have expired, exact whole-hour queries must also
+    // disclose holes. Surviving v1 hours cannot certify neighboring empty hours.
+    settings.llm_rollup_retention_hours = 24
+    settings.db_gc_llm_calls_days = 1
+    await rollup.refreshLlmRollup(3)
+    await client.query("DELETE FROM llm_calls WHERE created_at < NOW() - INTERVAL '1 day'")
+    const missing = { from: wide.from, to: new Date(base - 2 * 86400000) }
+    const gap = await usage.usageMetadata('tenant', missing)
+    assert.equal(gap.logsComplete, false)
+    assert.equal(gap.boundaryComplete, false)
+    assert.deepEqual(gap.coverageGaps, [{ from: missing.from.toISOString(), to: missing.to.toISOString() }])
+    assert.equal((await usage.usageSummary('tenant', missing)).requests, 0)
+    const legacyHour = new Date(missing.from.getTime() + 3600000)
+    await client.query(`INSERT INTO llm_calls_rollup(bucket_hour, company_id, purpose, model, source, calls, cost_usd)
+      VALUES ($1, 'tenant', 'chat', 'surviving-v1', 'server', 2, 4),
+             ($2, 'other', 'chat', 'other-v1', 'server', 20, 40)`, [legacyHour, missing.from])
+    // Residual raw under the old policy is still useful, but does not certify
+    // that other calls were not pruned. A v1-owned hour must not double count it.
+    await insert('residual-owned', legacyHour.getTime() + 1000, 'direct:novita')
+    await insert('residual-uncovered', missing.from.getTime() + 1000, 'direct:novita')
+    const partial = await usage.usageMetadata('tenant', missing)
+    assert.equal(partial.boundaryComplete, false)
+    assert.deepEqual(partial.legacyCoverage, [{ from: legacyHour.toISOString(), to: new Date(legacyHour.getTime() + 3600000).toISOString() }])
+    assert.equal(partial.coverageGaps.length, 2)
+    assert.equal(partial.coverageGaps[0].from, missing.from.toISOString())
+    const historicalSummary = await usage.usageSummary('tenant', missing)
+    assert.equal(historicalSummary.requests, 3)
+    assert.equal(historicalSummary.qualityUnknownRequests, 2)
+    assert.equal(historicalSummary.costUsd, 4.5)
+    const legacyOnly = { from: legacyHour, to: new Date(legacyHour.getTime() + 3600000) }
+    assert.equal((await usage.usageMetadata('tenant', legacyOnly)).boundaryComplete, true)
+    const partialLegacy = { from: new Date(legacyHour.getTime() + 30 * 60000), to: legacyOnly.to }
+    assert.equal((await usage.usageMetadata('tenant', partialLegacy)).boundaryComplete, false)
+    assert.equal((await usage.usageSummary('tenant', partialLegacy)).requests, 0,
+      'a partial hour cannot read the entire legacy bucket')
+
+    // Execute the writer's actual publication SQL at both sides of an exact
+    // hour. Empty certified v2 hours are valid zero usage even after raw expires.
+    assert.ok(publicationSql)
+    for (const timestamp of ['2026-09-02T12:00:00Z', '2026-09-02T12:00:00.001Z', '2026-09-02T12:43:00Z']) {
+      const until = new Date(timestamp), since = new Date(until.getTime() - 3 * 3600000)
+      await client.query(`UPDATE llm_rollup_state SET coverage_from = '2026-08-01T00:00:00Z',
+        completed_through = $1`, [since])
+      await client.query(publicationSql, [since, until, 24])
+      const expectedFloor = Math.ceil((until.getTime() - 24 * 3600000) / 3600000) * 3600000
+      const actualState = (await client.query('SELECT coverage_from FROM llm_rollup_state')).rows[0]
+      assert.equal(new Date(actualState.coverage_from).getTime(), expectedFloor, timestamp)
+      const emptyHour = { from: new Date(expectedFloor), to: new Date(expectedFloor + 3600000) }
+      const emptyMeta = await usage.usageMetadata('empty-tenant', emptyHour)
+      assert.equal(emptyMeta.retainedRollupFrom, emptyHour.from.toISOString())
+      assert.equal(emptyMeta.boundaryComplete, true)
+      assert.deepEqual(emptyMeta.coverageGaps, [])
+      assert.equal((await usage.usageSummary('empty-tenant', emptyHour)).requests, 0)
+    }
+    await client.query('DELETE FROM llm_rollup_state')
+    const absentState = await usage.usageMetadata('tenant', missing)
+    assert.equal(absentState.aggregationStatus, 'pending')
+    assert.equal(absentState.boundaryComplete, false)
+    assert.equal((await usage.usageSummary('tenant', missing)).requests, 2, 'missing state uses every remaining raw row')
+
   } finally {
     await client.end()
   }

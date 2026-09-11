@@ -129,23 +129,33 @@ export async function refreshLlmRollup(sinceHours: number, connection?: PoolClie
        cost_usd = EXCLUDED.cost_usd,
        cost_estimated = EXCLUDED.cost_estimated`, params)
     const retentionHours = automationNumber('llm_rollup_retention_hours')
+    // Use the exact publication timestamp for pruning too (pg NOW() can have
+    // sub-millisecond precision which the Date returned above cannot preserve).
     if (retentionHours > 0) {
       await client.query(
-        `DELETE FROM llm_calls_rollup WHERE bucket_hour < NOW() - ($1::int * INTERVAL '1 hour')`,
-        [retentionHours],
+        `DELETE FROM llm_calls_rollup WHERE bucket_hour < $2::timestamptz - ($1::int * INTERVAL '1 hour')`,
+        [retentionHours, until],
       )
       await client.query(
-        `DELETE FROM llm_calls_rollup_v2 WHERE bucket_hour < NOW() - ($1::int * INTERVAL '1 hour')`,
-        [retentionHours],
+        `DELETE FROM llm_calls_rollup_v2 WHERE bucket_hour < $2::timestamptz - ($1::int * INTERVAL '1 hour')`,
+        [retentionHours, until],
       )
     }
+    // A watermark certifies retained complete hours, including an empty hour.
+    // Clamp to the same (ceiled) deletion boundary; growing retention cannot
+    // resurrect a pruned interval unless this refresh actually rebuilt it.
     await client.query(
       `UPDATE llm_rollup_state SET
-         coverage_from = CASE WHEN completed_through < $1::timestamptz THEN $1::timestamptz
-                              ELSE COALESCE(coverage_from, $1::timestamptz) END,
+         coverage_from = GREATEST(
+           CASE WHEN completed_through < $1::timestamptz THEN $1::timestamptz
+                ELSE LEAST(coverage_from, $1::timestamptz) END,
+           CASE WHEN $3::int > 0 THEN
+             date_trunc('hour', $2::timestamptz - ($3::int * INTERVAL '1 hour'), 'UTC') +
+               CASE WHEN $2::timestamptz = date_trunc('hour', $2::timestamptz, 'UTC')
+                    THEN INTERVAL '0 hours' ELSE INTERVAL '1 hour' END END),
          completed_through = date_trunc('hour', $2::timestamptz, 'UTC'),
          aggregated_at = $2, attempted_at = $2, status = 'ready'
-       WHERE id`, [since > retainedFrom ? since : retainedFrom, until],
+       WHERE id`, [since > retainedFrom ? since : retainedFrom, until, retentionHours],
     )
     await client.query('COMMIT')
     return res.rowCount ?? 0
