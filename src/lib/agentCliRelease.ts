@@ -1,5 +1,5 @@
 // Update this immutable tag when publishing the next fork CLI Release.
-export const AGENT_CLI_RELEASE_TAG = 'agent-cli-v0.16.2-fork.3'
+export const AGENT_CLI_RELEASE_TAG = 'agent-cli-v0.16.2-fork.4'
 export const AGENT_CLI_RELEASE_VERSION = AGENT_CLI_RELEASE_TAG.replace('agent-cli-v', '')
 declare const __CUMORA_GITHUB_OWNER__: string | undefined
 declare const __CUMORA_GITHUB_REPO__: string | undefined
