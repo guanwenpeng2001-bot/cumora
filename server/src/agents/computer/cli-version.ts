@@ -123,6 +123,9 @@ export const ENGINE_VERSION_SPECS: Record<string, EngineVersionSpec> = {
     versionArgs: ['--version'],
     selfUpdate: 'agy update',
   },
+  zcode: {
+    versionArgs: ['--version'],
+  },
   hermes: {
     versionArgs: ['version'],
     selfUpdate: 'hermes update',
@@ -403,4 +406,21 @@ export async function probeLocalEngineVersion(id: string, binPath: string | null
   const spec = ENGINE_VERSION_SPECS[id]
   if (!spec || !binPath) return null
   return versionFromOutput(await spawnCommand(binPath, spec.versionArgs, 6000))
+}
+
+/** Retry only an inconclusive local version probe. A concrete version (whether
+ * compatible or too old) is authoritative and returns immediately. Delays are
+ * injectable so the retry contract can be tested without wall-clock sleeps. */
+export async function probeLocalEngineVersionWithRetry(
+  id: string,
+  binPath: string | null,
+  retryDelaysMs: readonly number[] = [0, 250, 1000],
+): Promise<string | null> {
+  if (!binPath) return null
+  for (const delayMs of retryDelaysMs) {
+    if (delayMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, delayMs))
+    const version = await probeLocalEngineVersion(id, binPath)
+    if (version) return version
+  }
+  return null
 }

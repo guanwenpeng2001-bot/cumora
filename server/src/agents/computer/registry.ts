@@ -25,7 +25,7 @@ import type { EngineModelCatalog, EngineModelOption, FastModelScope, ModelCatalo
 import { BYOA_SYNC_INTERVALS, type ByoaPolicyReport, makeByoaPolicy, parseByoaPolicyReport } from './runtime-policy.js'
 
 export type ComputerKind = 'cloud' | 'local' | 'vps'
-export type EngineId = 'managed' | 'claude' | 'codex' | 'kimi' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini' | 'qwen' | 'antigravity'
+export type EngineId = 'managed' | 'claude' | 'codex' | 'kimi' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini' | 'qwen' | 'antigravity' | 'zcode'
 export type ComputerStatus = 'online' | 'offline' | 'busy'
 
 /** How long a paired computer can go without a heartbeat before the sweep
@@ -66,6 +66,7 @@ const PAIRABLE: Record<Exclude<EngineId, 'managed'>, true> = {
   claude: true, codex: true, grok: true, cursor: true, opencode: true, pi: true, gemini: true,
   qwen: true,
   antigravity: true,
+  zcode: true,
 }
 export const PAIRABLE_ENGINES: ReadonlySet<string> = new Set<string>(Object.keys(PAIRABLE))
 
@@ -118,6 +119,7 @@ const ENGINE_BINS: Record<Exclude<EngineId, 'managed'>, string> = {
   gemini: 'gemini',
   qwen: 'qwen',
   antigravity: 'agy',
+  zcode: 'zcode',
 }
 
 /** Cached PATH snapshot from the daemon. The app reads this; it never probes. */
@@ -661,7 +663,8 @@ export async function mintAgentRuntimeToken(args: {
  *  CUMORA_DEFAULT_GROK_MODEL / CUMORA_DEFAULT_CURSOR_MODEL /
  *  CUMORA_DEFAULT_OPENCODE_MODEL / CUMORA_DEFAULT_PI_MODEL /
  *  CUMORA_DEFAULT_GEMINI_MODEL / CUMORA_DEFAULT_QWEN_MODEL /
- *  CUMORA_DEFAULT_ANTIGRAVITY_MODEL) so every BYOA
+ *  CUMORA_DEFAULT_ANTIGRAVITY_MODEL / CUMORA_DEFAULT_KIMI_MODEL /
+ *  CUMORA_DEFAULT_ZCODE_MODEL) so every BYOA
  *  daemon without a custom provider gets a consistent pin. Critical: a model
  *  upgrade in the underlying CLI (e.g. claude 4.7 → 4.8) silently changes
  *  agent behavior on every user's machine unless we pin here. A custom
@@ -722,6 +725,7 @@ export async function listAgentsForComputer(computerId: string): Promise<
   const geminiDefault = process.env.CUMORA_DEFAULT_GEMINI_MODEL?.trim() || null
   const qwenDefault = process.env.CUMORA_DEFAULT_QWEN_MODEL?.trim() || null
   const antigravityDefault = process.env.CUMORA_DEFAULT_ANTIGRAVITY_MODEL?.trim() || null
+  const zcodeDefault = process.env.CUMORA_DEFAULT_ZCODE_MODEL?.trim() || null
   return rows.map((r) => {
     const { availableEngines, detectedEngines, skillsJson, mcpJson, ...rest } = r
     const skills = (Array.isArray(skillsJson) ? skillsJson : []) as AgentSkillPayload[]
@@ -760,6 +764,8 @@ export async function listAgentsForComputer(computerId: string): Promise<
                     ? qwenDefault
                     : r.engine === 'antigravity'
                       ? antigravityDefault
+                      : r.engine === 'zcode'
+                        ? zcodeDefault
                     : null
     return dflt ? { ...agent, model: dflt } : agent
   })

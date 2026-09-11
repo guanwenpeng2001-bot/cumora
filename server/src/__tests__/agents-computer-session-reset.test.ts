@@ -78,6 +78,7 @@ test('other stale-target phrasings are recognized', () => {
     'Error: could not resume this conversation',
     'Error: unable to resume — thread has expired',
     'Error: no such session',
+    'Error: Session is not active',
   ]) {
     assert.equal(isStaleResumeError(`local claude failed (exit 1): ${phrase}`), true, phrase)
   }

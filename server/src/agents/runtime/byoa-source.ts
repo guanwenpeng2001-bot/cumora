@@ -11,6 +11,7 @@ export const BYOA_SOURCES = [
   'byoa-gemini',
   'byoa-qwen',
   'byoa-antigravity',
+  'byoa-zcode',
 ] as const
 
 export type ByoaSource = typeof BYOA_SOURCES[number]

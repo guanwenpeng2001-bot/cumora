@@ -26,6 +26,7 @@ test('authFailureHint correctly mentions the relevant CLI/tool for each engine',
   assert.match(authFailureHint('gemini', 'quota exceeded'), /gemini/)
   assert.match(authFailureHint('qwen', 'quota exceeded'), /qwen/)
   assert.match(authFailureHint('antigravity', 'quota exceeded'), /agy/)
+  assert.match(authFailureHint('zcode', 'quota exceeded'), /zcode/)
 })
 
 test('authFailureHint handles context overflow and poisoned body sentinels', () => {

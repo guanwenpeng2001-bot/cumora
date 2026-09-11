@@ -5,7 +5,7 @@ import { automationNumber, createOperationsWorker } from '../settings.js'
 import { EMPTY_USAGE, effectiveCostUsd, modelPriceTable, priceFor, type TokenUsage } from './cost.js'
 
 export type AgentRunStatus = 'running' | 'completed' | 'failed' | 'skipped'
-export type TriageSource = 'cloud' | 'byoa-claude' | 'byoa-codex' | 'byoa-kimi' | 'byoa-grok' | 'byoa-cursor' | 'byoa-opencode' | 'byoa-pi' | 'byoa-gemini' | 'byoa-qwen' | 'byoa-antigravity'
+export type TriageSource = 'cloud' | 'byoa-claude' | 'byoa-codex' | 'byoa-kimi' | 'byoa-grok' | 'byoa-cursor' | 'byoa-opencode' | 'byoa-pi' | 'byoa-gemini' | 'byoa-qwen' | 'byoa-antigravity' | 'byoa-zcode'
 export type AgentEventLevel = 'debug' | 'info' | 'warn' | 'error'
 
 type Queryable = Pick<PoolClient, 'query'>
